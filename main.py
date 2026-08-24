@@ -2614,14 +2614,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 try:
                     import cloudscraper as _cs
                     def _cs_request():
-    scraper = _cs.create_scraper()
-    # Send as text/plain with JSON string body (matches browser)
-    headers["Content-Type"] = "text/plain;charset=UTF-8"
-    body_str = json.dumps(payload)
-    if http_method == "PUT":
-        return scraper.put(url, data=body_str, headers=headers, timeout=120)
-    else:
-        return scraper.post(url, data=body_str, headers=headers, timeout=120)
+                        scraper = _cs.create_scraper()
+                        # Send as text/plain with JSON string body (matches browser)
+                        headers["Content-Type"] = "text/plain;charset=UTF-8"
+                        body_str = json.dumps(payload)
+                        if http_method == "PUT":
+                            return scraper.put(url, data=body_str, headers=headers, timeout=120)
+                        else:
+                            return scraper.post(url, data=body_str, headers=headers, timeout=120)
                     response = await asyncio.to_thread(_cs_request)
 
                     log_http_status(response.status_code, "LMArena API")
@@ -3102,16 +3102,16 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     transport_used = "userscript"
 
                             if stream_context is None:
-    # Last-resort: httpx streaming fallback.
-    client = await stack.enter_async_context(httpx.AsyncClient())
-    # Send as text/plain with JSON string body (matches browser DevTools)
-    headers["Content-Type"] = "text/plain;charset=UTF-8"
-    body_str = json.dumps(payload)
-    if http_method == "PUT":
-        stream_context = client.stream('PUT', url, content=body_str.encode('utf-8'), headers=headers, timeout=120)
-    else:
-        stream_context = client.stream('POST', url, content=body_str.encode('utf-8'), headers=headers, timeout=120)
-    transport_used = "httpx"
+                                # Last-resort: httpx streaming fallback.
+                                client = await stack.enter_async_context(httpx.AsyncClient())
+                                # Send as text/plain with JSON string body (matches browser DevTools)
+                                headers["Content-Type"] = "text/plain;charset=UTF-8"
+                                body_str = json.dumps(payload)
+                                if http_method == "PUT":
+                                    stream_context = client.stream('PUT', url, content=body_str.encode('utf-8'), headers=headers, timeout=120)
+                                else:
+                                    stream_context = client.stream('POST', url, content=body_str.encode('utf-8'), headers=headers, timeout=120)
+                                transport_used = "httpx"
 
                             # Userscript proxy jobs report their upstream HTTP status asynchronously.
                             # Wait for the status (or completion) before branching on status_code, while still
@@ -3434,7 +3434,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
 
                                     # If we rotated tokens, allow a fast retry when the backoff would exceed the remaining
                                     # stream deadline (common when one token is rate-limited but another isn't).
-                                    if token_rotated and current_token and current_token != old_token:
+                                    if token_rotated and current_token lim and current_token != old_token:
                                         remaining_budget = float(stream_total_timeout_seconds) - float(
                                             time.monotonic() - stream_started_at
                                         )
@@ -4751,10 +4751,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         raise
     except Exception as e:
         print(f"\n❌ TOP-LEVEL EXCEPTION")
-        print(f"📛 Error type: {type(e).__name__}")
-        print(f"📛 Error message: {str(e)}")
-        print("="*80 + "\n")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 # Anthropic API Models
