@@ -3434,7 +3434,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
 
                                     # If we rotated tokens, allow a fast retry when the backoff would exceed the remaining
                                     # stream deadline (common when one token is rate-limited but another isn't).
-                                    if token_rotated and current_token lim and current_token != old_token:
+                                    if token_rotated and current_token and current_token != old_token:
                                         remaining_budget = float(stream_total_timeout_seconds) - float(
                                             time.monotonic() - stream_started_at
                                         )
