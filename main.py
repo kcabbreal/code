@@ -806,6 +806,9 @@ async def get_initial_data() -> list:
                 }""")
                 if isinstance(models_raw, list) and len(models_raw) > 0:
                     fetched_models = models_raw
+                elif isinstance(models_raw, dict) and "models" in models_raw and len(models_raw["models"]) > 0:
+                    fetched_models = models_raw["models"]
+                if fetched_models:
                     log("OK", f"Models fetched via browser session ({len(fetched_models)} models)")
             except Exception:
                 pass
@@ -3121,29 +3124,29 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     <style>
         :root {
-            --bg-canvas: #171717;
-            --bg-sidebar: #0d0d0d;
-            --bg-card: #212121;
-            --bg-hover: #2a2a2a;
-            --bg-active: #2f2f2f;
-            --border: #2e2e2e;
-            --border-faint: rgba(255, 255, 255, 0.07);
-            --text: #ececec;
-            --text-muted: #9ca3af;
-            --text-faint: #6b7280;
-            --accent: #ffffff;
-            --accent-text: #000000;
+            --bg-base: #0f1115;
+            --bg-card: #181a20;
+            --bg-hover: #22252b;
+            --bg-active: #2b2f36;
+            --border: #2a2d35;
+            --border-faint: #22252b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --text-faint: #64748b;
+            --accent: #6366f1;
+            --accent-hover: #818cf8;
+            --sidebar-width: 280px;
         }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: var(--bg-canvas);
-            color: var(--text);
-            height: 100vh;
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg-base);
+            color: var(--text-main);
             display: flex;
+            height: 100vh;
             overflow: hidden;
-            font-size: 14.5px;
-            letter-spacing: -0.15px;
+            -webkit-font-smoothing: antialiased;
         }
         ::-webkit-scrollbar { width: 5px; height: 5px; }
         ::-webkit-scrollbar-track { background: transparent; }
@@ -3151,21 +3154,20 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
 
         /* --- SIDEBAR --- */
         .sidebar {
-            width: 260px;
-            background: var(--bg-sidebar);
+            width: var(--sidebar-width);
+            background: var(--bg-card);
             display: flex;
             flex-direction: column;
             flex-shrink: 0;
-            border-right: 1px solid var(--border-faint);
+            border-right: 1px solid var(--border);
             transition: margin-left 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-            user-select: none;
             z-index: 40;
         }
         .sidebar.collapsed {
-            margin-left: -260px;
+            margin-left: calc(-1 * var(--sidebar-width));
         }
         .sidebar-header {
-            padding: 14px 16px 10px;
+            padding: 16px 20px;
             display: flex;
             align-items: center;
             justify-content: space-between;
@@ -3175,113 +3177,66 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             align-items: center;
             gap: 10px;
             font-weight: 600;
-            font-size: 15px;
-            color: #fff;
+            font-size: 16px;
+            color: var(--text-main);
             text-decoration: none;
         }
         .brand-icon-circle {
-            width: 26px;
-            height: 26px;
-            border-radius: 50%;
-            background: #fff;
-            color: #000;
+            width: 28px;
+            height: 28px;
+            border-radius: 8px;
+            background: var(--accent);
+            color: white;
             display: flex;
             align-items: center;
             justify-content: center;
             font-weight: 800;
-            font-size: 12px;
-            letter-spacing: -0.5px;
+            font-size: 14px;
         }
         .icon-btn {
             background: none;
             border: none;
             color: var(--text-muted);
             cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
             padding: 6px;
             border-radius: 6px;
-            transition: all 0.15s;
+            transition: all 0.2s;
         }
         .icon-btn:hover {
-            color: #fff;
+            color: var(--text-main);
             background: var(--bg-hover);
         }
 
         .sidebar-content {
             flex: 1;
             overflow-y: auto;
-            padding: 0 10px 16px;
+            padding: 0 16px 16px;
             display: flex;
             flex-direction: column;
             gap: 12px;
         }
-        .nav-list {
-            display: flex;
-            flex-direction: column;
-            gap: 3px;
-        }
         .new-chat-btn {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px 14px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            background: var(--bg-card);
-            border: 1px solid var(--border);
-            color: #fff;
-            padding: 9px 12px;
-            border-radius: 10px;
+            cursor: pointer;
             font-size: 13.5px;
             font-weight: 500;
-            cursor: pointer;
-            transition: all 0.15s;
+            color: var(--text-main);
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            margin-bottom: 20px;
         }
-        .new-chat-btn:hover {
-            background: var(--bg-hover);
-            border-color: rgba(255, 255, 255, 0.2);
-        }
-        .kbd-shortcut {
-            font-size: 11px;
-            color: var(--text-faint);
-            border: 1px solid var(--border);
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-family: 'JetBrains Mono', monospace;
-        }
-
-        .sidebar-search-box {
-            position: relative;
-        }
-        .sidebar-search-input {
-            width: 100%;
-            background: #141414;
-            border: 1px solid var(--border-faint);
-            border-radius: 8px;
-            padding: 7px 10px 7px 30px;
-            font-size: 12.5px;
-            color: #fff;
-            outline: none;
-            font-family: inherit;
-        }
-        .sidebar-search-input:focus {
-            border-color: rgba(255, 255, 255, 0.3);
-        }
-        .sidebar-search-icon {
-            position: absolute;
-            left: 9px;
-            top: 8px;
-            color: var(--text-muted);
-            pointer-events: none;
-        }
+        .new-chat-btn:hover { background: var(--bg-hover); border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
 
         .sidebar-section-title {
             font-size: 11.5px;
             font-weight: 600;
             color: var(--text-faint);
-            padding: 8px 10px 2px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
+            padding: 8px 10px 4px;
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }
@@ -3289,16 +3244,15 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 8px 10px;
+            padding: 10px;
             border-radius: 8px;
-            font-size: 13px;
-            color: var(--text);
+            font-size: 13.5px;
+            color: var(--text-muted);
             cursor: pointer;
-            transition: background 0.12s;
-            position: relative;
+            transition: all 0.2s;
         }
-        .chat-history-item:hover { background: var(--bg-hover); }
-        .chat-history-item.active { background: var(--bg-active); color: #fff; font-weight: 500; }
+        .chat-history-item:hover { background: var(--bg-hover); color: var(--text-main); }
+        .chat-history-item.active { background: var(--bg-active); color: var(--text-main); }
         .chat-title-text {
             white-space: nowrap;
             overflow: hidden;
@@ -3319,95 +3273,54 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             border: none;
             color: var(--text-muted);
             cursor: pointer;
-            padding: 2px 4px;
-            border-radius: 4px;
-            font-size: 12px;
+            padding: 2px;
         }
-        .chat-action-btn:hover { color: #fff; }
+        .chat-action-btn:hover { color: var(--text-main); }
 
         .sidebar-footer {
-            padding: 10px 12px;
-            border-top: 1px solid var(--border-faint);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            position: relative;
+            padding: 16px;
+            border-top: 1px solid var(--border);
         }
         .user-pill {
             display: flex;
             align-items: center;
             gap: 10px;
             cursor: pointer;
-            padding: 6px 8px;
+            padding: 8px;
             border-radius: 8px;
-            flex: 1;
-            transition: background 0.12s;
+            transition: background 0.2s;
         }
         .user-pill:hover { background: var(--bg-hover); }
         .user-avatar-badge {
-            width: 26px;
-            height: 26px;
+            width: 32px;
+            height: 32px;
             border-radius: 50%;
-            background: #2563eb;
-            color: #fff;
-            font-size: 11px;
-            font-weight: 700;
+            background: var(--accent);
+            color: white;
             display: flex;
             align-items: center;
             justify-content: center;
+            font-size: 13px;
+            font-weight: 600;
         }
         .user-name {
-            font-size: 13px;
+            font-size: 14px;
             font-weight: 500;
-            color: #fff;
         }
-        .user-menu-popover {
-            position: absolute;
-            bottom: 54px;
-            left: 12px;
-            right: 12px;
-            background: #1e1e1e;
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 6px;
-            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.6);
-            display: none;
-            flex-direction: column;
-            gap: 2px;
-            z-index: 100;
-        }
-        .user-menu-popover.open { display: flex; }
-        .user-menu-item {
-            padding: 8px 12px;
-            font-size: 13px;
-            color: var(--text);
-            text-decoration: none;
-            border-radius: 6px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            cursor: pointer;
-        }
-        .user-menu-item:hover { background: var(--bg-hover); }
 
         /* --- MAIN CHAT CONTAINER --- */
         .main-chat-container {
             flex: 1;
             display: flex;
             flex-direction: column;
-            height: 100vh;
             position: relative;
-            background: var(--bg-canvas);
         }
 
-        /* TOP NAVBAR */
         .top-navbar {
-            padding: 10px 16px;
+            padding: 12px 20px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            z-index: 20;
-            border-bottom: 1px solid var(--border-faint);
         }
         .model-header-wrap {
             display: flex;
@@ -3415,44 +3328,27 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             gap: 8px;
             cursor: pointer;
             padding: 6px 12px;
-            border-radius: 10px;
-            background: rgba(255, 255, 255, 0.04);
-            border: 1px solid var(--border-faint);
-            transition: all 0.15s;
-        }
-        .model-header-wrap:hover {
-            background: var(--bg-hover);
-            border-color: rgba(255, 255, 255, 0.15);
-        }
-        .model-title-row {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 14px;
+            border-radius: 8px;
             font-weight: 600;
-            color: #fff;
+            color: var(--text-main);
         }
-        .top-right-tools {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
+        .model-header-wrap:hover { background: var(--bg-hover); }
 
         /* --- CHAT SCROLL STREAM --- */
         .chat-scroll-area {
             flex: 1;
             overflow-y: auto;
-            padding: 20px 20px 150px;
+            padding: 20px 20px 180px;
             display: flex;
             flex-direction: column;
             align-items: center;
         }
         .chat-content-width {
-            max-width: 768px;
+            max-width: 780px;
             width: 100%;
             display: flex;
             flex-direction: column;
-            gap: 28px;
+            gap: 32px;
         }
 
         /* --- EMPTY STATE / HERO --- */
@@ -3461,92 +3357,73 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            min-height: 60vh;
+            min-height: 70vh;
             width: 100%;
-            max-width: 740px;
-            margin: auto 0;
         }
         .hero-title {
-            font-size: 26px;
+            font-size: 32px;
             font-weight: 700;
-            color: #fff;
-            margin-bottom: 28px;
-            text-align: center;
+            margin-bottom: 32px;
+            color: var(--text-main);
+            letter-spacing: -0.02em;
+            background: linear-gradient(135deg, #fff 0%, #a5b4fc 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
-
-        /* HERO INPUT BOX */
         .hero-input-box {
             width: 100%;
-            background: var(--bg-card);
+            background: rgba(24, 26, 32, 0.6);
+            backdrop-filter: blur(12px);
             border: 1px solid var(--border);
-            border-radius: 24px;
-            padding: 16px 18px 12px;
+            border-radius: 16px;
+            padding: 14px;
             display: flex;
             flex-direction: column;
             gap: 12px;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
-            transition: border-color 0.15s;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+            transition: border-color 0.2s, box-shadow 0.2s;
         }
         .hero-input-box:focus-within {
-            border-color: rgba(255, 255, 255, 0.35);
+            border-color: var(--accent);
+            box-shadow: 0 8px 32px rgba(99, 102, 241, 0.15);
         }
         .hero-textarea {
             width: 100%;
             background: transparent;
             border: none;
-            color: #fff;
-            font-size: 15px;
+            outline: none;
+            color: var(--text-main);
+            font-size: 15.5px;
             font-family: inherit;
             resize: none;
-            outline: none;
-            max-height: 200px;
-            min-height: 24px;
             line-height: 1.5;
+            max-height: 200px;
+            padding: 4px;
         }
-        .hero-textarea::placeholder {
-            color: #737373;
-        }
+        .hero-textarea::placeholder { color: var(--text-faint); }
         .hero-tools-row {
             display: flex;
+            justify-content: flex-end;
             align-items: center;
-            justify-content: space-between;
         }
-        .hero-tools-left, .hero-tools-right {
+        .hero-tools-right {
             display: flex;
-            align-items: center;
             gap: 6px;
         }
-        .tool-icon-btn {
-            background: none;
-            border: none;
-            color: var(--text-muted);
-            width: 32px;
-            height: 32px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            transition: all 0.15s;
-        }
-        .tool-icon-btn:hover {
-            color: #fff;
-            background: var(--bg-hover);
-        }
         .send-pill-btn {
+            background: var(--text-main);
+            color: var(--bg-base);
+            border: none;
+            border-radius: 50%;
             width: 34px;
             height: 34px;
-            border-radius: 50%;
-            background: #fff;
-            color: #000;
-            border: none;
             display: flex;
             align-items: center;
             justify-content: center;
             cursor: pointer;
-            transition: opacity 0.15s;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
         }
-        .send-pill-btn:hover { opacity: 0.85; }
+        .send-pill-btn:hover { background: var(--accent); color: white; transform: scale(1.05); }
 
         /* SUGGESTIONS GRID */
         .suggestions-wrap {
@@ -3712,7 +3589,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             left: 0;
             right: 0;
             padding: 12px 20px 24px;
-            background: linear-gradient(180deg, transparent 0%, rgba(23, 23, 23, 0.95) 40%, #171717 100%);
+            background: linear-gradient(180deg, transparent 0%, rgba(15, 17, 21, 0.95) 40%, var(--bg-base) 100%);
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -3893,18 +3770,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                     <div class="hero-input-box">
                         <textarea class="hero-textarea" id="heroPromptInput" rows="1" placeholder="Ask Bridgena anything..." onkeydown="handleHeroKey(event)" oninput="autoResize(this)"></textarea>
                         <div class="hero-tools-row">
-                            <div class="hero-tools-left">
-                                <button class="tool-icon-btn" title="Attach file">
-                                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-                                </button>
-                                <button class="tool-icon-btn" title="Web search">
-                                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg>
-                                </button>
-                            </div>
                             <div class="hero-tools-right">
-                                <button class="tool-icon-btn" title="Voice input">
-                                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
-                                </button>
                                 <button class="send-pill-btn" onclick="sendFromHero()" title="Send">
                                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
                                 </button>
@@ -3944,18 +3810,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             <div class="hero-input-box" style="max-width:768px">
                 <textarea class="hero-textarea" id="dockedPromptInput" rows="1" placeholder="Ask Bridgena anything..." onkeydown="handleDockedKey(event)" oninput="autoResize(this)"></textarea>
                 <div class="hero-tools-row">
-                    <div class="hero-tools-left">
-                        <button class="tool-icon-btn" title="Attach file">
-                            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-                        </button>
-                        <button class="tool-icon-btn" title="Web search">
-                            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg>
-                        </button>
-                    </div>
                     <div class="hero-tools-right">
-                        <button class="tool-icon-btn" title="Voice input">
-                            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
-                        </button>
                         <button class="send-pill-btn" onclick="sendFromDocked()" title="Send">
                             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
                         </button>
