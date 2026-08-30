@@ -781,8 +781,68 @@ async def stream_oxalpha(messages: list, model: str = OX_UPSTREAM_MODEL):
 
 
 # ============================================================
-# ARENA MODEL CATALOG FETCHING
+# ARENA MODEL CATALOG FETCHING (RSC PAYLOAD EXTRACTOR)
 # ============================================================
+
+def extract_models_from_html(html: str) -> list:
+    if not html:
+        return []
+    
+    # 1. Search for Next.js RSC self.__next_f.push chunks
+    pushes = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.DOTALL)
+    for p in pushes:
+        try:
+            unescaped = p.encode("utf-8").decode("unicode_escape", errors="ignore")
+        except Exception:
+            unescaped = p
+        
+        if '"initialModels"' in unescaped or '"models"' in unescaped:
+            idx = unescaped.find('"initialModels":')
+            if idx == -1:
+                idx = unescaped.find('"models":')
+            if idx != -1:
+                start_arr = unescaped.find('[', idx)
+                if start_arr != -1:
+                    depth, end_arr, in_str, escape = 0, -1, False, False
+                    for i in range(start_arr, len(unescaped)):
+                        c = unescaped[i]
+                        if escape:
+                            escape = False
+                            continue
+                        if c == '\\':
+                            escape = True
+                            continue
+                        if c == '"':
+                            in_str = not in_str
+                            continue
+                        if not in_str:
+                            if c == '[':
+                                depth += 1
+                            elif c == ']':
+                                depth -= 1
+                                if depth == 0:
+                                    end_arr = i + 1
+                                    break
+                    if end_arr != -1:
+                        try:
+                            models = json.loads(unescaped[start_arr:end_arr])
+                            if isinstance(models, list) and len(models) > 20:
+                                return models
+                        except Exception:
+                            pass
+
+    # 2. Fallback: regex for JSON array containing models with publicName / organization
+    match = re.search(r'\[\{"id":"[0-9a-f\-]+","organization":.*?"userSelectable":true\}\]', html)
+    if match:
+        try:
+            models = json.loads(match.group(0))
+            if isinstance(models, list) and len(models) > 20:
+                return models
+        except Exception:
+            pass
+
+    return []
+
 
 async def get_initial_data() -> list:
     state = load_state()
@@ -794,47 +854,40 @@ async def get_initial_data() -> list:
         s["refresh_started"] = now
     mutate_state(mark_start)
 
-    # Try browser-based fetch first (has session cookies)
     fetched_models = []
+
+    # 1. Try browser-based extraction from active page content
     for jar_candidate in load_jars():
         s = keeper.sessions.get(jar_candidate.get("id"))
         if s and s.running and s.page and not s.page.is_closed():
             try:
-                models_raw = await s.page.evaluate("""async () => {
-                    try { const r = await fetch('/api/models', {credentials: 'include'}); return await r.json(); }
-                    catch(e) { return null; }
-                }""")
-                if isinstance(models_raw, list) and len(models_raw) > 100:
-                    fetched_models = models_raw
-                elif isinstance(models_raw, dict) and "models" in models_raw and len(models_raw["models"]) > 100:
-                    fetched_models = models_raw["models"]
-                if fetched_models:
-                    log("OK", f"Models fetched via browser session ({len(fetched_models)} models)")
-            except Exception:
-                pass
-            if fetched_models:
-                break
+                page_html = await s.page.content()
+                models = extract_models_from_html(page_html)
+                if len(models) > 50:
+                    fetched_models = models
+                    log("OK", f"Models extracted via browser session DOM ({len(fetched_models)} models)")
+                    break
+            except Exception as e:
+                log("DEBUG", f"Browser DOM model extraction attempt failed: {e}")
 
-    # Fallback to direct HTTP fetch
+    # 2. Direct HTTP GET to https://arena.ai/ to parse live RSC stream
     if not fetched_models:
         jar = acquire_jar()
         headers = build_request_headers(jar) if jar else {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-            "Accept": "*/*",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(f"{ARENA_BASE}/api/models", headers=headers)
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                resp = await client.get(f"{ARENA_BASE}/", headers=headers)
                 if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, list) and len(data) > 100:
-                        fetched_models = data
-                    elif isinstance(data, dict) and "models" in data and len(data["models"]) > 100:
-                        fetched_models = data["models"]
-                    if fetched_models:
-                        log("OK", f"Models fetched via direct HTTP ({len(fetched_models)} models)")
+                    models = extract_models_from_html(resp.text)
+                    if len(models) > 50:
+                        fetched_models = models
+                        log("OK", f"Models fetched via direct HTTP HTML parse ({len(fetched_models)} models)")
         except Exception as e:
-            log("WARN", f"Direct models fetch failed: {e}")
+            log("WARN", f"Direct HTML models fetch failed: {e}")
 
     if fetched_models:
         save_models(fetched_models)
@@ -3122,11 +3175,12 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
     <style>
         :root {
             --bg-base: #212121;
+            --bg-sidebar: #171717;
             --bg-card: #2f2f2f;
             --bg-hover: #2f2f2f;
             --bg-active: #424242;
-            --border: #424242;
-            --border-faint: #424242;
+            --border: #333333;
+            --border-faint: #2a2a2a;
             --text-main: #ececec;
             --text-muted: #b4b4b4;
             --text-faint: #737373;
@@ -3135,36 +3189,39 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
+        html, body {
+            height: 100%;
+            width: 100%;
+            overflow: hidden;
             font-family: 'Inter', -apple-system, sans-serif;
             background: var(--bg-base);
             color: var(--text-main);
             display: flex;
-            height: 100vh;
-            overflow: hidden;
             -webkit-font-smoothing: antialiased;
         }
+
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.18); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.28); }
 
         /* --- SIDEBAR --- */
         .sidebar {
             width: var(--sidebar-width);
-            background: #171717;
+            height: 100%;
+            background: var(--bg-sidebar);
             display: flex;
             flex-direction: column;
             flex-shrink: 0;
-            border-right: 1px solid transparent;
-            transition: margin-left 0.2s ease;
+            border-right: 1px solid var(--border);
+            transition: margin-left 0.2s cubic-bezier(0.16, 1, 0.3, 1);
             z-index: 40;
         }
         .sidebar.collapsed {
             margin-left: calc(-1 * var(--sidebar-width));
         }
         .sidebar-header {
-            padding: 16px;
+            padding: 14px 16px;
             display: flex;
             align-items: center;
             justify-content: space-between;
@@ -3197,7 +3254,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             cursor: pointer;
             padding: 6px;
             border-radius: 6px;
-            transition: all 0.2s;
+            transition: all 0.15s;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -3210,24 +3267,24 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         .sidebar-content {
             flex: 1;
             overflow-y: auto;
-            padding: 0 12px 16px;
+            padding: 0 10px 16px;
             display: flex;
             flex-direction: column;
-            gap: 12px;
+            gap: 10px;
         }
         .new-chat-btn {
             background: transparent;
-            border: none;
+            border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 10px;
+            padding: 9px 12px;
             display: flex;
             align-items: center;
             justify-content: space-between;
             cursor: pointer;
-            font-size: 14px;
+            font-size: 13.5px;
             font-weight: 500;
             color: var(--text-main);
-            transition: all 0.2s;
+            transition: background 0.15s;
         }
         .new-chat-btn:hover { background: var(--bg-hover); }
 
@@ -3243,34 +3300,34 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         }
         .sidebar-search-input {
             width: 100%;
-            background: transparent;
+            background: #212121;
             border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 8px 12px 8px 32px;
+            padding: 7px 10px 7px 30px;
             color: var(--text-main);
             font-size: 13px;
             outline: none;
         }
-        .sidebar-search-input:focus {
-            border-color: var(--text-muted);
-        }
+        .sidebar-search-input:focus { border-color: var(--text-muted); }
 
         .sidebar-section-title {
-            font-size: 12px;
+            font-size: 11.5px;
             font-weight: 600;
             color: var(--text-faint);
-            padding: 8px 8px 4px;
+            padding: 8px 6px 2px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
         .chat-history-item {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 10px;
+            padding: 8px 10px;
             border-radius: 8px;
             font-size: 13.5px;
             color: var(--text-main);
             cursor: pointer;
-            transition: all 0.2s;
+            transition: background 0.15s;
         }
         .chat-history-item:hover { background: var(--bg-hover); }
         .chat-history-item.active { background: var(--bg-active); }
@@ -3294,65 +3351,65 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             border: none;
             color: var(--text-muted);
             cursor: pointer;
-            padding: 2px;
+            padding: 3px;
+            border-radius: 4px;
+            font-size: 12px;
         }
-        .chat-action-btn:hover { color: var(--text-main); }
+        .chat-action-btn:hover { color: var(--text-main); background: #333; }
 
         .sidebar-footer {
-            padding: 12px;
-            border-top: 1px solid transparent;
+            padding: 10px;
+            border-top: 1px solid var(--border);
+            position: relative;
         }
         .user-pill {
             display: flex;
             align-items: center;
             gap: 10px;
             cursor: pointer;
-            padding: 8px;
+            padding: 6px 8px;
             border-radius: 8px;
-            transition: background 0.2s;
+            transition: background 0.15s;
         }
         .user-pill:hover { background: var(--bg-hover); }
         .user-avatar-badge {
-            width: 32px;
-            height: 32px;
+            width: 28px;
+            height: 28px;
             border-radius: 50%;
             background: var(--text-main);
             color: var(--bg-base);
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 13px;
-            font-weight: 600;
+            font-size: 12px;
+            font-weight: 700;
         }
-        .user-name {
-            font-size: 14px;
-            font-weight: 500;
-        }
+        .user-name { font-size: 13.5px; font-weight: 500; }
+
         .user-menu-popover {
             position: absolute;
-            bottom: 60px;
-            left: 12px;
-            width: 220px;
+            bottom: 55px;
+            left: 10px;
+            width: 210px;
             background: var(--bg-card);
             border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 6px;
+            border-radius: 10px;
+            padding: 4px;
             display: none;
             flex-direction: column;
-            gap: 2px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-            z-index: 50;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+            z-index: 60;
         }
         .user-menu-popover.open { display: flex; }
         .user-menu-item {
             display: flex;
             align-items: center;
             gap: 10px;
-            padding: 10px;
-            border-radius: 8px;
+            padding: 8px 10px;
+            border-radius: 6px;
             color: var(--text-main);
             text-decoration: none;
-            font-size: 14px;
+            font-size: 13.5px;
             cursor: pointer;
         }
         .user-menu-item:hover { background: var(--bg-active); }
@@ -3360,16 +3417,22 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         /* --- MAIN CHAT CONTAINER --- */
         .main-chat-container {
             flex: 1;
+            height: 100%;
             display: flex;
             flex-direction: column;
             position: relative;
+            overflow: hidden;
         }
 
+        /* --- TOP NAVBAR --- */
         .top-navbar {
-            padding: 12px 16px;
+            padding: 10px 16px;
             display: flex;
             align-items: center;
             justify-content: space-between;
+            flex-shrink: 0;
+            border-bottom: 1px solid transparent;
+            z-index: 20;
         }
         .model-header-wrap {
             display: flex;
@@ -3378,44 +3441,46 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             cursor: pointer;
             padding: 6px 12px;
             border-radius: 8px;
-            font-weight: 500;
+            font-weight: 600;
             font-size: 15px;
             color: var(--text-main);
             transition: background 0.15s;
+            user-select: none;
         }
-        .model-header-wrap:hover { background: var(--bg-hover); }
+        .model-header-wrap:hover { background: var(--bg-card); }
         .top-right-tools {
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 8px;
         }
 
-        /* --- CHAT SCROLL STREAM --- */
+        /* --- CHAT SCROLL AREA --- */
         .chat-scroll-area {
             flex: 1;
             overflow-y: auto;
-            padding: 20px 20px 140px;
             display: flex;
             flex-direction: column;
             align-items: center;
+            padding: 0 16px 140px;
+            position: relative;
         }
         .chat-content-width {
             max-width: 768px;
             width: 100%;
             display: flex;
             flex-direction: column;
-            gap: 24px;
+            flex: 1;
         }
 
-        /* --- EMPTY STATE / HERO --- */
+        /* --- HERO EMPTY STATE --- */
         .hero-empty-state {
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            min-height: 50vh;
+            min-height: 60vh;
             width: 100%;
-            margin-top: 10vh;
+            margin: auto 0;
         }
         .hero-title {
             font-size: 28px;
@@ -3423,21 +3488,24 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             margin-bottom: 24px;
             color: var(--text-main);
             text-align: center;
+            letter-spacing: -0.5px;
         }
         .hero-input-box {
             width: 100%;
-            background: #2f2f2f;
-            border: 1px solid transparent;
+            max-width: 768px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
             border-radius: 16px;
             padding: 12px 16px;
             display: flex;
             flex-direction: column;
             gap: 8px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-            transition: background 0.2s, box-shadow 0.2s;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+            transition: border-color 0.15s, background 0.15s;
         }
         .hero-input-box:focus-within {
-            background: #383838;
+            border-color: #555555;
+            background: #353535;
         }
         .hero-textarea {
             width: 100%;
@@ -3454,26 +3522,9 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         .hero-textarea::placeholder { color: var(--text-muted); }
         .hero-tools-row {
             display: flex;
-            justify-content: space-between;
+            justify-content: flex-end;
             align-items: center;
         }
-        .hero-tools-left, .hero-tools-right {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-        }
-        .tool-icon-btn {
-            background: none;
-            border: none;
-            color: var(--text-main);
-            cursor: pointer;
-            padding: 6px;
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .tool-icon-btn:hover { background: var(--bg-active); }
         .send-pill-btn {
             background: var(--text-main);
             color: var(--bg-base);
@@ -3485,36 +3536,44 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             align-items: center;
             justify-content: center;
             cursor: pointer;
-            transition: transform 0.2s;
+            transition: transform 0.15s, opacity 0.15s;
         }
         .send-pill-btn:hover { transform: scale(1.05); }
 
         /* SUGGESTIONS GRID */
         .suggestions-wrap {
-            margin-top: 32px;
+            margin-top: 28px;
             width: 100%;
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 12px;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 10px;
         }
         .suggest-card {
             background: transparent;
             border: 1px solid var(--border);
-            padding: 12px 16px;
+            padding: 12px 14px;
             border-radius: 12px;
             cursor: pointer;
-            transition: background 0.2s;
+            transition: background 0.15s, border-color 0.15s;
             display: flex;
             flex-direction: column;
             gap: 4px;
         }
         .suggest-card:hover {
             background: var(--bg-card);
+            border-color: #555;
         }
-        .suggest-title { font-size: 14px; font-weight: 500; color: var(--text-main); }
-        .suggest-desc { font-size: 13px; color: var(--text-muted); }
+        .suggest-title { font-size: 13.5px; font-weight: 500; color: var(--text-main); }
+        .suggest-desc { font-size: 12px; color: var(--text-muted); }
 
-        /* --- MESSAGE BUBBLES --- */
+        /* --- MESSAGES CONTAINER --- */
+        .messages-container {
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+            width: 100%;
+            padding-top: 20px;
+        }
         .message-wrapper {
             display: flex;
             flex-direction: column;
@@ -3524,11 +3583,11 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             align-items: flex-end;
         }
         .user-bubble {
-            background: #2f2f2f;
-            padding: 12px 18px;
+            background: var(--bg-card);
+            padding: 10px 16px;
             border-radius: 18px;
             max-width: 80%;
-            font-size: 15px;
+            font-size: 14.5px;
             line-height: 1.6;
             color: var(--text-main);
             white-space: pre-wrap;
@@ -3537,17 +3596,17 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
 
         .assistant-row {
             display: flex;
-            gap: 16px;
+            gap: 14px;
             width: 100%;
         }
         .assistant-avatar {
-            width: 32px;
-            height: 32px;
+            width: 28px;
+            height: 28px;
             border-radius: 50%;
             background: var(--text-main);
             color: var(--bg-base);
-            font-size: 14px;
-            font-weight: 600;
+            font-size: 13px;
+            font-weight: 700;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -3562,38 +3621,40 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             min-width: 0;
         }
         .assistant-meta {
-            font-size: 14px;
+            font-size: 13px;
             font-weight: 600;
             color: var(--text-main);
         }
         .assistant-body {
-            font-size: 15px;
+            font-size: 14.5px;
             line-height: 1.6;
             color: var(--text-main);
             word-break: break-word;
         }
-        .assistant-body p { margin-bottom: 16px; }
+        .assistant-body p { margin-bottom: 14px; }
         .assistant-body p:last-child { margin-bottom: 0; }
         .assistant-body pre {
             background: #0d0d0d;
+            border: 1px solid var(--border);
             border-radius: 8px;
-            margin: 16px 0;
+            margin: 14px 0;
             overflow: hidden;
         }
         .code-header-bar {
-            background: #1f1f1f;
-            padding: 8px 16px;
+            background: #1a1a1a;
+            padding: 6px 14px;
             font-size: 12px;
             color: var(--text-muted);
             display: flex;
             align-items: center;
             justify-content: space-between;
+            border-bottom: 1px solid #282828;
         }
         .code-copy-btn {
             background: none;
             border: none;
             color: var(--text-muted);
-            font-size: 12px;
+            font-size: 11.5px;
             cursor: pointer;
             display: flex;
             align-items: center;
@@ -3603,37 +3664,35 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         .code-copy-btn:hover { color: var(--text-main); }
         .assistant-body code {
             font-family: 'JetBrains Mono', monospace;
-            font-size: 13.5px;
+            font-size: 13px;
         }
         .assistant-body pre code {
             display: block;
-            padding: 16px;
+            padding: 14px;
             overflow-x: auto;
         }
 
         .thought-accordion {
-            background: transparent;
-            border-left: 2px solid var(--border);
-            margin-bottom: 16px;
+            background: rgba(255, 255, 255, 0.03);
+            border-left: 2px solid #555;
+            border-radius: 0 8px 8px 0;
+            margin-bottom: 14px;
             overflow: hidden;
         }
         .thought-accordion summary {
-            padding: 4px 12px;
-            font-size: 13px;
+            padding: 6px 10px;
+            font-size: 12.5px;
             color: var(--text-muted);
             cursor: pointer;
             font-weight: 500;
-            display: flex;
-            align-items: center;
-            gap: 6px;
             user-select: none;
         }
         .thought-accordion summary:hover { color: var(--text-main); }
         .thought-body {
-            padding: 12px 12px 0 12px;
-            font-size: 14px;
+            padding: 8px 12px 10px;
+            font-size: 13.5px;
             color: var(--text-muted);
-            line-height: 1.6;
+            line-height: 1.5;
             white-space: pre-wrap;
             font-style: italic;
         }
@@ -3644,65 +3703,66 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             bottom: 0;
             left: 0;
             right: 0;
-            padding: 0 20px 24px;
-            background: linear-gradient(180deg, transparent 0%, var(--bg-base) 20%);
+            padding: 10px 16px 20px;
+            background: linear-gradient(180deg, transparent 0%, rgba(33, 33, 33, 0.95) 30%, var(--bg-base) 100%);
             display: flex;
             flex-direction: column;
             align-items: center;
-            gap: 8px;
+            gap: 6px;
             z-index: 30;
         }
         .stop-pill {
             display: none;
             align-items: center;
             gap: 6px;
-            padding: 8px 16px;
+            padding: 6px 14px;
             background: var(--bg-card);
             border: 1px solid var(--border);
             color: var(--text-main);
             border-radius: 20px;
-            font-size: 13px;
+            font-size: 12.5px;
             font-weight: 500;
             cursor: pointer;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
         }
         .stop-pill:hover { background: var(--bg-active); }
         .stop-pill.visible { display: flex; }
         .stop-dot { width: 8px; height: 8px; background: #ef4444; border-radius: 2px; }
 
-        /* --- MODALS --- */
+        /* --- MODEL SELECTION MODAL --- */
         .modal-backdrop {
             position: fixed;
             inset: 0;
-            background: rgba(0, 0, 0, 0.5);
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(2px);
             display: none;
             align-items: center;
             justify-content: center;
             z-index: 1000;
-            padding: 20px;
+            padding: 16px;
         }
         .modal-backdrop.open { display: flex; }
         .modal-card {
             width: 100%;
-            max-width: 500px;
+            max-width: 520px;
             background: #212121;
             border: 1px solid var(--border);
-            border-radius: 12px;
+            border-radius: 14px;
             padding: 16px;
             display: flex;
             flex-direction: column;
             gap: 12px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-            max-height: 70vh;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+            max-height: 75vh;
         }
         .modal-search-input {
             width: 100%;
-            background: transparent;
+            background: #171717;
             border: 1px solid var(--border);
             color: var(--text-main);
             padding: 10px 14px;
             border-radius: 8px;
-            font-size: 14px;
+            font-size: 13.5px;
             font-family: inherit;
             outline: none;
         }
@@ -3711,25 +3771,25 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            gap: 4px;
+            gap: 3px;
             max-height: 380px;
         }
         .model-row-item {
-            padding: 10px 12px;
+            padding: 9px 12px;
             border-radius: 8px;
             cursor: pointer;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            transition: background 0.15s;
+            transition: background 0.12s;
         }
         .model-row-item:hover { background: var(--bg-hover); }
         .model-row-item.active { background: var(--bg-active); }
-        .model-row-name { font-weight: 500; font-size: 14px; color: var(--text-main); }
-        .model-row-provider { font-size: 12.5px; color: var(--text-muted); }
+        .model-row-name { font-weight: 500; font-size: 13.5px; color: var(--text-main); }
+        .model-row-provider { font-size: 12px; color: var(--text-muted); }
 
         @media (max-width: 768px) {
-            .sidebar { position: fixed; height: 100vh; }
+            .sidebar { position: fixed; height: 100%; }
             .sidebar.collapsed { margin-left: -260px; }
         }
     </style>
@@ -3751,22 +3811,20 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         <div class="sidebar-content">
             <button class="new-chat-btn" onclick="newChat()">
                 <div style="display:flex;align-items:center;gap:8px">
-                    <div class="brand-icon-circle" style="background:transparent;border:1px solid var(--border);width:28px;height:28px;color:var(--text-main)">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-                    </div>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
                     <span>New Chat</span>
                 </div>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
+                <span style="font-size:11px;color:var(--text-faint)">Ctrl+K</span>
             </button>
 
             <!-- SEARCH -->
             <div class="sidebar-search-box">
-                <svg class="sidebar-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-                <input type="text" class="sidebar-search-input" id="chatSearchInput" placeholder="Search" oninput="filterHistoryList()">
+                <svg class="sidebar-search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                <input type="text" class="sidebar-search-input" id="chatSearchInput" placeholder="Search chats..." oninput="filterHistoryList()">
             </div>
 
             <!-- CHAT LIST -->
-            <div class="sidebar-section-title">Today</div>
+            <div class="sidebar-section-title">Recent Chats</div>
             <div class="nav-list" id="chatHistoryList"></div>
         </div>
 
@@ -3780,7 +3838,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
                     <span>Control Center</span>
                 </a>
-                <a href="/logout" class="user-menu-item" style="color:#f87171">
+                <a href="/logout" class="user-menu-item" style="color:#ef4444">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
                     <span>Sign Out</span>
                 </a>
@@ -3792,22 +3850,27 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
     <main class="main-chat-container">
         <!-- TOP NAVBAR -->
         <header class="top-navbar">
-            <div style="display:flex;align-items:center;gap:10px">
+            <div style="display:flex;align-items:center;gap:8px">
                 <button class="icon-btn" onclick="toggleSidebar()" title="Toggle Sidebar">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
                 </button>
                 <div class="model-header-wrap" onclick="openModelModal()">
-                    <span id="currentModelLabel" style="font-weight:600">gpt-4.1-nano</span>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                    <span id="currentModelLabel">gpt-4o</span>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>
                 </div>
             </div>
 
             <div class="top-right-tools">
-                <div class="user-avatar-badge" style="cursor:pointer;width:32px;height:32px" onclick="toggleUserMenu()">AD</div>
+                <button class="icon-btn" title="New Chat" onclick="newChat()">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                </button>
+                <button class="icon-btn" title="Control Center" onclick="location.href='/dashboard'">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+                </button>
             </div>
         </header>
 
-        <!-- CHAT STREAM SCROLL -->
+        <!-- CHAT SCROLL AREA -->
         <div class="chat-scroll-area" id="chatScrollArea">
             <div class="chat-content-width" id="chatContentWidth">
                 
@@ -3816,17 +3879,12 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                     <div class="hero-title">How can I help you today?</div>
 
                     <!-- HERO INPUT BOX -->
-                    <div class="hero-input-box" style="width:100%; max-width:768px">
+                    <div class="hero-input-box">
                         <textarea class="hero-textarea" id="heroPromptInput" rows="1" placeholder="Message Bridgena..." onkeydown="handleHeroKey(event)" oninput="autoResize(this)"></textarea>
                         <div class="hero-tools-row">
-                            <div class="hero-tools-left">
-                                <button class="tool-icon-btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg></button>
-                            </div>
-                            <div class="hero-tools-right">
-                                <button class="send-pill-btn" onclick="sendFromHero()" title="Send">
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
-                                </button>
-                            </div>
+                            <button class="send-pill-btn" onclick="sendFromHero()" title="Send">
+                                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
+                            </button>
                         </div>
                     </div>
 
@@ -3836,7 +3894,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                             <div class="suggest-title">Write Python script</div>
                             <div class="suggest-desc">async worker queue architecture</div>
                         </div>
-                        <div class="suggest-card" onclick="useSuggestion('Explain how DeepSeek R1 and reasoning models handle chain-of-thought')">
+                        <div class="suggest-card" onclick="useSuggestion('Explain how DeepSeek R1 reasoning models work internally')">
                             <div class="suggest-title">Reasoning models</div>
                             <div class="suggest-desc">deep chain-of-thought mechanisms</div>
                         </div>
@@ -3848,7 +3906,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                 </div>
 
                 <!-- MESSAGES CONTAINER -->
-                <div id="messagesList" style="display:none;flex-direction:column;gap:24px;width:100%"></div>
+                <div class="messages-container" id="messagesList" style="display:none"></div>
 
             </div>
         </div>
@@ -3859,20 +3917,15 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                 <div class="stop-dot"></div>
                 <span>Stop generating</span>
             </button>
-            <div class="hero-input-box" style="width:100%; max-width:768px">
+            <div class="hero-input-box">
                 <textarea class="hero-textarea" id="dockedPromptInput" rows="1" placeholder="Message Bridgena..." onkeydown="handleDockedKey(event)" oninput="autoResize(this)"></textarea>
                 <div class="hero-tools-row">
-                    <div class="hero-tools-left">
-                        <button class="tool-icon-btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg></button>
-                    </div>
-                    <div class="hero-tools-right">
-                        <button class="send-pill-btn" onclick="sendFromDocked()" title="Send">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
-                        </button>
-                    </div>
+                    <button class="send-pill-btn" onclick="sendFromDocked()" title="Send">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
+                    </button>
                 </div>
             </div>
-            <div style="font-size:11.5px; color:var(--text-faint); margin-top:4px;">Bridgena can make mistakes. Check important info.</div>
+            <div style="font-size:11.5px;color:var(--text-faint);margin-top:2px">Bridgena can make mistakes. Verify important info.</div>
         </div>
     </main>
 
@@ -3880,31 +3933,39 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
     <div class="modal-backdrop" id="modelModalBackdrop" onclick="closeModelModal(event)">
         <div class="modal-card" onclick="event.stopPropagation()">
             <div style="display:flex;justify-content:space-between;align-items:center">
-                <span style="font-weight:600;font-size:16px;color:var(--text-main)">Select a model</span>
+                <span style="font-weight:600;font-size:15px;color:var(--text-main)">Select Model (<span id="modalModelCount">0</span> available)</span>
                 <button class="icon-btn" onclick="closeModelModal()">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
                 </button>
             </div>
-            <input type="text" class="modal-search-input" id="modelSearchInput" placeholder="Search models..." oninput="filterModelsList()">
+            <input type="text" class="modal-search-input" id="modelSearchInput" placeholder="Search models by name or provider..." oninput="filterModelsList()">
             <div class="modal-models-list" id="modalModelsList"></div>
         </div>
     </div>
 
     <script>
-    let currentModel = localStorage.getItem('nx_model') || 'gpt-4.1-nano';
+    let currentModel = localStorage.getItem('nx_model') || 'gpt-4o';
     let availableModels = [];
-    let conversations = JSON.parse(localStorage.getItem('nx_conversations') || '[]');
+    let conversations = [];
+    try {
+        conversations = JSON.parse(localStorage.getItem('nx_conversations') || '[]');
+        if (!Array.isArray(conversations)) conversations = [];
+    } catch(e) {
+        conversations = [];
+    }
     let currentConvId = localStorage.getItem('nx_current_id') || null;
     let abortController = null;
 
-    marked.setOptions({
-        breaks: true,
-        gfm: true,
-        highlight: function(code, lang) {
-            const language = hljs.getLanguage(lang) ? lang : 'plaintext';
-            return hljs.highlight(code, { language }).value;
-        }
-    });
+    // Safe Markdown Renderer with fallback
+    function safeRenderMarkdown(text) {
+        if (!text) return '';
+        try {
+            if (typeof marked !== 'undefined') {
+                return marked.parse(text);
+            }
+        } catch(e) {}
+        return escapeHtml(text).replace(/\n/g, '<br>');
+    }
 
     function toggleSidebar() {
         document.getElementById('appSidebar').classList.toggle('collapsed');
@@ -3935,7 +3996,10 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
 
     function openModelModal() {
         document.getElementById('modelModalBackdrop').classList.add('open');
-        document.getElementById('modelSearchInput').focus();
+        const inp = document.getElementById('modelSearchInput');
+        inp.value = '';
+        renderModelsList();
+        setTimeout(() => inp.focus(), 50);
     }
 
     function closeModelModal(e) {
@@ -3960,23 +4024,30 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                     currentModel = availableModels[0].id;
                 }
             } else {
-                availableModels = [{ id: 'gpt-4.1-nano', owned_by: 'OpenAI' }];
+                availableModels = [{ id: 'gpt-4o', owned_by: 'OpenAI' }];
             }
         } catch (e) {
-            availableModels = [{ id: 'gpt-4.1-nano', owned_by: 'OpenAI' }];
+            availableModels = [{ id: 'gpt-4o', owned_by: 'OpenAI' }];
         }
         document.getElementById('currentModelLabel').textContent = currentModel;
+        document.getElementById('modalModelCount').textContent = availableModels.length;
         renderModelsList();
     }
 
     function renderModelsList() {
         const list = document.getElementById('modalModelsList');
-        const q = (document.getElementById('modelSearchInput').value || '').toLowerCase();
-        const filtered = availableModels.filter(m => m.id && m.id.toLowerCase().includes(q) || (m.owned_by && m.owned_by.toLowerCase().includes(q)));
+        const q = (document.getElementById('modelSearchInput').value || '').toLowerCase().trim();
+        const filtered = availableModels.filter(m => (m.id && m.id.toLowerCase().includes(q)) || (m.owned_by && m.owned_by.toLowerCase().includes(q)));
+        
+        if (filtered.length === 0) {
+            list.innerHTML = `<div style="padding:14px;font-size:13px;color:var(--text-faint);text-align:center">No matching models found</div>`;
+            return;
+        }
+
         list.innerHTML = filtered.map(m => `
-            <div class="model-row-item ${m.id === currentModel ? 'active' : ''}" onclick="selectModel('${m.id}')">
-                <span class="model-row-name">${m.id}</span>
-                <span class="model-row-provider">${m.owned_by || 'Arena'}</span>
+            <div class="model-row-item ${m.id === currentModel ? 'active' : ''}" onclick="selectModel('${escapeAttr(m.id)}')">
+                <span class="model-row-name">${escapeHtml(m.id)}</span>
+                <span class="model-row-provider">${escapeHtml(m.owned_by || 'Arena')}</span>
             </div>
         `).join('');
     }
@@ -3986,12 +4057,15 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
     }
 
     function getActiveConv() {
-        return conversations.find(c => c.id === currentConvId);
+        if (!currentConvId) return null;
+        return conversations.find(c => c && c.id === currentConvId) || null;
     }
 
     function saveConversations() {
-        localStorage.setItem('nx_conversations', JSON.stringify(conversations));
-        localStorage.setItem('nx_current_id', currentConvId || '');
+        try {
+            localStorage.setItem('nx_conversations', JSON.stringify(conversations));
+            localStorage.setItem('nx_current_id', currentConvId || '');
+        } catch(e) {}
         renderHistoryList();
     }
 
@@ -3999,7 +4073,8 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         currentConvId = null;
         saveConversations();
         renderChatView();
-        document.getElementById('heroPromptInput').focus();
+        const inp = document.getElementById('heroPromptInput');
+        if (inp) inp.focus();
     }
 
     function selectChat(id) {
@@ -4010,7 +4085,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
 
     function deleteChat(id, e) {
         if (e) e.stopPropagation();
-        conversations = conversations.filter(c => c.id !== id);
+        conversations = conversations.filter(c => c && c.id !== id);
         if (currentConvId === id) currentConvId = null;
         saveConversations();
         renderChatView();
@@ -4018,9 +4093,9 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
 
     function renameChat(id, e) {
         if (e) e.stopPropagation();
-        const conv = conversations.find(c => c.id === id);
+        const conv = conversations.find(c => c && c.id === id);
         if (!conv) return;
-        const newTitle = prompt('Enter conversation title:', conv.title);
+        const newTitle = prompt('Enter conversation title:', conv.title || 'New Chat');
         if (newTitle && newTitle.trim()) {
             conv.title = newTitle.trim();
             saveConversations();
@@ -4033,12 +4108,12 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
 
     function renderHistoryList() {
         const list = document.getElementById('chatHistoryList');
-        const q = (document.getElementById('chatSearchInput')?.value || '').toLowerCase();
-        const filtered = conversations.filter(c => !q || (c.title || '').toLowerCase().includes(q));
+        const q = (document.getElementById('chatSearchInput')?.value || '').toLowerCase().trim();
+        const filtered = conversations.filter(c => c && (!q || (c.title || '').toLowerCase().includes(q)));
 
         if (filtered.length === 0) {
             list.innerHTML = `
-                <div style="padding:10px;font-size:13px;color:var(--text-faint);text-align:center">
+                <div style="padding:10px;font-size:12.5px;color:var(--text-faint);text-align:center">
                     No recent chats
                 </div>
             `;
@@ -4062,7 +4137,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         const msgsList = document.getElementById('messagesList');
         const docked = document.getElementById('dockedComposer');
 
-        if (!conv || !conv.messages || conv.messages.length === 0) {
+        if (!conv || !Array.isArray(conv.messages) || conv.messages.length === 0) {
             hero.style.display = 'flex';
             msgsList.style.display = 'none';
             docked.style.display = 'none';
@@ -4077,21 +4152,23 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
 
     function copyCode(btn) {
         const pre = btn.closest('pre');
-        const code = pre.querySelector('code').innerText;
-        navigator.clipboard.writeText(code);
-        btn.textContent = '✓ Copied';
-        setTimeout(() => btn.textContent = 'Copy', 2000);
+        const code = pre ? pre.querySelector('code')?.innerText || '' : '';
+        if (code) {
+            navigator.clipboard.writeText(code);
+            btn.innerHTML = '✓ Copied';
+            setTimeout(() => { btn.innerHTML = 'Copy'; }, 2000);
+        }
     }
 
     function renderMessages() {
         const conv = getActiveConv();
-        if (!conv) return;
+        if (!conv || !Array.isArray(conv.messages)) return;
         const box = document.getElementById('messagesList');
         box.innerHTML = conv.messages.map((m, idx) => {
             if (m.role === 'user') {
                 return `
                     <div class="message-wrapper user">
-                        <div class="user-bubble">${escapeHtml(m.content)}</div>
+                        <div class="user-bubble">${escapeHtml(m.content || '')}</div>
                     </div>
                 `;
             } else {
@@ -4099,19 +4176,19 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                 let thoughtHtml = '';
                 if (m.thought) {
                     thoughtHtml = `
-                        <details class="thought-accordion">
+                        <details class="thought-accordion" open>
                             <summary>Thinking Process</summary>
                             <div class="thought-body">${escapeHtml(m.thought)}</div>
                         </details>
                     `;
                 }
-                const renderedMarkdown = marked.parse(parsed);
+                const renderedMarkdown = safeRenderMarkdown(parsed);
                 return `
                     <div class="message-wrapper assistant" id="msg-${idx}">
                         <div class="assistant-row">
                             <div class="assistant-avatar">B</div>
                             <div class="assistant-content-col">
-                                <div class="assistant-meta">${m.model || currentModel}</div>
+                                <div class="assistant-meta">${escapeHtml(m.model || currentModel)}</div>
                                 ${thoughtHtml}
                                 <div class="assistant-body">${renderedMarkdown}</div>
                             </div>
@@ -4124,10 +4201,10 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         box.querySelectorAll('pre').forEach(pre => {
             if (!pre.querySelector('.code-header-bar')) {
                 const codeEl = pre.querySelector('code');
-                const lang = (codeEl.className.match(/language-(\\w+)/) || [, 'code'])[1];
+                const lang = (codeEl?.className?.match(/language-(\\w+)/) || [, 'code'])[1];
                 const header = document.createElement('div');
                 header.className = 'code-header-bar';
-                header.innerHTML = `<span>${lang}</span><button class="code-copy-btn" onclick="copyCode(this)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg> Copy</button>`;
+                header.innerHTML = `<span>${escapeHtml(lang)}</span><button class="code-copy-btn" onclick="copyCode(this)"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg> Copy</button>`;
                 pre.insertBefore(header, codeEl);
             }
         });
@@ -4137,17 +4214,24 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
     }
 
     function escapeHtml(str) {
-        return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        return (str || '').toString().replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    function escapeAttr(str) {
+        return (str || '').toString().replace(/'/g, "\\'");
     }
 
     function useSuggestion(text) {
-        document.getElementById('heroPromptInput').value = text;
-        sendFromHero();
+        const inp = document.getElementById('heroPromptInput');
+        if (inp) {
+            inp.value = text;
+            sendFromHero();
+        }
     }
 
     function sendFromHero() {
         const inp = document.getElementById('heroPromptInput');
-        const txt = inp.value.trim();
+        const txt = inp?.value?.trim();
         if (!txt) return;
         inp.value = '';
         inp.style.height = 'auto';
@@ -4156,7 +4240,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
 
     function sendFromDocked() {
         const inp = document.getElementById('dockedPromptInput');
-        const txt = inp.value.trim();
+        const txt = inp?.value?.trim();
         if (!txt) return;
         inp.value = '';
         inp.style.height = 'auto';
@@ -4181,7 +4265,8 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         saveConversations();
         renderChatView();
 
-        document.getElementById('stopPill').classList.add('visible');
+        const stopBtn = document.getElementById('stopPill');
+        if (stopBtn) stopBtn.classList.add('visible');
         abortController = new AbortController();
 
         try {
@@ -4238,7 +4323,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                 assistantMsg.content += '\n\n*(Generation interrupted: ' + e.message + ')*';
             }
         } finally {
-            document.getElementById('stopPill').classList.remove('visible');
+            if (stopBtn) stopBtn.classList.remove('visible');
             abortController = null;
             saveConversations();
             renderMessages();
@@ -4250,7 +4335,8 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
             abortController.abort();
             abortController = null;
         }
-        document.getElementById('stopPill').classList.remove('visible');
+        const stopBtn = document.getElementById('stopPill');
+        if (stopBtn) stopBtn.classList.remove('visible');
     }
 
     document.addEventListener('keydown', e => {
@@ -4260,9 +4346,22 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         }
     });
 
-    renderHistoryList();
-    renderChatView();
-    loadModels();
+    document.addEventListener('click', e => {
+        const pop = document.getElementById('userMenuPopover');
+        const pill = document.querySelector('.user-pill');
+        if (pop && pop.classList.contains('open') && !pop.contains(e.target) && !pill.contains(e.target)) {
+            pop.classList.remove('open');
+        }
+    });
+
+    // Initialize safely
+    try {
+        renderHistoryList();
+        renderChatView();
+        loadModels();
+    } catch(e) {
+        console.error('Initialization error:', e);
+    }
     </script>
 </body>
 </html>"""
