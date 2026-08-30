@@ -1214,12 +1214,25 @@ class KeeperSession:
                     continue
 
             if not modal_already_open:
-                # Force open sidebar if collapsed, so Log In text mounts
-                try:
-                    await page.locator("button[aria-label*='sidebar' i]").first.click(timeout=3000)
-                    await asyncio.sleep(1.5)
-                except Exception:
-                    pass
+                # Check if sidebar is already open (our cookie should have done this)
+                # Only try to toggle sidebar if Log In button is NOT visible
+                login_visible = False
+                for sel in ["button:has-text('Log In')", "a:has-text('Log In')", "button:has-text('Log in')", "a:has-text('Log in')"]:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            login_visible = True
+                            break
+                    except Exception:
+                        continue
+
+                if not login_visible:
+                    # Sidebar might be collapsed — try toggling it open
+                    try:
+                        await page.locator("button[aria-label*='sidebar' i]").first.click(timeout=3000)
+                        await asyncio.sleep(1.5)
+                    except Exception:
+                        pass
 
                 # Try to click Log In button in the page
                 login_selectors = [
