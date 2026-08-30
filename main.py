@@ -1148,6 +1148,7 @@ class KeeperSession:
         try:
             # ---- STEP 1: Navigate ----
             self._set_step("[1/6] Navigating to arena.ai...")
+            await self._ensure_sidebar_cookie()
             await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
             await self._wait_cloudflare(page)
             await self._handle_turnstile(page)
