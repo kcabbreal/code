@@ -1147,6 +1147,32 @@ class KeeperSession:
         except Exception:
             pass
 
+    async def _dismiss_promos(self, page):
+        """Dismiss any promotional banners/ads that Arena shows (e.g. 'Get More Done With Agents').
+        These banners can cover the sidebar and block the Log In button."""
+        try:
+            dismiss_selectors = [
+                "text='Hide this'",
+                "button:has-text('Hide this')",
+                "a:has-text('Hide this')",
+                "text='Dismiss'",
+                "button:has-text('Dismiss')",
+                "button:has-text('Close')",
+                "button[aria-label='Close']",
+                "button[aria-label='Dismiss']",
+            ]
+            for sel in dismiss_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        await loc.click(timeout=3000)
+                        log("INFO", f"[{self.name}] Dismissed promo banner via: {sel}")
+                        await asyncio.sleep(1)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     # --- Multi-Step Native Email/Password Login ---
 
     async def _login_email_native(self) -> Tuple[bool, str]:
@@ -1169,6 +1195,9 @@ class KeeperSession:
             await self._wait_cloudflare(page)
             await self._handle_turnstile(page)
             await asyncio.sleep(2)
+
+            # ---- Dismiss any promo banners blocking the UI ----
+            await self._dismiss_promos(page)
 
             # ---- STEP 2: Open login modal ----
             self._set_step("[2/6] Locating and opening login modal...")
@@ -1777,6 +1806,9 @@ class KeeperSession:
             await self._handle_turnstile(self.page)
             await self._ensure_sidebar_cookie()
             await self._inject_visual_cursor(self.page)
+
+            # Dismiss any promo banners that might block the UI
+            await self._dismiss_promos(self.page)
 
             self.running = True
             self.last_health_ok = 0
