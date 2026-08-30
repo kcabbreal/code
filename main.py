@@ -1,4962 +1,5132 @@
+"""
+Bridgena v1.0 — OpenAI-Compatible Bridge for arena.ai
+Multi-worker · Session Keeper · Browser Bridge · Low Resource
+"""
+import argparse
 import asyncio
-import builtins as _builtins
-import json
-import os
-import re
-import shutil
-import sys
-import uuid
-import time
-import secrets
 import base64
-import mimetypes
 import hashlib
-from collections import defaultdict
-from contextlib import asynccontextmanager, AsyncExitStack
+import json
+import math
+import mimetypes
+import os
+import random
+import re
+import secrets
+import sys
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, List
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urlsplit, urlparse, parse_qs
-
-import uvicorn
-from camoufox.async_api import AsyncCamoufox
-from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import HTMLResponse, RedirectResponse, StreamingResponse
-from fastapi.security import APIKeyHeader
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
-import requests
-
-# Import from modularized modules
-from . import constants
-from . import config as _config_module
-from . import state as _state_module
-from .config import get_models, save_models
-from .browser_utils import (
-    _is_windows,
-    _normalize_camoufox_window_mode,
-    _windows_apply_window_mode_by_title_substring,
-    _maybe_apply_camoufox_window_mode,
-    click_turnstile,
-    is_execution_context_destroyed_error,
-    safe_page_evaluate,
-    _consume_background_task_exception,
-    _cancel_background_task,
+import uvicorn
+from fastapi import (
+    Depends, FastAPI, File, Form, Header, HTTPException,
+    Request, Response, UploadFile, status,
 )
-from .recaptcha import (
-    extract_recaptcha_params_from_text,
-    get_recaptcha_settings,
-    _mint_recaptcha_v3_token_in_page,
-    _camoufox_proxy_signup_anonymous_user,
-    _set_provisional_user_id_in_browser,
-    _maybe_inject_arena_auth_cookie_from_localstorage,
-    find_chrome_executable,
-    get_recaptcha_v3_token_with_chrome,
-    get_recaptcha_v3_token,
-    refresh_recaptcha_token,
-    get_cached_recaptcha_token,
+from fastapi.responses import (
+    HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse,
 )
-from .auth import (
-    _combine_split_arena_auth_cookies,
-    _capture_ephemeral_arena_auth_token_from_cookies,
-    _upsert_browser_session_into_config,
-    normalize_user_agent_value,
-    get_request_headers_with_token,
-    _decode_arena_auth_session_token,
-    maybe_build_arena_auth_cookie_from_signup_response_body,
-    _decode_jwt_payload,
-    extract_supabase_anon_key_from_text,
-    _derive_supabase_auth_base_url_from_arena_auth_token,
-    get_arena_auth_token_expiry_epoch,
-    is_arena_auth_token_expired,
-    is_probably_valid_arena_auth_token,
-    refresh_arena_auth_token_via_lmarena_http,
-    refresh_arena_auth_token_via_supabase,
-    maybe_refresh_expired_auth_tokens_via_lmarena_http,
-    maybe_refresh_expired_auth_tokens,
-    get_next_auth_token,
-    remove_auth_token,
-    ARENA_AUTH_REFRESH_LOCK,
-)
+from fastapi.security import APIKeyHeader
 
-from .transport import (
-    BrowserFetchStreamResponse,
-    UserscriptProxyStreamResponse,
-    _touch_userscript_poll,
-    _get_userscript_proxy_queue,
-    _userscript_proxy_is_active,
-    _userscript_proxy_check_secret,
-    _cleanup_userscript_proxy_jobs,
-    _mark_userscript_proxy_inactive,
-    _finalize_userscript_proxy_job,
-    _detect_arena_origin,
-    _arena_origin_candidates,
-    _arena_auth_cookie_specs,
-    _provisional_user_id_cookie_specs,
-    _get_arena_context_cookies,
-    _normalize_userscript_proxy_url,
-    fetch_lmarena_stream_via_userscript_proxy,
-    fetch_lmarena_stream_via_chrome,
-    fetch_lmarena_stream_via_camoufox,
-    fetch_via_proxy_queue,
-    push_proxy_chunk,
-    camoufox_proxy_worker,
-)
+try:
+    from playwright.async_api import async_playwright
+except ImportError:
+    async_playwright = None
 
-from .vision_solver import (
-    solve_recaptcha_v2_challenge,
-    VisionSolverConfig,
-    VISION_SOLVER_AVAILABLE,
-)
+try:
+    from camoufox.async_api import AsyncCamoufox
+except ImportError:
+    AsyncCamoufox = None
 
-# Aliases for backward compatibility
-DEBUG = constants.DEBUG
-PORT = constants.PORT
-HTTPStatus = constants.HTTPStatus
-STATUS_MESSAGES = constants.STATUS_MESSAGES
-RECAPTCHA_SITEKEY = constants.RECAPTCHA_SITEKEY
-RECAPTCHA_ACTION = constants.RECAPTCHA_ACTION
-RECAPTCHA_V2_SITEKEY = constants.RECAPTCHA_V2_SITEKEY
-TURNSTILE_SITEKEY = constants.TURNSTILE_SITEKEY
-STRICT_BROWSER_FETCH_MODELS = constants.STRICT_BROWSER_FETCH_MODELS
-STRICT_CHROME_FETCH_MODELS = STRICT_BROWSER_FETCH_MODELS  # backward compat alias
-LMARENA_ORIGIN = constants.LMARENA_ORIGIN
-ARENA_ORIGIN = constants.ARENA_ORIGIN
-ARENA_HOST_TO_ORIGIN = constants.ARENA_HOST_TO_ORIGIN
-DEFAULT_REQUEST_TIMEOUT = constants.DEFAULT_REQUEST_TIMEOUT
-GRECAPTCHA_TIMEOUT_MS = constants.GRECAPTCHA_TIMEOUT_MS
-GRECAPTCHA_POLL_MS = constants.GRECAPTCHA_POLL_MS
-TOKEN_EXPIRY_SKEW_SECONDS = constants.TOKEN_EXPIRY_SKEW_SECONDS
-RECAPTCHA_TOKEN_EXPIRY_SECONDS = constants.RECAPTCHA_TOKEN_EXPIRY_SECONDS
-RECAPTCHA_V3_TOKEN_LIFETIME_SECONDS = constants.RECAPTCHA_V3_TOKEN_LIFETIME_SECONDS
-PERIODIC_REFRESH_INTERVAL_SECONDS = constants.PERIODIC_REFRESH_INTERVAL_SECONDS
-DEFAULT_RATE_LIMIT_RPM = constants.DEFAULT_RATE_LIMIT_RPM
-RATE_LIMIT_WINDOW_SECONDS = constants.RATE_LIMIT_WINDOW_SECONDS
-DEFAULT_USERSCRIPT_PROXY_POLL_TIMEOUT_SECONDS = constants.DEFAULT_USERSCRIPT_PROXY_POLL_TIMEOUT_SECONDS
-DEFAULT_USERSCRIPT_PROXY_JOB_TTL_SECONDS = constants.DEFAULT_USERSCRIPT_PROXY_JOB_TTL_SECONDS
-USERSCRIPT_PROXY_ACTIVE_WINDOW_BUFFER_SECONDS = constants.USERSCRIPT_PROXY_ACTIVE_WINDOW_BUFFER_SECONDS
-USERSCRIPT_PROXY_JOB_TTL_MAX_SECONDS = constants.USERSCRIPT_PROXY_JOB_TTL_MAX_SECONDS
-DEFAULT_CAMOUFOX_PROXY_WINDOW_MODE = constants.DEFAULT_CAMOUFOX_PROXY_WINDOW_MODE
-DEFAULT_CAMOUFOX_FETCH_WINDOW_MODE = constants.DEFAULT_CAMOUFOX_FETCH_WINDOW_MODE
-DEFAULT_CHROME_FETCH_WINDOW_MODE = constants.DEFAULT_CHROME_FETCH_WINDOW_MODE
-VALID_WINDOW_MODES = constants.VALID_WINDOW_MODES
-CHROME_PATH_CANDIDATES = constants.CHROME_PATH_CANDIDATES
-EDGE_PATH_CANDIDATES = constants.EDGE_PATH_CANDIDATES
-DEFAULT_USER_AGENT = constants.DEFAULT_USER_AGENT
-MAX_IMAGE_SIZE_BYTES = constants.MAX_IMAGE_SIZE_BYTES
-SUPPORTED_IMAGE_MIME_TYPES = constants.SUPPORTED_IMAGE_MIME_TYPES
-CF_CLEARANCE_COOKIE = constants.CF_CLEARANCE_COOKIE
-CF_BM_COOKIE = constants.CF_BM_COOKIE
-CF_UVID_COOKIE = constants.CF_UVID_COOKIE
-PROVISIONAL_USER_ID_COOKIE = constants.PROVISIONAL_USER_ID_COOKIE
-ARENA_AUTH_COOKIE = constants.ARENA_AUTH_COOKIE
-GRECAPTCHA_COOKIE = constants.GRECAPTCHA_COOKIE
-ARENA_COOKIE_DOMAINS = constants.ARENA_COOKIE_DOMAINS
-ARENA_DIRECT_MODE_URL = constants.ARENA_DIRECT_MODE_URL
-NEXTJS_API_SIGNUP = constants.NEXTJS_API_SIGNUP
-CONTENT_TYPE_TEXT_PLAIN_UTF8 = constants.CONTENT_TYPE_TEXT_PLAIN_UTF8
-CONTENT_TYPE_APPLICATION_JSON = constants.CONTENT_TYPE_APPLICATION_JSON
-TURNSTILE_SELECTORS = constants.TURNSTILE_SELECTORS
-TURNSTILE_INNER_SELECTORS = constants.TURNSTILE_INNER_SELECTORS
-ARENA_ORIGIN_HEADER = constants.ARENA_ORIGIN_HEADER
-ARENA_REFERER_HEADER = constants.ARENA_REFERER_HEADER
-SUPABASE_JWT_PATTERN = constants.SUPABASE_JWT_PATTERN
-CLOUDFLARE_CHALLENGE_TITLE = constants.CLOUDFLARE_CHALLENGE_TITLE
+# ============================================================
+# CONFIGURATION & CONSTANTS
+# ============================================================
 
-# Backoff functions
-def get_rate_limit_sleep_seconds(retry_after: Optional[str], attempt: int) -> int:
-    return constants.get_rate_limit_backoff_seconds(retry_after, attempt)
+PORT = int(os.environ.get("BRIDGENA_PORT", "8000"))
+ARENA_BASE = "https://arena.ai"
+ARENA_MODES = ["direct-battle", "direct"]
+MAX_PROMPT = 50000
+COOLDOWN_SEC = 45 * 60
+REFRESH_INTERVAL = 3600
 
-def get_general_backoff_seconds(attempt: int) -> int:
-    return constants.get_general_backoff_seconds(attempt)
+COMPACT_THRESHOLD = 30000
+KEEP_RECENT_MSGS = 4
+
+OX_BASE = "https://oxalpha.com"
+OX_ENDPOINT = "/api/chat"
+OX_UPSTREAM_MODEL = "z-ai/glm-5.3-flash"
+OX_ALIASES = {"glm-5.3-flash", "ox-alpha"}
+OX_MODEL_ID = "glm-5.3-flash"
+OX_SESSION_TTL = 20 * 60
+
+CONFIG_FILE = "config.json"
+MODELS_FILE = "models.json"
+STATE_FILE = "state.json"
+JARS_FILE = "cookie_jars.json"
+LOG_FILE = "logs.jsonl"
+OX_SESSION_FILE = "oxalpha_session.json"
+OX_COOKIES_FILE = "oxalpha_cookies.json"
+SELECTORS_FILE = "login_selectors.json"
+PROFILES_DIR = "browser_profiles"
+
+STATE_LOCK = ".state.lock"
+JARS_LOCK = ".jars.lock"
+
+KEEPER_RELOGIN_TIMEOUT = 150
+KEEPER_HEALTH_INTERVAL = 600
+KEEPER_ACTIVITY_MIN = 60
+KEEPER_ACTIVITY_MAX = 120
+KEEPER_NAV_MIN = 1200
+KEEPER_NAV_MAX = 2000
+
+GATING_TRUE_KEYS = {"isPro", "pro", "gated", "requiresPro", "isStealth", "isGated"}
+GATING_FALSE_KEYS = {"userSelectable", "selectable", "available", "enabled"}
+MAX_LOG_LINES = 3000
+MAX_CONVERSATIONS = 500
+
+dashboard_sessions: Dict[str, str] = {}
+
+DEFAULT_KNOWN_MODELS = [
+    {"id": "claude-3-7-sonnet-20250219", "publicName": "claude-3-7-sonnet", "organization": "Anthropic", "capabilities": {"inputCapabilities": {"image": True, "text": True}, "outputCapabilities": {"text": True}}},
+    {"id": "claude-3-5-sonnet-20241022", "publicName": "claude-3-5-sonnet", "organization": "Anthropic", "capabilities": {"inputCapabilities": {"image": True, "text": True}, "outputCapabilities": {"text": True}}},
+    {"id": "gpt-4o", "publicName": "gpt-4o", "organization": "OpenAI", "capabilities": {"inputCapabilities": {"image": True, "text": True}, "outputCapabilities": {"text": True}}},
+    {"id": "gpt-4.5-preview", "publicName": "gpt-4.5-preview", "organization": "OpenAI", "capabilities": {"inputCapabilities": {"image": True, "text": True}, "outputCapabilities": {"text": True}}},
+    {"id": "o3-mini", "publicName": "o3-mini", "organization": "OpenAI", "capabilities": {"inputCapabilities": {"image": False, "text": True}, "outputCapabilities": {"text": True}}},
+    {"id": "o1", "publicName": "o1", "organization": "OpenAI", "capabilities": {"inputCapabilities": {"image": True, "text": True}, "outputCapabilities": {"text": True}}},
+    {"id": "deepseek-ai/deepseek-r1", "publicName": "deepseek-r1", "organization": "DeepSeek", "capabilities": {"inputCapabilities": {"image": False, "text": True}, "outputCapabilities": {"text": True}}},
+    {"id": "deepseek-ai/deepseek-v3", "publicName": "deepseek-v3", "organization": "DeepSeek", "capabilities": {"inputCapabilities": {"image": False, "text": True}, "outputCapabilities": {"text": True}}},
+    {"id": "gemini-2.0-flash", "publicName": "gemini-2.0-flash", "organization": "Google", "capabilities": {"inputCapabilities": {"image": True, "text": True}, "outputCapabilities": {"text": True}}},
+    {"id": "gemini-2.0-pro-exp-02-05", "publicName": "gemini-2.0-pro-exp", "organization": "Google", "capabilities": {"inputCapabilities": {"image": True, "text": True}, "outputCapabilities": {"text": True}}},
+    {"id": "meta-llama/llama-3.3-70b-instruct", "publicName": "llama-3.3-70b-instruct", "organization": "Meta", "capabilities": {"inputCapabilities": {"image": False, "text": True}, "outputCapabilities": {"text": True}}},
+    {"id": "qwen/qwen-2.5-max", "publicName": "qwen-2.5-max", "organization": "Qwen", "capabilities": {"inputCapabilities": {"image": False, "text": True}, "outputCapabilities": {"text": True}}},
+]
 
 
-def safe_print(*args, **kwargs) -> None:
-    """
-    Print without crashing on Windows console encoding issues (e.g., GBK can't encode emoji).
-    This must never raise, because it's used inside request handlers/streaming generators.
-    """
-    try:
-        _builtins.print(*args, **kwargs)
-    except UnicodeEncodeError:
-        file = kwargs.get("file") or sys.stdout
-        sep = kwargs.get("sep", " ")
-        end = kwargs.get("end", "\n")
-        flush = bool(kwargs.get("flush", False))
+# ============================================================
+# CROSS-PROCESS FILE LOCK
+# ============================================================
 
-        try:
-            text = sep.join(str(a) for a in args) + end
-            encoding = getattr(file, "encoding", None) or getattr(sys.stdout, "encoding", None) or "utf-8"
-            safe_text = text.encode(encoding, errors="backslashreplace").decode(encoding, errors="ignore")
-            file.write(safe_text)
-            if flush:
-                try:
-                    file.flush()
-                except Exception:
-                    pass
-        except Exception:
-            return
+class FileLock:
+    def __init__(self, path: str, timeout: float = 20.0, stale: float = 30.0):
+        self.path, self.timeout, self.stale = path, timeout, stale
+        self.fd = None
 
-
-# Ensure all module-level `print(...)` calls are resilient to Windows console encoding issues.
-# (Some environments default to GBK, which cannot encode emoji.)
-print = safe_print  # type: ignore[assignment]
-
-
-def debug_print(*args, **kwargs):
-    """Print debug messages only if DEBUG is True"""
-    if DEBUG:
-        print(*args, **kwargs)
-
-
-def get_status_emoji(status_code: int) -> str:
-    if 200 <= status_code < 300:
-        return "✅"
-    elif 300 <= status_code < 400:
-        return "↪️"
-    elif 400 <= status_code < 500:
-        if status_code == 401:
-            return "🔒"
-        elif status_code == 403:
-            return "🚫"
-        elif status_code == 404:
-            return "❓"
-        elif status_code == 429:
-            return "⏱️"
-        return "⚠️"
-    elif 500 <= status_code < 600:
-        return "❌"
-    return "ℹ️"
-
-
-def log_http_status(status_code: int, context: str = "") -> None:
-    emoji = get_status_emoji(status_code)
-    message = STATUS_MESSAGES.get(status_code, f"Unknown Status {status_code}")
-    if context:
-        debug_print(f"{emoji} HTTP {status_code}: {message} ({context})")
-    else:
-        debug_print(f"{emoji} HTTP {status_code}: {message}")
-
-
-
-# Updated constants from gpt4free/g4f/Provider/needs_auth/LMArena.py
-RECAPTCHA_SITEKEY = "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I"
-RECAPTCHA_ACTION = "chat_submit"
-# reCAPTCHA Enterprise v2 sitekey used when v3 scoring fails and LMArena prompts a checkbox challenge.
-RECAPTCHA_V2_SITEKEY = "6Ld7ePYrAAAAAB34ovoFoDau1fqCJ6IyOjFEQaMn"
-# Cloudflare Turnstile sitekey used by LMArena to mint anonymous-user signup tokens.
-# (Used for POST /nextjs-api/sign-up before `arena-auth-prod-v1` exists.)
-TURNSTILE_SITEKEY = "0x4AAAAAAA65vWDmG-O_lPtT"
-STREAM_CREATE_EVALUATION_PATH = "/nextjs-api/stream/create-evaluation"
-
-# LMArena occasionally changes the reCAPTCHA sitekey/action. We try to discover them from captured JS chunks on startup
-# and persist them into config.json; these helpers read and apply those values with safe fallbacks.
-
-# _is_windows, _normalize_camoufox_window_mode imported from browser_utils
-
-
-USERSCRIPT_PROXY_LAST_POLL_AT: float = 0.0
-_USERSCRIPT_PROXY_QUEUE: Optional[asyncio.Queue] = None
-_USERSCRIPT_PROXY_JOBS: dict[str, dict] = {}
-
-
-# Custom UUIDv7 implementation (using correct Unix epoch)
-def uuid7():
-    """
-    Generate a UUIDv7 using Unix epoch (milliseconds since 1970-01-01)
-    matching the browser's implementation.
-    """
-    timestamp_ms = int(time.time() * 1000)
-    rand_a = secrets.randbits(12)
-    rand_b = secrets.randbits(62)
-    
-    uuid_int = timestamp_ms << 80
-    uuid_int |= (0x7000 | rand_a) << 64
-    uuid_int |= (0x8000000000000000 | rand_b)
-    
-    hex_str = f"{uuid_int:032x}"
-    return f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:32]}"
-
-def _get_signed_url_expiry(url: str) -> Optional[float]:
-    """Extract expiry timestamp from an S3/R2 signed URL."""
-    try:
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query)
-        # S3/R2 standard headers for signed URLs
-        date_str = params.get("X-Amz-Date", [None])[0]
-        expires_str = params.get("X-Amz-Expires", [None])[0]
-        if not date_str or not expires_str:
-            return None
-        
-        # Parse timestamp format: 20260425T071405Z
-        dt = datetime.strptime(date_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-        return dt.timestamp() + int(expires_str)
-    except (ValueError, TypeError, IndexError, AttributeError):
-        return None
-
-def check_link_expiry(url: str) -> bool:
-    """Check if an S3/R2 signed URL is still valid based on its query params."""
-    expiry_ts = _get_signed_url_expiry(url)
-    if expiry_ts is None:
-        return False
-    # Return True if current time is before expiry (with 60s safety buffer)
-    return time.time() < (expiry_ts - 60)
-
-# Image upload helper functions
-async def upload_image_to_lmarena(image_data: bytes, mime_type: str, filename: str) -> Optional[tuple]:
-    """
-    Upload an image to LMArena R2 storage and return the key and download URL.
-    Uses MD5 caching to avoid re-uploading the same image.
-    """
-    try:
-        # Validate inputs
-        if not image_data:
-            debug_print("❌ Image data is empty")
-            return None
-        
-        # 0. Check MD5 Cache
-        image_hash = hashlib.md5(image_data).hexdigest()
-        cached = _state_module.IMAGES_CACHE.get(image_hash)
-        if cached:
-            # Use cached expiry directly if available, otherwise fallback to parsing URL
-            expiry = cached.get("expiry")
-            if expiry is None:
-                expiry = _get_signed_url_expiry(cached.get("url", ""))
-            
-            if expiry and time.time() < (expiry - 60):
-                debug_print(f"📦 Using cached image for hash {image_hash[:8]}...")
-                return cached["key"], cached["url"]
-            else:
-                debug_print(f"📦 Cached image expired for hash {image_hash[:8]}. Re-uploading...")
-                _state_module.IMAGES_CACHE.pop(image_hash, None)
-        
-        if not mime_type or not mime_type.startswith('image/'):
-            debug_print(f"❌ Invalid MIME type: {mime_type}")
-            return None
-        
-        # Step 1: Request upload URL
-        debug_print(f"📤 Step 1: Requesting upload URL for {filename}")
-        
-        # Get Next-Action IDs from config
-        config = get_config()
-        upload_action_id = config.get("next_action_upload")
-        signed_url_action_id = config.get("next_action_signed_url")
-        
-        if not upload_action_id or not signed_url_action_id:
-            debug_print("❌ Next-Action IDs not found in config. Please refresh tokens from dashboard.")
-            return None
-        
-        # Prepare headers for Next.js Server Action
-        request_headers = get_request_headers()
-        request_headers.update({
-            "Accept": "text/x-component",
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Next-Action": upload_action_id,
-            "Referer": "https://arena.ai/?mode=direct",
-        })
-        
-        import cloudscraper as _cs
-        def _cs_upload():
-            scraper = _cs.create_scraper()
-            return scraper.post(
-                "https://arena.ai/?mode=direct",
-                headers=request_headers,
-                data=json.dumps([filename, mime_type]),
-                timeout=30.0,
-            )
-        try:
-            response = await asyncio.to_thread(_cs_upload)
-            response.raise_for_status()
-        except (_cs.exceptions.CloudflareException, requests.exceptions.RequestException) as e:
-            debug_print(f"❌ Error while requesting upload URL: {e}")
-            return None
-        
-        # Parse response - format: 0:{...}\n1:{...}\n
-        try:
-            lines = response.text.strip().split('\n')
-            upload_data = None
-            for line in lines:
-                if line.startswith('1:'):
-                    upload_data = json.loads(line[2:])
-                    break
-            
-            if not upload_data or not upload_data.get('success'):
-                debug_print(f"❌ Failed to get upload URL: {response.text[:200]}")
-                return None
-            
-            upload_url = upload_data['data']['uploadUrl']
-            key = upload_data['data']['key']
-            debug_print(f"✅ Got upload URL and key: {key}")
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            debug_print(f"❌ Failed to parse upload URL response: {e}")
-            return None
-        
-        # Step 2: Upload image to R2 storage
-        debug_print(f"📤 Step 2: Uploading image to R2 storage ({len(image_data)} bytes)")
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.put(
-                    upload_url,
-                    content=image_data,
-                    headers={"Content-Type": mime_type},
-                    timeout=60.0
-                )
-                response.raise_for_status()
-                debug_print(f"✅ Image uploaded successfully")
-        except httpx.TimeoutException:
-            debug_print("❌ Timeout while uploading image to R2 storage")
-            return None
-        except httpx.HTTPError as e:
-            debug_print(f"❌ HTTP error while uploading image: {e}")
-            return None
-        
-        # Step 3: Get signed download URL (uses different Next-Action)
-        debug_print(f"📤 Step 3: Requesting signed download URL")
-        request_headers_step3 = request_headers.copy()
-        request_headers_step3["Next-Action"] = signed_url_action_id
-        
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://arena.ai/?mode=direct",
-                    headers=request_headers_step3,
-                    content=json.dumps([key]),
-                    timeout=30.0
-                )
-                response.raise_for_status()
-        except httpx.TimeoutException:
-            debug_print("❌ Timeout while requesting download URL")
-            return None
-        except httpx.HTTPError as e:
-            debug_print(f"❌ HTTP error while requesting download URL: {e}")
-            return None
-        
-        # Parse response
-        try:
-            lines = response.text.strip().split('\n')
-            download_data = None
-            for line in lines:
-                if line.startswith('1:'):
-                    download_data = json.loads(line[2:])
-                    break
-            
-            if not download_data or not download_data.get('success'):
-                debug_print(f"❌ Failed to get download URL: {response.text[:200]}")
-                return None
-            
-            download_url = download_data['data']['url']
-            debug_print(f"✅ Got signed download URL: {download_url[:100]}...")
-            
-            # Cache the uploaded image by MD5 to avoid redundant uploads.
-            expiry_ts = _get_signed_url_expiry(download_url)
-            if expiry_ts is None:
-                expiry_ts = time.time() + 3600
-
+    def __enter__(self):
+        start = time.time()
+        while True:
             try:
-                # Size limit for IMAGES_CACHE to prevent memory growth (FIFO eviction)
-                if len(_state_module.IMAGES_CACHE) >= 1000:
-                    # Clear 10% of cache if full
-                    keys_to_remove = list(_state_module.IMAGES_CACHE)[:100]
-                    for k in keys_to_remove:
-                        _state_module.IMAGES_CACHE.pop(k, None)
-                
-                _state_module.IMAGES_CACHE[image_hash] = {"key": key, "url": download_url, "expiry": float(expiry_ts)}
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(self.fd, str(os.getpid()).encode())
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(self.path) > self.stale:
+                        os.remove(self.path)
+                        continue
+                except FileNotFoundError:
+                    pass
+                if time.time() - start > self.timeout:
+                    return self
+                time.sleep(0.02)
+
+    def __exit__(self, *args):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            try:
+                os.remove(self.path)
             except Exception:
                 pass
 
-            return (key, download_url)
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            debug_print(f"❌ Failed to parse download URL response: {e}")
-            return None
-            
-    except Exception as e:
-        debug_print(f"❌ Unexpected error uploading image: {type(e).__name__}: {e}")
-        return None
 
-def _coerce_message_content_to_text(content) -> str:
-    """Best-effort coercion of message content to plain text (no images)."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                if part.get("type") == "text":
-                    parts.append(str(part.get("text", "")))
-                elif "text" in part:
-                    parts.append(str(part.get("text", "")))
-                elif "content" in part:
-                    parts.append(str(part.get("content", "")))
-            elif isinstance(part, str):
-                parts.append(part)
-        return "\n".join([p for p in parts if p is not None]).strip()
-    return str(content)
+def atomic_write(path: str, data: Any) -> None:
+    tmp = f"{path}.tmp{os.getpid()}_{secrets.token_hex(4)}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
 
 
-async def process_message_content(content, model_capabilities: dict) -> tuple[str, List[dict]]:
-    """
-    Process message content, handle images if present and model supports them.
-    
-    Args:
-        content: Message content (string or list of content parts)
-        model_capabilities: Model's capability dictionary
-    
-    Returns:
-        Tuple of (text_content, experimental_attachments)
-    """
-    # Check if model supports image input
-    supports_images = model_capabilities.get('inputCapabilities', {}).get('image', False)
-    
-    # If content is a string, return it as-is
-    if isinstance(content, str):
-        return content, []
-    
-    # If content is a list (OpenAI format with multiple parts)
-    if isinstance(content, list):
-        text_parts = []
-        attachments = []
-        
-        for part in content:
-            if isinstance(part, dict):
-                if part.get('type') == 'text':
-                    text_parts.append(part.get('text', ''))
-                elif 'text' in part:
-                    text_parts.append(part.get('text', ''))
-                elif 'content' in part:
-                    text_parts.append(part.get('content', ''))
-                    
-                elif part.get('type') == 'image_url' and supports_images:
-                    image_url = part.get('image_url', {})
-                    if isinstance(image_url, dict):
-                        url = image_url.get('url', '')
-                    else:
-                        url = image_url
-                    
-                    # Handle base64-encoded images
-                    if url.startswith('data:'):
-                        # Format: data:image/png;base64,iVBORw0KGgo...
-                        try:
-                            # Validate and parse data URI
-                            if ',' not in url:
-                                debug_print(f"❌ Invalid data URI format (no comma separator)")
-                                continue
-                            
-                            header, data = url.split(',', 1)
-                            
-                            # Parse MIME type
-                            if ';' not in header or ':' not in header:
-                                debug_print(f"❌ Invalid data URI header format")
-                                continue
-                            
-                            mime_type = header.split(';')[0].split(':')[1]
-                            
-                            # Validate MIME type
-                            if not mime_type.startswith('image/'):
-                                debug_print(f"❌ Invalid MIME type: {mime_type}")
-                                continue
-                            
-                            # Decode base64
-                            try:
-                                image_data = base64.b64decode(data)
-                            except Exception as e:
-                                debug_print(f"❌ Failed to decode base64 data: {e}")
-                                continue
-                            
-                            # Validate image size (max 10MB)
-                            if len(image_data) > 10 * 1024 * 1024:
-                                debug_print(f"❌ Image too large: {len(image_data)} bytes (max 10MB)")
-                                continue
-                            
-                            # Generate filename
-                            ext = mimetypes.guess_extension(mime_type) or '.png'
-                            filename = f"upload-{uuid.uuid4()}{ext}"
-                            
-                            debug_print(f"🖼️  Processing base64 image: {filename}, size: {len(image_data)} bytes")
-                            
-                            # Upload to LMArena
-                            upload_result = await upload_image_to_lmarena(image_data, mime_type, filename)
-                            
-                            if upload_result:
-                                key, download_url = upload_result
-                                # Add as attachment in LMArena format
-                                attachments.append({
-                                    "name": key,
-                                    "contentType": mime_type,
-                                    "url": download_url
-                                })
-                                debug_print(f"✅ Image uploaded and added to attachments")
-                            else:
-                                debug_print(f"⚠️  Failed to upload image, skipping")
-                        except Exception as e:
-                            debug_print(f"❌ Unexpected error processing base64 image: {type(e).__name__}: {e}")
-                    
-                    # Handle URL images (direct URLs)
-                    elif url.startswith('http://') or url.startswith('https://'):
-                        # For external URLs, we'd need to download and re-upload
-                        # For now, skip this case
-                        debug_print(f"⚠️  External image URLs not yet supported: {url[:100]}")
-                        
-                elif part.get('type') == 'image_url' and not supports_images:
-                    debug_print(f"⚠️  Image provided but model doesn't support images")
-            elif isinstance(part, str):
-                text_parts.append(part)
-        
-        # Combine text parts
-        text_content = '\n'.join(text_parts).strip()
-        return text_content, attachments
-    
-    # Fallback
-    return str(content), []
+# ============================================================
+# LOGGING WITH ROTATION
+# ============================================================
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+_log_counter = 0
+
+def log(level: str, message: str) -> None:
+    global _log_counter
+    entry = {
+        "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        "level": level, "message": message, "pid": os.getpid(),
+    }
     try:
-        await startup_event()
-    except Exception as e:
-        debug_print(f"❌ Error during startup: {e}")
-    yield
+        _log_counter += 1
+        if _log_counter % 500 == 0:
+            try:
+                if os.path.getsize(LOG_FILE) > 400_000:
+                    with open(LOG_FILE, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                    with open(LOG_FILE, "w", encoding="utf-8") as f:
+                        f.writelines(lines[-(MAX_LOG_LINES // 2):])
+            except Exception:
+                pass
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+    print(f"[{entry['time']}] [{level:>5}] {message}", flush=True)
 
-app = FastAPI(lifespan=lifespan)
 
-# Add CORS middleware to handle preflight requests and avoid 405 errors
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"https?://.*",  # WARNING: For development only. Restrict to specific origins in production.
-    allow_credentials=True,
-    allow_methods=["*"],  # This includes GET, POST, PUT, DELETE, OPTIONS, etc.
-    allow_headers=["*"],
-)
+append_log = log
 
-# --- Constants & Global State ---
-CONFIG_FILE = constants.CONFIG_FILE
-MODELS_FILE = constants.MODELS_FILE
-API_KEY_HEADER = APIKeyHeader(name="Authorization", auto_error=False)
 
-# In-memory stores
-# { "api_key": { "conversation_id": session_data } }
-chat_sessions: Dict[str, Dict[str, dict]] = defaultdict(dict)
-# { "session_id": "username" }
-dashboard_sessions = {}
-# { "api_key": [timestamp1, timestamp2, ...] }
-api_key_usage = defaultdict(list)
-# { "model_id": count }
-model_usage_stats = defaultdict(int)
-# Token cycling: current index for round-robin selection
-current_token_index = 0
-# Track config file path changes to reset per-config state in tests/dev.
-_LAST_CONFIG_FILE: Optional[str] = None
-# Track which token is assigned to each conversation (conversation_id -> token)
-conversation_tokens: Dict[str, str] = {}
-# Track failed tokens per request to avoid retrying with same token
-request_failed_tokens: Dict[str, set] = {}
-
-# Ephemeral Arena auth cookie captured from browser sessions (not persisted unless enabled).
-EPHEMERAL_ARENA_AUTH_TOKEN: Optional[str] = None
-
-# Supabase anon key (public client key) discovered from LMArena's JS bundles. Kept in-memory by default.
-SUPABASE_ANON_KEY: Optional[str] = None
-
-# --- New Global State for reCAPTCHA ---
-RECAPTCHA_TOKEN: Optional[str] = None
-# Initialize expiry far in the past to force a refresh on startup
-RECAPTCHA_EXPIRY: datetime = datetime.now(timezone.utc) - timedelta(days=365)
-# --------------------------------------
-
-# --- Helper Functions ---
-
-def get_config():
-    global current_token_index, _LAST_CONFIG_FILE
-    # If tests or callers swap CONFIG_FILE at runtime, reset the token round-robin index so token selection
-    # is deterministic per config file.
-    if _LAST_CONFIG_FILE != CONFIG_FILE:
-        _LAST_CONFIG_FILE = CONFIG_FILE
-        current_token_index = 0
+def read_logs(n: int = 150) -> list:
     try:
-        with open(CONFIG_FILE, "r") as f:
+        with open(LOG_FILE, encoding="utf-8") as f:
+            lines = f.readlines()
+        return [json.loads(line) for line in lines[-n:] if line.strip()]
+    except Exception:
+        return []
+
+
+# ============================================================
+# UUID V7
+# ============================================================
+
+def uuid7() -> str:
+    ts = int(time.time() * 1000)
+    combined = (
+        (ts << 80)
+        | ((0x7000 | secrets.randbits(12)) << 64)
+        | (0x8000000000000000 | secrets.randbits(62))
+    )
+    h = f"{combined:032x}"
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
+# ============================================================
+# SHARED STATE (WITH IN-MEMORY CACHE)
+# ============================================================
+
+_state_cache = None
+_state_cache_time = 0.0
+
+def default_state() -> dict:
+    return {
+        "conversations": {}, "usage_stats": {}, "rate_buckets": {},
+        "blocked_models": [], "last_refresh": 0, "refresh_started": 0,
+        "keeper_pid": None, "keeper_heartbeat": 0, "keeper_status": [],
+    }
+
+
+def load_state() -> dict:
+    global _state_cache, _state_cache_time
+    now = time.time()
+    if _state_cache is not None and now - _state_cache_time < 3:
+        return _state_cache
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        state = {}
+    for k, v in default_state().items():
+        state.setdefault(k, v)
+    _state_cache = state
+    _state_cache_time = now
+    return state
+
+
+def mutate_state(fn) -> None:
+    global _state_cache, _state_cache_time
+    with FileLock(STATE_LOCK):
+        try:
+            with open(STATE_FILE, encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+        for k, v in default_state().items():
+            state.setdefault(k, v)
+        fn(state)
+        atomic_write(STATE_FILE, state)
+        _state_cache = state
+        _state_cache_time = time.time()
+
+
+# ============================================================
+# CONFIG & MODELS (WITH CACHE)
+# ============================================================
+
+_models_cache = None
+_models_cache_time = 0.0
+
+def get_config() -> dict:
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
             config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        debug_print(f"⚠️  Config file error: {e}, using defaults")
+    except Exception:
         config = {}
-    except Exception as e:
-        debug_print(f"⚠️  Unexpected error reading config: {e}, using defaults")
-        config = {}
-
-    # Ensure default keys exist
-    try:
-        _config_module._apply_config_defaults(config)
-    except Exception as e:
-        debug_print(f"⚠️  Error setting config defaults: {e}")
-
+    config.setdefault("password", "admin")
+    config.setdefault("api_keys", [])
+    config.setdefault("workers", 1)
     return config
 
 
-def load_usage_stats():
-    """Load usage stats from config into memory"""
-    global model_usage_stats
+def save_config(config: dict) -> None:
+    atomic_write(CONFIG_FILE, config)
+
+
+def get_models() -> list:
+    global _models_cache, _models_cache_time
+    now = time.time()
+    if _models_cache is not None and now - _models_cache_time < 30:
+        return _models_cache
     try:
-        config = get_config()
-        model_usage_stats = defaultdict(int, config.get("usage_stats", {}))
+        with open(MODELS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list) and len(data) > 0:
+                _models_cache = data
+                _models_cache_time = now
+                return data
+    except Exception:
+        pass
+    return list(DEFAULT_KNOWN_MODELS)
+
+
+def save_models(models: list) -> None:
+    global _models_cache, _models_cache_time
+    atomic_write(MODELS_FILE, models)
+    _models_cache = models
+    _models_cache_time = time.time()
+
+
+def is_model_selectable(model: dict) -> bool:
+    for key in GATING_TRUE_KEYS:
+        if model.get(key) is True:
+            return False
+    for key in GATING_FALSE_KEYS:
+        if model.get(key) is False:
+            return False
+    return True
+
+
+def get_selectable_models() -> list:
+    blocked = set(load_state().get("blocked_models", []))
+    seen, out = set(), []
+    for model in get_models():
+        name = model.get("publicName") or model.get("id") or model.get("name")
+        if not name or name in blocked or name in seen:
+            continue
+        if not is_model_selectable(model):
+            continue
+        caps = model.get("capabilities", {}).get("outputCapabilities", {})
+        if caps and caps.get("text") is False:
+            continue
+        mc = dict(model)
+        mc["publicName"] = name
+        mc.setdefault("organization", "Arena")
+        seen.add(name)
+        out.append(mc)
+    return out
+
+
+# ============================================================
+# COOKIE VALIDATION & JARS POOL (WITH CACHE)
+# ============================================================
+
+_jars_cache = None
+_jars_cache_time = 0.0
+
+def _validate_cookies(raw_data: Union[str, list, dict]) -> list:
+    items = []
+    if isinstance(raw_data, list):
+        items = raw_data
+    elif isinstance(raw_data, dict):
+        items = raw_data.get("cookies", [raw_data])
+    elif isinstance(raw_data, str):
+        raw_str = raw_data.strip()
+        if not raw_str:
+            return []
+        try:
+            parsed = json.loads(raw_str)
+            if isinstance(parsed, list):
+                items = parsed
+            elif isinstance(parsed, dict):
+                items = parsed.get("cookies", [parsed])
+        except Exception:
+            items = []
+            for line in raw_str.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    items.append({
+                        "domain": parts[0], "path": parts[2],
+                        "secure": parts[3].lower() == "true",
+                        "expirationDate": float(parts[4]) if parts[4].replace(".", "", 1).isdigit() else None,
+                        "name": parts[5], "value": parts[6], "httpOnly": False,
+                    })
+                elif "=" in line:
+                    for p in line.split(";"):
+                        if "=" in p:
+                            k, v = p.strip().split("=", 1)
+                            if k.lower() not in ("path", "domain", "expires", "max-age", "samesite"):
+                                items.append({"name": k.strip(), "value": v.strip(), "domain": ".arena.ai", "path": "/"})
+    out, seen = [], set()
+    for c in items:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "").strip()
+        val = str(c.get("value") or "").strip()
+        if not name or not val:
+            continue
+        key = (name, c.get("domain", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "name": name, "value": val,
+            "domain": c.get("domain") or ".arena.ai",
+            "path": c.get("path") or "/",
+            "secure": bool(c.get("secure", True)),
+            "httpOnly": bool(c.get("httpOnly", False)),
+            "expirationDate": c.get("expirationDate") or c.get("expires"),
+        })
+    return out
+
+
+def load_jars() -> list:
+    global _jars_cache, _jars_cache_time
+    now = time.time()
+    if _jars_cache is not None and now - _jars_cache_time < 2:
+        return _jars_cache
+    try:
+        with open(JARS_FILE, encoding="utf-8") as f:
+            jars = json.load(f)
+        result = jars if isinstance(jars, list) else []
+    except Exception:
+        result = []
+    _jars_cache = result
+    _jars_cache_time = now
+    return result
+
+
+def mutate_jars(fn) -> None:
+    global _jars_cache, _jars_cache_time
+    with FileLock(JARS_LOCK):
+        try:
+            with open(JARS_FILE, encoding="utf-8") as f:
+                jars = json.load(f)
+            if not isinstance(jars, list):
+                jars = []
+        except Exception:
+            jars = []
+        fn(jars)
+        atomic_write(JARS_FILE, jars)
+        _jars_cache = jars
+        _jars_cache_time = time.time()
+
+
+def _new_jar(name: str, cookies: list, email: str = "", password: str = "",
+             login_method: str = "email", keeper_enabled: bool = False) -> Tuple[dict, set]:
+    required = {"arena-auth-prod-v1.0", "arena-auth-prod-v1.1", "arena-auth-prod-v1", "cf_clearance"}
+    found = required & {c.get("name") for c in cookies}
+    jar = {
+        "id": f"jar_{uuid.uuid4().hex[:10]}",
+        "name": name or f"Account {time.strftime('%H:%M')}",
+        "enabled": True, "cookies": cookies, "status": "ok",
+        "expired": False, "limited_until": 0, "usage_count": 0,
+        "last_used": 0, "created": int(time.time()),
+        "login_method": login_method, "email": email, "password": password,
+        "keeper_enabled": keeper_enabled, "keeper_headless": True,
+        "keeper_humanize": False,
+    }
+    mutate_jars(lambda jars: jars.append(jar))
+    return jar, found
+
+
+def find_cookie(cookies: list, name: str) -> str:
+    for c in cookies:
+        if c.get("name") == name:
+            return c.get("value", "")
+    return ""
+
+
+def jar_has_auth(jar: dict) -> bool:
+    cookies = jar.get("cookies", [])
+    return bool(
+        find_cookie(cookies, "arena-auth-prod-v1.0")
+        or find_cookie(cookies, "arena-auth-prod-v1.1")
+        or find_cookie(cookies, "arena-auth-prod-v1")
+    )
+
+
+def jar_has_cf(jar: dict) -> bool:
+    return bool(find_cookie(jar.get("cookies", []), "cf_clearance"))
+
+
+def jar_available(jar: dict, now: float = None) -> bool:
+    now = now or time.time()
+    if not jar.get("enabled", True):
+        return False
+    if jar.get("limited_until", 0) >= now:
+        return False
+    if not jar_has_auth(jar):
+        return False
+    session = keeper.sessions.get(jar.get("id"))
+    if session and session.running and session.last_health_ok and (now - session.last_health_ok) < 900:
+        return True
+    return not jar.get("expired", False)
+
+
+def acquire_jar() -> Optional[dict]:
+    """Pick the least-recently-used available jar. If no jars are free
+    (all rate-limited or expired), fall back to sharing any enabled jar
+    with a valid keeper session as a last resort."""
+    now = time.time()
+    chosen = {}
+    def pick(jars: list):
+        best = None
+        # 1. Try to find a fully available jar (not limited, not expired, has auth)
+        for j in jars:
+            if jar_available(j, now):
+                if best is None or j.get("last_used", 0) < best.get("last_used", 0):
+                    best = j
+        # 2. Fallback: if no available jar, share the least-used enabled jar with a live session
+        if best is None:
+            for j in jars:
+                if not j.get("enabled", True):
+                    continue
+                session = keeper.sessions.get(j.get("id"))
+                if session and session.running and session.last_health_ok:
+                    if best is None or j.get("last_used", 0) < best.get("last_used", 0):
+                        best = j
+        if best:
+            best["last_used"] = now
+            best["usage_count"] = best.get("usage_count", 0) + 1
+            chosen["jar"] = best
+    mutate_jars(pick)
+    return chosen.get("jar")
+
+
+def mark_jar_status(jar_id: str, status_type: str) -> None:
+    def upd(jars: list):
+        for j in jars:
+            if j.get("id") == jar_id:
+                if status_type == "limited":
+                    j["limited_until"] = time.time() + COOLDOWN_SEC
+                    j["status"] = "limited"
+                    log("WARN", f"Jar '{j.get('name')}' rate-limited — cooling {COOLDOWN_SEC // 60}min")
+                elif status_type == "expired":
+                    j["expired"] = True
+                    j["status"] = "expired"
+                    log("ERROR", f"Jar '{j.get('name')}' marked EXPIRED")
+                elif status_type == "ok":
+                    j["expired"] = False
+                    j["limited_until"] = 0
+                    j["status"] = "ok"
+                    log("OK", f"Jar '{j.get('name')}' reset to healthy")
+    mutate_jars(upd)
+
+
+def build_cookie_header(jar: dict) -> str:
+    cookies = jar.get("cookies", [])
+    parts = []
+    known = set()
+    for name_key in ["cf_clearance", "arena-auth-prod-v1.0", "arena-auth-prod-v1.1", "arena-auth-prod-v1"]:
+        val = find_cookie(cookies, name_key)
+        if val:
+            parts.append(f"{name_key}={val}")
+            known.add(name_key)
+    for c in cookies:
+        n = c.get("name", "")
+        if n and n not in known:
+            parts.append(f"{n}={c.get('value', '')}")
+    return "; ".join(parts)
+
+
+def build_request_headers(jar: dict) -> dict:
+    cookie_header = build_cookie_header(jar)
+    if not cookie_header:
+        raise HTTPException(status_code=500, detail="Cookie jar is empty.")
+    ua = jar.get("user_agent") or (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+    )
+    return {
+        "Content-Type": "application/json", "Cookie": cookie_header,
+        "Origin": ARENA_BASE, "Referer": f"{ARENA_BASE}/text/direct",
+        "User-Agent": ua, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
+        "sec-ch-ua": '"Chromium";v="133", "Not(A:Brand";v="99"',
+        "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
+    }
+
+
+# ============================================================
+# STATE HELPERS & METRICS
+# ============================================================
+
+def block_model(name: str) -> None:
+    def fn(state: dict):
+        if name not in state["blocked_models"]:
+            state["blocked_models"].append(name)
+            log("WARN", f"Model '{name}' hidden — gated on this account")
+    mutate_state(fn)
+
+
+def record_usage(model_name: str) -> None:
+    try:
+        def fn(state: dict):
+            state["usage_stats"][model_name] = state["usage_stats"].get(model_name, 0) + 1
+        mutate_state(fn)
     except Exception as e:
-        debug_print(f"⚠️  Error loading usage stats: {e}, using empty stats")
-        model_usage_stats = defaultdict(int)
+        log("WARN", f"Usage record failed: {e}")
 
-def save_config(config, *, preserve_auth_tokens: bool = True):
+
+def check_rate_limit(api_key_str: str, rpm: int) -> dict:
+    now = time.time()
+    result = {"ok": True, "retry": 0}
+    def fn(state: dict):
+        bucket = [t for t in state["rate_buckets"].get(api_key_str, []) if now - t < 60]
+        if len(bucket) >= rpm:
+            result["ok"] = False
+            result["retry"] = max(1, int(60 - (now - min(bucket))))
+        else:
+            bucket.append(now)
+            state["rate_buckets"][api_key_str] = bucket[-(rpm + 5):]
+    mutate_state(fn)
+    return result
+
+
+# ============================================================
+# CONVERSATION STATE & HISTORY
+# ============================================================
+
+def get_conversation(key: str) -> dict:
+    state = load_state()
+    conv = state.get("conversations", {}).get(key)
+    if conv is None:
+        conv = {}
+    if "arena_id" in conv:
+        old_model = conv.get("model") or "__legacy__"
+        conv = {
+            "arena": {old_model: {"arena_id": conv["arena_id"], "mode": conv.get("mode", "direct-battle")}},
+            "model": conv.get("model"), "history": [], "user_count": 0,
+        }
+    conv.setdefault("arena", {})
+    conv.setdefault("model", None)
+    conv.setdefault("history", [])
+    conv.setdefault("user_count", 0)
+    conv.setdefault("compact_cache", {})
+    return conv
+
+
+def save_conversation(key: str, conv: dict) -> None:
+    conv["updated"] = time.time()
+    def fn(state: dict):
+        state["conversations"][key] = conv
+        if len(state["conversations"]) > MAX_CONVERSATIONS:
+            items = sorted(state["conversations"].items(), key=lambda kv: kv[1].get("updated", 0))
+            for k, _ in items[:len(items) - MAX_CONVERSATIONS]:
+                state["conversations"].pop(k, None)
     try:
-        # Avoid clobbering user-provided auth tokens when multiple tasks write config.json concurrently.
-        # Background refreshes/cookie upserts shouldn't overwrite auth tokens that may have been added via the dashboard.
-        if preserve_auth_tokens:
-            try:
-                with open(CONFIG_FILE, "r") as f:
-                    on_disk = json.load(f)
-            except Exception:
-                on_disk = None
-
-            if isinstance(on_disk, dict):
-                if "auth_tokens" in on_disk and isinstance(on_disk.get("auth_tokens"), list):
-                    config["auth_tokens"] = list(on_disk.get("auth_tokens") or [])
-                if "auth_token" in on_disk:
-                    config["auth_token"] = str(on_disk.get("auth_token") or "")
-
-        # Persist in-memory stats to the config dict before saving
-        config["usage_stats"] = dict(model_usage_stats)
-        tmp_path = f"{CONFIG_FILE}.tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(config, f, indent=4)
-        os.replace(tmp_path, CONFIG_FILE)
+        mutate_state(fn)
     except Exception as e:
-        debug_print(f"❌ Error saving config: {e}")
+        log("WARN", f"Conversation save failed: {e}")
 
-def get_request_headers():
-    """Get request headers with the first available auth token (for compatibility)"""
-    config = get_config()
-    
-    # Try to get token from auth_tokens first, then fallback to single token
-    auth_tokens = config.get("auth_tokens", [])
-    if auth_tokens:
-        token = auth_tokens[0]  # Just use first token for non-API requests
-    else:
-        token = config.get("auth_token", "").strip()
-        if not token:
-            cookie_store = config.get("browser_cookies")
-            if isinstance(cookie_store, dict) and bool(config.get("persist_arena_auth_cookie")):
-                token = str(cookie_store.get("arena-auth-prod-v1") or "").strip()
-                if token:
-                    config["auth_tokens"] = [token]
-                    save_config(config, preserve_auth_tokens=False)
-        if not token:
-            raise HTTPException(status_code=500, detail="Arena auth token not set in dashboard.")
-    
-    return get_request_headers_with_token(token)
 
-# --- Dashboard Authentication ---
+# ============================================================
+# OX ALPHA INTEGRATION
+# ============================================================
 
-async def get_current_session(request: Request):
-    session_id = request.cookies.get("session_id")
-    if session_id and session_id in dashboard_sessions:
-        return dashboard_sessions[session_id]
-    return None
+def oxalpha_models() -> list:
+    return [
+        {"id": OX_MODEL_ID, "publicName": "glm-5.3-flash", "organization": "Zhipu AI (via OX Alpha)",
+         "owned_by": "oxalpha", "capabilities": {"inputCapabilities": {"image": False, "text": True}, "outputCapabilities": {"text": True}}},
+        {"id": "ox-alpha", "publicName": "ox-alpha", "organization": "OX Alpha Direct",
+         "owned_by": "oxalpha", "capabilities": {"inputCapabilities": {"image": False, "text": True}, "outputCapabilities": {"text": True}}},
+    ]
 
-# --- API Key Authentication & Rate Limiting ---
 
-async def rate_limit_api_key(key: str = Depends(API_KEY_HEADER)):
-    config = get_config()
-    api_keys = config.get("api_keys", [])
-
-    api_key_str = None
-    if key and key.startswith("Bearer "):
-        api_key_str = key[7:].strip()
-
-    # If no API keys configured, allow anonymous access (optional auth)
-    if not api_keys:
-        return {"key": "anonymous", "name": "Anonymous", "rpm": 9999}
-
-    # If keys are configured but none provided, use first available key
-    if not api_key_str:
-        api_key_str = api_keys[0]["key"]
-
-    key_data = next((k for k in api_keys if k["key"] == api_key_str), None)
-    if not key_data:
-        raise HTTPException(status_code=401, detail="Invalid API Key.")
-
-    # Rate Limiting
-    rate_limit = key_data.get("rpm", 60)
-    current_time = time.time()
-
-    # Clean up old timestamps (older than 60 seconds)
-    api_key_usage[api_key_str] = [t for t in api_key_usage[api_key_str] if current_time - t < 60]
-
-    if len(api_key_usage[api_key_str]) >= rate_limit:
-        # Calculate seconds until oldest request expires (60 seconds window)
-        oldest_timestamp = min(api_key_usage[api_key_str])
-        retry_after = int(60 - (current_time - oldest_timestamp))
-        retry_after = max(1, retry_after)  # At least 1 second
-
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded. Please try again later.",
-            headers={"Retry-After": str(retry_after)}
-        )
-
-    api_key_usage[api_key_str].append(current_time)
-
-    return key_data
-
-# --- Core Logic ---
-
-async def get_initial_data():
-    debug_print("Starting initial data retrieval...")
+def load_oxalpha_cookies() -> list:
     try:
-        async with AsyncCamoufox(headless=True, main_world_eval=True) as browser:
+        with open(OX_COOKIES_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def load_oxalpha_session() -> dict:
+    try:
+        with open(OX_SESSION_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_oxalpha_session(sess: dict) -> None:
+    atomic_write(OX_SESSION_FILE, sess)
+
+
+async def oxas(force: bool = False) -> dict:
+    sess = load_oxalpha_session()
+    now = time.time()
+    if not force and sess.get("token") and (now - sess.get("updated", 0) < OX_SESSION_TTL):
+        return sess
+    cookies = load_oxalpha_cookies()
+    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies if c.get("name"))
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "Accept": "*/*", "Origin": OX_BASE, "Referer": f"{OX_BASE}/", "Cookie": cookie_str,
+    }
+    new_sess = {"headers": headers, "token": "valid" if cookie_str else None, "updated": now}
+    save_oxalpha_session(new_sess)
+    return new_sess
+
+
+async def oxalpha_verify_via_browser() -> dict:
+    if AsyncCamoufox is None:
+        log("ERROR", "Camoufox is required for OX Alpha browser verification")
+        return {}
+    try:
+        async with AsyncCamoufox(headless=True, humanize=False) as browser:
             page = await browser.new_page()
-            
-            # Set up route interceptor BEFORE navigating
-            debug_print("  🎯 Setting up route interceptor for JS chunks...")
-            captured_responses = []
-            
-            async def capture_js_route(route):
-                """Intercept and capture JS chunk responses"""
-                url = route.request.url
-                if '/_next/static/chunks/' in url and '.js' in url:
-                    try:
-                        # Fetch the original response
-                        response = await route.fetch()
-                        # Get the response body
-                        body = await response.body()
-                        text = body.decode('utf-8')
-
-                        # debug_print(f"    📥 Captured JS chunk: {url.split('/')[-1][:50]}...")
-                        captured_responses.append({'url': url, 'text': text})
-                        
-                        # Continue with the original response (don't modify)
-                        await route.fulfill(response=response, body=body)
-                    except Exception as e:
-                        debug_print(f"    ⚠️  Error capturing response: {e}")
-                        # If something fails, just continue normally
-                        await route.continue_()
-                else:
-                    # Not a JS chunk, just continue normally
-                    await route.continue_()
-            
-            # Register the route interceptor
-            await page.route('**/*', capture_js_route)
-            
-            debug_print("Navigating to arena.ai...")
-            await page.goto("https://arena.ai/", wait_until="domcontentloaded")
-
-            debug_print("Waiting for Cloudflare challenge to complete...")
-            challenge_passed = False
-            for i in range(12): # Up to 120 seconds
+            existing = load_oxalpha_cookies()
+            if existing:
                 try:
-                    title = await page.title()
-                except Exception:
-                    title = ""
-                
-                if "Just a moment" not in title:
-                    challenge_passed = True
-                    break
-                
-                debug_print(f"  ⏳ Waiting for Cloudflare challenge... (attempt {i+1}/12)")
-                await click_turnstile(page)
-                
-                try:
-                    await page.wait_for_function(
-                        "() => document.title.indexOf('Just a moment...') === -1", 
-                        timeout=10000
-                    )
-                    challenge_passed = True
-                    break
+                    await page.context.add_cookies(to_playwright_cookies(existing))
                 except Exception:
                     pass
-            
-            if challenge_passed:
-                debug_print("✅ Cloudflare challenge passed.")
-            else:
-                debug_print("❌ Cloudflare challenge took too long or failed.")
-                # Even if the challenge didn't clear, persist any cookies we did get.
-                # Sometimes Cloudflare/BM cookies are still set and can help subsequent attempts.
-                try:
-                    cookies = await page.context.cookies()
-                    _capture_ephemeral_arena_auth_token_from_cookies(cookies)
-                    try:
-                        user_agent = await page.evaluate("() => navigator.userAgent")
-                    except Exception:
-                        user_agent = None
-
-                    config = get_config()
-                    ua_for_config = None
-                    if not normalize_user_agent_value(config.get("user_agent")):
-                        ua_for_config = user_agent
-                    if _upsert_browser_session_into_config(config, cookies, user_agent=ua_for_config):
-                        save_config(config)
-                except Exception:
-                    pass
-                return
-
-            # Give it time to capture all JS responses
+            await page.goto(f"{OX_BASE}/", wait_until="domcontentloaded")
             await asyncio.sleep(5)
-
-            # Persist cookies + UA for downstream httpx/chrome-fetch alignment.
             cookies = await page.context.cookies()
-            _capture_ephemeral_arena_auth_token_from_cookies(cookies)
-            try:
-                user_agent = await page.evaluate("() => navigator.userAgent")
-            except Exception:
-                user_agent = None
+            simplified = [
+                {"name": c["name"], "value": c["value"], "domain": c.get("domain", ""), "path": c.get("path", "/")}
+                for c in cookies if c.get("name")
+            ]
+            atomic_write(OX_COOKIES_FILE, simplified)
+            sess = {"cookies": simplified, "updated": time.time(), "token": "browser_verified"}
+            save_oxalpha_session(sess)
+            log("OK", f"OX Alpha verification complete ({len(simplified)} cookies)")
+            return sess
+    except Exception as e:
+        log("ERROR", f"OX Alpha verification failed: {e}")
+        return {}
 
-            config = get_config()
-            # Prefer keeping an existing UA (often set by Chrome contexts) instead of overwriting with Camoufox UA.
-            ua_for_config = None
-            if not normalize_user_agent_value(config.get("user_agent")):
-                ua_for_config = user_agent
-            if _upsert_browser_session_into_config(config, cookies, user_agent=ua_for_config):
-                save_config(config)
 
-            if str(config.get("cf_clearance") or "").strip():
-                debug_print(f"✅ Saved cf_clearance token: {str(config.get('cf_clearance'))[:20]}...")
-            else:
-                debug_print("⚠️ Could not find cf_clearance cookie.")
-
-            page_body = ""
-
-            # Extract models
-            debug_print("Extracting models from page...")
-            try:
-                page_body = await page.content()
-                match = re.search(r'{\\"initialModels\\":(\[.*?\]),\\"initialModel[A-Z]Id', page_body, re.DOTALL)
-                if match:
-                    models_json = match.group(1).encode().decode('unicode_escape')
-                    models = json.loads(models_json)
-                    save_models(models)
-                    debug_print(f"✅ Saved {len(models)} models")
-                else:
-                    debug_print("⚠️ Could not find models in page")
-            except Exception as e:
-                debug_print(f"❌ Error extracting models: {e}")
-
-            # Extract Next-Action IDs from captured JavaScript responses (Aggressive Discovery)
-            debug_print(f"\nExtracting Next-Action IDs from {len(captured_responses)} captured JS responses...")
-            try:
-                if not captured_responses:
-                    debug_print("  ⚠️  No JavaScript responses were captured")
-                else:
-                    debug_print(f"  📦 Scanning {len(captured_responses)} JavaScript chunks for Server Actions...")
-                    # Regex pattern based on Next.js server-reference generation:
-                    # (0,a.createServerReference)("HASH",a.callServer,void 0,a.findSourceMapURL,"ACTION_NAME")
-                    action_pattern = r'\(0,[a-zA-Z_$][\w$]*\.createServerReference\)\(["\']([\w\d]*?)["\'],[a-zA-Z_$][\w$]*\.callServer,void 0,[a-zA-Z_$][\w$]*\.findSourceMapURL,["\'](\w+)["\']\)'
-                    
-                    found_count = 0
-                    for item in captured_responses:
-                        text = str(item.get('text', ''))
-                        matches = re.findall(action_pattern, text)
-                        for action_id, action_name in matches:
-                            if _state_module.DISCOVERED_ACTIONS.get(action_name) != action_id:
-                                _state_module.DISCOVERED_ACTIONS[action_name] = action_id
-                                found_count += 1
-                    
-                    if found_count > 0:
-                        debug_print(f"  ✅ Updated {found_count} Next-Action IDs in memory")
-                        if "generateUploadUrl" in _state_module.DISCOVERED_ACTIONS:
-                            config["next_action_upload"] = _state_module.DISCOVERED_ACTIONS["generateUploadUrl"]
-                        if "getSignedUrl" in _state_module.DISCOVERED_ACTIONS:
-                            config["next_action_signed_url"] = _state_module.DISCOVERED_ACTIONS["getSignedUrl"]
-                        save_config(config)
-                    
-                    if _state_module.DISCOVERED_ACTIONS:
-                        debug_print(f"✅ Discovered {len(_state_module.DISCOVERED_ACTIONS)} Server Actions (New/Updated: {found_count})")
-                    
-            except Exception as e:
-                debug_print(f"❌ Error during Server Action discovery: {e}")
-                debug_print("   This is optional - continuing without them")
-
-            # Extract reCAPTCHA sitekey/action from captured JS responses (helps keep up with LMArena changes).
-            debug_print(f"\nExtracting reCAPTCHA params from {len(captured_responses)} captured JS responses...")
-            try:
-                discovered_sitekey: Optional[str] = None
-                discovered_action: Optional[str] = None
-
-                for item in captured_responses or []:
-                    if not isinstance(item, dict):
+async def stream_oxalpha(messages: list, model: str = OX_UPSTREAM_MODEL):
+    await oxas()
+    cookies = load_oxalpha_cookies()
+    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies if c.get("name"))
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "Origin": OX_BASE, "Referer": f"{OX_BASE}/", "Cookie": cookie_str,
+    }
+    payload = {"model": OX_UPSTREAM_MODEL, "messages": messages, "stream": True}
+    url = f"{OX_BASE}{OX_ENDPOINT}"
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        try:
+            async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    yield ("error", f"OX Alpha returned HTTP {resp.status_code}: {body.decode('utf-8', errors='ignore')[:200]}")
+                    return
+                in_think = False
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line:
                         continue
-                    text = item.get("text")
-                    if not isinstance(text, str) or not text:
-                        continue
-                    sitekey, action = extract_recaptcha_params_from_text(text)
-                    if sitekey and not discovered_sitekey:
-                        discovered_sitekey = sitekey
-                    if action and not discovered_action:
-                        discovered_action = action
-                    if discovered_sitekey and discovered_action:
-                        break
-
-                # Fallback: try the HTML we already captured.
-                if (not discovered_sitekey or not discovered_action) and page_body:
-                    sitekey, action = extract_recaptcha_params_from_text(page_body)
-                    if sitekey and not discovered_sitekey:
-                        discovered_sitekey = sitekey
-                    if action and not discovered_action:
-                        discovered_action = action
-
-                if discovered_sitekey:
-                    config["recaptcha_sitekey"] = discovered_sitekey
-                if discovered_action:
-                    config["recaptcha_action"] = discovered_action
-
-                if discovered_sitekey or discovered_action:
-                    save_config(config)
-                    debug_print("✅ Saved reCAPTCHA params to config")
-                    if discovered_sitekey:
-                        debug_print(f"   Sitekey: {discovered_sitekey[:20]}...")
-                    if discovered_action:
-                        debug_print(f"   Action: {discovered_action}")
-                else:
-                    debug_print("⚠️ Could not extract reCAPTCHA params; using defaults")
-            except Exception as e:
-                debug_print(f"❌ Error extracting reCAPTCHA params: {e}")
-                debug_print("   This is optional - continuing without them")
-
-            # Extract Supabase anon key from captured JS responses (in-memory only).
-            # This enables refreshing expired `arena-auth-prod-v1` sessions without user interaction.
-            try:
-                global SUPABASE_ANON_KEY
-                if not str(SUPABASE_ANON_KEY or "").strip():
-                    discovered_key: Optional[str] = None
-                    for item in captured_responses or []:
-                        if not isinstance(item, dict):
-                            continue
-                        text = item.get("text")
-                        if not isinstance(text, str) or not text:
-                            continue
-                        discovered_key = extract_supabase_anon_key_from_text(text)
-                        if discovered_key:
+                    if line.startswith("data: "):
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
                             break
-                    if (not discovered_key) and page_body:
-                        discovered_key = extract_supabase_anon_key_from_text(page_body)
-                    if discovered_key:
-                        SUPABASE_ANON_KEY = discovered_key
-                        debug_print(f"✅ Discovered Supabase anon key: {discovered_key[:16]}...")
+                        try:
+                            data_json = json.loads(data_str)
+                            choice = data_json.get("choices", [{}])[0]
+                            delta = choice.get("delta", {})
+                            content = delta.get("content", "")
+                            reasoning = delta.get("reasoning_content", "")
+                            if reasoning:
+                                yield ("reasoning", reasoning)
+                            if content:
+                                if "<think>" in content:
+                                    in_think = True
+                                    parts = content.split("<think>", 1)
+                                    if parts[0]:
+                                        yield ("content", parts[0])
+                                    content = parts[1]
+                                if in_think and "</think>" in content:
+                                    in_think = False
+                                    parts = content.split("</think>", 1)
+                                    if parts[0]:
+                                        yield ("reasoning", parts[0])
+                                    if parts[1]:
+                                        yield ("content", parts[1])
+                                    continue
+                                if in_think:
+                                    yield ("reasoning", content)
+                                else:
+                                    yield ("content", content)
+                        except Exception:
+                            continue
+        except Exception as e:
+            yield ("error", f"OX Alpha connection error: {e}")
+
+
+# ============================================================
+# ARENA MODEL CATALOG FETCHING
+# ============================================================
+
+async def get_initial_data() -> list:
+    state = load_state()
+    now = time.time()
+    if now - state.get("refresh_started", 0) < 30:
+        return get_models()
+
+    def mark_start(s):
+        s["refresh_started"] = now
+    mutate_state(mark_start)
+
+    jar = acquire_jar()
+    headers = build_request_headers(jar) if jar else {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+    }
+    fetched_models = []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(f"{ARENA_BASE}/api/models", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    fetched_models = data
+                elif isinstance(data, dict) and "models" in data:
+                    fetched_models = data["models"]
+    except Exception as e:
+        log("WARN", f"Direct models fetch failed: {e}")
+
+    if not fetched_models and jar:
+        s = keeper.sessions.get(jar.get("id"))
+        if s and s.running and s.page and not s.page.is_closed():
+            try:
+                models_raw = await s.page.evaluate("""async () => {
+                    try { const r = await fetch('/api/models', {credentials: 'include'}); return await r.json(); }
+                    catch(e) { return null; }
+                }""")
+                if isinstance(models_raw, list) and len(models_raw) > 0:
+                    fetched_models = models_raw
             except Exception:
                 pass
 
-            debug_print("✅ Initial data retrieval complete")
-    except Exception as e:
-        debug_print(f"❌ An error occurred during initial data retrieval: {e}")
+    if fetched_models:
+        save_models(fetched_models)
+        def mark_done(s):
+            s["last_refresh"] = time.time()
+            s["refresh_started"] = 0
+        mutate_state(mark_done)
+        log("OK", f"Model catalog refreshed ({len(fetched_models)} models)")
+        return fetched_models
 
-async def periodic_refresh_task():
-    """Background task to refresh cf_clearance and models every 30 minutes"""
+    def mark_fail(s):
+        s["refresh_started"] = 0
+    mutate_state(mark_fail)
+    return get_models()
+
+
+# ============================================================
+# SESSION KEEPER — SELECTORS & HELPERS
+# ============================================================
+
+DEFAULT_SELECTORS = {
+    "signin": [
+        'button:has-text("Login")', 'button:has-text("Log in")', 'button:has-text("Log In")',
+        'button:has-text("Sign in")', 'button:has-text("Sign In")',
+        'a:has-text("Login")', 'a:has-text("Log in")', 'a:has-text("Log In")',
+        'a:has-text("Sign in")', 'a:has-text("Sign In")',
+        '[data-testid*="login" i]', '[data-testid*="signin" i]',
+        'header button:has-text("Log in")', 'header a:has-text("Log in")',
+    ],
+    "email_option": [
+        'button:has-text("Continue with email")', 'a:has-text("Continue with email")',
+        'button:has-text("Sign in with email")', 'a:has-text("Sign in with email")',
+        'button:has-text("Email")',
+    ],
+    "submit": [
+        'button:has-text("Continue")', 'button:has-text("Log in")', 'button:has-text("Login")',
+        'button:has-text("Sign in")', 'button[type="submit"]',
+    ],
+    "email_input": [
+        'input[type="email"]', 'input[autocomplete="email"]', 'input[name="email"]',
+        'input[name="username"]', 'input[id="email"]',
+        'input[placeholder*="mail" i]', 'input[placeholder*="email" i]',
+    ],
+    "password_input": [
+        'input[type="password"]', 'input[name="password"]', '#password',
+        'input[placeholder*="password" i]', 'input[autocomplete="current-password"]',
+    ],
+    "error_markers": [
+        "wrong password", "invalid credentials", "incorrect email",
+        "no account found", "password is incorrect", "too many attempts",
+    ],
+    "sidebar_toggle": [
+        "button:has(svg path[d*='19 21L5 21'])",
+        "[aria-label*='sidebar' i]", "[aria-label*='menu' i]",
+    ],
+}
+
+
+def load_selectors() -> dict:
+    try:
+        with open(SELECTORS_FILE, encoding="utf-8") as f:
+            user = json.load(f)
+        merged = {k: list(v) for k, v in DEFAULT_SELECTORS.items()}
+        merged.update(user)
+        return merged
+    except Exception:
+        return {k: list(v) for k, v in DEFAULT_SELECTORS.items()}
+
+
+def to_playwright_cookies(cookies: list) -> list:
+    out = []
+    for c in cookies:
+        name, value = c.get("name", ""), c.get("value", "")
+        if not name or not value:
+            continue
+        item = {
+            "name": name, "value": value,
+            "domain": c.get("domain") or ".arena.ai",
+            "path": c.get("path") or "/",
+            "secure": bool(c.get("secure", True)),
+            "httpOnly": bool(c.get("httpOnly", False)),
+        }
+        exp = c.get("expirationDate") or c.get("expires")
+        if exp and isinstance(exp, (int, float)) and exp > 0:
+            item["expires"] = exp
+        out.append(item)
+    return out
+
+
+class BridgeHTTPError(Exception):
+    def __init__(self, status: int, body: str):
+        self.status, self.body = status, body
+        super().__init__(f"HTTP {status}: {body[:200]}")
+
+
+class ConversationLost(Exception):
+    pass
+
+
+# ============================================================
+# KEEPER SESSION — UNIVERSAL STEALTH BROWSER ENGINE
+# ============================================================
+
+class KeeperSession:
+    """Persistent browser session for one Arena account.
+    Cross-platform stealth engine compatible with Windows, macOS, Linux, and Pterodactyl/Docker containers.
+    Supports Edge (fastest), Chrome, Chromium, and bundled headless binaries with humanized mouse/keyboard trajectories."""
+
+    def __init__(self, jar: dict, headless: bool = True, keep_forever: bool = False):
+        self.jar_id = jar["id"]
+        self.name = jar.get("name", self.jar_id)
+        self.login_method = jar.get("login_method") or "email"
+        self.email = jar.get("email") or ""
+        self.password = jar.get("password") or ""
+        self.user_agent = jar.get("user_agent") or None
+        self.headless = headless
+        self.keep_forever = keep_forever
+        self.humanize = bool(jar.get("keeper_humanize", True))
+
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self._loop_task = None
+        self._action_lock = asyncio.Lock()
+
+        self.running = False
+        self.status = "stopped"
+        self.error = None
+        self.current_step = ""
+        self.step_history = []
+        self.last_activity = 0.0
+        self.last_health_ok = 0.0
+        self.last_nav = 0.0
+        self.last_restart = 0.0
+        self.fail_count = 0
+        self.next_retry = 0.0
+        self.relogin_count = 0
+        self.active_requests = 0
+        self._auth_sig_cache = None
+        self._cur_x = 200.0
+        self._cur_y = 200.0
+
+    def _set_step(self, step_text: str):
+        """Record and broadcast a detailed login/keeper progress step."""
+        self.current_step = step_text
+        entry = f"[{time.strftime('%H:%M:%S')}] {step_text}"
+        self.step_history.append(entry)
+        if len(self.step_history) > 40:
+            self.step_history = self.step_history[-40:]
+        log("INFO", f"[{self.name}] {step_text}")
+
+    # --- Visual Cursor & Human Input ---
+
+    async def _inject_visual_cursor(self, page):
+        """Inject a visual cursor tracker into the DOM for live browser watching."""
+        try:
+            await page.evaluate("""() => {
+                if (document.getElementById('__nx_visual_cursor')) return;
+                const dot = document.createElement('div');
+                dot.id = '__nx_visual_cursor';
+                dot.style.cssText = 'position:fixed;width:18px;height:18px;border-radius:50%;background:rgba(239,68,68,0.85);border:2px solid #fff;box-shadow:0 0 12px rgba(239,68,68,0.9);pointer-events:none;z-index:2147483647;transition:transform 0.05s ease-out;transform:translate(-50%,-50%);left:200px;top:200px;';
+                document.documentElement.appendChild(dot);
+                window.addEventListener('mousemove', e => {
+                    dot.style.left = e.clientX + 'px';
+                    dot.style.top = e.clientY + 'px';
+                });
+            }""")
+        except Exception:
+            pass
+
+    async def _human_move(self, page, target_x: float, target_y: float, steps: int = 14):
+        """Move mouse with smooth multi-step curve to simulate authentic human movement."""
+        start_x, start_y = self._cur_x, self._cur_y
+        for i in range(1, steps + 1):
+            t = i / steps
+            ease = t * t * (3 - 2 * t)
+            deviation = (math.sin(t * 3.14159)) * random.uniform(-4, 4)
+            cx = start_x + (target_x - start_x) * ease + deviation
+            cy = start_y + (target_y - start_y) * ease + deviation
+            try:
+                await page.mouse.move(cx, cy)
+                await asyncio.sleep(random.uniform(0.012, 0.025))
+            except Exception:
+                break
+        try:
+            await page.mouse.move(target_x, target_y)
+        except Exception:
+            pass
+        self._cur_x, self._cur_y = target_x, target_y
+        self.last_activity = time.time()
+
+    async def _human_click(self, page, locator, timeout_ms: int = 4000) -> bool:
+        """Move cursor to element and click naturally."""
+        try:
+            if await locator.count() == 0:
+                return False
+            box = await locator.bounding_box()
+            if not box:
+                await locator.scroll_into_view_if_needed()
+                box = await locator.bounding_box()
+            if box:
+                tx = box["x"] + box["width"] * random.uniform(0.35, 0.65)
+                ty = box["y"] + box["height"] * random.uniform(0.35, 0.65)
+                await self._human_move(page, tx, ty)
+                await asyncio.sleep(random.uniform(0.05, 0.12))
+                await page.mouse.down()
+                await asyncio.sleep(random.uniform(0.04, 0.09))
+                await page.mouse.up()
+                return True
+            else:
+                await locator.click(timeout=timeout_ms)
+                return True
+        except Exception:
+            try:
+                await locator.click(timeout=timeout_ms, force=True)
+                return True
+            except Exception:
+                return False
+
+    async def _human_type(self, page, locator, text: str, instant: bool = False):
+        """Click input and fill text. Uses instant fill by default for reliability."""
+        await self._human_click(page, locator)
+        await asyncio.sleep(0.15)
+        try:
+            await locator.fill("")
+        except Exception:
+            try:
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+            except Exception:
+                pass
+        # Always use instant fill for login fields - more reliable
+        await locator.fill(text)
+        await asyncio.sleep(0.2)
+
+    # --- Browser Helpers ---
+
+    async def _wait_cloudflare(self, page, timeout: int = 35000):
+        try:
+            await page.wait_for_function(
+                "() => document.title.indexOf('Just a moment') === -1", timeout=timeout)
+        except Exception:
+            pass
+
+    async def _handle_turnstile(self, page):
+        try:
+            for frame in page.frames:
+                frame_url = (frame.url or "").lower()
+                if "turnstile" in frame_url or "challenges.cloudflare.com" in frame_url:
+                    btn = frame.locator('input[type="checkbox"], .cf-turnstile, #challenge-stage')
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        self._set_step("Interacting with Cloudflare Turnstile challenge...")
+                        await self._human_click(page, btn.first)
+                        await asyncio.sleep(2)
+                        return True
+        except Exception:
+            pass
+        return False
+
+    async def _ensure_sidebar_cookie(self):
+        """Set sidebar_state cookie so the arena.ai sidebar stays open."""
+        try:
+            if self.context:
+                await self.context.add_cookies([
+                    {"name": "sidebar_state", "value": "true",
+                     "domain": ".arena.ai", "path": "/", "secure": True, "httpOnly": False},
+                    {"name": "sidebar_state", "value": "true",
+                     "domain": "arena.ai", "path": "/", "secure": True, "httpOnly": False},
+                    {"name": "sidebar_state", "value": "true",
+                     "domain": ".lmarena.ai", "path": "/", "secure": True, "httpOnly": False},
+                ])
+        except Exception:
+            pass
+
+    async def _verify_auth_state(self, page) -> bool:
+        """Thorough check to verify whether user is genuinely logged into arena.ai."""
+        try:
+            # 1. If Login button is visible on page, we are NOT logged in
+            login_btn = page.locator("button:has-text('Log In'), a:has-text('Log In')").first
+            if await login_btn.count() > 0 and await login_btn.is_visible():
+                return False
+
+            # 2. If 'Log In or Create' modal is visible, we are NOT logged in
+            modal_title = page.locator("text='Log In or Create'").first
+            if await modal_title.count() > 0 and await modal_title.is_visible():
+                return False
+
+            # 3. Check actual unified history API status
+            status_code = await page.evaluate(
+                "async () => { try { const r = await fetch('/api/history/unified?limit=1', "
+                "{credentials:'include'}); return r.status; } catch(e) { return 0; } }"
+            )
+            if status_code == 200:
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _screenshot(self, page, tag: str):
+        try:
+            safe = re.sub(r"[^a-zA-Z0-9_-]", "_", tag)[:30]
+            path = f"login_debug_{self.jar_id}_{safe}_{int(time.time())}.png"
+            await page.screenshot(path=path)
+            log("WARN", f"[{self.name}] Debug screenshot saved: {path}")
+        except Exception:
+            pass
+
+    # --- Multi-Step Native Email/Password Login ---
+
+    async def _login_email_native(self) -> Tuple[bool, str]:
+        """Multi-step email + password login on arena.ai modal.
+        Uses instant fill for speed and reliability.
+        Handles: Log In button -> email input -> Continue with email -> password -> Login."""
+        page = self.page
+        if not page or page.is_closed():
+            return False, "Browser page is closed"
+        if not self.email or not self.password:
+            return False, "No email/password credentials configured"
+
+        await self._inject_visual_cursor(page)
+
+        try:
+            # ---- STEP 1: Navigate ----
+            self._set_step("[1/6] Navigating to arena.ai...")
+            await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+            await self._wait_cloudflare(page)
+            await self._handle_turnstile(page)
+            await asyncio.sleep(2)
+
+            # ---- STEP 2: Open login modal ----
+            self._set_step("[2/6] Locating and opening login modal...")
+
+            # Check if login modal is already visible (email input present)
+            modal_already_open = False
+            for sel in ["input[placeholder='Your email']", "input[type='email']"]:
+                loc = page.locator(sel).first
+                try:
+                    if await loc.count() > 0 and await loc.is_visible():
+                        modal_already_open = True
+                        break
+                except Exception:
+                    continue
+
+            if not modal_already_open:
+                # Try to click Log In button in the page
+                login_selectors = [
+                    "button:has-text('Log In')",
+                    "a:has-text('Log In')",
+                    "button:has-text('Log in')",
+                    "a:has-text('Log in')",
+                    "button:has-text('Sign In')",
+                    "a:has-text('Sign In')",
+                ]
+                clicked = False
+                for sel in login_selectors:
+                    try:
+                        btn = page.locator(sel).first
+                        if await btn.count() > 0 and await btn.is_visible():
+                            await btn.click(timeout=5000)
+                            clicked = True
+                            self._set_step("[2/6] Clicked Log In button, waiting for modal...")
+                            break
+                    except Exception:
+                        continue
+
+                if not clicked:
+                    # Maybe the modal is controlled via JS, try evaluating
+                    try:
+                        await page.evaluate("document.querySelector('button[class*=login], a[href*=login]')?.click()")
+                    except Exception:
+                        pass
+
+                # Wait for the email input to appear in the modal
+                try:
+                    await page.wait_for_selector(
+                        "input[placeholder='Your email'], input[type='email'], input[name='email']",
+                        state="visible", timeout=8000
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+            # ---- STEP 3: Fill email ----
+            self._set_step(f"[3/6] Entering email: {self.email}...")
+            email_loc = None
+            email_selectors = [
+                "input[placeholder='Your email']",
+                "input[type='email']",
+                "input[name='email']",
+                "input[placeholder*='email' i]",
+                "input[name='identifier']",
+            ]
+            for sel in email_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        email_loc = loc
+                        break
+                except Exception:
+                    continue
+
+            if not email_loc:
+                await self._screenshot(page, "no_email_input")
+                err = "Email input field not found on login modal"
+                self._set_step(f"[FAILED at Step 3] {err}")
+                return False, err
+
+            # Instant fill
+            await email_loc.click()
+            await asyncio.sleep(0.1)
+            await email_loc.fill(self.email)
+            await asyncio.sleep(0.3)
+            self._set_step(f"[3/6] Email entered: {self.email}")
+
+            # ---- STEP 4: Click "Continue with email" ----
+            self._set_step("[4/6] Clicking 'Continue with email'...")
+
+            # The arena.ai modal has a specific "Continue with email" button
+            # Try multiple strategies to find and click it
+            submit_clicked = False
+
+            # Strategy 1: Try exact text match buttons
+            continue_selectors = [
+                "button:has-text('Continue with email')",
+                "button:has-text('Continue with Email')",
+                "button:text-is('Continue with email')",
+            ]
+            for sel in continue_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await btn.click(timeout=5000)
+                        submit_clicked = True
+                        self._set_step("[4/6] Clicked 'Continue with email' button")
+                        break
+                except Exception:
+                    continue
+
+            # Strategy 2: Find button by searching all buttons in the modal
+            if not submit_clicked:
+                try:
+                    buttons = page.locator("button")
+                    count = await buttons.count()
+                    for i in range(count):
+                        btn = buttons.nth(i)
+                        try:
+                            txt = (await btn.inner_text()).strip().lower()
+                            if "continue" in txt and "email" in txt:
+                                await btn.click(timeout=5000)
+                                submit_clicked = True
+                                self._set_step("[4/6] Clicked continue button (text search)")
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+            # Strategy 3: Generic submit/continue buttons
+            if not submit_clicked:
+                for sel in ["button:has-text('Continue')", "button[type='submit']"]:
+                    try:
+                        btn = page.locator(sel).first
+                        if await btn.count() > 0 and await btn.is_visible():
+                            await btn.click(timeout=5000)
+                            submit_clicked = True
+                            self._set_step("[4/6] Clicked submit/continue button")
+                            break
+                    except Exception:
+                        continue
+
+            # Strategy 4: Press Enter as last resort
+            if not submit_clicked:
+                await page.keyboard.press("Enter")
+                self._set_step("[4/6] Pressed Enter to submit email")
+
+            await asyncio.sleep(3)
+
+            # ---- Check for "Create Account" (unregistered email) ----
+            try:
+                create_heading = page.locator("text='Create Account'").first
+                if await create_heading.count() > 0 and await create_heading.is_visible():
+                    err = f"Account {self.email} is not registered on arena.ai (shows 'Create Account')"
+                    self._set_step(f"[FAILED at Step 4] {err}")
+                    await self._screenshot(page, "create_account_shown")
+                    return False, err
+            except Exception:
+                pass
+
+            # ---- STEP 5: Enter password ----
+            self._set_step("[5/6] Waiting for password field...")
+            pw_loc = None
+            pw_deadline = time.time() + 12
+            while time.time() < pw_deadline:
+                for sel in ["input[type='password']", "input[name='password']", "input[placeholder*='password' i]"]:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            pw_loc = loc
+                            break
+                    except Exception:
+                        continue
+                if pw_loc:
+                    break
+                await asyncio.sleep(0.5)
+
+            if not pw_loc:
+                # Maybe we're already authenticated after email?
+                if await self._verify_auth_state(page):
+                    self._set_step("[SUCCESS] Authenticated without password!")
+                    return True, "Authenticated without password"
+                await self._screenshot(page, "no_password_field")
+                # Also screenshot the current page state for debugging
+                try:
+                    page_text = await page.inner_text("body")
+                    log("WARN", f"[{self.name}] Page text after email submit: {page_text[:300]}")
+                except Exception:
+                    pass
+                err = "Password field did not appear after email submission"
+                self._set_step(f"[FAILED at Step 5] {err}")
+                return False, err
+
+            self._set_step("[5/6] Entering password...")
+            await pw_loc.click()
+            await asyncio.sleep(0.1)
+            await pw_loc.fill(self.password)
+            await asyncio.sleep(0.3)
+
+            # ---- STEP 6: Submit password and verify ----
+            self._set_step("[6/6] Submitting credentials & verifying...")
+
+            # Arena.ai password screen has a "Login" button (not "Log In")
+            login_clicked = False
+            login_btn_selectors = [
+                "button:has-text('Login')",
+                "button:has-text('Log In')",
+                "button:has-text('Log in')",
+                "button:has-text('Sign In')",
+                "button:has-text('Sign in')",
+                "button[type='submit']",
+            ]
+            for sel in login_btn_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await btn.click(timeout=5000)
+                        login_clicked = True
+                        self._set_step("[6/6] Clicked Login button, verifying session...")
+                        break
+                except Exception:
+                    continue
+
+            if not login_clicked:
+                await page.keyboard.press("Enter")
+                self._set_step("[6/6] Pressed Enter to submit, verifying session...")
+
+            # Wait for authentication to complete
+            auth_deadline = time.time() + 20
+            while time.time() < auth_deadline:
+                try:
+                    if await self._verify_auth_state(page):
+                        await asyncio.sleep(1)
+                        await self._harvest_cookies()
+                        self._set_step("[SUCCESS] Authentication successful! Session cookies saved.")
+                        return True, "Login successful"
+                except Exception:
+                    pass
+
+                # Also check for error messages on the page
+                try:
+                    for marker in ["wrong password", "invalid", "incorrect", "too many attempts"]:
+                        err_el = page.locator(f"text=/{marker}/i").first
+                        if await err_el.count() > 0 and await err_el.is_visible():
+                            err = f"Login rejected: {marker}"
+                            self._set_step(f"[FAILED at Step 6] {err}")
+                            return False, err
+                except Exception:
+                    pass
+
+                await asyncio.sleep(1.0)
+
+            await self._screenshot(page, "auth_timeout")
+            err = "Authentication timed out — password may be wrong or session didn't validate"
+            self._set_step(f"[FAILED at Step 6] {err}")
+            return False, err
+
+        except Exception as e:
+            try:
+                await self._screenshot(page, "login_exception")
+            except Exception:
+                pass
+            err = f"Login exception: {type(e).__name__}: {e}"
+            self._set_step(f"[ERROR] {err}")
+            return False, err
+
+    # --- Cookie Harvesting ---
+
+    async def _harvest_cookies(self):
+        try:
+            await self._ensure_sidebar_cookie()
+            if not self.context:
+                return
+            cookies = await self.context.cookies()
+            simplified = [
+                {"name": c.get("name", ""), "value": c.get("value", ""),
+                 "domain": c.get("domain", ""), "path": c.get("path", "/"),
+                 "secure": c.get("secure", False), "httpOnly": c.get("httpOnly", False),
+                 "expirationDate": c.get("expires")}
+                for c in cookies if c.get("name")
+            ]
+            auth_val = (find_cookie(simplified, "arena-auth-prod-v1.0")
+                        or find_cookie(simplified, "arena-auth-prod-v1.1")
+                        or find_cookie(simplified, "arena-auth-prod-v1") or "")
+            sig = hashlib.sha256(auth_val.encode()).hexdigest()[:10] if auth_val else "none"
+
+            def upd(jars: list):
+                for j in jars:
+                    if j["id"] != self.jar_id: continue
+                    if simplified:
+                        j["cookies"] = simplified
+                        j["expired"] = False
+            mutate_jars(upd)
+
+            if sig != self._auth_sig_cache:
+                log("OK", f"[{self.name}] Cookies synced (auth {'present' if auth_val else 'MISSING'})")
+                self._auth_sig_cache = sig
+
+            # Persist browser state to profile directory
+            try:
+                profile_dir = os.path.join(PROFILES_DIR, self.jar_id)
+                os.makedirs(profile_dir, exist_ok=True)
+                if self.context:
+                    await self.context.storage_state(path=os.path.join(profile_dir, "state.json"))
+            except Exception:
+                pass
+        except Exception as e:
+            log("WARN", f"[{self.name}] Cookie harvest failed: {e}")
+
+    # --- Activity & Health ---
+
+    async def _do_activity(self):
+        if self.status != "running" or self.active_requests > 0 or self._action_lock.locked():
+            return
+        async with self._action_lock:
+            page = self.page
+            if not page or page.is_closed():
+                return
+            try:
+                size = page.viewport_size or {"width": 1440, "height": 900}
+                tx = random.randint(100, max(101, size["width"] - 100))
+                ty = random.randint(100, max(101, size["height"] - 100))
+                await self._human_move(page, tx, ty, steps=8)
+                await page.mouse.wheel(0, random.randint(-50, 150))
+            except Exception:
+                pass
+
+    async def check_health(self) -> bool:
+        async with self._action_lock:
+            try:
+                page = self.page
+                if not page or page.is_closed():
+                    return False
+                if ARENA_BASE not in (page.url or "") and self.active_requests == 0:
+                    await self._ensure_sidebar_cookie()
+                    await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                    await self._wait_cloudflare(page)
+                if await self._verify_auth_state(page):
+                    self.last_health_ok = time.time()
+                    await self._harvest_cookies()
+                    return True
+                return False
+            except Exception as e:
+                self.error = f"health: {type(e).__name__}: {e}"
+                return False
+
+    # --- Relogin Flow ---
+
+    async def relogin(self) -> bool:
+        self.status = "reconnecting"
+        self.error = None
+        self._set_step("Starting re-login sequence...")
+        try:
+            return await asyncio.wait_for(self._relogin_impl(), timeout=KEEPER_RELOGIN_TIMEOUT)
+        except asyncio.TimeoutError:
+            self.error = f"Relogin timed out after {KEEPER_RELOGIN_TIMEOUT}s"
+            self._set_step(f"[TIMEOUT] {self.error}")
+            log("ERROR", f"[{self.name}] {self.error}")
+            self._schedule_retry()
+            return False
+
+    async def _relogin_impl(self) -> bool:
+        async with self._action_lock:
+            self.status = "degraded"
+            try:
+                page = self.page
+                if not page or page.is_closed():
+                    self.error = "Page is closed — restarting browser"
+                    self._set_step("Browser page was closed, restarting browser...")
+                    self._schedule_retry()
+                    return False
+
+                if not (self.email and self.password):
+                    self.error = "No credentials configured — enter email:password in dashboard"
+                    self._set_step(f"[ERROR] {self.error}")
+                    log("ERROR", f"[{self.name}] {self.error}")
+                    self._schedule_retry()
+                    return False
+
+                ok, msg = await self._login_email_native()
+                if ok:
+                    await asyncio.sleep(2)
+                    await self._harvest_cookies()
+                    self.relogin_count += 1
+                    self.status = "running"
+                    self.fail_count = 0
+                    self.next_retry = 0
+                    log("OK", f"[{self.name}] ✓ Reconnected successfully via {self.login_method}")
+                    return True
+
+                self.error = msg
+                log("ERROR", f"[{self.name}] Relogin failed: {msg}")
+                self._schedule_retry()
+                return False
+
+            except Exception as e:
+                self.error = f"{type(e).__name__}: {e}"
+                self._set_step(f"[ERROR] Relogin crashed: {self.error}")
+                log("ERROR", f"[{self.name}] Relogin crashed: {self.error}")
+                if "TargetClosedError" in str(e):
+                    asyncio.create_task(self.restart())
+                else:
+                    self._schedule_retry()
+                return False
+
+    def _schedule_retry(self):
+        self.fail_count += 1
+        delay = min(45 * (2 ** (self.fail_count - 1)), 600)
+        self.next_retry = time.time() + delay
+        self._set_step(f"Retry scheduled in {delay}s (attempt {self.fail_count})")
+
+    async def poke(self):
+        if not self.running:
+            return
+        if await self.check_health():
+            return
+        if time.time() >= self.next_retry:
+            await self.relogin()
+
+    # --- Bridge Streaming Fetch ---
+
+    async def bridge_fetch(self, url: str, payload: dict):
+        page = self.page
+        if not page or page.is_closed():
+            raise RuntimeError("Keeper browser page is closed")
+        req_id = uuid.uuid4().hex[:8]
+        queue: asyncio.Queue = asyncio.Queue()
+        meta = {}
+        prefix = f"__NX{req_id}"
+
+        def on_console(msg):
+            try:
+                text = msg.text
+                if isinstance(text, str) and text.startswith(prefix):
+                    tag = text[len(prefix)]
+                    body = text[len(prefix) + 1:]
+                    if tag == "S": meta["status"] = int(body)
+                    elif tag == "E": meta["error"] = body
+                    elif tag == "D":
+                        data = json.loads(body)
+                        if data is None: queue.put_nowait(None)
+                        else: queue.put_nowait(data)
+            except Exception:
+                pass
+
+        page.on("console", on_console)
+        self.active_requests += 1
+        try:
+            script = """async ([url, payload, rid]) => {
+                const P = s => console.log('__NX' + rid + s);
+                try {
+                    const r = await fetch(url, {
+                        method: 'POST', credentials: 'include',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(payload)
+                    });
+                    P('S' + r.status);
+                    if (!r.ok) { P('E' + (await r.text()).slice(0, 400)); return; }
+                    const reader = r.body.getReader();
+                    const dec = new TextDecoder();
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        const text = dec.decode(value, {stream: true});
+                        for (const line of text.split('\n')) {
+                            if (line.trim()) P('D' + JSON.stringify(line));
+                        }
+                    }
+                    P('D' + JSON.stringify(null));
+                } catch(e) {
+                    P('S500'); P('E' + e.message);
+                }
+            }"""
+            eval_task = asyncio.create_task(page.evaluate(script, [url, payload, req_id]))
+            while True:
+                line = await queue.get()
+                if line is None:
+                    break
+                if line.startswith("data: ") or line.startswith("event: "):
+                    yield line
+            if eval_task.done() and eval_task.exception():
+                raise RuntimeError(f"Bridge evaluate exception: {eval_task.exception()}")
+            status_code = meta.get("status", 0)
+            if status_code != 200:
+                raise BridgeHTTPError(status_code, meta.get("error", ""))
+        finally:
+            self.active_requests -= 1
+            page.remove_listener("console", on_console)
+
+    # --- Cross-Platform Browser Lifecycle ---
+
+    async def start(self) -> bool:
+        if self.running:
+            return True
+        self.status = "starting"
+        self.error = None
+        self._set_step("Initializing stealth browser engine...")
+        try:
+            if async_playwright is not None:
+                self.playwright = await async_playwright().start()
+                launched = False
+
+                common_args = [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--window-size=1440,900",
+                ]
+
+                channels_to_try = ["chromium", None, "chrome", "msedge"]
+                for channel in channels_to_try:
+                    try:
+                        launch_kw = {"headless": self.headless, "args": common_args}
+                        if channel:
+                            launch_kw["channel"] = channel
+                        self.browser = await self.playwright.chromium.launch(**launch_kw)
+                        launched = True
+                        self._set_step(f"Stealth engine started ({channel or 'bundled chromium'})")
+                        break
+                    except Exception:
+                        continue
+
+                if not launched:
+                    for bin_path in [
+                        "/usr/bin/chromium",
+                        "/usr/bin/chromium-browser",
+                        "/usr/bin/google-chrome",
+                        "/usr/bin/google-chrome-stable",
+                        "/snap/bin/chromium",
+                    ]:
+                        if os.path.exists(bin_path):
+                            try:
+                                self.browser = await self.playwright.chromium.launch(
+                                    executable_path=bin_path, headless=self.headless, args=common_args
+                                )
+                                launched = True
+                                self._set_step(f"Stealth engine started via container binary ({bin_path})")
+                                break
+                            except Exception:
+                                pass
+
+                if not launched:
+                    try:
+                        self.browser = await self.playwright.firefox.launch(headless=self.headless)
+                        launched = True
+                        self._set_step("Stealth engine started (Firefox fallback)")
+                    except Exception:
+                        pass
+
+                if not launched and AsyncCamoufox is not None:
+                    self.browser = await AsyncCamoufox(headless=self.headless).__aenter__()
+                    launched = True
+                    self._set_step("Stealth engine started (Camoufox fallback)")
+
+                if not launched:
+                    self.status = "error"
+                    self.error = "No browser engine found. Run 'playwright install chromium' or install Edge/Chrome."
+                    self._set_step(f"ERROR: {self.error}")
+                    log("ERROR", f"[{self.name}] {self.error}")
+                    return False
+
+                # Use persistent profile directory per account for cookie/session isolation
+                profile_dir = os.path.join(PROFILES_DIR, self.jar_id)
+                os.makedirs(profile_dir, exist_ok=True)
+                self.context = await self.browser.new_context(
+                    viewport={"width": 1440, "height": 900},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+                    storage_state=os.path.join(profile_dir, "state.json") if os.path.exists(os.path.join(profile_dir, "state.json")) else None,
+                )
+                self.page = await self.context.new_page()
+                await self.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            elif AsyncCamoufox is not None:
+                cm = AsyncCamoufox(headless=self.headless, humanize=self.humanize)
+                self.browser = await cm.__aenter__()
+                self.context = self.browser.contexts[0] if self.browser.contexts else await self.browser.new_context()
+                self.page = await self.context.new_page()
+            else:
+                self.status = "error"
+                self.error = "No browser engine available"
+                log("ERROR", f"[{self.name}] {self.error}")
+                return False
+
+            jar = next((j for j in load_jars() if j["id"] == self.jar_id), None)
+            if jar and jar.get("cookies"):
+                try:
+                    await self.context.add_cookies(to_playwright_cookies(jar["cookies"]))
+                except Exception as e:
+                    log("WARN", f"[{self.name}] Cookie restore partial: {e}")
+
+            self._set_step("Navigating to arena.ai...")
+            await self._ensure_sidebar_cookie()
+            await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+            await self._wait_cloudflare(self.page)
+            await self._handle_turnstile(self.page)
+            await self._ensure_sidebar_cookie()
+            await self._inject_visual_cursor(self.page)
+
+            self.running = True
+            self.last_health_ok = 0
+            self.status = "running"
+            self._set_step("Keeper session active")
+            log("OK", f"[{self.name}] Keeper started ({'headless' if self.headless else 'LIVE WINDOW'})")
+
+            if not await self.check_health():
+                log("WARN", f"[{self.name}] Initial health check negative — triggering relogin")
+                await self.relogin()
+
+            self._loop_task = asyncio.create_task(self._session_loop())
+            return True
+
+        except Exception as e:
+            self.status = "error"
+            self.error = f"{type(e).__name__}: {e}"
+            self._set_step(f"ERROR: Failed to start: {self.error}")
+            log("ERROR", f"[{self.name}] Failed to start: {self.error}")
+            return False
+
+    async def stop(self):
+        self.running = False
+        if self._loop_task:
+            try: self._loop_task.cancel()
+            except Exception: pass
+        try:
+            if self.page: await self._harvest_cookies()
+        except Exception: pass
+        try:
+            if self.context: await self.context.close()
+        except Exception: pass
+        try:
+            if self.browser: await self.browser.close()
+        except Exception: pass
+        try:
+            if self.playwright: await self.playwright.stop()
+        except Exception: pass
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.status = "stopped"
+        self._set_step("Keeper stopped")
+        log("INFO", f"[{self.name}] Keeper stopped")
+
+    async def restart(self):
+        self.last_restart = time.time()
+        self._set_step("Restarting browser keeper...")
+        log("INFO", f"[{self.name}] Restarting browser")
+        resume = self.running or self.keep_forever
+        await self.stop()
+        if resume:
+            await asyncio.sleep(2)
+            await self.start()
+
+    async def _session_loop(self):
+        while self.running:
+            try:
+                await self._do_activity()
+                if (time.time() - self.last_nav > random.uniform(KEEPER_NAV_MIN, KEEPER_NAV_MAX)
+                        and self.active_requests == 0 and not self._action_lock.locked()):
+                    async with self._action_lock:
+                        await self._ensure_sidebar_cookie()
+                        await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                        await self._wait_cloudflare(self.page)
+                        self.last_nav = time.time()
+                if time.time() - self.last_health_ok > KEEPER_HEALTH_INTERVAL:
+                    if not await self.check_health():
+                        if time.time() >= self.next_retry:
+                            log("WARN", f"[{self.name}] Session disconnected — attempting relogin")
+                            await self.relogin()
+                await asyncio.sleep(random.uniform(KEEPER_ACTIVITY_MIN, KEEPER_ACTIVITY_MAX))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.error = f"{type(e).__name__}: {e}"
+                log("ERROR", f"[{self.name}] Loop exception: {self.error} — restarting")
+                try:
+                    await self.restart()
+                except Exception:
+                    pass
+                await asyncio.sleep(10)
+
+
+# ============================================================
+# SESSION KEEPER ORCHESTRATOR
+# ============================================================
+
+class SessionKeeper:
+    def __init__(self):
+        self.sessions: Dict[str, KeeperSession] = {}
+
+    def status(self) -> list:
+        now = time.time()
+        return [
+            {
+                "jar_id": s.jar_id, "name": s.name, "status": s.status,
+                "error": s.error, "method": s.login_method,
+                "current_step": s.current_step,
+                "step_history": s.step_history,
+                "relogins": s.relogin_count,
+                "last_activity": int(now - s.last_activity) if s.last_activity else None,
+                "healthy": (now - s.last_health_ok) < 900 if s.last_health_ok else False,
+                "next_retry": int(s.next_retry - now) if s.next_retry > now else 0,
+                "live": not s.headless,
+            }
+            for s in self.sessions.values()
+        ]
+
+    async def sync(self):
+        wanted = {j["id"]: j for j in load_jars() if j.get("enabled", True) and j.get("keeper_enabled")}
+        for jid in list(self.sessions):
+            s = self.sessions[jid]
+            if jid not in wanted and not s.keep_forever:
+                await s.stop()
+                del self.sessions[jid]
+        for jid, jar in wanted.items():
+            s = self.sessions.get(jid)
+            if s is None:
+                s = KeeperSession(jar, headless=jar.get("keeper_headless", True))
+                self.sessions[jid] = s
+                asyncio.create_task(s.start())
+            else:
+                if (s.email != (jar.get("email") or "") or s.password != (jar.get("password") or "")
+                        or s.login_method != (jar.get("login_method") or "email")):
+                    s.email = jar.get("email") or ""
+                    s.password = jar.get("password") or ""
+                    s.login_method = jar.get("login_method") or "email"
+                    s.fail_count = 0
+                    s.next_retry = 0
+                    log("INFO", f"[{s.name}] Credentials updated in keeper")
+                if s.status == "error" and time.time() - s.last_restart > 120:
+                    asyncio.create_task(s.restart())
+
+    async def start_live(self, jar_id: str) -> tuple:
+        jar = next((j for j in load_jars() if j["id"] == jar_id), None)
+        if not jar:
+            return False, "Account not found"
+        existing = self.sessions.get(jar_id)
+        if existing and existing.running:
+            await existing.stop()
+        s = KeeperSession(jar, headless=False, keep_forever=True)
+        self.sessions[jar_id] = s
+        asyncio.create_task(s.start())
+        return True, f"Live browser launching for '{jar.get('name')}'"
+
+
+keeper = SessionKeeper()
+
+
+async def get_live_cookies(jar_id: str) -> Optional[list]:
+    s = keeper.sessions.get(jar_id)
+    if s and s.running and s.page and not s.page.is_closed():
+        try:
+            cookies = await s.page.context.cookies()
+            return [
+                {"name": c.get("name", ""), "value": c.get("value", ""),
+                 "domain": c.get("domain", ""), "path": c.get("path", "/"),
+                 "secure": c.get("secure", False), "httpOnly": c.get("httpOnly", False),
+                 "expirationDate": c.get("expires")}
+                for c in cookies if c.get("name")
+            ]
+        except Exception:
+            return None
+    return None
+
+
+async def keeper_election_loop():
+    log("INFO", "Session keeper background supervisor active")
     while True:
         try:
-            # Wait 30 minutes (1800 seconds)
-            await asyncio.sleep(1800)
-            debug_print("\n" + "="*60)
-            debug_print("🔄 Starting scheduled 30-minute refresh...")
-            debug_print("="*60)
-            await get_initial_data()
-            debug_print("✅ Scheduled refresh completed")
-            debug_print("="*60 + "\n")
+            state = load_state()
+            now = time.time()
+            owner = state.get("keeper_pid")
+            mine = owner == os.getpid()
+            stale = now - state.get("keeper_heartbeat", 0) > 90
+            if mine or stale or not owner:
+                await keeper.sync()
+                def tick(s: dict):
+                    s["keeper_pid"] = os.getpid()
+                    s["keeper_heartbeat"] = now
+                    s["keeper_status"] = keeper.status()
+                mutate_state(tick)
         except Exception as e:
-            debug_print(f"❌ Error in periodic refresh task: {e}")
-            # Continue the loop even if there's an error
-            continue
+            log("ERROR", f"Keeper election loop: {e}")
+        await asyncio.sleep(15)
 
-async def startup_event():
-    # Prevent unit tests (TestClient/ASGITransport) from clobbering the user's real config.json
-    # and running slow browser/network startup routines.
-    if os.environ.get("PYTEST_CURRENT_TEST"):
+
+async def periodic_model_refresher():
+    while True:
+        await asyncio.sleep(REFRESH_INTERVAL)
+        try:
+            await get_initial_data()
+        except Exception as e:
+            log("WARN", f"Periodic model refresh: {e}")
+
+
+# ============================================================
+# TRANSSTREAM ENGINE & ERROR HANDLING
+# ============================================================
+
+def _friendly_arena_error(error_text: str, model_name: str) -> str:
+    t = str(error_text)
+    if "high demand" in t.lower():
+        return f"'{model_name}' is experiencing high demand on Arena. Try again shortly."
+    if "is not found for API version" in t or "not supported for generateContent" in t:
+        return f"'{model_name}' is temporarily unavailable on Arena's backend."
+    if t.strip().lower() in ("bad request", "400"):
+        return f"Arena rejected the request for '{model_name}'. The model might be misconfigured."
+    if "too long" in t.lower() or "maximum" in t.lower() or "limit" in t.lower():
+        return f"Context exceeded '{model_name}'s limit. Context has been compacted — retry."
+    return f"Arena upstream message for '{model_name}': {t[:400]}"
+
+
+async def _parse_bridge_stream(session: KeeperSession, url: str, payload: dict, model_name: str):
+    content, reasoning, error_text = "", "", None
+    mode = payload.get("mode", "direct-battle")
+    async for line in session.bridge_fetch(url, payload):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("a0:"):
+            try:
+                t = json.loads(line[3:])
+                content += t
+                yield ("content", t)
+            except json.JSONDecodeError:
+                continue
+        elif line.startswith("ag:"):
+            try:
+                t = json.loads(line[3:])
+                reasoning += t
+                yield ("reasoning", t)
+            except json.JSONDecodeError:
+                continue
+        elif line.startswith("a3:"):
+            try:
+                err = json.loads(line[3:])
+                error_text = err if isinstance(err, str) else json.dumps(err)
+            except json.JSONDecodeError:
+                error_text = line[3:]
+            log("ERROR", f"Arena stream error frame: {error_text}")
+        elif line.startswith("ad:"):
+            try:
+                md = json.loads(line[3:])
+                yield ("finish", md.get("finishReason", "stop"))
+            except json.JSONDecodeError:
+                continue
+    if not content and not reasoning:
+        yield ("error", _friendly_arena_error(error_text, model_name) if error_text
+               else "Arena returned an empty response.")
+    yield ("end", {"content": content, "reasoning": reasoning, "mode": mode})
+
+
+async def _stream_once_bridge(session: KeeperSession, url: str, payload: dict, model_name: str,
+                              preferred_modes: list, is_followup: bool):
+    last_err = "No attempts made"
+    for mode in (preferred_modes or ARENA_MODES):
+        p = dict(payload)
+        p["mode"] = mode
+        try:
+            async for event in _parse_bridge_stream(session, url, p, model_name):
+                yield event
+            log("OK", f"Browser-bridge stream complete — mode='{mode}' jar='{session.jar_id}'")
+            return
+        except BridgeHTTPError as e:
+            last_err = f"{e.status} {e.body[:200]}"
+            body = e.body or ""
+            if e.status in (400, 422):
+                if "not available for user selection" in body:
+                    block_model(model_name)
+                    raise HTTPException(status_code=403, detail=f"'{model_name}' is not selectable.")
+                if "model not found" in body.lower():
+                    asyncio.create_task(get_initial_data())
+                    raise HTTPException(status_code=404, detail="Arena model list is refreshing.")
+                log("WARN", f"Bridge mode='{mode}' rejected: {last_err}")
+                continue
+            if e.status == 429:
+                mark_jar_status(session.jar_id, "limited")
+                raise HTTPException(status_code=429, detail="Arena rate limit reached.")
+            if e.status in (401, 403):
+                mark_jar_status(session.jar_id, "expired")
+                asyncio.create_task(session.poke())
+                raise HTTPException(status_code=502, detail="Arena authentication expired.")
+            raise HTTPException(status_code=502, detail=f"Arena error {e.status}: {body[:300]}")
+        except HTTPException as e:
+            d = str(e.detail)
+            if is_followup and "model" not in d.lower() and ("not found" in d.lower() or "conversation" in d.lower()):
+                raise ConversationLost(d)
+            raise
+    raise HTTPException(status_code=502, detail=f"Arena rejected on all modes: {last_err}")
+
+
+async def _open_arena_stream(client: httpx.AsyncClient, url: str, payload: dict, headers: dict,
+                             jar_id: str, model_public_name: str = "", preferred_modes: list = None):
+    attempts = []
+    for mode in (preferred_modes or ARENA_MODES):
+        attempt_payload = dict(payload)
+        attempt_payload["mode"] = mode
+        try:
+            req = client.build_request("POST", url, json=attempt_payload, headers=headers)
+            resp = await client.send(req, stream=True)
+        except httpx.TimeoutException:
+            attempts.append((mode, "timeout", "Request timed out"))
+            continue
+        except Exception as e:
+            attempts.append((mode, "network", str(e)))
+            continue
+        if resp.status_code in (400, 422):
+            try:
+                await resp.aread()
+                body = resp.text[:600]
+            except Exception:
+                body = "<unreadable>"
+            await resp.aclose()
+            if "not available for user selection" in body:
+                if model_public_name:
+                    block_model(model_public_name)
+                raise HTTPException(status_code=403, detail=f"'{model_public_name}' is not selectable.")
+            if "model not found" in body.lower():
+                asyncio.create_task(get_initial_data())
+                raise HTTPException(status_code=404, detail="Arena model not found. Refreshing.")
+            attempts.append((mode, resp.status_code, body))
+            continue
+        if resp.status_code == 429:
+            try:
+                await resp.aread()
+            except Exception:
+                pass
+            await resp.aclose()
+            if jar_id:
+                mark_jar_status(jar_id, "limited")
+            raise HTTPException(status_code=429, detail="Arena rate limit reached.")
+        if resp.status_code in (401, 403):
+            try:
+                await resp.aread()
+            except Exception:
+                pass
+            await resp.aclose()
+            if jar_id:
+                mark_jar_status(jar_id, "expired")
+            raise HTTPException(status_code=502, detail="Arena authentication expired.")
+        if resp.status_code >= 400:
+            try:
+                await resp.aread()
+                body = resp.text[:400]
+            except Exception:
+                body = ""
+            await resp.aclose()
+            raise HTTPException(status_code=502, detail=f"Arena error {resp.status_code}: {body}")
+        return resp, attempt_payload
+    detail = " | ".join(f"mode={m}: {s} {b[:100]}" for m, s, b in attempts)
+    raise HTTPException(status_code=502, detail=f"All modes failed: {detail}")
+
+
+async def _stream_once(client: httpx.AsyncClient, url: str, payload: dict, headers: dict,
+                       jar_id: str, model_name: str, is_followup: bool):
+    response = None
+    try:
+        response, used = await _open_arena_stream(client, url, payload, headers, jar_id, model_name)
+        mode = used["mode"]
+        content, reasoning, error_text = "", "", None
+        async for line in response.aiter_lines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("a0:"):
+                try:
+                    t = json.loads(line[3:])
+                    content += t
+                    yield ("content", t)
+                except json.JSONDecodeError:
+                    continue
+            elif line.startswith("ag:"):
+                try:
+                    t = json.loads(line[3:])
+                    reasoning += t
+                    yield ("reasoning", t)
+                except json.JSONDecodeError:
+                    continue
+            elif line.startswith("a3:"):
+                try:
+                    err = json.loads(line[3:])
+                    error_text = err if isinstance(err, str) else json.dumps(err)
+                except json.JSONDecodeError:
+                    error_text = line[3:]
+                log("ERROR", f"Upstream error frame: {error_text}")
+            elif line.startswith("ad:"):
+                try:
+                    md = json.loads(line[3:])
+                    yield ("finish", md.get("finishReason", "stop"))
+                except json.JSONDecodeError:
+                    continue
+        if not content and not reasoning:
+            if error_text:
+                yield ("error", _friendly_arena_error(error_text, model_name))
+            else:
+                yield ("error", "Arena returned an empty response.")
+        yield ("end", {"content": content, "reasoning": reasoning, "mode": mode})
+    except HTTPException as e:
+        d = str(e.detail)
+        if is_followup and "model" not in d.lower() and ("not found" in d.lower() or "conversation" in d.lower()):
+            raise ConversationLost(d)
+        raise
+    finally:
+        if response is not None:
+            try:
+                await response.aclose()
+            except Exception:
+                pass
+
+
+# ============================================================
+# COMPACTION & CONTEXT PRESERVATION
+# ============================================================
+
+async def arena_oneoff(model_id: str, model_name: str, prompt: str, jar: dict) -> Optional[str]:
+    try:
+        headers = build_request_headers(jar)
+        base = {
+            "id": str(uuid7()), "mode": "direct-battle", "modelAId": model_id,
+            "userMessageId": str(uuid7()), "modelAMessageId": str(uuid7()),
+            "userMessage": {"content": prompt}, "modality": "chat",
+        }
+        url = f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
+        text = ""
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            async for ev in _stream_once(client, url, base, headers, jar["id"], model_name, False):
+                if ev[0] == "content":
+                    text += ev[1]
+                elif ev[0] == "error":
+                    return None
+        return text.strip() or None
+    except Exception:
+        return None
+
+
+def build_preamble(prior: list) -> str:
+    lines = []
+    for m in prior:
+        r = m.get("role", "user")
+        label = {"user": "User", "assistant": "Assistant", "system": "System"}.get(r, "User")
+        lines.append(f"{label}: {m.get('content', '')}")
+    return "\n\n".join(lines)
+
+
+async def compact_via_arena(prior: list, model_id: str, model_name: str, jar: dict) -> Optional[str]:
+    transcript = "\n\n".join(
+        f"{m.get('role', 'user').capitalize()}: {m.get('content', '')}"
+        for m in prior[:-KEEP_RECENT_MSGS] if m.get("content")
+    )
+    prompt = (
+        "Summarize the following conversation into a dense, factual, compact briefing. "
+        "Preserve core user goals, constraints, and pending items.\n\n"
+        f"Transcript:\n{transcript}"
+    )[:MAX_PROMPT - 600]
+    out = await arena_oneoff(model_id, model_name, prompt, jar)
+    return out.strip() if out and len(out) > 30 else None
+
+
+async def generate_title(user_msg: str, assistant_reply: str) -> str:
+    jar = acquire_jar()
+    if jar:
+        models = get_selectable_models()
+        if models:
+            fast_model = models[0]
+            prompt = (
+                "Provide a concise title (3-6 words) for this conversation. No quotes or punctuation.\n\n"
+                f"User: {user_msg[:300]}\nAssistant: {assistant_reply[:300]}\n\nTitle:"
+            )
+            title = await arena_oneoff(fast_model["id"], fast_model.get("publicName", ""), prompt, jar)
+            if title:
+                cleaned = title.strip().strip("\"'`").replace("\n", " ")
+                cleaned = re.sub(r"^(Title:\s*|Chat:\s*)", "", cleaned, flags=re.IGNORECASE).strip()
+                if 2 <= len(cleaned) <= 60:
+                    return cleaned
+    words = re.sub(r"^(please\s+|can\s+you\s+|how\s+to\s+|what\s+is\s+)", "", user_msg, flags=re.IGNORECASE).strip().split()
+    return " ".join(words[:6])[:48].capitalize() if words else "New chat"
+
+
+# ============================================================
+# MASTER CHAT ROUTER
+# ============================================================
+
+async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key, jar,
+                            prior_messages=None, is_api=False, request_user_count=None):
+    jar_id = jar["id"]
+    s = keeper.sessions.get(jar_id)
+    bridge = None
+    if s and s.running and s.page and not s.page.is_closed() and s.last_health_ok and (time.time() - s.last_health_ok) < 900:
+        bridge = s
+        log("INFO", f"[{s.name}] Routing via browser-bridge transport")
+
+    headers = None
+    if bridge is None:
+        live = await get_live_cookies(jar_id)
+        if live and (find_cookie(live, "arena-auth-prod-v1.0") or find_cookie(live, "arena-auth-prod-v1.1") or find_cookie(live, "arena-auth-prod-v1")):
+            jar = dict(jar)
+            jar["cookies"] = live
+            jar["expired"] = False
+        headers = build_request_headers(jar)
+
+    for attempt in (0, 1):
+        conv = get_conversation(conv_key)
+        model_conv = conv["arena"].get(model_name) if conv.get("model") == model_name else None
+        follow = model_conv is not None
+        if is_api and follow and request_user_count is not None:
+            follow = request_user_count == conv.get("user_count", 0) + 1
+
+        notices = []
+        if follow:
+            content_to_send = prompt
+            base = {
+                "modelAId": model_id, "userMessageId": str(uuid7()),
+                "modelAMessageId": str(uuid7()), "modality": "chat",
+                "id": model_conv["arena_id"],
+            }
+            url = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/{model_conv['arena_id']}"
+            m = model_conv.get("mode", "direct-battle")
+            preferred = [m] + [x for x in ARENA_MODES if x != m]
+        else:
+            prior = list(prior_messages) if is_api else list(conv.get("history") or [])
+            prior = [x for x in prior if isinstance(x, dict) and x.get("content")]
+            total_chars = sum(len(x["content"]) for x in prior)
+            compacted = False
+            if total_chars > COMPACT_THRESHOLD:
+                fingerprint = f"{len(prior)}:{prior[-1]['content'][:40] if prior else ''}"
+                summary = None
+                cache = conv.get("compact_cache") or {}
+                if cache.get("fingerprint") == fingerprint and cache.get("summary"):
+                    summary = cache["summary"]
+                else:
+                    log("INFO", f"Compacting conversation '{conv_key}' ({total_chars} chars)…")
+                    summary = await compact_via_arena(prior, model_id, model_name, jar)
+                    if summary:
+                        conv["compact_cache"] = {"fingerprint": fingerprint, "summary": summary}
+                        save_conversation(conv_key, conv)
+                if summary:
+                    prior = [{"role": "system", "content": "Summary of previous discussion:\n" + summary}] + prior[-KEEP_RECENT_MSGS:]
+                    compacted = True
+                    notices.append("Context limit reached — earlier turns were compacted.")
+                else:
+                    prior = prior[-KEEP_RECENT_MSGS:]
+                    compacted = True
+                    notices.append("Context limit reached — only recent messages kept.")
+                if not is_api:
+                    conv["history"] = prior
+                    save_conversation(conv_key, conv)
+            preamble = build_preamble(prior)
+            if preamble:
+                content_to_send = (
+                    "=== PREVIOUS CONVERSATION (context) ===\n\n"
+                    f"{preamble}\n\n"
+                    "=== CURRENT USER MESSAGE — REPLY TO THIS ===\n\n"
+                    f"{prompt}"
+                )
+                if not compacted:
+                    notices.append(f"Model changed or fresh turn — preserved {len(prior)} turns.")
+            else:
+                content_to_send = prompt
+            base = {
+                "modelAId": model_id, "userMessageId": str(uuid7()),
+                "modelAMessageId": str(uuid7()), "modality": "chat", "id": str(uuid7()),
+            }
+            url = f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
+            preferred = ARENA_MODES
+
+        user_message = {"content": content_to_send}
+        if attachments:
+            user_message["experimental_attachments"] = attachments
+        base["userMessage"] = user_message
+
+        try:
+            final = None
+            for n in notices:
+                yield ("notice", n)
+            if bridge:
+                async for ev in _stream_once_bridge(bridge, url, base, model_name, preferred, follow):
+                    if ev[0] == "end":
+                        final = ev[1]
+                    else:
+                        yield ev
+            else:
+                async with httpx.AsyncClient(timeout=90.0) as client:
+                    async for ev in _stream_once(client, url, base, headers, jar_id, model_name, follow):
+                        if ev[0] == "end":
+                            final = ev[1]
+                        else:
+                            yield ev
+            if final:
+                if final["content"].strip() or final["reasoning"].strip():
+                    conv2 = get_conversation(conv_key)
+                    conv2["arena"][model_name] = {"arena_id": base["id"], "mode": final["mode"]}
+                    conv2["model"] = model_name
+                    if is_api and request_user_count is not None:
+                        conv2["user_count"] = request_user_count
+                    if not is_api:
+                        conv2["history"].append({"role": "user", "content": prompt})
+                        conv2["history"].append({"role": "assistant", "content": final["content"].strip() or final["reasoning"].strip()})
+                        conv2["history"] = conv2["history"][-200:]
+                    save_conversation(conv_key, conv2)
+                yield ("done", {"mode": final["mode"], "content_len": len(final["content"]), "reasoning_len": len(final["reasoning"])})
+            return
+        except ConversationLost as e:
+            log("WARN", f"Upstream session lost — falling back ({str(e)[:120]})")
+            conv2 = get_conversation(conv_key)
+            conv2["arena"].pop(model_name, None)
+            save_conversation(conv_key, conv2)
+            continue
+    yield ("error", "Arena request failed to resolve.")
+
+
+# ============================================================
+# IMAGE UPLOAD PIPELINE
+# ============================================================
+
+async def upload_image_to_arena(image_data: bytes, mime_type: str, filename: str) -> Optional[tuple]:
+    jar = acquire_jar()
+    if not jar:
+        return None
+    try:
+        if not image_data or not mime_type.startswith("image/"):
+            return None
+        rh = build_request_headers(jar)
+        rh.update({
+            "Accept": "text/x-component", "Content-Type": "text/plain;charset=UTF-8",
+            "Next-Action": "70cb393626e05a5f0ce7dcb46977c36c139fa85f91",
+            "Referer": f"{ARENA_BASE}/?mode=direct",
+        })
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(f"{ARENA_BASE}/?mode=direct", headers=rh, content=json.dumps([filename, mime_type]))
+            response.raise_for_status()
+            upload_data = None
+            for line in response.text.strip().split("\n"):
+                if line.startswith("1:"):
+                    upload_data = json.loads(line[2:])
+                    break
+            if not upload_data or not upload_data.get("success"):
+                return None
+            upload_url = upload_data["data"]["uploadUrl"]
+            key = upload_data["data"]["key"]
+            response = await client.put(upload_url, content=image_data, headers={"Content-Type": mime_type}, timeout=60.0)
+            response.raise_for_status()
+            step3 = rh.copy()
+            step3["Next-Action"] = "6064c365792a3eaf40a60a874b327fe031ea6f22d7"
+            response = await client.post(f"{ARENA_BASE}/?mode=direct", headers=step3, content=json.dumps([key]), timeout=30.0)
+            response.raise_for_status()
+            download_data = None
+            for line in response.text.strip().split("\n"):
+                if line.startswith("1:"):
+                    download_data = json.loads(line[2:])
+                    break
+            if not download_data or not download_data.get("success"):
+                return None
+            log("OK", f"Image written to R2 storage: {key}")
+            return (key, download_data["data"]["url"])
+    except Exception as e:
+        log("ERROR", f"Image upload failed: {type(e).__name__}: {e}")
+        return None
+
+
+async def process_message_content(content, model_capabilities: dict):
+    supports_images = model_capabilities.get("inputCapabilities", {}).get("image", False)
+    if isinstance(content, str):
+        return content, []
+    if isinstance(content, list):
+        text_parts, attachments = [], []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                text_parts.append(part.get("text", ""))
+            elif part.get("type") == "image_url" and supports_images:
+                image_url = part.get("image_url", {})
+                url = image_url.get("url", "") if isinstance(image_url, dict) else image_url
+                if url.startswith("data:"):
+                    try:
+                        if "," not in url:
+                            continue
+                        header, data = url.split(",", 1)
+                        if ";" not in header or ":" not in header:
+                            continue
+                        mime_type = header.split(";")[0].split(":")[1]
+                        if not mime_type.startswith("image/"):
+                            continue
+                        image_data = base64.b64decode(data)
+                        if len(image_data) > 10 * 1024 * 1024:
+                            continue
+                        ext = mimetypes.guess_extension(mime_type) or ".png"
+                        result = await upload_image_to_arena(image_data, mime_type, f"upload-{uuid.uuid4()}{ext}")
+                        if result:
+                            key, dl_url = result
+                            attachments.append({"name": key, "contentType": mime_type, "url": dl_url})
+                    except Exception as e:
+                        log("WARN", f"Base64 image processing failed: {e}")
+        return "\n".join(text_parts).strip(), attachments
+    return str(content), []
+
+
+# ============================================================
+# FASTAPI APPLICATION & LIFESPAN
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(keeper_election_loop())
+    asyncio.create_task(periodic_model_refresher())
+    asyncio.create_task(get_initial_data())
+    asyncio.create_task(auto_login_on_boot())
+    yield
+
+
+async def auto_login_on_boot():
+    """Auto-start keeper sessions for all accounts with email+password on boot.
+    Checks if already authenticated first to avoid unnecessary login.
+    Works headless (no display required)."""
+    await asyncio.sleep(5)  # Let the app fully start
+    jars = load_jars()
+    accounts_with_creds = [j for j in jars if j.get("email") and j.get("password") and j.get("enabled", True)]
+    if not accounts_with_creds:
+        log("INFO", "Auto-login: No accounts with credentials found, skipping")
         return
 
+    log("INFO", f"Auto-login: Starting keeper sessions for {len(accounts_with_creds)} account(s)...")
+
+    # Enable keeper for all accounts with credentials
+    def enable_keepers(jars_list):
+        for j in jars_list:
+            if j.get("email") and j.get("password") and j.get("enabled", True):
+                j["keeper_enabled"] = True
+    mutate_jars(enable_keepers)
+
+    # Give the election loop time to pick them up
+    await asyncio.sleep(3)
+
+    # The keeper_election_loop / sync() will now start sessions for all keeper_enabled jars
+    # and the start() method already does health check + relogin if needed
+    log("INFO", f"Auto-login: {len(accounts_with_creds)} account(s) queued for keeper sessions")
+
+app = FastAPI(title="Bridgena", version="1.0", lifespan=lifespan)
+api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+
+async def get_current_session(request: Request) -> Optional[str]:
+    sid = request.cookies.get("session_id")
+    if sid and sid in dashboard_sessions:
+        return dashboard_sessions[sid]
+    return None
+
+
+async def verify_api_key(request: Request,
+                         authorization: Optional[str] = Depends(api_key_header),
+                         x_api_key: Optional[str] = Header(None)) -> dict:
+    # Allow authenticated web sessions to use the API without a key
+    sid = request.cookies.get("session_id")
+    if sid and sid in dashboard_sessions:
+        return {"name": "web-session", "rpm": 120, "key": "web-session"}
+
+    cfg = get_config()
+    keys = cfg.get("api_keys", [])
+    if not keys:
+        return {"name": "default", "rpm": 60}
+    token = None
+    if authorization:
+        token = authorization[7:].strip() if authorization.startswith("Bearer ") else authorization.strip()
+    elif x_api_key:
+        token = x_api_key.strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing API Key")
+    matched = next((k for k in keys if k.get("key") == token), None)
+    if not matched:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+    rpm = matched.get("rpm", 60)
+    rate_res = check_rate_limit(token, rpm)
+    if not rate_res["ok"]:
+        raise HTTPException(status_code=429, detail=f"Rate limit of {rpm} RPM exceeded. Retry in {rate_res['retry']}s.")
+    return matched
+
+
+# ============================================================
+# ROOT ROUTE
+# ============================================================
+
+@app.get("/")
+async def root(request: Request):
+    if await get_current_session(request):
+        return RedirectResponse(url="/chat")
+    return RedirectResponse(url="/login")
+
+
+# ============================================================
+# OPENAI COMPATIBLE ENDPOINTS
+# ============================================================
+
+@app.get("/v1/models")
+@app.get("/models")
+async def list_models(_auth=Depends(verify_api_key)):
+    arena_m = get_selectable_models()
+    ox_m = oxalpha_models()
+    data = []
+    ts = int(time.time())
+    for m in arena_m:
+        data.append({"id": m.get("publicName"), "object": "model", "created": ts, "owned_by": m.get("organization", "arena.ai")})
+    for m in ox_m:
+        data.append({"id": m["id"], "object": "model", "created": ts, "owned_by": m["owned_by"]})
+    return {"object": "list", "data": data}
+
+
+@app.get("/v1/models/{model_id:path}")
+@app.get("/models/{model_id:path}")
+async def retrieve_model(model_id: str, _auth=Depends(verify_api_key)):
+    models = get_selectable_models() + oxalpha_models()
+    m = next((x for x in models if x.get("publicName") == model_id or x.get("id") == model_id), None)
+    if not m:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+    return {"id": m.get("publicName") or m.get("id"), "object": "model", "created": int(time.time()),
+            "owned_by": m.get("organization") or m.get("owned_by", "arena.ai")}
+
+
+@app.post("/v1/chat/completions")
+@app.post("/chat/completions")
+async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
     try:
-        # Ensure config and models files exist
-        config = get_config()
-        if not config.get("api_keys"):
-            config["api_keys"] = [
-                {
-                    "name": "Default Key",
-                    "key": f"sk-lmab-{uuid.uuid4()}",
-                    "rpm": 60,
-                    "created": int(time.time()),
-                }
-            ]
-        save_config(config)
-        save_models(get_models())
-        # Load usage stats from config
-        load_usage_stats()
-        
-        # 1. First, get initial data (cookies, models, etc.)
-        # We await this so we have the cookie BEFORE trying reCAPTCHA
-        await get_initial_data() 
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    model_name = body.get("model")
+    messages = body.get("messages", [])
+    stream = body.get("stream", False)
+    if not model_name:
+        raise HTTPException(status_code=400, detail="Field 'model' is required")
+    if not messages or not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="Field 'messages' must be a non-empty list")
 
-        # Best-effort: if the user-configured auth cookies are expired base64 sessions, try to refresh one so the
-        # Camoufox proxy worker can start with a valid `arena-auth-prod-v1` cookie.
-        try:
-            refreshed = await maybe_refresh_expired_auth_tokens()
-        except Exception:
-            refreshed = None
-        if refreshed:
-            debug_print("🔄 Refreshed arena-auth-prod-v1 session (startup).")
-        
-        # 2. Do not prefetch reCAPTCHA at startup.
-        # The internal Camoufox userscript-proxy mints tokens in-page for strict models, and non-strict
-        # requests can refresh on-demand. Avoid launching extra browser instances at startup.
+    # OX Alpha route
+    if model_name in OX_ALIASES:
+        record_usage(OX_MODEL_ID)
+        if stream:
+            async def sse_gen():
+                comp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+                ts = int(time.time())
+                async for t, chunk in stream_oxalpha(messages, model=model_name):
+                    if t == "content":
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
+                    elif t == "reasoning":
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_name, 'choices': [{'index': 0, 'delta': {'reasoning_content': chunk}, 'finish_reason': None}]})}\n\n"
+                    elif t == "error":
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': 'stop'}]})}\n\n"
+                yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(sse_gen(), media_type="text/event-stream")
+        else:
+            full_content, full_reasoning = "", ""
+            async for t, chunk in stream_oxalpha(messages, model=model_name):
+                if t == "content":
+                    full_content += chunk
+                elif t == "reasoning":
+                    full_reasoning += chunk
+            return {"id": f"chatcmpl-{uuid.uuid4().hex[:12]}", "object": "chat.completion", "created": int(time.time()),
+                    "model": model_name, "choices": [{"index": 0, "message": {"role": "assistant", "content": full_content, "reasoning_content": full_reasoning or None}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 
-        # 3. Start background tasks
-        asyncio.create_task(periodic_refresh_task())
-        
-        # Mark userscript proxy as active at startup to allow immediate delegation
-        # to the internal Camoufox proxy worker.
-        global last_userscript_poll, USERSCRIPT_PROXY_LAST_POLL_AT
-        now = time.time()
-        last_userscript_poll = now
-        USERSCRIPT_PROXY_LAST_POLL_AT = now
-        
-        asyncio.create_task(camoufox_proxy_worker())
-        
-    except Exception as e:
-        debug_print(f"❌ Error during startup: {e}")
-        # Continue anyway - server should still start
+    # Arena route
+    models = get_models()
+    model_obj = next((m for m in models if m.get("publicName") == model_name or m.get("id") == model_name), None)
+    if not model_obj:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+    model_id = model_obj["id"]
+    model_public_name = model_obj.get("publicName", model_name)
+    model_caps = model_obj.get("capabilities", {})
+    jar = acquire_jar()
+    if not jar:
+        raise HTTPException(status_code=503, detail="No healthy accounts available.")
+    record_usage(model_public_name)
+    prior_messages = []
+    last_msg = messages[-1]
+    prompt_text, attachments = await process_message_content(last_msg.get("content", ""), model_caps)
+    for msg in messages[:-1]:
+        c_text, _ = await process_message_content(msg.get("content", ""), model_caps)
+        prior_messages.append({"role": msg.get("role", "user"), "content": c_text})
+    user_count = sum(1 for m in messages if m.get("role") == "user")
+    req_hash = hashlib.sha256(json.dumps([m.get("content") for m in messages[:-1]], default=str).encode()).hexdigest()[:16]
+    conv_key = f"api:{req_hash}"
 
-# --- UI Endpoints (Login/Dashboard) ---
+    if stream:
+        async def sse_gen():
+            comp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            ts = int(time.time())
+            try:
+                async for ev in stream_arena_chat(model_id, model_public_name, prompt_text, attachments, conv_key, jar,
+                                                  prior_messages=prior_messages, is_api=True, request_user_count=user_count):
+                    t, v = ev
+                    if t == "content":
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'content': v}, 'finish_reason': None}]})}\n\n"
+                    elif t == "reasoning":
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'reasoning_content': v}, 'finish_reason': None}]})}\n\n"
+                    elif t == "error":
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'content': v}, 'finish_reason': 'stop'}]})}\n\n"
+                yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'content': str(e)}, 'finish_reason': 'stop'}]})}\n\n"
+                yield "data: [DONE]\n\n"
+        return StreamingResponse(sse_gen(), media_type="text/event-stream")
+    else:
+        full_content, full_reasoning = "", ""
+        async for ev in stream_arena_chat(model_id, model_public_name, prompt_text, attachments, conv_key, jar,
+                                          prior_messages=prior_messages, is_api=True, request_user_count=user_count):
+            t, v = ev
+            if t == "content":
+                full_content += v
+            elif t == "reasoning":
+                full_reasoning += v
+            elif t == "error":
+                raise HTTPException(status_code=502, detail=v)
+        return {"id": f"chatcmpl-{uuid.uuid4().hex[:12]}", "object": "chat.completion", "created": int(time.time()),
+                "model": model_public_name, "choices": [{"index": 0, "message": {"role": "assistant", "content": full_content, "reasoning_content": full_reasoning or None}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 
-@app.get("/", response_class=HTMLResponse)
-async def root_redirect():
-    return RedirectResponse(url="/dashboard")
+
+# ============================================================
+# ============================================================
+# UI - MINIMALIST AUTHENTICATION & LOGIN (/login)
+# ============================================================
+
+LOGIN_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Bridgena - Sign In</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #141414;
+            --card-bg: #1c1c1c;
+            --border: #2a2a2a;
+            --border-focus: #ffffff;
+            --text-main: #ececec;
+            --text-muted: #8e8e8e;
+            --accent: #ffffff;
+            --accent-text: #000000;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .login-card {
+            width: 100%;
+            max-width: 380px;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 36px 28px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+        }
+        .logo-circle {
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background: #fff;
+            color: #000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 16px;
+            letter-spacing: -0.5px;
+            margin-bottom: 16px;
+        }
+        .brand-title {
+            font-size: 20px;
+            font-weight: 700;
+            margin-bottom: 6px;
+            color: #fff;
+        }
+        .brand-sub {
+            font-size: 13.5px;
+            color: var(--text-muted);
+            margin-bottom: 24px;
+            text-align: center;
+        }
+        .error-banner {
+            width: 100%;
+            background: rgba(239, 68, 68, 0.12);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #f87171;
+            padding: 10px 14px;
+            border-radius: 10px;
+            font-size: 13px;
+            margin-bottom: 18px;
+            text-align: center;
+        }
+        form { width: 100%; }
+        .input-group {
+            margin-bottom: 16px;
+            position: relative;
+        }
+        .input-group label {
+            display: block;
+            font-size: 12.5px;
+            font-weight: 600;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+        .input-box {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+        .input-box input {
+            width: 100%;
+            background: #141414;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px 42px 12px 14px;
+            color: #fff;
+            font-size: 14px;
+            font-family: inherit;
+            outline: none;
+            transition: border-color 0.15s;
+        }
+        .input-box input:focus {
+            border-color: rgba(255, 255, 255, 0.4);
+        }
+        .eye-toggle {
+            position: absolute;
+            right: 12px;
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 4px;
+        }
+        .eye-toggle:hover { color: #fff; }
+        .btn-submit {
+            width: 100%;
+            background: var(--accent);
+            color: var(--accent-text);
+            border: none;
+            padding: 12px 16px;
+            border-radius: 12px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.15s;
+            font-family: inherit;
+            margin-top: 4px;
+        }
+        .btn-submit:hover { opacity: 0.9; }
+        .footer-note {
+            margin-top: 24px;
+            font-size: 12px;
+            color: #555;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="logo-circle">B</div>
+        <div class="brand-title">Bridgena</div>
+        <div class="brand-sub">Enter your password to access the workspace</div>
+        __ERROR_MSG__
+        <form action="/login" method="post">
+            <div class="input-group">
+                <label for="password">Password</label>
+                <div class="input-box">
+                    <input type="password" id="password" name="password" placeholder="Enter password..." required autofocus>
+                    <button type="button" class="eye-toggle" onclick="togglePassword()" title="Show/Hide Password">
+                        <svg id="eyeIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                    </button>
+                </div>
+            </div>
+            <button type="submit" class="btn-submit">Sign In</button>
+        </form>
+        <div class="footer-note">
+            <span>● Nexus Bridge v8.0</span>
+        </div>
+    </div>
+    <script>
+    function togglePassword() {
+        const inp = document.getElementById('password');
+        const eye = document.getElementById('eyeIcon');
+        if (inp.type === 'password') {
+            inp.type = 'text';
+            eye.innerHTML = '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line>';
+        } else {
+            inp.type = 'password';
+            eye.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle>';
+        }
+    }
+    </script>
+</body>
+</html>"""
+
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request, error: Optional[str] = None):
     if await get_current_session(request):
-        return RedirectResponse(url="/dashboard")
-    
-    error_msg = '<div class="error-message">Invalid password. Please try again.</div>' if error else ''
-    
-    return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Login - LMArena Bridge</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-                body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    min-height: 100vh;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    padding: 20px;
-                }}
-                .login-container {{
-                    background: white;
-                    padding: 40px;
-                    border-radius: 10px;
-                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-                    width: 100%;
-                    max-width: 400px;
-                }}
-                h1 {{
-                    color: #333;
-                    margin-bottom: 10px;
-                    font-size: 28px;
-                }}
-                .subtitle {{
-                    color: #666;
-                    margin-bottom: 30px;
-                    font-size: 14px;
-                }}
-                .form-group {{
-                    margin-bottom: 20px;
-                }}
-                label {{
-                    display: block;
-                    margin-bottom: 8px;
-                    color: #555;
-                    font-weight: 500;
-                }}
-                input[type="password"] {{
-                    width: 100%;
-                    padding: 12px;
-                    border: 2px solid #e1e8ed;
-                    border-radius: 6px;
-                    font-size: 16px;
-                    transition: border-color 0.3s;
-                }}
-                input[type="password"]:focus {{
-                    outline: none;
-                    border-color: #667eea;
-                }}
-                button {{
-                    width: 100%;
-                    padding: 12px;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                    border: none;
-                    border-radius: 6px;
-                    font-size: 16px;
-                    font-weight: 600;
-                    cursor: pointer;
-                    transition: transform 0.2s;
-                }}
-                button:hover {{
-                    transform: translateY(-2px);
-                }}
-                button:active {{
-                    transform: translateY(0);
-                }}
-                .error-message {{
-                    background: #fee;
-                    color: #c33;
-                    padding: 12px;
-                    border-radius: 6px;
-                    margin-bottom: 20px;
-                    border-left: 4px solid #c33;
-                .error-message {{
-                    background: #fee;
-                    color: #c33;
-                    padding: 12px;
-                    border-radius: 6px;
-                    margin-bottom: 20px;
-                    border-left: 4px solid #c33;
-                }}
-                .password-hint {{
-                    font-size: 12px;
-                    color: #888;
-                    margin-top: 8px;
-                }}
-                .password-hint code {{
-                    background: #f5f5f5;
-                    padding: 2px 6px;
-                    border-radius: 4px;
-                    font-family: monospace;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="login-container">
-                <h1>LMArena Bridge</h1>
-                <div class="subtitle">Sign in to access the dashboard</div>
-                {error_msg}
-                <form action="/login" method="post">
-                    <div class="form-group">
-                        <label for="password">Password</label>
-                        <input type="password" id="password" name="password" placeholder="Enter your password" required autofocus>
-                    <div class="form-group">
-                        <label for="password">Password</label>
-                        <input type="password" id="password" name="password" placeholder="Enter your password" required autofocus>
-                        <div class="password-hint">Default password: <code>admin</code></div>
-                    </div>
-                    <button type="submit">Sign In</button>
-                </form>
-            </div>
-        </body>
-        </html>
-    """
+        return RedirectResponse(url="/chat")
+    err_box = '<div class="error-banner">Incorrect password. Please try again.</div>' if error else ""
+    return LOGIN_TEMPLATE.replace("__ERROR_MSG__", err_box)
+
 
 @app.post("/login")
 async def login_submit(response: Response, password: str = Form(...)):
     config = get_config()
-    if password == config.get("password"):
+    cfg_pw = config.get("password", "admin")
+    if password == cfg_pw or not cfg_pw:
         session_id = str(uuid.uuid4())
         dashboard_sessions[session_id] = "admin"
-        response = RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-        response.set_cookie(key="session_id", value=session_id, httponly=True)
-        return response
+        log("INFO", "Dashboard authentication successful")
+        r = RedirectResponse(url="/chat", status_code=status.HTTP_303_SEE_OTHER)
+        r.set_cookie(key="session_id", value=session_id, httponly=True, samesite="lax", path="/", max_age=86400 * 30)
+        return r
+    log("WARN", "Failed dashboard login attempt")
     return RedirectResponse(url="/login?error=1", status_code=status.HTTP_303_SEE_OTHER)
 
+
 @app.get("/logout")
-async def logout(request: Request, response: Response):
-    session_id = request.cookies.get("session_id")
-    if session_id in dashboard_sessions:
-        del dashboard_sessions[session_id]
-    response = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
-    response.delete_cookie("session_id")
-    return response
+async def logout(request: Request):
+    sid = request.cookies.get("session_id")
+    if sid in dashboard_sessions:
+        del dashboard_sessions[sid]
+    r = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+    r.delete_cookie("session_id", path="/")
+    return r
+
+
+# ============================================================
+# UI - MINIMALIST OPENWEBUI / CHATGPT CHAT WORKSPACE (/chat)
+# ============================================================
+
+CHAT_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Bridgena</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.1/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <style>
+        :root {
+            --bg-canvas: #171717;
+            --bg-sidebar: #0d0d0d;
+            --bg-card: #212121;
+            --bg-hover: #2a2a2a;
+            --bg-active: #2f2f2f;
+            --border: #2e2e2e;
+            --border-faint: rgba(255, 255, 255, 0.07);
+            --text: #ececec;
+            --text-muted: #9ca3af;
+            --text-faint: #6b7280;
+            --accent: #ffffff;
+            --accent-text: #000000;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-canvas);
+            color: var(--text);
+            height: 100vh;
+            display: flex;
+            overflow: hidden;
+            font-size: 14.5px;
+            letter-spacing: -0.15px;
+        }
+        ::-webkit-scrollbar { width: 5px; height: 5px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 4px; }
+
+        /* --- SIDEBAR --- */
+        .sidebar {
+            width: 260px;
+            background: var(--bg-sidebar);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            border-right: 1px solid var(--border-faint);
+            transition: margin-left 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+            user-select: none;
+            z-index: 40;
+        }
+        .sidebar.collapsed {
+            margin-left: -260px;
+        }
+        .sidebar-header {
+            padding: 14px 16px 10px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .sidebar-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 600;
+            font-size: 15px;
+            color: #fff;
+            text-decoration: none;
+        }
+        .brand-icon-circle {
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            background: #fff;
+            color: #000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 12px;
+            letter-spacing: -0.5px;
+        }
+        .icon-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 6px;
+            border-radius: 6px;
+            transition: all 0.15s;
+        }
+        .icon-btn:hover {
+            color: #fff;
+            background: var(--bg-hover);
+        }
+
+        .sidebar-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0 10px 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .nav-list {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        }
+        .new-chat-btn {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: #fff;
+            padding: 9px 12px;
+            border-radius: 10px;
+            font-size: 13.5px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .new-chat-btn:hover {
+            background: var(--bg-hover);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+        .kbd-shortcut {
+            font-size: 11px;
+            color: var(--text-faint);
+            border: 1px solid var(--border);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .sidebar-search-box {
+            position: relative;
+        }
+        .sidebar-search-input {
+            width: 100%;
+            background: #141414;
+            border: 1px solid var(--border-faint);
+            border-radius: 8px;
+            padding: 7px 10px 7px 30px;
+            font-size: 12.5px;
+            color: #fff;
+            outline: none;
+            font-family: inherit;
+        }
+        .sidebar-search-input:focus {
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+        .sidebar-search-icon {
+            position: absolute;
+            left: 9px;
+            top: 8px;
+            color: var(--text-muted);
+            pointer-events: none;
+        }
+
+        .sidebar-section-title {
+            font-size: 11.5px;
+            font-weight: 600;
+            color: var(--text-faint);
+            padding: 8px 10px 2px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .chat-history-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 10px;
+            border-radius: 8px;
+            font-size: 13px;
+            color: var(--text);
+            cursor: pointer;
+            transition: background 0.12s;
+            position: relative;
+        }
+        .chat-history-item:hover { background: var(--bg-hover); }
+        .chat-history-item.active { background: var(--bg-active); color: #fff; font-weight: 500; }
+        .chat-title-text {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            flex: 1;
+        }
+        .chat-item-actions {
+            display: none;
+            align-items: center;
+            gap: 4px;
+            margin-left: 6px;
+        }
+        .chat-history-item:hover .chat-item-actions {
+            display: flex;
+        }
+        .chat-action-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 2px 4px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .chat-action-btn:hover { color: #fff; }
+
+        .sidebar-footer {
+            padding: 10px 12px;
+            border-top: 1px solid var(--border-faint);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: relative;
+        }
+        .user-pill {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            cursor: pointer;
+            padding: 6px 8px;
+            border-radius: 8px;
+            flex: 1;
+            transition: background 0.12s;
+        }
+        .user-pill:hover { background: var(--bg-hover); }
+        .user-avatar-badge {
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            background: #2563eb;
+            color: #fff;
+            font-size: 11px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .user-name {
+            font-size: 13px;
+            font-weight: 500;
+            color: #fff;
+        }
+        .user-menu-popover {
+            position: absolute;
+            bottom: 54px;
+            left: 12px;
+            right: 12px;
+            background: #1e1e1e;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 6px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.6);
+            display: none;
+            flex-direction: column;
+            gap: 2px;
+            z-index: 100;
+        }
+        .user-menu-popover.open { display: flex; }
+        .user-menu-item {
+            padding: 8px 12px;
+            font-size: 13px;
+            color: var(--text);
+            text-decoration: none;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+        }
+        .user-menu-item:hover { background: var(--bg-hover); }
+
+        /* --- MAIN CHAT CONTAINER --- */
+        .main-chat-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            position: relative;
+            background: var(--bg-canvas);
+        }
+
+        /* TOP NAVBAR */
+        .top-navbar {
+            padding: 10px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            z-index: 20;
+            border-bottom: 1px solid var(--border-faint);
+        }
+        .model-header-wrap {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            padding: 6px 12px;
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-faint);
+            transition: all 0.15s;
+        }
+        .model-header-wrap:hover {
+            background: var(--bg-hover);
+            border-color: rgba(255, 255, 255, 0.15);
+        }
+        .model-title-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #fff;
+        }
+        .top-right-tools {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        /* --- CHAT SCROLL STREAM --- */
+        .chat-scroll-area {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px 20px 150px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .chat-content-width {
+            max-width: 768px;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 28px;
+        }
+
+        /* --- EMPTY STATE / HERO --- */
+        .hero-empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 60vh;
+            width: 100%;
+            max-width: 740px;
+            margin: auto 0;
+        }
+        .hero-title {
+            font-size: 26px;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 28px;
+            text-align: center;
+        }
+
+        /* HERO INPUT BOX */
+        .hero-input-box {
+            width: 100%;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            padding: 16px 18px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+            transition: border-color 0.15s;
+        }
+        .hero-input-box:focus-within {
+            border-color: rgba(255, 255, 255, 0.35);
+        }
+        .hero-textarea {
+            width: 100%;
+            background: transparent;
+            border: none;
+            color: #fff;
+            font-size: 15px;
+            font-family: inherit;
+            resize: none;
+            outline: none;
+            max-height: 200px;
+            min-height: 24px;
+            line-height: 1.5;
+        }
+        .hero-textarea::placeholder {
+            color: #737373;
+        }
+        .hero-tools-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .hero-tools-left, .hero-tools-right {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .tool-icon-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .tool-icon-btn:hover {
+            color: #fff;
+            background: var(--bg-hover);
+        }
+        .send-pill-btn {
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            background: #fff;
+            color: #000;
+            border: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: opacity 0.15s;
+        }
+        .send-pill-btn:hover { opacity: 0.85; }
+
+        /* SUGGESTIONS GRID */
+        .suggestions-wrap {
+            margin-top: 32px;
+            width: 100%;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 10px;
+        }
+        .suggest-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            padding: 14px;
+            border-radius: 14px;
+            cursor: pointer;
+            transition: all 0.15s;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .suggest-card:hover {
+            background: var(--bg-hover);
+            border-color: rgba(255, 255, 255, 0.2);
+            transform: translateY(-1px);
+        }
+        .suggest-title { font-size: 13.5px; font-weight: 600; color: #fff; }
+        .suggest-desc { font-size: 12px; color: var(--text-muted); }
+
+        /* --- MESSAGE BUBBLES --- */
+        .message-wrapper {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            width: 100%;
+        }
+        .message-wrapper.user {
+            align-items: flex-end;
+        }
+        .user-bubble {
+            background: #2b2b2b;
+            border: 1px solid var(--border-faint);
+            padding: 12px 18px;
+            border-radius: 20px;
+            max-width: 80%;
+            font-size: 14.5px;
+            line-height: 1.6;
+            color: #fff;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .assistant-row {
+            display: flex;
+            gap: 14px;
+            width: 100%;
+        }
+        .assistant-avatar {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            background: #fff;
+            color: #000;
+            font-size: 12px;
+            font-weight: 800;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            margin-top: 4px;
+        }
+        .assistant-content-col {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-width: 0;
+        }
+        .assistant-meta {
+            font-size: 12.5px;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+        .assistant-body {
+            font-size: 14.5px;
+            line-height: 1.7;
+            color: #e5e7eb;
+            word-break: break-word;
+        }
+        .assistant-body p { margin-bottom: 12px; }
+        .assistant-body p:last-child { margin-bottom: 0; }
+        .assistant-body pre {
+            background: #111111;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            margin: 14px 0;
+            overflow: hidden;
+        }
+        .code-header-bar {
+            background: #1a1a1a;
+            padding: 6px 14px;
+            font-size: 12px;
+            color: var(--text-muted);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+        }
+        .code-copy-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 12px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-family: inherit;
+        }
+        .code-copy-btn:hover { color: #fff; }
+        .assistant-body code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+        }
+        .assistant-body pre code {
+            display: block;
+            padding: 14px;
+            overflow-x: auto;
+        }
+
+        .thought-accordion {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border-faint);
+            border-radius: 10px;
+            margin-bottom: 14px;
+            overflow: hidden;
+        }
+        .thought-accordion summary {
+            padding: 8px 12px;
+            font-size: 12.5px;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            user-select: none;
+        }
+        .thought-accordion summary:hover { color: #fff; }
+        .thought-body {
+            padding: 10px 14px;
+            font-size: 13px;
+            color: #9ca3af;
+            border-top: 1px solid var(--border-faint);
+            line-height: 1.5;
+            white-space: pre-wrap;
+            font-style: italic;
+        }
+
+        /* --- DOCKED BOTTOM COMPOSER --- */
+        .docked-composer-wrap {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            padding: 12px 20px 24px;
+            background: linear-gradient(180deg, transparent 0%, rgba(23, 23, 23, 0.95) 40%, #171717 100%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            z-index: 30;
+        }
+        .stop-pill {
+            display: none;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: #fff;
+            border-radius: 20px;
+            font-size: 12.5px;
+            font-weight: 500;
+            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+        }
+        .stop-pill.visible { display: flex; }
+        .stop-dot { width: 8px; height: 8px; background: #ef4444; border-radius: 2px; }
+
+        /* --- MODALS --- */
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            padding: 20px;
+        }
+        .modal-backdrop.open { display: flex; }
+        .modal-card {
+            width: 100%;
+            max-width: 520px;
+            background: #1e1e1e;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.7);
+            max-height: 80vh;
+        }
+        .modal-search-input {
+            width: 100%;
+            background: #141414;
+            border: 1px solid var(--border);
+            color: #fff;
+            padding: 10px 14px;
+            border-radius: 10px;
+            font-size: 13.5px;
+            font-family: inherit;
+            outline: none;
+        }
+        .modal-models-list {
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            max-height: 380px;
+        }
+        .model-row-item {
+            padding: 10px 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            transition: background 0.12s;
+        }
+        .model-row-item:hover { background: var(--bg-hover); }
+        .model-row-item.active { background: var(--bg-active); }
+        .model-row-name { font-weight: 600; font-size: 13.5px; color: #fff; }
+        .model-row-provider { font-size: 12px; color: var(--text-muted); }
+
+        @media (max-width: 768px) {
+            .sidebar { position: fixed; height: 100vh; }
+            .sidebar.collapsed { margin-left: -260px; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- SIDEBAR -->
+    <aside class="sidebar" id="appSidebar">
+        <div class="sidebar-header">
+            <a href="/chat" class="sidebar-brand">
+                <div class="brand-icon-circle">B</div>
+                <span>Bridgena</span>
+            </a>
+            <button class="icon-btn" onclick="toggleSidebar()" title="Toggle Sidebar">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>
+            </button>
+        </div>
+
+        <div class="sidebar-content">
+            <div class="new-chat-btn" onclick="newChat()">
+                <div style="display:flex;align-items:center;gap:8px">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                    <span>New Chat</span>
+                </div>
+                <span class="kbd-shortcut">Ctrl+K</span>
+            </div>
+
+            <!-- SEARCH -->
+            <div class="sidebar-search-box">
+                <svg class="sidebar-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                <input type="text" class="sidebar-search-input" id="chatSearchInput" placeholder="Search chats..." oninput="filterHistoryList()">
+            </div>
+
+            <!-- CHAT LIST -->
+            <div class="sidebar-section-title">
+                <span>Recent Chats</span>
+            </div>
+            <div class="nav-list" id="chatHistoryList"></div>
+        </div>
+
+        <div class="sidebar-footer">
+            <div class="user-pill" onclick="toggleUserMenu()">
+                <div class="user-avatar-badge">AD</div>
+                <div class="user-name">Admin Workspace</div>
+            </div>
+            <div class="user-menu-popover" id="userMenuPopover">
+                <a href="/dashboard" class="user-menu-item">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+                    <span>Control Center</span>
+                </a>
+                <a href="/logout" class="user-menu-item" style="color:#f87171">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+                    <span>Sign Out</span>
+                </a>
+            </div>
+        </div>
+    </aside>
+
+    <!-- MAIN CHAT CONTAINER -->
+    <main class="main-chat-container">
+        <!-- TOP NAVBAR -->
+        <header class="top-navbar">
+            <div style="display:flex;align-items:center;gap:10px">
+                <button class="icon-btn" onclick="toggleSidebar()" title="Toggle Sidebar">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>
+                </button>
+                <div class="model-header-wrap" onclick="openModelModal()">
+                    <div class="model-title-row">
+                        <span id="currentModelLabel">gpt-4.1-nano</span>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                    </div>
+                </div>
+            </div>
+
+            <div class="top-right-tools">
+                <button class="icon-btn" title="New Chat" onclick="newChat()">
+                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                </button>
+                <button class="icon-btn" title="Control Center" onclick="location.href='/dashboard'">
+                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+                </button>
+                <div class="user-avatar-badge" style="cursor:pointer" onclick="toggleUserMenu()">AD</div>
+            </div>
+        </header>
+
+        <!-- CHAT STREAM SCROLL -->
+        <div class="chat-scroll-area" id="chatScrollArea">
+            <div class="chat-content-width" id="chatContentWidth">
+                
+                <!-- EMPTY HERO STATE -->
+                <div class="hero-empty-state" id="heroEmptyState">
+                    <div class="hero-title">What can I help with today?</div>
+
+                    <!-- HERO INPUT BOX -->
+                    <div class="hero-input-box">
+                        <textarea class="hero-textarea" id="heroPromptInput" rows="1" placeholder="Ask Bridgena anything..." onkeydown="handleHeroKey(event)" oninput="autoResize(this)"></textarea>
+                        <div class="hero-tools-row">
+                            <div class="hero-tools-left">
+                                <button class="tool-icon-btn" title="Attach file">
+                                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                                </button>
+                                <button class="tool-icon-btn" title="Web search">
+                                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg>
+                                </button>
+                            </div>
+                            <div class="hero-tools-right">
+                                <button class="tool-icon-btn" title="Voice input">
+                                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
+                                </button>
+                                <button class="send-pill-btn" onclick="sendFromHero()" title="Send">
+                                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SUGGESTIONS -->
+                    <div class="suggestions-wrap">
+                        <div class="suggest-card" onclick="useSuggestion('Write an async Python script demonstrating worker queue architecture')">
+                            <div class="suggest-title">Write Python script</div>
+                            <div class="suggest-desc">async worker queue architecture</div>
+                        </div>
+                        <div class="suggest-card" onclick="useSuggestion('Explain how DeepSeek R1 and reasoning models handle chain-of-thought')">
+                            <div class="suggest-title">Reasoning models</div>
+                            <div class="suggest-desc">deep chain-of-thought mechanisms</div>
+                        </div>
+                        <div class="suggest-card" onclick="useSuggestion('Design a modern dark UI component with pure CSS and clean aesthetics')">
+                            <div class="suggest-title">Design CSS component</div>
+                            <div class="suggest-desc">minimalist dark mode aesthetics</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- MESSAGES CONTAINER -->
+                <div id="messagesList" style="display:none;flex-direction:column;gap:24px;width:100%"></div>
+
+            </div>
+        </div>
+
+        <!-- DOCKED BOTTOM COMPOSER -->
+        <div class="docked-composer-wrap" id="dockedComposer" style="display:none">
+            <button class="stop-pill" id="stopPill" onclick="stopGenerating()">
+                <div class="stop-dot"></div>
+                <span>Stop generating</span>
+            </button>
+            <div class="hero-input-box" style="max-width:768px">
+                <textarea class="hero-textarea" id="dockedPromptInput" rows="1" placeholder="Ask Bridgena anything..." onkeydown="handleDockedKey(event)" oninput="autoResize(this)"></textarea>
+                <div class="hero-tools-row">
+                    <div class="hero-tools-left">
+                        <button class="tool-icon-btn" title="Attach file">
+                            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                        </button>
+                        <button class="tool-icon-btn" title="Web search">
+                            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg>
+                        </button>
+                    </div>
+                    <div class="hero-tools-right">
+                        <button class="tool-icon-btn" title="Voice input">
+                            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
+                        </button>
+                        <button class="send-pill-btn" onclick="sendFromDocked()" title="Send">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- MODEL SELECTOR MODAL -->
+    <div class="modal-backdrop" id="modelModalBackdrop" onclick="closeModelModal(event)">
+        <div class="modal-card" onclick="event.stopPropagation()">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+                <span style="font-weight:700;font-size:15px;color:#fff">Select Model</span>
+                <button class="icon-btn" onclick="closeModelModal()">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+            </div>
+            <input type="text" class="modal-search-input" id="modelSearchInput" placeholder="Search models by name or provider..." oninput="filterModelsList()">
+            <div class="modal-models-list" id="modalModelsList"></div>
+        </div>
+    </div>
+
+    <script>
+    let currentModel = localStorage.getItem('nx_model') || 'gpt-4.1-nano';
+    let availableModels = [];
+    let conversations = JSON.parse(localStorage.getItem('nx_conversations') || '[]');
+    let currentConvId = localStorage.getItem('nx_current_id') || null;
+    let abortController = null;
+
+    marked.setOptions({
+        breaks: true,
+        gfm: true,
+        highlight: function(code, lang) {
+            const language = hljs.getLanguage(lang) ? lang : 'plaintext';
+            return hljs.highlight(code, { language }).value;
+        }
+    });
+
+    function toggleSidebar() {
+        document.getElementById('appSidebar').classList.toggle('collapsed');
+    }
+
+    function toggleUserMenu() {
+        document.getElementById('userMenuPopover').classList.toggle('open');
+    }
+
+    function autoResize(textarea) {
+        textarea.style.height = 'auto';
+        textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+    }
+
+    function handleHeroKey(e) {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendFromHero();
+        }
+    }
+
+    function handleDockedKey(e) {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendFromDocked();
+        }
+    }
+
+    function openModelModal() {
+        document.getElementById('modelModalBackdrop').classList.add('open');
+        document.getElementById('modelSearchInput').focus();
+    }
+
+    function closeModelModal(e) {
+        document.getElementById('modelModalBackdrop').classList.remove('open');
+    }
+
+    function selectModel(modelId) {
+        currentModel = modelId;
+        localStorage.setItem('nx_model', modelId);
+        document.getElementById('currentModelLabel').textContent = modelId;
+        closeModelModal();
+        renderModelsList();
+    }
+
+    async function loadModels() {
+        try {
+            const r = await fetch('/chat/api/models');
+            const d = await r.json();
+            if (d.data && d.data.length > 0) {
+                availableModels = d.data;
+                if (!availableModels.some(m => m.id === currentModel)) {
+                    currentModel = availableModels[0].id;
+                }
+            } else {
+                availableModels = [{ id: 'gpt-4.1-nano', owned_by: 'OpenAI' }];
+            }
+        } catch (e) {
+            availableModels = [{ id: 'gpt-4.1-nano', owned_by: 'OpenAI' }];
+        }
+        document.getElementById('currentModelLabel').textContent = currentModel;
+        renderModelsList();
+    }
+
+    function renderModelsList() {
+        const list = document.getElementById('modalModelsList');
+        const q = (document.getElementById('modelSearchInput').value || '').toLowerCase();
+        const filtered = availableModels.filter(m => m.id.toLowerCase().includes(q) || (m.owned_by && m.owned_by.toLowerCase().includes(q)));
+        list.innerHTML = filtered.map(m => `
+            <div class="model-row-item ${m.id === currentModel ? 'active' : ''}" onclick="selectModel('${m.id}')">
+                <span class="model-row-name">${m.id}</span>
+                <span class="model-row-provider">${m.owned_by || 'Arena'}</span>
+            </div>
+        `).join('');
+    }
+
+    function filterModelsList() {
+        renderModelsList();
+    }
+
+    function getActiveConv() {
+        return conversations.find(c => c.id === currentConvId);
+    }
+
+    function saveConversations() {
+        localStorage.setItem('nx_conversations', JSON.stringify(conversations));
+        localStorage.setItem('nx_current_id', currentConvId || '');
+        renderHistoryList();
+    }
+
+    function newChat() {
+        currentConvId = null;
+        saveConversations();
+        renderChatView();
+        document.getElementById('heroPromptInput').focus();
+    }
+
+    function selectChat(id) {
+        currentConvId = id;
+        saveConversations();
+        renderChatView();
+    }
+
+    function deleteChat(id, e) {
+        if (e) e.stopPropagation();
+        conversations = conversations.filter(c => c.id !== id);
+        if (currentConvId === id) currentConvId = null;
+        saveConversations();
+        renderChatView();
+    }
+
+    function renameChat(id, e) {
+        if (e) e.stopPropagation();
+        const conv = conversations.find(c => c.id === id);
+        if (!conv) return;
+        const newTitle = prompt('Enter conversation title:', conv.title);
+        if (newTitle && newTitle.trim()) {
+            conv.title = newTitle.trim();
+            saveConversations();
+        }
+    }
+
+    function filterHistoryList() {
+        renderHistoryList();
+    }
+
+    function renderHistoryList() {
+        const list = document.getElementById('chatHistoryList');
+        const q = (document.getElementById('chatSearchInput')?.value || '').toLowerCase();
+        const filtered = conversations.filter(c => !q || (c.title || '').toLowerCase().includes(q));
+
+        if (filtered.length === 0) {
+            list.innerHTML = `
+                <div style="padding:10px;font-size:12.5px;color:var(--text-faint);text-align:center">
+                    No conversations
+                </div>
+            `;
+            return;
+        }
+
+        list.innerHTML = filtered.map(c => `
+            <div class="chat-history-item ${c.id === currentConvId ? 'active' : ''}" onclick="selectChat('${c.id}')">
+                <span class="chat-title-text">${escapeHtml(c.title || 'New Chat')}</span>
+                <div class="chat-item-actions">
+                    <button class="chat-action-btn" onclick="renameChat('${c.id}', event)" title="Rename">✏️</button>
+                    <button class="chat-action-btn" onclick="deleteChat('${c.id}', event)" title="Delete">🗑️</button>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function renderChatView() {
+        const conv = getActiveConv();
+        const hero = document.getElementById('heroEmptyState');
+        const msgsList = document.getElementById('messagesList');
+        const docked = document.getElementById('dockedComposer');
+
+        if (!conv || !conv.messages || conv.messages.length === 0) {
+            hero.style.display = 'flex';
+            msgsList.style.display = 'none';
+            docked.style.display = 'none';
+            msgsList.innerHTML = '';
+        } else {
+            hero.style.display = 'none';
+            msgsList.style.display = 'flex';
+            docked.style.display = 'flex';
+            renderMessages();
+        }
+    }
+
+    function copyCode(btn) {
+        const pre = btn.closest('pre');
+        const code = pre.querySelector('code').innerText;
+        navigator.clipboard.writeText(code);
+        btn.textContent = '✓ Copied';
+        setTimeout(() => btn.textContent = 'Copy', 2000);
+    }
+
+    function renderMessages() {
+        const conv = getActiveConv();
+        if (!conv) return;
+        const box = document.getElementById('messagesList');
+        box.innerHTML = conv.messages.map((m, idx) => {
+            if (m.role === 'user') {
+                return `
+                    <div class="message-wrapper user">
+                        <div class="user-bubble">${escapeHtml(m.content)}</div>
+                    </div>
+                `;
+            } else {
+                let parsed = m.content || '';
+                let thoughtHtml = '';
+                if (m.thought) {
+                    thoughtHtml = `
+                        <details class="thought-accordion">
+                            <summary>✦ Thinking Process</summary>
+                            <div class="thought-body">${escapeHtml(m.thought)}</div>
+                        </details>
+                    `;
+                }
+                const renderedMarkdown = marked.parse(parsed);
+                return `
+                    <div class="message-wrapper assistant" id="msg-${idx}">
+                        <div class="assistant-row">
+                            <div class="assistant-avatar">B</div>
+                            <div class="assistant-content-col">
+                                <div class="assistant-meta">${m.model || currentModel}</div>
+                                ${thoughtHtml}
+                                <div class="assistant-body">${renderedMarkdown}</div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+        }).join('');
+
+        box.querySelectorAll('pre').forEach(pre => {
+            if (!pre.querySelector('.code-header-bar')) {
+                const codeEl = pre.querySelector('code');
+                const lang = (codeEl.className.match(/language-(\\w+)/) || [, 'code'])[1];
+                const header = document.createElement('div');
+                header.className = 'code-header-bar';
+                header.innerHTML = `<span>${lang}</span><button class="code-copy-btn" onclick="copyCode(this)">Copy</button>`;
+                pre.insertBefore(header, codeEl);
+            }
+        });
+
+        const scrollArea = document.getElementById('chatScrollArea');
+        scrollArea.scrollTop = scrollArea.scrollHeight;
+    }
+
+    function escapeHtml(str) {
+        return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function useSuggestion(text) {
+        document.getElementById('heroPromptInput').value = text;
+        sendFromHero();
+    }
+
+    function sendFromHero() {
+        const inp = document.getElementById('heroPromptInput');
+        const txt = inp.value.trim();
+        if (!txt) return;
+        inp.value = '';
+        inp.style.height = 'auto';
+        sendMessage(txt);
+    }
+
+    function sendFromDocked() {
+        const inp = document.getElementById('dockedPromptInput');
+        const txt = inp.value.trim();
+        if (!txt) return;
+        inp.value = '';
+        inp.style.height = 'auto';
+        sendMessage(txt);
+    }
+
+    async function sendMessage(text) {
+        let conv = getActiveConv();
+        if (!conv) {
+            conv = {
+                id: 'conv_' + Date.now(),
+                title: text.slice(0, 36) + (text.length > 36 ? '...' : ''),
+                messages: []
+            };
+            conversations.unshift(conv);
+            currentConvId = conv.id;
+        }
+
+        conv.messages.push({ role: 'user', content: text });
+        const assistantMsg = { role: 'assistant', content: '', thought: '', model: currentModel };
+        conv.messages.push(assistantMsg);
+        saveConversations();
+        renderChatView();
+
+        document.getElementById('stopPill').classList.add('visible');
+        abortController = new AbortController();
+
+        try {
+            const history = conv.messages.slice(0, -1).map(m => ({ role: m.role, content: m.content }));
+            const r = await fetch('/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: currentModel,
+                    messages: history,
+                    stream: true
+                }),
+                signal: abortController.signal
+            });
+
+            if (!r.ok) {
+                const errText = await r.text();
+                assistantMsg.content = '⚠️ Error (' + r.status + '): ' + errText;
+                saveConversations();
+                renderMessages();
+                return;
+            }
+
+            const reader = r.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    const dataStr = line.slice(6).trim();
+                    if (dataStr === '[DONE]') continue;
+                    try {
+                        const parsed = JSON.parse(dataStr);
+                        const delta = parsed.choices?.[0]?.delta;
+                        if (delta?.content) {
+                            assistantMsg.content += delta.content;
+                        }
+                        if (delta?.reasoning_content || delta?.thought) {
+                            assistantMsg.thought += (delta.reasoning_content || delta.thought);
+                        }
+                        renderMessages();
+                    } catch (e) {}
+                }
+            }
+        } catch (e) {
+            if (e.name !== 'AbortError') {
+                assistantMsg.content += '\\n\\n*(Generation interrupted: ' + e.message + ')*';
+            }
+        } finally {
+            document.getElementById('stopPill').classList.remove('visible');
+            abortController = null;
+            saveConversations();
+            renderMessages();
+        }
+    }
+
+    function stopGenerating() {
+        if (abortController) {
+            abortController.abort();
+            abortController = null;
+        }
+        document.getElementById('stopPill').classList.remove('visible');
+    }
+
+    document.addEventListener('keydown', e => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+            e.preventDefault();
+            newChat();
+        }
+    });
+
+    renderHistoryList();
+    renderChatView();
+    loadModels();
+    </script>
+</body>
+</html>"""
+
+
+@app.get("/chat", response_class=HTMLResponse)
+async def chat_page(request: Request):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    return HTMLResponse(CHAT_TEMPLATE)
+
+
+@app.get("/chat/api/models")
+async def chat_api_models(request: Request):
+    if not await get_current_session(request):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    data = [{"id": m.get("publicName"), "owned_by": m.get("organization", "Arena")} for m in get_selectable_models()]
+    for om in oxalpha_models():
+        data.append({"id": om["id"], "owned_by": om["owned_by"]})
+    jars = load_jars()
+    now = time.time()
+    healthy = sum(1 for j in jars if jar_available(j, now))
+    return {"data": data, "jars_total": len(jars), "jars_healthy": healthy}
+
+
+# ============================================================
+# UI - MINIMALIST CONTROL CENTER DASHBOARD (/dashboard)
+# ============================================================
+
+DASHBOARD_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Bridgena - Control Center</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #141414;
+            --card: #1e1e1e;
+            --card-sub: #252525;
+            --border: #2c2c2c;
+            --border-hover: rgba(255, 255, 255, 0.18);
+            --text: #ececec;
+            --text-muted: #8e8e8e;
+            --text-faint: #666666;
+            --accent: #ffffff;
+            --accent-text: #000000;
+            --green: #22c55e;
+            --yellow: #eab308;
+            --red: #ef4444;
+            --blue: #3b82f6;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 24px 32px;
+            font-size: 14px;
+            letter-spacing: -0.15px;
+        }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 4px; }
+
+        /* HEADER */
+        .dash-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 28px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+        .header-title-wrap {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .header-logo-circle {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: #fff;
+            color: #000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 14px;
+            letter-spacing: -0.5px;
+        }
+        h1 { font-size: 19px; font-weight: 700; color: #fff; }
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .header-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 8px 14px;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 500;
+            text-decoration: none;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .header-btn:hover { background: #282828; color: #fff; border-color: var(--border-hover); }
+        .header-btn.primary { background: #fff; color: #000; font-weight: 600; border-color: #fff; }
+        .header-btn.primary:hover { opacity: 0.9; }
+
+        /* STATS GRID */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 18px 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .stat-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            color: var(--text-muted);
+            font-size: 12.5px;
+            font-weight: 500;
+        }
+        .stat-card .val {
+            font-size: 24px;
+            font-weight: 700;
+            color: #fff;
+            font-feature-settings: 'tnum';
+        }
+        .stat-card .desc {
+            font-size: 12px;
+            color: var(--text-faint);
+        }
+
+        /* TABS */
+        .tabs-container {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 20px;
+            overflow-x: auto;
+        }
+        .tab-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            padding: 10px 16px;
+            font-size: 13.5px;
+            font-weight: 500;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: all 0.15s;
+            font-family: inherit;
+        }
+        .tab-btn:hover { color: #fff; }
+        .tab-btn.active { color: #fff; border-bottom-color: #fff; font-weight: 600; }
+        .tab-content { display: none; flex-direction: column; gap: 20px; }
+        .tab-content.active { display: flex; }
+
+        /* CARDS & TABLES */
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 22px;
+        }
+        .card h2 {
+            font-size: 16px;
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 14px;
+        }
+        .card-header-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+        }
+        .card-header-bar h2 { margin-bottom: 0; }
+
+        .table-responsive { width: 100%; overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+        th {
+            color: var(--text-muted);
+            font-weight: 600;
+            font-size: 11.5px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+        }
+        td {
+            padding: 12px;
+            border-bottom: 1px solid var(--border);
+            vertical-align: middle;
+        }
+        tr:hover td { background: rgba(255, 255, 255, 0.02); }
+
+        /* BADGES */
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 11.5px;
+            font-weight: 600;
+            text-transform: capitalize;
+        }
+        .badge.ok, .badge.running { background: rgba(34, 197, 94, 0.12); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3); }
+        .badge.limited, .badge.reconnecting, .badge.starting { background: rgba(234, 179, 8, 0.12); color: #facc15; border: 1px solid rgba(234, 179, 8, 0.3); }
+        .badge.expired, .badge.error, .badge.stopped { background: rgba(239, 68, 68, 0.12); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+
+        .step-pill {
+            display: inline-block;
+            background: #141414;
+            border: 1px solid var(--border);
+            color: #38bdf8;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 6px;
+            max-width: 280px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* FORMS */
+        .form-row { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+        input, select, textarea {
+            background: #141414;
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 10px 14px;
+            border-radius: 10px;
+            font-family: inherit;
+            font-size: 13.5px;
+            outline: none;
+            transition: all 0.15s;
+        }
+        input:focus, select:focus, textarea:focus {
+            border-color: rgba(255, 255, 255, 0.4);
+        }
+        button.btn {
+            background: #fff;
+            color: #000;
+            border: none;
+            padding: 9px 16px;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s;
+            font-family: inherit;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        button.btn:hover { opacity: 0.9; }
+        button.btn-sec { background: var(--card-sub); color: var(--text); border: 1px solid var(--border); }
+        button.btn-sec:hover { background: #2e2e2e; border-color: var(--border-hover); }
+        button.btn-sm { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
+        button.btn-red { color: #f87171; border-color: rgba(239, 68, 68, 0.3); }
+        button.btn-red:hover { background: rgba(239, 68, 68, 0.15); }
+
+        /* LOG BOX */
+        .log-box-container {
+            background: #0d0d0d;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 14px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            max-height: 420px;
+            overflow-y: auto;
+            line-height: 1.6;
+        }
+        .log-line { margin-bottom: 4px; white-space: pre-wrap; word-break: break-all; }
+        .log-OK { color: #4ade80; }
+        .log-WARN { color: #facc15; }
+        .log-ERROR { color: #f87171; }
+        .log-INFO { color: #94a3b8; }
+
+        /* TOAST NOTIFICATION */
+        .toast-popup {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: #1e1e1e;
+            border: 1px solid var(--border);
+            color: #fff;
+            padding: 12px 18px;
+            border-radius: 12px;
+            box-shadow: 0 15px 30px rgba(0, 0, 0, 0.7);
+            font-size: 13.5px;
+            display: none;
+            align-items: center;
+            gap: 10px;
+            z-index: 999;
+        }
+        .toast-popup.show { display: flex; }
+    </style>
+</head>
+<body>
+
+    <!-- TOP HEADER -->
+    <div class="dash-header">
+        <div class="header-title-wrap">
+            <div class="header-logo-circle">B</div>
+            <div>
+                <h1>Bridgena Control Center</h1>
+                <div style="color:var(--text-muted);font-size:12.5px">Arena.ai Session & Account Management</div>
+            </div>
+        </div>
+        <div class="header-actions">
+            <a href="/chat" class="header-btn primary">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                <span>Launch Workspace</span>
+            </a>
+            <a href="/logout" class="header-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+                <span>Sign out</span>
+            </a>
+        </div>
+    </div>
+
+    <!-- STATS METRICS -->
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-card-header">
+                <span>Healthy Accounts</span>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+            </div>
+            <div class="val">__HEALTHY_JARS__ / __TOTAL_JARS__</div>
+            <div class="desc">Active in pool</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-card-header">
+                <span>Active Keepers</span>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+            </div>
+            <div class="val" id="statKeepers">__ACTIVE_KEEPERS__</div>
+            <div class="desc">Browser sessions running</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-card-header">
+                <span>Loaded Models</span>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+            </div>
+            <div class="val">__TOTAL_MODELS__</div>
+            <div class="desc">Selectable model catalog</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-card-header">
+                <span>API Keys</span>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+            </div>
+            <div class="val">__TOTAL_KEYS__</div>
+            <div class="desc">Active gateway keys</div>
+        </div>
+    </div>
+
+    <!-- TABS -->
+    <div class="tabs-container">
+        <button class="tab-btn active" onclick="switchTab('accounts', this)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+            <span>Accounts & Keepers</span>
+        </button>
+        <button class="tab-btn" onclick="switchTab('import', this)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+            <span>Import Accounts</span>
+        </button>
+        <button class="tab-btn" onclick="switchTab('keys', this)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+            <span>API Keys</span>
+        </button>
+        <button class="tab-btn" onclick="switchTab('models', this)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+            <span>Model Catalog</span>
+        </button>
+        <button class="tab-btn" onclick="switchTab('oxalpha', this)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+            <span>OX Alpha Bridge</span>
+        </button>
+        <button class="tab-btn" onclick="switchTab('logs', this)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+            <span>Live Logs</span>
+        </button>
+    </div>
+
+    <!-- TAB 1: ACCOUNTS -->
+    <div id="tab-accounts" class="tab-content active">
+        <div class="card">
+            <div class="card-header-bar">
+                <h2>Account Pool & Session Keepers</h2>
+                <div style="font-size:12.5px;color:var(--text-muted)">Live step updates enabled</div>
+            </div>
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Account</th>
+                            <th>Health</th>
+                            <th>Keeper State & Progress</th>
+                            <th>Requests</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="jarsTableBody">__JARS_ROWS__</tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 2: IMPORT -->
+    <div id="tab-import" class="tab-content">
+        <div class="card">
+            <h2>Bulk Import Accounts (Email:Password)</h2>
+            <p style="color:var(--text-muted);font-size:13px;margin-bottom:14px">Paste email:password lines below. Session keeper will automatically log in using native stealth browser automation.</p>
+            <form action="/jars/bulk" method="post">
+                <div class="form-row">
+                    <textarea name="accounts" rows="4" placeholder="user1@example.com:password123&#10;user2@example.com:password456" style="width:100%" required></textarea>
+                </div>
+                <div class="form-row" style="align-items:center">
+                    <label style="font-size:13px;color:var(--text-muted);display:flex;align-items:center;gap:6px">
+                        <input type="checkbox" name="keeper_enabled" value="1" checked> Enable Keep-Alive & Auto-Login
+                    </label>
+                    <div style="flex:1"></div>
+                    <button type="submit" class="btn">Import Accounts</button>
+                </div>
+            </form>
+        </div>
+        <div class="card">
+            <h2>Add Arena Account via Cookie File</h2>
+            <form action="/jars/add" method="post" enctype="multipart/form-data">
+                <div class="form-row">
+                    <input type="text" name="name" placeholder="Account Label" style="flex:1">
+                    <input type="file" name="cookie_file" required style="flex:1">
+                    <button type="submit" class="btn">Upload Cookies (JSON / Netscape)</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- TAB 3: API KEYS -->
+    <div id="tab-keys" class="tab-content">
+        <div class="card">
+            <h2>Create New API Key</h2>
+            <form action="/create-key" method="post">
+                <div class="form-row">
+                    <input type="text" name="name" placeholder="Key Label (e.g. Production App)" required style="flex:1">
+                    <input type="number" name="rpm" placeholder="Rate Limit (RPM)" value="60" required style="width:160px">
+                    <button type="submit" class="btn">Generate Key</button>
+                </div>
+            </form>
+        </div>
+        <div class="card">
+            <h2>Active API Keys</h2>
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Label</th>
+                            <th>API Key</th>
+                            <th>RPM Limit</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>__KEYS_ROWS__</tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 4: MODELS -->
+    <div id="tab-models" class="tab-content">
+        <div class="card">
+            <div class="card-header-bar">
+                <h2>Selectable Model Catalog</h2>
+                <form action="/refresh-tokens" method="post">
+                    <button type="submit" class="btn btn-sm">Refresh Catalog</button>
+                </form>
+            </div>
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Public Model ID</th>
+                            <th>Provider / Org</th>
+                            <th>Vision Support</th>
+                        </tr>
+                    </thead>
+                    <tbody>__MODELS_ROWS__</tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 5: OX ALPHA -->
+    <div id="tab-oxalpha" class="tab-content">
+        <div class="card">
+            <h2>OX Alpha Secondary Inference Bridge</h2>
+            <p style="font-size:13.5px;color:var(--text-muted);margin-bottom:16px">Secondary low-latency route for <code>z-ai/glm-5.3-flash</code> and <code>ox-alpha</code> models.</p>
+            <div class="form-row">
+                <form action="/oxalpha/verify" method="post">
+                    <button type="submit" class="btn">Verify via Browser</button>
+                </form>
+                <form action="/oxalpha/refresh" method="post">
+                    <button type="submit" class="btn btn-sec">Force Token Refresh</button>
+                </form>
+            </div>
+            <form action="/oxalpha/upload" method="post" enctype="multipart/form-data" style="margin-top:16px">
+                <div class="form-row">
+                    <input type="file" name="cookie_file" required style="flex:1">
+                    <button type="submit" class="btn">Upload OX Alpha Cookies</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- TAB 6: LIVE LOGS -->
+    <div id="tab-logs" class="tab-content">
+        <div class="card">
+            <div class="card-header-bar">
+                <h2>Live Debug Logs</h2>
+                <div style="display:flex;gap:8px">
+                    <button class="btn btn-sec btn-sm" onclick="copyAllLogs()">Copy Logs</button>
+                    <form action="/clear-logs" method="post">
+                        <button type="submit" class="btn btn-sec btn-sm">Clear Logs</button>
+                    </form>
+                </div>
+            </div>
+            <div class="log-box-container" id="logBox"></div>
+        </div>
+    </div>
+
+    <!-- TOAST POPUP -->
+    <div class="toast-popup" id="toastPopup">
+        <span id="toastMsg">Action completed</span>
+    </div>
+
+    <script>
+        function showToast(msg) {
+            const t = document.getElementById('toastPopup');
+            document.getElementById('toastMsg').textContent = msg;
+            t.classList.add('show');
+            setTimeout(() => t.classList.remove('show'), 3500);
+        }
+        function copyKey(keyStr) {
+            navigator.clipboard.writeText(keyStr);
+            showToast('API Key copied to clipboard');
+        }
+        function copyAllLogs() {
+            const txt = document.getElementById('logBox').innerText;
+            navigator.clipboard.writeText(txt);
+            showToast('Logs copied to clipboard');
+        }
+        function switchTab(name, btn) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            if (btn) btn.classList.add('active');
+            document.getElementById('tab-' + name).classList.add('active');
+        }
+
+        async function triggerRelogin(jarId) {
+            showToast('Re-login triggered. Polling real-time steps...');
+            try {
+                const formData = new FormData();
+                formData.append('jar_id', jarId);
+                await fetch('/keeper/relogin', { method: 'POST', body: formData });
+                fetchStatus();
+            } catch(e) {
+                showToast('Failed to trigger relogin: ' + e.message);
+            }
+        }
+
+        async function fetchLogs() {
+            try {
+                const r = await fetch('/debug-logs/data');
+                const d = await r.json();
+                const box = document.getElementById('logBox');
+                box.innerHTML = (d.logs || []).map(l => '<div class="log-line log-' + l.level + '">[' + l.time + '] [' + l.level + '] ' + l.message + '</div>').join('');
+                box.scrollTop = box.scrollHeight;
+            } catch(e) {}
+        }
+
+        async function fetchStatus() {
+            try {
+                const r = await fetch('/keeper/status');
+                const d = await r.json();
+                if (d.sessions) {
+                    const running = d.sessions.filter(s => s.status === 'running').length;
+                    document.getElementById('statKeepers').textContent = running;
+                    for (const s of d.sessions) {
+                        const stepEl = document.getElementById('step-val-' + s.jar_id);
+                        if (stepEl && s.current_step) {
+                            stepEl.textContent = s.current_step;
+                        }
+                        const badgeEl = document.getElementById('status-badge-' + s.jar_id);
+                        if (badgeEl) {
+                            badgeEl.className = 'badge ' + s.status;
+                            badgeEl.textContent = s.status;
+                        }
+                    }
+                }
+            } catch(e) {}
+        }
+
+        setInterval(fetchLogs, 4000);
+        setInterval(fetchStatus, 1200);
+        fetchLogs();
+        fetchStatus();
+    </script>
+</body>
+</html>"""
+
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(session: str = Depends(get_current_session)):
-    if not session:
+async def dashboard_page(request: Request):
+    if not await get_current_session(request):
         return RedirectResponse(url="/login")
-
-    try:
-        config = get_config()
-        models = get_models()
-    except Exception as e:
-        debug_print(f"❌ Error loading dashboard data: {e}")
-        # Return error page
-        return HTMLResponse(f"""
-            <html><body style="font-family: sans-serif; padding: 40px; text-align: center;">
-                <h1>⚠️ Dashboard Error</h1>
-                <p>Failed to load configuration: {str(e)}</p>
-                <p><a href="/logout">Logout</a> | <a href="/dashboard">Retry</a></p>
-            </body></html>
-        """, status_code=500)
-
-    # Render API Keys
-    keys_html = ""
-    for key in config["api_keys"]:
-        key_name = key.get("name") or "Unnamed Key"
-        key_value = key.get("key") or ""
-        rpm_value = key.get("rpm", 60)
-        created_date = time.strftime('%Y-%m-%d %H:%M', time.localtime(key.get('created', 0)))
-        keys_html += f"""
-            <tr>
-                <td><strong>{key_name}</strong></td>
-                <td><code class="api-key-code">{key_value}</code></td>
-                <td><span class="badge">{rpm_value} RPM</span></td>
-                <td><small>{created_date}</small></td>
-                <td>
-                    <form action='/delete-key' method='post' style='margin:0;' onsubmit='return confirm("Delete this API key?");'>
-                        <input type='hidden' name='key_id' value='{key_value}'>
-                        <button type='submit' class='btn-delete'>Delete</button>
-                    </form>
-                </td>
-            </tr>
-        """
-
-    # Render Models (limit to first 20 with text output)
-    text_models = [m for m in models if m.get('capabilities', {}).get('outputCapabilities', {}).get('text')]
-    models_html = ""
-    for i, model in enumerate(text_models[:20]):
-        rank = model.get('rank', '?')
-        org = model.get('organization', 'Unknown')
-        models_html += f"""
-            <div class="model-card">
-                <div class="model-header">
-                    <span class="model-name">{model.get('publicName', 'Unnamed')}</span>
-                    <span class="model-rank">Rank {rank}</span>
-                </div>
-                <div class="model-org">{org}</div>
-            </div>
-        """
-    
-    if not models_html:
-        models_html = '<div class="no-data">No models found. Token may be invalid or expired.</div>'
-
-    # Render Stats
-    stats_html = ""
-    if model_usage_stats:
-        for model, count in sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]:
-            stats_html += f"<tr><td>{model}</td><td><strong>{count}</strong></td></tr>"
-    else:
-        stats_html = "<tr><td colspan='2' class='no-data'>No usage data yet</td></tr>"
-
-    # Check token status - check both legacy auth_token and new auth_tokens list
-    has_auth_token = bool(str(config.get("auth_token") or "").strip()) or any(config.get("auth_tokens") or [])
-    token_status = "✅ Configured" if has_auth_token else "❌ Not Set"
-    token_class = "status-good" if has_auth_token else "status-bad"
-    
-    cf_status = "✅ Configured" if config.get("cf_clearance") else "❌ Not Set"
-    cf_class = "status-good" if config.get("cf_clearance") else "status-bad"
-    
-    # Get recent activity count (last 24 hours)
-    recent_activity = sum(1 for timestamps in api_key_usage.values() for t in timestamps if time.time() - t < 86400)
-
-    return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Dashboard - LMArena Bridge</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
-            <style>
-                @keyframes fadeIn {{
-                    from {{ opacity: 0; transform: translateY(20px); }}
-                    to {{ opacity: 1; transform: translateY(0); }}
-                }}
-                @keyframes slideIn {{
-                    from {{ opacity: 0; transform: translateX(-20px); }}
-                    to {{ opacity: 1; transform: translateX(0); }}
-                }}
-                @keyframes pulse {{
-                    0%, 100% {{ transform: scale(1); }}
-                    50% {{ transform: scale(1.05); }}
-                }}
-                @keyframes shimmer {{
-                    0% {{ background-position: -1000px 0; }}
-                    100% {{ background-position: 1000px 0; }}
-                }}
-                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-                body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-                    background: #f5f7fa;
-                    color: #333;
-                    line-height: 1.6;
-                }}
-                .header {{
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                    padding: 20px 0;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                }}
-                .header-content {{
-                    max-width: 1200px;
-                    margin: 0 auto;
-                    padding: 0 20px;
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                }}
-                h1 {{
-                    font-size: 24px;
-                    font-weight: 600;
-                }}
-                .logout-btn {{
-                    background: rgba(255,255,255,0.2);
-                    color: white;
-                    padding: 8px 16px;
-                    border-radius: 6px;
-                    text-decoration: none;
-                    transition: background 0.3s;
-                }}
-                .logout-btn:hover {{
-                    background: rgba(255,255,255,0.3);
-                }}
-                .container {{
-                    max-width: 1200px;
-                    margin: 30px auto;
-                    padding: 0 20px;
-                }}
-                .section {{
-                    background: white;
-                    border-radius: 10px;
-                    padding: 25px;
-                    margin-bottom: 25px;
-                    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-                }}
-                .section-header {{
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 20px;
-                    padding-bottom: 15px;
-                    border-bottom: 2px solid #f0f0f0;
-                }}
-                h2 {{
-                    font-size: 20px;
-                    color: #333;
-                    font-weight: 600;
-                }}
-                .status-badge {{
-                    padding: 6px 12px;
-                    border-radius: 6px;
-                    font-size: 13px;
-                    font-weight: 600;
-                }}
-                .status-good {{ background: #d4edda; color: #155724; }}
-                .status-bad {{ background: #f8d7da; color: #721c24; }}
-                table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                }}
-                th {{
-                    background: #f8f9fa;
-                    padding: 12px;
-                    text-align: left;
-                    font-weight: 600;
-                    color: #555;
-                    font-size: 14px;
-                    border-bottom: 2px solid #e9ecef;
-                }}
-                td {{
-                    padding: 12px;
-                    border-bottom: 1px solid #f0f0f0;
-                }}
-                tr:hover {{
-                    background: #f8f9fa;
-                }}
-                .form-group {{
-                    margin-bottom: 15px;
-                }}
-                label {{
-                    display: block;
-                    margin-bottom: 6px;
-                    font-weight: 500;
-                    color: #555;
-                }}
-                input[type="text"], input[type="number"], textarea {{
-                    width: 100%;
-                    padding: 10px;
-                    border: 2px solid #e1e8ed;
-                    border-radius: 6px;
-                    font-size: 14px;
-                    font-family: inherit;
-                    transition: border-color 0.3s;
-                }}
-                input:focus, textarea:focus {{
-                    outline: none;
-                    border-color: #667eea;
-                }}
-                textarea {{
-                    resize: vertical;
-                    font-family: 'Courier New', monospace;
-                    min-height: 100px;
-                }}
-                button, .btn {{
-                    padding: 10px 20px;
-                    border: none;
-                    border-radius: 6px;
-                    font-size: 14px;
-                    font-weight: 600;
-                    cursor: pointer;
-                    transition: all 0.3s;
-                }}
-                button[type="submit"]:not(.btn-delete) {{
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                }}
-                button[type="submit"]:not(.btn-delete):hover {{
-                    transform: translateY(-2px);
-                    box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
-                }}
-                .btn-delete {{
-                    background: #dc3545;
-                    color: white;
-                    padding: 6px 12px;
-                    font-size: 13px;
-                }}
-                .btn-delete:hover {{
-                    background: #c82333;
-                }}
-                .api-key-code {{
-                    background: #f8f9fa;
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                    font-family: 'Courier New', monospace;
-                    font-size: 12px;
-                    color: #495057;
-                }}
-                .badge {{
-                    background: #e7f3ff;
-                    color: #0066cc;
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                    font-size: 12px;
-                    font-weight: 600;
-                }}
-                .model-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-                    gap: 15px;
-                    margin-top: 15px;
-                }}
-                .model-card {{
-                    background: #f8f9fa;
-                    padding: 15px;
-                    border-radius: 8px;
-                    border-left: 4px solid #667eea;
-                }}
-                .model-header {{
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 8px;
-                }}
-                .model-name {{
-                    font-weight: 600;
-                    color: #333;
-                    font-size: 14px;
-                }}
-                .model-rank {{
-                    background: #667eea;
-                    color: white;
-                    padding: 2px 8px;
-                    border-radius: 12px;
-                    font-size: 11px;
-                    font-weight: 600;
-                }}
-                .model-org {{
-                    color: #666;
-                    font-size: 12px;
-                }}
-                .no-data {{
-                    text-align: center;
-                    color: #999;
-                    padding: 20px;
-                    font-style: italic;
-                }}
-                .stats-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                    gap: 20px;
-                    margin-bottom: 20px;
-                }}
-                .stat-card {{
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                    padding: 20px;
-                    border-radius: 8px;
-                    text-align: center;
-                    animation: fadeIn 0.6s ease-out;
-                    transition: transform 0.3s;
-                }}
-                .stat-card:hover {{
-                    transform: translateY(-5px);
-                    box-shadow: 0 8px 16px rgba(102, 126, 234, 0.4);
-                }}
-                .section {{
-                    animation: slideIn 0.5s ease-out;
-                }}
-                .section:nth-child(2) {{ animation-delay: 0.1s; }}
-                .section:nth-child(3) {{ animation-delay: 0.2s; }}
-                .section:nth-child(4) {{ animation-delay: 0.3s; }}
-                .model-card {{
-                    animation: fadeIn 0.4s ease-out;
-                    transition: transform 0.2s, box-shadow 0.2s;
-                }}
-                .model-card:hover {{
-                    transform: translateY(-3px);
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-                }}
-                .stat-value {{
-                    font-size: 32px;
-                    font-weight: bold;
-                    margin-bottom: 5px;
-                }}
-                .stat-label {{
-                    font-size: 14px;
-                    opacity: 0.9;
-                }}
-                .form-row {{
-                    display: grid;
-                    grid-template-columns: 2fr 1fr auto;
-                    gap: 10px;
-                    align-items: end;
-                }}
-                @media (max-width: 768px) {{
-                    .form-row {{
-                        grid-template-columns: 1fr;
-                    }}
-                    .model-grid {{
-                        grid-template-columns: 1fr;
-                    }}
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <div class="header-content">
-                    <h1>🚀 LMArena Bridge Dashboard</h1>
-                    <a href="/logout" class="logout-btn">Logout</a>
-                </div>
-            </div>
-
-            <div class="container">
-                <!-- Stats Overview -->
-                <div class="stats-grid">
-                    <div class="stat-card">
-                        <div class="stat-value">{len(config['api_keys'])}</div>
-                        <div class="stat-label">API Keys</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">{len(text_models)}</div>
-                        <div class="stat-label">Available Models</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">{sum(model_usage_stats.values())}</div>
-                        <div class="stat-label">Total Requests</div>
-                    </div>
-                </div>
-
-                <!-- Arena Auth Token -->
-                <div class="section">
-                    <div class="section-header">
-                        <h2>🔐 Arena Authentication Tokens</h2>
-                        <span class="status-badge {token_class}">{token_status}</span>
-                    </div>
-                    
-                    <h3 style="margin-bottom: 15px; font-size: 16px;">Multiple Auth Tokens (Round-Robin)</h3>
-                    <p style="color: #666; margin-bottom: 15px;">Add multiple tokens for automatic cycling. Each conversation will use a consistent token.</p>
-                    
-                    {''.join([f'''
-                    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px; padding: 10px; background: #f8f9fa; border-radius: 6px;">
-                        <code style="flex: 1; font-family: 'Courier New', monospace; font-size: 12px; word-break: break-all;">{token[:50]}...</code>
-                        <form action="/delete-auth-token" method="post" style="margin: 0;" onsubmit="return confirm('Delete this token?');">
-                            <input type="hidden" name="token_index" value="{i}">
-                            <button type="submit" class="btn-delete">Delete</button>
-                        </form>
-                    </div>
-                    ''' for i, token in enumerate(config.get("auth_tokens", []))])}
-                    
-                    {('<div class="no-data">No tokens configured. Add tokens below.</div>' if not config.get("auth_tokens") else '')}
-                    
-                    <h3 style="margin-top: 25px; margin-bottom: 15px; font-size: 16px;">Add New Token</h3>
-                    <form action="/add-auth-token" method="post">
-                        <div class="form-group">
-                            <label for="new_auth_token">New Arena Auth Token</label>
-                            <textarea id="new_auth_token" name="new_auth_token" placeholder="Paste a new arena-auth-prod-v1 token here" required></textarea>
-                        </div>
-                        <button type="submit">Add Token</button>
-                    </form>
-                </div>
-
-                <!-- Cloudflare Clearance -->
-                <div class="section">
-                    <div class="section-header">
-                        <h2>☁️ Cloudflare Clearance</h2>
-                        <span class="status-badge {cf_class}">{cf_status}</span>
-                    </div>
-                    <p style="color: #666; margin-bottom: 15px;">This is automatically fetched on startup. If API requests fail with 404 errors, the token may have expired.</p>
-                    <code style="background: #f8f9fa; padding: 10px; display: block; border-radius: 6px; word-break: break-all; margin-bottom: 15px;">
-                        {config.get("cf_clearance", "Not set")}
-                    </code>
-                    <form action="/refresh-tokens" method="post" style="margin-top: 15px;">
-                        <button type="submit" style="background: #28a745;">🔄 Refresh Tokens &amp; Models</button>
-                    </form>
-                    <p style="color: #999; font-size: 13px; margin-top: 10px;"><em>Note: This will fetch a fresh cf_clearance token and update the model list.</em></p>
-                </div>
-
-                <!-- API Keys -->
-                <div class="section">
-                    <div class="section-header">
-                        <h2>🔑 API Keys</h2>
-                    </div>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Name</th>
-                                <th>Key</th>
-                                <th>Rate Limit</th>
-                                <th>Created</th>
-                                <th>Action</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {keys_html if keys_html else '<tr><td colspan="5" class="no-data">No API keys configured</td></tr>'}
-                        </tbody>
-                    </table>
-                    
-                    <h3 style="margin-top: 30px; margin-bottom: 15px; font-size: 18px;">Create New API Key</h3>
-                    <form action="/create-key" method="post">
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label for="name">Key Name</label>
-                                <input type="text" id="name" name="name" placeholder="e.g., Production Key" required>
-                            </div>
-                            <div class="form-group">
-                                <label for="rpm">Rate Limit (RPM)</label>
-                                <input type="number" id="rpm" name="rpm" value="60" min="1" max="1000" required>
-                            </div>
-                            <div class="form-group">
-                                <label>&nbsp;</label>
-                                <button type="submit">Create Key</button>
-                            </div>
-                        </div>
-                    </form>
-                </div>
-
-                <!-- Usage Statistics -->
-                <div class="section">
-                    <div class="section-header">
-                        <h2>📊 Usage Statistics</h2>
-                    </div>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-bottom: 30px;">
-                        <div>
-                            <h3 style="text-align: center; margin-bottom: 15px; font-size: 16px; color: #666;">Model Usage Distribution</h3>
-                            <canvas id="modelPieChart" style="max-height: 300px;"></canvas>
-                        </div>
-                        <div>
-                            <h3 style="text-align: center; margin-bottom: 15px; font-size: 16px; color: #666;">Request Count by Model</h3>
-                            <canvas id="modelBarChart" style="max-height: 300px;"></canvas>
-                        </div>
-                    </div>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Model</th>
-                                <th>Requests</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {stats_html}
-                        </tbody>
-                    </table>
-                </div>
-
-                <!-- Available Models -->
-                <div class="section">
-                    <div class="section-header">
-                        <h2>🤖 Available Models</h2>
-                    </div>
-                    <p style="color: #666; margin-bottom: 15px;">Showing top 20 text-based models (Rank 1 = Best)</p>
-                    <div class="model-grid">
-                        {models_html}
-                    </div>
-                </div>
-            </div>
-            
-            <script>
-                // Prepare data for charts
-                const statsData = {json.dumps(dict(sorted(model_usage_stats.items(), key=lambda x: x[1], reverse=True)[:10]))};
-                const modelNames = Object.keys(statsData);
-                const modelCounts = Object.values(statsData);
-                
-                // Generate colors for charts
-                const colors = [
-                    '#667eea', '#764ba2', '#f093fb', '#4facfe',
-                    '#43e97b', '#fa709a', '#fee140', '#30cfd0',
-                    '#a8edea', '#fed6e3'
-                ];
-                
-                // Pie Chart
-                if (modelNames.length > 0) {{
-                    const pieCtx = document.getElementById('modelPieChart').getContext('2d');
-                    new Chart(pieCtx, {{
-                        type: 'doughnut',
-                        data: {{
-                            labels: modelNames,
-                            datasets: [{{
-                                data: modelCounts,
-                                backgroundColor: colors,
-                                borderWidth: 2,
-                                borderColor: '#fff'
-                            }}]
-                        }},
-                        options: {{
-                            responsive: true,
-                            maintainAspectRatio: true,
-                            plugins: {{
-                                legend: {{
-                                    position: 'bottom',
-                                    labels: {{
-                                        padding: 15,
-                                        font: {{
-                                            size: 11
-                                        }}
-                                    }}
-                                }},
-                                tooltip: {{
-                                    callbacks: {{
-                                        label: function(context) {{
-                                            const label = context.label || '';
-                                            const value = context.parsed || 0;
-                                            const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                                            const percentage = ((value / total) * 100).toFixed(1);
-                                            return label + ': ' + value + ' (' + percentage + '%)';
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }});
-                    
-                    // Bar Chart
-                    const barCtx = document.getElementById('modelBarChart').getContext('2d');
-                    new Chart(barCtx, {{
-                        type: 'bar',
-                        data: {{
-                            labels: modelNames,
-                            datasets: [{{
-                                label: 'Requests',
-                                data: modelCounts,
-                                backgroundColor: colors[0],
-                                borderColor: colors[1],
-                                borderWidth: 1
-                            }}]
-                        }},
-                        options: {{
-                            responsive: true,
-                            maintainAspectRatio: true,
-                            plugins: {{
-                                legend: {{
-                                    display: false
-                                }},
-                                tooltip: {{
-                                    callbacks: {{
-                                        label: function(context) {{
-                                            return 'Requests: ' + context.parsed.y;
-                                        }}
-                                    }}
-                                }}
-                            }},
-                            scales: {{
-                                y: {{
-                                    beginAtZero: true,
-                                    ticks: {{
-                                        stepSize: 1
-                                    }}
-                                }},
-                                x: {{
-                                    ticks: {{
-                                        font: {{
-                                            size: 10
-                                        }},
-                                        maxRotation: 45,
-                                        minRotation: 45
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }});
-                }} else {{
-                    // Show "no data" message
-                    document.getElementById('modelPieChart').parentElement.innerHTML = '<p style="text-align: center; color: #999; padding: 50px;">No usage data yet</p>';
-                    document.getElementById('modelBarChart').parentElement.innerHTML = '<p style="text-align: center; color: #999; padding: 50px;">No usage data yet</p>';
-                }}
-            </script>
-        </body>
-        </html>
-    """
-
-@app.post("/update-auth-token")
-async def update_auth_token(session: str = Depends(get_current_session), auth_token: str = Form(...)):
-    if not session:
-        return RedirectResponse(url="/login")
-    config = get_config()
-    config["auth_token"] = auth_token.strip()
-    save_config(config, preserve_auth_tokens=False)
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-
-@app.post("/create-key")
-async def create_key(session: str = Depends(get_current_session), name: str = Form(...), rpm: int = Form(...)):
-    if not session:
-        return RedirectResponse(url="/login")
-    try:
-        config = get_config()
-        new_key = {
-            "name": name.strip(),
-            "key": f"sk-lmab-{uuid.uuid4()}",
-            "rpm": max(1, min(rpm, 1000)),  # Clamp between 1-1000
-            "created": int(time.time())
-        }
-        config["api_keys"].append(new_key)
-        save_config(config)
-    except Exception as e:
-        debug_print(f"❌ Error creating key: {e}")
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-
-@app.post("/delete-key")
-async def delete_key(session: str = Depends(get_current_session), key_id: str = Form(...)):
-    if not session:
-        return RedirectResponse(url="/login")
-    try:
-        config = get_config()
-        config["api_keys"] = [k for k in config["api_keys"] if k["key"] != key_id]
-        save_config(config)
-    except Exception as e:
-        debug_print(f"❌ Error deleting key: {e}")
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-
-@app.post("/add-auth-token")
-async def add_auth_token(session: str = Depends(get_current_session), new_auth_token: str = Form(...)):
-    if not session:
-        return RedirectResponse(url="/login")
-    try:
-        config = get_config()
-        token = new_auth_token.strip()
-        if token and token not in config.get("auth_tokens", []):
-            if "auth_tokens" not in config:
-                config["auth_tokens"] = []
-            config["auth_tokens"].append(token)
-            save_config(config, preserve_auth_tokens=False)
-    except Exception as e:
-        debug_print(f"❌ Error adding auth token: {e}")
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-
-@app.post("/delete-auth-token")
-async def delete_auth_token(session: str = Depends(get_current_session), token_index: int = Form(...)):
-    if not session:
-        return RedirectResponse(url="/login")
-    try:
-        config = get_config()
-        auth_tokens = config.get("auth_tokens", [])
-        if 0 <= token_index < len(auth_tokens):
-            auth_tokens.pop(token_index)
-            config["auth_tokens"] = auth_tokens
-            save_config(config, preserve_auth_tokens=False)
-    except Exception as e:
-        debug_print(f"❌ Error deleting auth token: {e}")
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-
-@app.post("/refresh-tokens")
-async def refresh_tokens(session: str = Depends(get_current_session)):
-    if not session:
-        return RedirectResponse(url="/login")
-    try:
-        await get_initial_data()
-    except Exception as e:
-        debug_print(f"❌ Error refreshing tokens: {e}")
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-
-# --- Userscript Proxy Support ---
-
-# In-memory queue for Userscript Proxy
-# { task_id: asyncio.Future }
-proxy_pending_tasks: Dict[str, asyncio.Future] = {}
-# List of tasks waiting to be picked up by the userscript
-# [ { id, url, method, body } ]
-proxy_task_queue: List[dict] = []
-# Timestamp of last userscript poll
-last_userscript_poll: float = 0
-
-@app.get("/proxy/tasks")
-async def get_proxy_tasks(api_key: dict = Depends(rate_limit_api_key)):
-    """
-    Endpoint for the Userscript to poll for new tasks.
-    Requires a valid API key to prevent unauthorized task stealing.
-    """
-    global last_userscript_poll
-    last_userscript_poll = time.time()
-    
-    # In a real multi-user scenario, we might want to filter tasks by user/session.
-    # For this bridge, we assume a single trust domain.
-    current_tasks = list(proxy_task_queue)
-    proxy_task_queue.clear()
-    return current_tasks
-
-@app.post("/proxy/result/{task_id}")
-async def post_proxy_result(task_id: str, request: Request, api_key: dict = Depends(rate_limit_api_key)):
-    """
-    Endpoint for the Userscript to post results (chunks or full response).
-    """
-    try:
-        data = await request.json()
-        if task_id in proxy_pending_tasks:
-            future = proxy_pending_tasks[task_id]
-            if not future.done():
-                future.set_result(data)
-        return {"status": "ok"}
-    except Exception as e:
-        debug_print(f"❌ Error processing proxy result for {task_id}: {e}")
-        return {"status": "error", "message": str(e)}
-
-@app.post("/api/v1/userscript/poll")
-async def userscript_poll(request: Request):
-    """
-    Long-poll endpoint for the Tampermonkey/Violetmonkey proxy client (docs/lmbridge-proxy.user.js).
-    Returns 204 when no jobs are available.
-    """
-    _userscript_proxy_check_secret(request)
-
-    global USERSCRIPT_PROXY_LAST_POLL_AT, last_userscript_poll
+    jars = load_jars()
     now = time.time()
-    USERSCRIPT_PROXY_LAST_POLL_AT = now
-    # Keep legacy proxy detection working too.
-    last_userscript_poll = now
+    healthy_jars = sum(1 for j in jars if jar_available(j, now))
+    active_keepers = sum(1 for s in keeper.sessions.values() if s.running)
 
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
+    jars_rows = []
+    for j in jars:
+        st = "ok" if jar_available(j, now) else ("limited" if j.get("limited_until", 0) > now else "expired")
+        ks = keeper.sessions.get(j.get("id"))
+        keeper_status = '<span class="badge stopped">Disabled</span>'
+        step_text = ""
+        if j.get("keeper_enabled"):
+            if ks:
+                keeper_status = f'<span class="badge {ks.status}" id="status-badge-{j["id"]}">{ks.status}</span>'
+                step_text = ks.current_step or (ks.error if ks.error else "")
+            else:
+                keeper_status = f'<span class="badge stopped" id="status-badge-{j["id"]}">Pending</span>'
+
+        step_html = f'<div class="step-pill" id="step-val-{j["id"]}" title="{step_text}">{step_text or "Idle"}</div>' if step_text else f'<div class="step-pill" id="step-val-{j["id"]}">Ready</div>'
+
+        jars_rows.append(f"""
+        <tr>
+            <td>
+                <strong>{j.get('name', 'Account')}</strong>
+                <br><small style="color:var(--text-muted)">{j.get('email') or 'No email'}</small>
+            </td>
+            <td><span class="badge {st}">{st}</span></td>
+            <td>
+                <div style="display:flex;flex-direction:column;gap:4px">
+                    <div>{keeper_status}</div>
+                    {step_html}
+                </div>
+            </td>
+            <td><strong>{j.get('usage_count', 0)}</strong> reqs</td>
+            <td>
+                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                    <button type="button" class="btn btn-sm" onclick="triggerRelogin('{j['id']}')">Re-login</button>
+                    <form action="/keeper/live" method="post"><input type="hidden" name="jar_id" value="{j['id']}"><button type="submit" class="btn btn-sec btn-sm">Live Browser</button></form>
+                    <form action="/jars/reset" method="post"><input type="hidden" name="jar_id" value="{j['id']}"><button type="submit" class="btn btn-sec btn-sm">Reset</button></form>
+                    <form action="/jars/toggle" method="post"><input type="hidden" name="jar_id" value="{j['id']}"><button type="submit" class="btn btn-sec btn-sm">{'Disable' if j.get('enabled', True) else 'Enable'}</button></form>
+                    <form action="/jars/delete" method="post"><input type="hidden" name="jar_id" value="{j['id']}"><button type="submit" class="btn btn-sec btn-sm btn-red">Delete</button></form>
+                </div>
+            </td>
+        </tr>""")
 
     cfg = get_config()
-    timeout_seconds = data.get("timeout_seconds")
-    if timeout_seconds is None:
-        timeout_seconds = cfg.get("userscript_proxy_poll_timeout_seconds", 25)
+    keys = cfg.get("api_keys", [])
+    keys_rows = []
+    for k in keys:
+        keys_rows.append(f"""
+        <tr>
+            <td><strong>{k.get('name')}</strong></td>
+            <td><code style="background:rgba(255,255,255,0.06);padding:3px 8px;border-radius:6px;font-family:'JetBrains Mono',monospace;cursor:pointer" onclick="copyKey('{k.get('key')}')" title="Click to copy">{k.get('key')}</code></td>
+            <td><span class="badge ok">{k.get('rpm')} RPM</span></td>
+            <td><form action="/delete-key" method="post"><input type="hidden" name="key_id" value="{k['key']}"><button type="submit" class="btn btn-sec btn-sm btn-red">Revoke</button></form></td>
+        </tr>""")
+
+    models = get_selectable_models()
+    models_rows = []
+    for m in models:
+        has_vision = '<span class="badge ok">Yes</span>' if m.get("capabilities", {}).get("inputCapabilities", {}).get("image") else '<span class="badge stopped">No</span>'
+        models_rows.append(f"""
+        <tr>
+            <td><strong>{m.get('publicName')}</strong></td>
+            <td><span style="color:var(--text-muted)">{m.get('organization')}</span></td>
+            <td>{has_vision}</td>
+        </tr>""")
+
+    html = (
+        DASHBOARD_TEMPLATE
+        .replace("__HEALTHY_JARS__", str(healthy_jars))
+        .replace("__TOTAL_JARS__", str(len(jars)))
+        .replace("__ACTIVE_KEEPERS__", str(active_keepers))
+        .replace("__TOTAL_MODELS__", str(len(models)))
+        .replace("__TOTAL_KEYS__", str(len(keys)))
+        .replace("__JARS_ROWS__", "".join(jars_rows) if jars_rows else "<tr><td colspan='5' style='text-align:center;color:var(--text-muted);padding:24px'>No accounts in pool</td></tr>")
+        .replace("__KEYS_ROWS__", "".join(keys_rows) if keys_rows else "<tr><td colspan='4' style='text-align:center;color:var(--text-muted);padding:24px'>No API keys created</td></tr>")
+        .replace("__MODELS_ROWS__", "".join(models_rows) if models_rows else "<tr><td colspan='3' style='text-align:center;color:var(--text-muted);padding:24px'>No models loaded</td></tr>")
+    )
+    return HTMLResponse(html)
+
+
+# ============================================================
+# API KEY & JAR POOL ACTIONS
+# ============================================================
+
+@app.post("/jars/add")
+async def jars_add(request: Request, name: str = Form(""), cookie_file: UploadFile = File(...)):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
     try:
-        timeout_seconds = int(timeout_seconds)
-    except Exception:
-        timeout_seconds = 25
-    timeout_seconds = max(0, min(timeout_seconds, 60))
+        cookies = _validate_cookies((await cookie_file.read()).decode("utf-8"))
+        jar, found = _new_jar(name.strip(), cookies)
+        log("OK", f"Account '{jar['name']}' added ({len(cookies)} cookies, keys: {sorted(found) or 'NONE'})")
+    except Exception as e:
+        log("ERROR", f"Jar upload failed: {type(e).__name__}: {e}")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
-    _cleanup_userscript_proxy_jobs(cfg)
 
-    queue = _get_userscript_proxy_queue()
-    end = time.time() + float(timeout_seconds)
-    while True:
-        remaining = end - time.time()
-        if remaining <= 0:
-            return Response(status_code=204)
-        try:
-            job_id = await asyncio.wait_for(queue.get(), timeout=remaining)
-        except asyncio.TimeoutError:
-            return Response(status_code=204)
+@app.post("/jars/add-text")
+async def jars_add_text(request: Request, name: str = Form(""), cookie_json: str = Form(...)):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    try:
+        jar, found = _new_jar(name.strip(), _validate_cookies(cookie_json.strip()))
+        log("OK", f"Account '{jar['name']}' added ({sorted(found) or 'NONE'})")
+    except Exception as e:
+        log("ERROR", f"Jar paste failed: {type(e).__name__}: {e}")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
-        job = _USERSCRIPT_PROXY_JOBS.get(str(job_id))
-        if not isinstance(job, dict):
+
+@app.post("/jars/bulk")
+async def jars_bulk(request: Request, accounts: str = Form(...), keeper_enabled: Optional[str] = Form(None)):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    created, skipped = 0, 0
+    for line in accounts.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
-        # Mark as picked up as soon as we hand the job to a poller so the server-side pickup timeout
-        # doesn't trip while the poller/browser is starting.
-        try:
-            picked = job.get("picked_up_event")
-            if isinstance(picked, asyncio.Event) and not picked.is_set():
-                picked.set()
-                if not job.get("picked_up_at_monotonic"):
-                    job["picked_up_at_monotonic"] = time.monotonic()
-            if str(job.get("phase") or "") == "queued":
-                job["phase"] = "picked_up"
-        except Exception:
-            pass
-        return {"job_id": str(job_id), "payload": job.get("payload") or {}}
+        m = re.match(r"^([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})\s*[:|,;]\s*(.+)$", line)
+        if not m:
+            skipped += 1
+            continue
+        email, password = m.group(1), m.group(2).strip()
+        name = email.split("@")[0]
+        _new_jar(name, [], email=email, password=password, login_method="email", keeper_enabled=bool(keeper_enabled))
+        created += 1
+    log("OK", f"Bulk accounts: {created} created, {skipped} skipped (keeper={'on' if keeper_enabled else 'off'})")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 
-@app.post("/api/v1/userscript/push")
-async def userscript_push(request: Request):
-    """
-    Receives streamed lines from the userscript proxy and feeds them into the waiting request.
-    """
-    _userscript_proxy_check_secret(request)
+@app.post("/jars/toggle")
+async def jars_toggle(request: Request, jar_id: str = Form(...)):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    def fn(jars):
+        for j in jars:
+            if j["id"] == jar_id:
+                j["enabled"] = not j.get("enabled", True)
+                log("INFO", f"Account '{j.get('name')}' {'enabled' if j['enabled'] else 'disabled'}")
+    mutate_jars(fn)
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
+
+@app.post("/jars/reset")
+async def jars_reset(request: Request, jar_id: str = Form(...)):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    mark_jar_status(jar_id, "ok")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/jars/delete")
+async def jars_delete(request: Request, jar_id: str = Form(...)):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    mutate_jars(lambda jars: jars.__setitem__(slice(None), [j for j in jars if j["id"] != jar_id]))
+    log("WARN", f"Account {jar_id} deleted")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/oxalpha/upload")
+async def oxalpha_upload(request: Request, cookie_file: UploadFile = File(...)):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
     try:
-        data = await request.json()
-    except Exception:
-        data = {}
-
-    job_id = str(data.get("job_id") or "").strip()
-    if not job_id:
-        raise HTTPException(status_code=400, detail="Missing job_id")
-
-    job = _USERSCRIPT_PROXY_JOBS.get(job_id)
-    if not isinstance(job, dict):
-        raise HTTPException(status_code=404, detail="Unknown job_id")
-
-    fetch_started = data.get("upstream_fetch_started")
-    if fetch_started is None:
-        fetch_started = data.get("fetch_started")
-    status_code = data.get("status")
-    if fetch_started or isinstance(status_code, int):
-        try:
-            if not job.get("upstream_fetch_started_at_monotonic"):
-                job["upstream_fetch_started_at_monotonic"] = time.monotonic()
-        except Exception:
-            pass
-
-    if isinstance(status_code, int):
-        job["status_code"] = int(status_code)
-        status_event = job.get("status_event")
-        if isinstance(status_event, asyncio.Event):
-            status_event.set()
-    headers = data.get("headers")
-    if isinstance(headers, dict):
-        job["headers"] = headers
-
-    error = data.get("error")
-    if error:
-        job["error"] = str(error)
-
-    lines = data.get("lines") or []
-    if isinstance(lines, list):
-        for line in lines:
-            if line is None:
-                continue
-            await job["lines_queue"].put(str(line))
-
-    if bool(data.get("done")):
-        job["done"] = True
-        done_event = job.get("done_event")
-        if isinstance(done_event, asyncio.Event):
-            done_event.set()
-        status_event = job.get("status_event")
-        if isinstance(status_event, asyncio.Event):
-            status_event.set()
-        await job["lines_queue"].put(None)
-
-    return {"status": "ok"}
-
-
-# --- OpenAI Compatible API Endpoints ---
-
-@app.get("/api/v1/health")
-async def health_check():
-    """Health check endpoint for monitoring"""
-    try:
-        models = get_models()
-        config = get_config()
-        
-        # Basic health checks
-        has_cf_clearance = bool(config.get("cf_clearance"))
-        has_models = len(models) > 0
-        has_api_keys = len(config.get("api_keys", [])) > 0
-        
-        status = "healthy" if (has_cf_clearance and has_models) else "degraded"
-        
-        return {
-            "status": status,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "checks": {
-                "cf_clearance": has_cf_clearance,
-                "models_loaded": has_models,
-                "model_count": len(models),
-                "api_keys_configured": has_api_keys
-            }
-        }
+        cookies = _validate_cookies((await cookie_file.read()).decode("utf-8"))
+        atomic_write(OX_COOKIES_FILE, cookies)
+        log("OK", f"OX Alpha cookies saved ({len(cookies)})")
     except Exception as e:
-        return {
-            "status": "unhealthy",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "error": str(e)
-        }
-
-# --- Ollama-compatible stubs (OpenWebUI probes these endpoints) ---
-
-@app.get("/api/v1/api/tags")
-async def ollama_tags(api_key: dict = Depends(rate_limit_api_key)):
-    models = get_models()
-    
-    valid_models = [m for m in models 
-                   if (m.get('capabilities', {}).get('outputCapabilities', {}).get('text')
-                       or m.get('capabilities', {}).get('outputCapabilities', {}).get('search')
-                       or m.get('capabilities', {}).get('outputCapabilities', {}).get('image'))
-                   and m.get('organization')]
-    
-    ollama_models = [
-        {
-            "name": model.get("publicName", ""),
-            "model": model.get("publicName", ""),
-            "modified_at": "2024-01-01T00:00:00Z",
-            "size": 0
-        }
-        for model in valid_models if model.get("publicName")
-    ]
-    return {"models": ollama_models}
+        log("ERROR", f"OX cookie upload failed: {e}")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 
-@app.get("/api/v1/api/ps")
-async def ollama_ps(api_key: dict = Depends(rate_limit_api_key)):
-    return {"models": []}
+@app.post("/oxalpha/verify")
+async def oxalpha_verify_endpoint(request: Request):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    sess = await oxalpha_verify_via_browser()
+    if not sess.get("cookies"):
+        log("ERROR", "OX Alpha browser verification produced no session")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 
-@app.get("/api/v1/api/version")
-async def ollama_version(api_key: dict = Depends(rate_limit_api_key)):
-    return {"version": "0.1.0"}
+@app.post("/oxalpha/refresh")
+async def oxalpha_refresh(request: Request):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    await oxas(force=True)
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
-@app.get("/api/v1/models")
-async def list_models(api_key: dict = Depends(rate_limit_api_key)):
+
+@app.post("/refresh-tokens")
+async def refresh_tokens(request: Request):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    await get_initial_data()
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/create-key")
+async def create_key(request: Request, name: str = Form(...), rpm: int = Form(...)):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    config = get_config()
+    config["api_keys"].append({
+        "name": name.strip(), "key": f"sk-lmab-{uuid.uuid4()}",
+        "rpm": max(1, min(rpm, 1000)), "created": int(time.time()),
+    })
+    save_config(config)
+    log("OK", f"API key created: {name}")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/delete-key")
+async def delete_key(request: Request, key_id: str = Form(...)):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    config = get_config()
+    config["api_keys"] = [k for k in config["api_keys"] if k["key"] != key_id]
+    save_config(config)
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/debug-logs/data")
+async def debug_logs_data(request: Request):
+    if not await get_current_session(request):
+        return {"logs": []}
+    return {"logs": read_logs(120)}
+
+
+@app.post("/clear-logs")
+async def clear_logs(request: Request):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
     try:
-        models = get_models()
-        
-        # Filter for models with text OR search OR image output capability and an organization (exclude stealth models)
-        # Always include image models - no special key needed
-        valid_models = [m for m in models 
-                       if (m.get('capabilities', {}).get('outputCapabilities', {}).get('text')
-                           or m.get('capabilities', {}).get('outputCapabilities', {}).get('search')
-                           or m.get('capabilities', {}).get('outputCapabilities', {}).get('image'))
-                       and m.get('organization')]
-        
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "id": model.get("publicName"),
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": model.get("organization", "lmarena")
-                } for model in valid_models if model.get("publicName")
-            ]
-        }
-    except Exception as e:
-        debug_print(f"❌ Error listing models: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to load models: {str(e)}")
-
-
-@app.get("/api/v1/_debug/stream")
-async def debug_stream(api_key: dict = Depends(rate_limit_api_key)):  # noqa: ARG001
-    async def _gen():
-        yield ": keep-alive\n\n"
-        await asyncio.sleep(0.05)
-        yield 'data: {"ok":true}\n\n'
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(_gen(), media_type="text/event-stream")
-
-@app.post("/api/v1/chat/completions")
-async def api_chat_completions(request: Request, api_key: dict = Depends(rate_limit_api_key)):
-    debug_print("\n" + "="*80)
-    debug_print("🔵 NEW API REQUEST RECEIVED")
-    debug_print("="*80)
-    
-    try:
-        # Parse request body with error handling
-        try:
-            body = await request.json()
-        except json.JSONDecodeError as e:
-            debug_print(f"❌ Invalid JSON in request body: {e}")
-            raise HTTPException(status_code=400, detail=f"Invalid JSON in request body: {str(e)}")
-        except Exception as e:
-            debug_print(f"❌ Failed to read request body: {e}")
-            raise HTTPException(status_code=400, detail=f"Failed to read request body: {str(e)}")
-        
-        debug_print(f"📥 Request body keys: {list(body.keys())}")
-        
-        # Validate required fields
-        model_public_name = body.get("model")
-        messages = body.get("messages", [])
-        stream = body.get("stream", False)
-        
-        debug_print(f"🌊 Stream mode: {stream}")
-        debug_print(f"🤖 Requested model: {model_public_name}")
-        debug_print(f"💬 Number of messages: {len(messages)}")
-        
-        if not model_public_name:
-            debug_print("❌ Missing 'model' in request")
-            raise HTTPException(status_code=400, detail="Missing 'model' in request body.")
-        
-        if not messages:
-            debug_print("❌ Missing 'messages' in request")
-            raise HTTPException(status_code=400, detail="Missing 'messages' in request body.")
-        
-        if not isinstance(messages, list):
-            debug_print("❌ 'messages' must be an array")
-            raise HTTPException(status_code=400, detail="'messages' must be an array.")
-        
-        if len(messages) == 0:
-            debug_print("❌ 'messages' array is empty")
-            raise HTTPException(status_code=400, detail="'messages' array cannot be empty.")
-
-        # Find model ID from public name
-        try:
-            models = get_models()
-            debug_print(f"📚 Total models loaded: {len(models)}")
-        except Exception as e:
-            debug_print(f"❌ Failed to load models: {e}")
-            raise HTTPException(
-                status_code=503,
-                detail="Failed to load model list from LMArena. Please try again later."
-            )
-        
-        model_id = None
-        model_org = None
-        model_capabilities = {}
-        
-        for m in models:
-            if m.get("publicName") == model_public_name:
-                model_id = m.get("id")
-                model_org = m.get("organization")
-                model_capabilities = m.get("capabilities", {})
-                break
-        
-        if not model_id:
-            debug_print(f"❌ Model '{model_public_name}' not found in model list")
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Model '{model_public_name}' not found. Use /api/v1/models to see available models."
-            )
-        
-        # Check if model is a stealth model (no organization)
-        if not model_org:
-            debug_print(f"❌ Model '{model_public_name}' is a stealth model (no organization)")
-            raise HTTPException(
-                status_code=403,
-                detail="You do not have access to stealth models. Contact cloudwaddie for more info."
-            )
-        
-        debug_print(f"✅ Found model ID: {model_id}")
-        debug_print(f"🔧 Model capabilities: {model_capabilities}")
-        
-        # Determine modality based on model capabilities.
-        # Priority: image > search > chat
-        if model_capabilities.get("outputCapabilities", {}).get("image"):
-            modality = "image"
-        elif model_capabilities.get("outputCapabilities", {}).get("search"):
-            modality = "search"
-        else:
-            modality = "chat"
-        debug_print(f"🔍 Model modality: {modality}")
-
-        # Log usage
-        try:
-            model_usage_stats[model_public_name] += 1
-            # Save stats immediately after incrementing
-            config = get_config()
-            config["usage_stats"] = dict(model_usage_stats)
-            save_config(config)
-        except Exception as e:
-            # Don't fail the request if usage logging fails
-            debug_print(f"⚠️  Failed to log usage stats: {e}")
-
-        # Extract system prompt if present and prepend to first user message
-        system_prompt = ""
-        system_messages = [m for m in messages if m.get("role") == "system"]
-        if system_messages:
-            system_prompt = "\n\n".join([_coerce_message_content_to_text(m.get("content", "")) for m in system_messages])
-            debug_print(f"📋 System prompt found: {system_prompt[:100]}..." if len(system_prompt) > 100 else f"📋 System prompt: {system_prompt}")
-        
-        # Process last message content (may include images)
-        try:
-            last_message_content = messages[-1].get("content", "")
-            try:
-                prompt, experimental_attachments = await process_message_content(last_message_content, model_capabilities)
-            except Exception as e:
-                debug_print(f"❌ Failed to process message content: {e}")
-                raise HTTPException(status_code=400, detail=f"Invalid message content: {str(e)}")
-            
-            # If there's a system prompt and this is the first user message, prepend it
-            if system_prompt:
-                prompt = f"{system_prompt}\n\n{prompt}"
-                debug_print(f"✅ System prompt prepended to user message")
-        except Exception as e:
-            debug_print(f"❌ Failed to process message content: {e}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to process message content: {str(e)}"
-            )
-        
-        # Validate prompt
-        if not prompt:
-            # If no text but has attachments, that's okay for vision models
-            if not experimental_attachments:
-                debug_print("❌ Last message has no content")
-                raise HTTPException(status_code=400, detail="Last message must have content.")
-        
-        # Log prompt length for debugging character limit issues
-        debug_print(f"📝 User prompt length: {len(prompt)} characters")
-        debug_print(f"🖼️  Attachments: {len(experimental_attachments)} images")
-        debug_print(f"📝 User prompt preview: {prompt[:100]}..." if len(prompt) > 100 else f"📝 User prompt: {prompt}")
-        
-        # Check for reasonable character limit (LMArena appears to have limits)
-        # Typical limit seems to be around 32K-64K characters based on testing
-        MAX_PROMPT_LENGTH = 113567  # User hardcoded limit
-        if len(prompt) > MAX_PROMPT_LENGTH:
-            error_msg = f"Prompt too long ({len(prompt)} characters). LMArena has a character limit of approximately {MAX_PROMPT_LENGTH} characters. Please reduce the message size."
-            debug_print(f"❌ {error_msg}")
-            raise HTTPException(status_code=400, detail=error_msg)
-        
-        # Use API key + conversation tracking
-        api_key_str = api_key["key"]
-
-        # --- NEW: Get reCAPTCHA v3 Token for Payload ---
-        # For strict models, we defer token minting to the in-browser fetch transport to avoid extra
-        # automation-driven token requests (which can lower scores and increase flakiness).
-        use_browser_fetch_for_model = model_public_name in STRICT_BROWSER_FETCH_MODELS
-        strict_chrome_fetch_model = use_browser_fetch_for_model  # compat alias
-
-        recaptcha_token = ""
-        if strict_chrome_fetch_model:
-            # If the internal proxy is active, we MUST NOT use a cached token, as it causes 403s.
-            # Instead, we pass an empty string and let the in-page minting handle it.
-            if (time.time() - last_userscript_poll) < 15:
-                debug_print("🔐 Strict model + Proxy: token will be minted in-page.")
-                recaptcha_token = ""
-            else:
-                # Best-effort: use a cached token so browser transports don't have to wait on grecaptcha to load.
-                # (They can still mint in-session if needed.)
-                recaptcha_token = get_cached_recaptcha_token()
-                if recaptcha_token:
-                    debug_print("🔐 Strict model: using cached reCAPTCHA v3 token in payload.")
-                else:
-                    debug_print("🔐 Strict model: reCAPTCHA token will be minted in the Chrome fetch session.")
-        else:
-            # reCAPTCHA v3 tokens can behave like single-use tokens; force a fresh token for streaming requests.
-            # For streaming, we defer this until inside generate_stream to avoid blocking initial headers.
-            if stream:
-                recaptcha_token = ""
-            else:
-                recaptcha_token = await refresh_recaptcha_token(force_new=False)
-                if not recaptcha_token:
-                    debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Service Unavailable: Failed to acquire reCAPTCHA token. The bridge server may be blocked."
-                    )
-                debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
-        # -----------------------------------------------
-        
-        # Generate conversation ID from context (API key + model + first user message)
-        import hashlib
-        first_user_message = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
-        if isinstance(first_user_message, list):
-            # Handle array content format
-            first_user_message = str(first_user_message)
-        conversation_key = f"{api_key_str}_{model_public_name}_{first_user_message[:100]}"
-        conversation_id = hashlib.sha256(conversation_key.encode()).hexdigest()[:16]
-        
-        debug_print(f"🔑 API Key: {api_key_str[:20]}...")
-        debug_print(f"💭 Auto-generated Conversation ID: {conversation_id}")
-        debug_print(f"🔑 Conversation key: {conversation_key[:100]}...")
-
-        # Headers are prepared after selecting an auth token (or when falling back to browser-only transports).
-        headers: dict[str, str] = {}
-        
-        # Check if conversation exists for this API key (robust to tests patching chat_sessions to a plain dict)
-        per_key_sessions = chat_sessions.setdefault(api_key_str, {})
-        session = per_key_sessions.get(conversation_id)
-        
-        # Detect retry: if session exists and last message is same user message (no assistant response after it)
-        is_retry = False
-        retry_message_id = None
-        
-        if session and len(session.get("messages", [])) >= 2:
-            stored_messages = session["messages"]
-            # Check if last stored message is from user with same content
-            if stored_messages[-1]["role"] == "user" and stored_messages[-1]["content"] == prompt:
-                # This is a retry - client sent same message again without assistant response
-                is_retry = True
-                retry_message_id = stored_messages[-1]["id"]
-                # Get the assistant message ID that needs to be regenerated
-                if len(stored_messages) >= 2 and stored_messages[-2]["role"] == "assistant":
-                    # There was a previous assistant response - we'll retry that one
-                    retry_message_id = stored_messages[-2]["id"]
-                    debug_print(f"🔁 RETRY DETECTED - Regenerating assistant message {retry_message_id}")
-        
-        if is_retry and retry_message_id:
-            debug_print(f"🔁 Using RETRY endpoint")
-            # Use LMArena's retry endpoint
-            # Format: PUT /nextjs-api/stream/retry-evaluation-session-message/{sessionId}/messages/{messageId}
-            payload = {}
-            url = f"https://arena.ai/nextjs-api/stream/retry-evaluation-session-message/{session['conversation_id']}/messages/{retry_message_id}"
-            debug_print(f"📤 Target URL: {url}")
-            debug_print(f"📦 Using PUT method for retry")
-            http_method = "PUT"
-        elif not session:
-            debug_print("🆕 Creating NEW conversation session")
-            # New conversation - Generate all IDs at once (like the browser does)
-            session_id = str(uuid7())
-            user_msg_id = str(uuid7())
-            model_msg_id = str(uuid7())
-            model_b_msg_id = str(uuid7())
-            
-            debug_print(f"🔑 Generated session_id: {session_id}")
-            debug_print(f"👤 Generated user_msg_id: {user_msg_id}")
-            debug_print(f"🤖 Generated model_msg_id: {model_msg_id}")
-            debug_print(f"🤖 Generated model_b_msg_id   : {model_b_msg_id}")
-             
-            payload = {
-                "id": session_id,
-                "mode": "direct-battle",
-                "modelAId": model_id,
-                "userMessageId": user_msg_id,
-                "modelAMessageId": model_msg_id,
-                "modelBMessageId": model_b_msg_id,
-                "userMessage": {
-                    "content": prompt,
-                    "experimental_attachments": experimental_attachments,
-                    "metadata": {}
-                },
-                "modality": modality,
-                "recaptchaV3Token": recaptcha_token, # <--- ADD TOKEN HERE
-            }
-            url = f"https://arena.ai{STREAM_CREATE_EVALUATION_PATH}"
-            debug_print(f"📤 Target URL: {url}")
-            debug_print(f"📦 Payload structure: Simple userMessage format")
-            debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
-            http_method = "POST"
-        else:
-            debug_print("🔄 Using EXISTING conversation session")
-            # Follow-up message - Generate new message IDs
-            user_msg_id = str(uuid7())
-            debug_print(f"👤 Generated followup user_msg_id: {user_msg_id}")
-            model_msg_id = str(uuid7())
-            debug_print(f"🤖 Generated followup model_msg_id: {model_msg_id}")
-            model_b_msg_id = str(uuid7())
-            debug_print(f"🤖 Generated followup model_b_msg_id: {model_b_msg_id}")
-             
-            payload = {
-                "id": session["conversation_id"],
-                "modelAId": model_id,
-                "userMessageId": user_msg_id,
-                "modelAMessageId": model_msg_id,
-                "modelBMessageId": model_b_msg_id,
-                "userMessage": {
-                    "content": prompt,
-                    "experimental_attachments": experimental_attachments,
-                    "metadata": {}
-                },
-                "modality": modality,
-                "recaptchaV3Token": recaptcha_token, # <--- ADD TOKEN HERE
-            }
-            url = f"https://arena.ai/nextjs-api/stream/post-to-evaluation/{session['conversation_id']}"
-            debug_print(f"📤 Target URL: {url}")
-            debug_print(f"📦 Payload structure: Simple userMessage format")
-            debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
-            http_method = "POST"
-
-        debug_print(f"\n🚀 Making API request to LMArena...")
-        debug_print(f"⏱️  Timeout set to: 120 seconds")
-        
-        # Initialize failed tokens tracking for this request
-        request_id = str(uuid.uuid4())
-        failed_tokens = set()
-        force_browser_transports_in_stream = False
-        
-        # Get initial auth token using round-robin (excluding any failed ones)
-        current_token = ""
-        try:
-            current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-        except HTTPException:
-            debug_print("⚠️ No auth token configured; enabling browser/proxy transports.")
-            current_token = ""
-            force_browser_transports_in_stream = True
-
-        # Strict models: if round-robin picked a placeholder/invalid-looking token but there is a better token
-        # available, switch to the first plausible token without mutating user config.
-        if strict_chrome_fetch_model and current_token and not is_probably_valid_arena_auth_token(current_token):
-            try:
-                cfg_now = get_config()
-                tokens_now = cfg_now.get("auth_tokens", [])
-                if not isinstance(tokens_now, list):
-                    tokens_now = []
-            except Exception:
-                tokens_now = []
-            better = ""
-            for cand in tokens_now:
-                cand = str(cand or "").strip()
-                if not cand or cand == current_token or cand in failed_tokens:
-                    continue
-                if is_probably_valid_arena_auth_token(cand):
-                    better = cand
-                    break
-            if better:
-                debug_print("🔑 Switching to a plausible auth token for strict model streaming.")
-                current_token = better
-            else:
-                debug_print("⚠️ Selected auth token format looks unusual; continuing with it (no better token found).")
-
-        # If we still don't have a usable token (e.g. only expired base64 sessions remain), try to refresh one
-        # in-memory only (do not rewrite the user's config.json auth tokens).
-        if (not current_token) or (not is_probably_valid_arena_auth_token(current_token)):
-            try:
-                refreshed = await maybe_refresh_expired_auth_tokens(exclude_tokens=failed_tokens)
-            except Exception:
-                refreshed = None
-            if refreshed:
-                debug_print("🔄 Refreshed arena-auth-prod-v1 session.")
-                current_token = refreshed
-        headers = get_request_headers_with_token(current_token, recaptcha_token)
-        if current_token:
-            debug_print(f"🔑 Using token (round-robin): {current_token[:20]}...")
-        else:
-            debug_print("🔑 No auth token configured (will rely on browser session cookies).")
-        
-        async def make_request_with_retry(url, payload, http_method, max_retries=3):
-            nonlocal current_token, headers, failed_tokens, recaptcha_token
-
-            for attempt in range(max_retries):
-                try:
-                    import cloudscraper as _cs
-                    def _cs_request():
-                        scraper = _cs.create_scraper()
-                        # Send as text/plain with JSON string body (matches browser)
-                        headers["Content-Type"] = "text/plain;charset=UTF-8"
-                        body_str = json.dumps(payload)
-                        if http_method == "PUT":
-                            return scraper.put(url, data=body_str, headers=headers, timeout=120)
-                        else:
-                            return scraper.post(url, data=body_str, headers=headers, timeout=120)
-                    response = await asyncio.to_thread(_cs_request)
-
-                    log_http_status(response.status_code, "LMArena API")
-
-                    if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-                        debug_print(f"⏱️  Attempt {attempt + 1}/{max_retries} - Rate limit with token {current_token[:20]}...")
-                        retry_after = response.headers.get("Retry-After")
-                        sleep_seconds = get_rate_limit_sleep_seconds(retry_after, attempt)
-                        debug_print(f"  Retry-After header: {retry_after!r}")
-
-                        if attempt < max_retries - 1:
-                            try:
-                                current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
-                                await asyncio.sleep(sleep_seconds)
-                                continue
-                            except HTTPException as e:
-                                debug_print(f"❌ No more tokens available: {e.detail}")
-                                break
-
-                    elif response.status_code == HTTPStatus.FORBIDDEN:
-                        try:
-                            error_body = response.json()
-                        except Exception:
-                            error_body = None
-                        if isinstance(error_body, dict) and error_body.get("error") == "recaptcha validation failed":
-                            debug_print(
-                                f"🤖 Attempt {attempt + 1}/{max_retries} - reCAPTCHA validation failed. Refreshing token..."
-                            )
-                            new_token = await refresh_recaptcha_token(force_new=True)
-                            if new_token and isinstance(payload, dict):
-                                payload["recaptchaV3Token"] = new_token
-                                recaptcha_token = new_token
-                            if attempt < max_retries - 1:
-                                headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                await asyncio.sleep(1)
-                                continue
-
-                    elif response.status_code == HTTPStatus.UNAUTHORIZED:
-                        debug_print(f"🔒 Attempt {attempt + 1}/{max_retries} - Auth failed with token {current_token[:20]}...")
-                        failed_tokens.add(current_token)
-                        debug_print(f"📝 Failed tokens so far: {len(failed_tokens)}")
-
-                        if attempt < max_retries - 1:
-                            try:
-                                current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                debug_print(f"🔄 Retrying with next token: {current_token[:20]}...")
-                                await asyncio.sleep(1)
-                                continue
-                            except HTTPException as e:
-                                debug_print(f"❌ No more tokens available: {e.detail}")
-                                break
-
-                    response.raise_for_status()
-                    return response
-
-                except (requests.exceptions.HTTPError, _cs.exceptions.CloudflareException) as e:
-                    status_code = getattr(getattr(e, 'response', None), 'status_code', None)
-                    if status_code and status_code not in [429, 401]:
-                        raise
-                    if attempt == max_retries - 1:
-                        raise
-
-            raise HTTPException(status_code=503, detail="Max retries exceeded")
-
-        if stream:
-            async def generate_stream():
-                nonlocal current_token, headers, failed_tokens, recaptcha_token
-                nonlocal session_id, user_msg_id, model_msg_id, model_b_msg_id
-                
-                # Safety: don't keep client sockets open forever on repeated upstream failures.
-                try:
-                    stream_total_timeout_seconds = float(get_config().get("stream_total_timeout_seconds", 600))
-                except Exception:
-                    stream_total_timeout_seconds = 600.0
-                stream_total_timeout_seconds = max(30.0, min(stream_total_timeout_seconds, 3600.0))
-                stream_started_at = time.monotonic()
-
-                # Flush an immediate comment to keep the client connection alive while we do heavy lifting upstream
-                yield ": keep-alive\n\n"
-                await asyncio.sleep(0)
-                
-                async def wait_for_task(task):
-                    while True:
-                        done, _ = await asyncio.wait({task}, timeout=1.0)
-                        if task in done:
-                            break
-                        yield ": keep-alive\n\n"
-
-                chunk_id = f"chatcmpl-{uuid.uuid4()}"
-                
-                # Helper to keep connection alive during backoff
-                async def wait_with_keepalive(seconds: float):
-                    end_time = time.time() + float(seconds)
-                    while time.time() < end_time:
-                        yield ": keep-alive\n\n"
-                        await asyncio.sleep(min(1.0, end_time - time.time()))
-
-                # Use browser transports (Userscript proxy / Chrome/Camoufox) proactively for:
-                #   - models known to be strict with reCAPTCHA
-                #   - any streaming request when no auth token is available (browser session may be able to sign up / reuse cookies)
-                disable_userscript_proxy_env = bool(os.environ.get("LM_BRIDGE_DISABLE_USERSCRIPT_PROXY"))
-                proxy_active_at_start = False
-                if not disable_userscript_proxy_env:
-                    try:
-                        proxy_active_at_start = _userscript_proxy_is_active()
-                    except Exception:
-                        proxy_active_at_start = False
-
-                # If the userscript proxy is active (internal Camoufox worker / extension poller), route streaming
-                # through it immediately to avoid side-channel reCAPTCHA token minting (which can launch headful Chrome).
-                use_browser_transports = (
-                    force_browser_transports_in_stream
-                    or (model_public_name in STRICT_BROWSER_FETCH_MODELS)
-                    or proxy_active_at_start
-                )
-                prefer_chrome_transport = False
-                if use_browser_transports and (model_public_name in STRICT_BROWSER_FETCH_MODELS):
-                    debug_print(f"🔐 Strict model detected ({model_public_name}), enabling browser fetch transport.")
-                elif use_browser_transports and force_browser_transports_in_stream:
-                    debug_print("⚠️ Stream mode without auth token: preferring userscript proxy / browser fetch transports.")
-                elif use_browser_transports and proxy_active_at_start:
-                    debug_print("🦊 Userscript proxy is ACTIVE: routing stream through proxy and skipping side-channel reCAPTCHA mint.")
-
-                # Non-strict models: mint a fresh side-channel token before the first upstream attempt so we don't
-                # send an empty `recaptchaV3Token` (which commonly yields 403 "recaptcha validation failed").
-                if (not use_browser_transports) and (not str(recaptcha_token or "").strip()):
-                    try:
-                        refresh_task = asyncio.create_task(refresh_recaptcha_token(force_new=True))
-                        async for ka in wait_for_task(refresh_task):
-                            yield ka
-                        new_token = refresh_task.result()
-                    except Exception:
-                        new_token = None
-                    if new_token:
-                        recaptcha_token = new_token
-                        if isinstance(payload, dict):
-                            payload["recaptchaV3Token"] = new_token
-                        headers = get_request_headers_with_token(current_token, recaptcha_token)
-                
-                recaptcha_403_failures = 0
-                no_delta_failures = 0
-                attempt = 0
-                recaptcha_403_consecutive = 0
-                recaptcha_403_last_transport: Optional[str] = None
-                strict_token_prefill_attempted = False
-                disable_userscript_for_request = False
-                force_proxy_recaptcha_mint = False
-
-                retry_429_count = 0
-                retry_403_count = 0
-
-                max_retries = 3
-                current_retry_attempt = 0
-                
-                # Infinite retry loop (until client disconnects, max attempts reached, or we get success)
-                while True:
-                    attempt += 1
-
-                    # Abort if the client disconnects.
-                    try:
-                        if await request.is_disconnected():
-                            return
-                    except Exception:
-                        pass
-
-                    # Stop retrying after a configurable deadline or too many attempts to avoid infinite hangs.
-                    if (time.monotonic() - stream_started_at) > stream_total_timeout_seconds or attempt > 20:
-                        error_chunk = {
-                            "error": {
-                                "message": "Upstream retry timeout or max attempts exceeded while streaming from LMArena.",
-                                "type": "upstream_timeout",
-                                "code": HTTPStatus.GATEWAY_TIMEOUT,
-                            }
-                        }
-                        yield f"data: {json.dumps(error_chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-                    # Reset response data for each attempt
-                    response_text = ""
-                    reasoning_text = ""
-                    citations = []
-                    unhandled_preview: list[str] = []
-
-                    try:
-                        async with AsyncExitStack() as stack:
-                            debug_print(f"📡 Sending {http_method} request for streaming (attempt {attempt})...")
-                            stream_context = None
-                            transport_used = "httpx"
-                            
-                            # Userscript proxy is now a backup-only transport.  We check
-                            # availability here but defer actually using it until after
-                            # browser transports have been attempted.
-                            use_userscript = False
-                            cfg_now = None
-                            userscript_proxy_available = False
-                            if (
-                                use_browser_transports
-                                and not disable_userscript_for_request
-                                and not disable_userscript_proxy_env
-                            ):
-                                try:
-                                    cfg_now = get_config()
-                                except Exception:
-                                    cfg_now = None
-
-                                try:
-                                    proxy_active = _userscript_proxy_is_active(cfg_now)
-                                except Exception:
-                                    proxy_active = False
-
-                                if not proxy_active:
-                                    try:
-                                        grace_seconds = float((cfg_now or {}).get("userscript_proxy_grace_seconds", 0.5))
-                                    except Exception:
-                                        grace_seconds = 0.5
-                                    grace_seconds = max(0.0, min(grace_seconds, 2.0))
-                                    if grace_seconds > 0:
-                                        deadline = time.time() + grace_seconds
-                                        while time.time() < deadline:
-                                            try:
-                                                if _userscript_proxy_is_active(cfg_now):
-                                                    proxy_active = True
-                                                    break
-                                            except Exception:
-                                                pass
-                                            yield ": keep-alive\n\n"
-                                            await asyncio.sleep(0.05)
-
-                                if proxy_active:
-                                    userscript_proxy_available = True
-                                    debug_print("🌐 Userscript Proxy is ACTIVE (will use as backup after browser transports).")
-                                # Default behavior: mint in-page (higher success rate than side-channel cached tokens).
-                                # Optional: allow pre-filling a cached token for speed via config flag.
-                                try:
-                                    prefill_cached = bool((cfg_now or {}).get("userscript_proxy_prefill_cached_recaptcha", False))
-                                except Exception:
-                                    prefill_cached = False
-                                if (
-                                    prefill_cached
-                                    and isinstance(payload, dict)
-                                    and not force_proxy_recaptcha_mint
-                                    and not str(payload.get("recaptchaV3Token") or "").strip()
-                                ):
-                                    try:
-                                        cached = get_cached_recaptcha_token()
-                                    except Exception:
-                                        cached = ""
-                                    if cached:
-                                        debug_print(f"🔐 Using cached reCAPTCHA v3 token for proxy (len={len(str(cached))})")
-                                        payload["recaptchaV3Token"] = cached
-
-                            # Strict models: when we're about to fall back to buffered browser fetch transports (not the
-                            # streaming proxy), a side-channel token can avoid hangs while grecaptcha loads in-page.
-                            if (
-                                stream_context is None
-                                and use_browser_transports
-                                and not use_userscript
-                                and isinstance(payload, dict)
-                                and not strict_token_prefill_attempted
-                                and not str(payload.get("recaptchaV3Token") or "").strip()
-                            ):
-                                strict_token_prefill_attempted = True
-                                try:
-                                    refresh_task = asyncio.create_task(refresh_recaptcha_token(force_new=True))
-                                except Exception:
-                                    refresh_task = None
-                                if refresh_task is not None:
-                                    while True:
-                                        done, _ = await asyncio.wait({refresh_task}, timeout=1.0)
-                                        if refresh_task in done:
-                                            break
-                                        yield ": keep-alive\n\n"
-                                    try:
-                                        new_token = refresh_task.result()
-                                    except Exception:
-                                        new_token = None
-                                    if new_token:
-                                        payload["recaptchaV3Token"] = new_token
-
-                            if stream_context is None and use_browser_transports:
-                                browser_fetch_attempts = 5
-                                try:
-                                    browser_fetch_attempts = int(get_config().get("chrome_fetch_recaptcha_max_attempts", 5))
-                                except Exception:
-                                    browser_fetch_attempts = 5
-
-                                # If we have a cached side-channel reCAPTCHA token, prefer passing it into the browser
-                                # fetch transports (they will reuse it on the first attempt and only mint in-page if
-                                # needed). This helps when in-page grecaptcha is slow/flaky.
-                                if isinstance(payload, dict) and not str(payload.get("recaptchaV3Token") or "").strip():
-                                    try:
-                                        cached_token = get_cached_recaptcha_token()
-                                    except Exception:
-                                        cached_token = ""
-                                    if cached_token:
-                                        payload["recaptchaV3Token"] = cached_token
-
-                                async def _try_chrome_fetch() -> Optional[BrowserFetchStreamResponse]:
-                                    debug_print("🌐 Using Chrome fetch transport for streaming...")
-                                    try:
-                                        auth_for_browser = str(current_token or "").strip()
-                                        try:
-                                            cand = str(EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()
-                                        except Exception:
-                                            cand = ""
-                                        if cand:
-                                            try:
-                                                if (
-                                                    is_probably_valid_arena_auth_token(cand)
-                                                    and not is_arena_auth_token_expired(cand, skew_seconds=0)
-                                                    and (
-                                                        (not auth_for_browser)
-                                                        or (not is_probably_valid_arena_auth_token(auth_for_browser))
-                                                        or is_arena_auth_token_expired(auth_for_browser, skew_seconds=0)
-                                                    )
-                                                ):
-                                                    auth_for_browser = cand
-                                            except Exception:
-                                                auth_for_browser = cand
-
-                                        try:
-                                            chrome_outer_timeout = float(get_config().get("chrome_fetch_outer_timeout_seconds", 120))
-                                        except Exception:
-                                            chrome_outer_timeout = 120.0
-                                        chrome_outer_timeout = max(20.0, min(chrome_outer_timeout, 300.0))
-
-                                        return await asyncio.wait_for(
-                                            fetch_lmarena_stream_via_chrome(
-                                                http_method=http_method,
-                                                url=url,
-                                                payload=payload if isinstance(payload, dict) else {},
-                                                auth_token=auth_for_browser,
-                                                timeout_seconds=120,
-                                                max_recaptcha_attempts=browser_fetch_attempts,
-                                            ),
-                                            timeout=chrome_outer_timeout,
-                                        )
-                                    except asyncio.TimeoutError:
-                                        debug_print("⚠️ Chrome fetch transport timed out (launch/nav hang).")
-                                        return None
-                                    except Exception as e:
-                                        debug_print(f"⚠️ Chrome fetch transport error: {e}")
-                                        return None
-
-                                async def _try_camoufox_fetch() -> Optional[BrowserFetchStreamResponse]:
-                                    debug_print("🦊 Using Camoufox fetch transport for streaming...")
-                                    try:
-                                        auth_for_browser = str(current_token or "").strip()
-                                        try:
-                                            cand = str(EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()
-                                        except Exception:
-                                            cand = ""
-                                        if cand:
-                                            try:
-                                                if (
-                                                    is_probably_valid_arena_auth_token(cand)
-                                                    and not is_arena_auth_token_expired(cand, skew_seconds=0)
-                                                    and (
-                                                        (not auth_for_browser)
-                                                        or (not is_probably_valid_arena_auth_token(auth_for_browser))
-                                                        or is_arena_auth_token_expired(auth_for_browser, skew_seconds=0)
-                                                    )
-                                                ):
-                                                    auth_for_browser = cand
-                                            except Exception:
-                                                auth_for_browser = cand
-
-                                        try:
-                                            camoufox_outer_timeout = float(
-                                                get_config().get("camoufox_fetch_outer_timeout_seconds", 180)
-                                            )
-                                        except Exception:
-                                            camoufox_outer_timeout = 180.0
-                                        camoufox_outer_timeout = max(20.0, min(camoufox_outer_timeout, 300.0))
-
-                                        return await asyncio.wait_for(
-                                            fetch_lmarena_stream_via_camoufox(
-                                                http_method=http_method,
-                                                url=url,
-                                                payload=payload if isinstance(payload, dict) else {},
-                                                auth_token=auth_for_browser,
-                                                timeout_seconds=120,
-                                                max_recaptcha_attempts=browser_fetch_attempts,
-                                            ),
-                                            timeout=camoufox_outer_timeout,
-                                        )
-                                    except asyncio.TimeoutError:
-                                        debug_print("⚠️ Camoufox fetch transport timed out (launch/nav hang).")
-                                        return None
-                                    except Exception as e:
-                                        debug_print(f"⚠️ Camoufox fetch transport error: {e}")
-                                        return None
-
-                                if prefer_chrome_transport:
-                                    chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                    while True:
-                                        done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                        if chrome_task in done:
-                                            try:
-                                                stream_context = chrome_task.result()
-                                            except Exception:
-                                                stream_context = None
-                                            break
-                                        yield ": keep-alive\n\n"
-                                    if stream_context is not None:
-                                        transport_used = "chrome"
-                                    if stream_context is None:
-                                        camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({camoufox_task}, timeout=1.0)
-                                            if camoufox_task in done:
-                                                try:
-                                                    stream_context = camoufox_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield ": keep-alive\n\n"
-                                        if stream_context is not None:
-                                            transport_used = "camoufox"
-                                else:
-                                    camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                    while True:
-                                        done, _ = await asyncio.wait({camoufox_task}, timeout=1.0)
-                                        if camoufox_task in done:
-                                            try:
-                                                stream_context = camoufox_task.result()
-                                            except Exception:
-                                                stream_context = None
-                                            break
-                                        yield ": keep-alive\n\n"
-                                    if stream_context is not None:
-                                        transport_used = "camoufox"
-                                    if stream_context is None:
-                                        chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                            if chrome_task in done:
-                                                try:
-                                                    stream_context = chrome_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield ": keep-alive\n\n"
-                                        if stream_context is not None:
-                                            transport_used = "chrome"
-
-                            # Userscript proxy: backup transport after browser transports fail.
-                            if stream_context is None and userscript_proxy_available and not disable_userscript_for_request:
-                                use_userscript = True
-                                debug_print(
-                                    f"📫 Delegating request to Userscript Proxy (poll active {int(time.time() - last_userscript_poll)}s ago)..."
-                                )
-                                proxy_auth_token = str(current_token or "").strip()
-                                try:
-                                    if (
-                                        proxy_auth_token
-                                        and not str(proxy_auth_token).startswith("base64-")
-                                        and is_arena_auth_token_expired(proxy_auth_token, skew_seconds=0)
-                                    ):
-                                        proxy_auth_token = ""
-                                except Exception:
-                                    pass
-                                stream_context = await fetch_via_proxy_queue(
-                                    url=url,
-                                    payload=payload if isinstance(payload, dict) else {},
-                                    http_method=http_method,
-                                    timeout_seconds=120,
-                                    streaming=True,
-                                    auth_token=proxy_auth_token,
-                                )
-                                if stream_context is None:
-                                    debug_print("⚠️ Userscript Proxy returned None (timeout?). Falling back to cloudscraper...")
-                                    use_userscript = False
-                                else:
-                                    transport_used = "userscript"
-
-                            if stream_context is None:
-                                # Last-resort: httpx streaming fallback.
-                                client = await stack.enter_async_context(httpx.AsyncClient())
-                                # Send as text/plain with JSON string body (matches browser DevTools)
-                                headers["Content-Type"] = "text/plain;charset=UTF-8"
-                                body_str = json.dumps(payload)
-                                if http_method == "PUT":
-                                    stream_context = client.stream('PUT', url, content=body_str.encode('utf-8'), headers=headers, timeout=120)
-                                else:
-                                    stream_context = client.stream('POST', url, content=body_str.encode('utf-8'), headers=headers, timeout=120)
-                                transport_used = "httpx"
-
-                            # Userscript proxy jobs report their upstream HTTP status asynchronously.
-                            # Wait for the status (or completion) before branching on status_code, while still
-                            # keeping the client connection alive.
-                            if transport_used == "userscript":
-                                proxy_job_id = ""
-                                try:
-                                    proxy_job_id = str(getattr(stream_context, "job_id", "") or "").strip()
-                                except Exception:
-                                    proxy_job_id = ""
-
-                                proxy_job = _USERSCRIPT_PROXY_JOBS.get(proxy_job_id) if proxy_job_id else None
-                                status_event = None
-                                done_event = None
-                                picked_up_event = None
-                                lines_queue = None
-                                if isinstance(proxy_job, dict):
-                                    status_event = proxy_job.get("status_event")
-                                    done_event = proxy_job.get("done_event")
-                                    picked_up_event = proxy_job.get("picked_up_event")
-                                    lines_queue = proxy_job.get("lines_queue")
- 
-                                if isinstance(status_event, asyncio.Event) and not status_event.is_set():
-                                    try:
-                                        pickup_timeout_seconds = float(
-                                            get_config().get("userscript_proxy_pickup_timeout_seconds", 10)
-                                        )
-                                    except Exception:
-                                        pickup_timeout_seconds = 10.0
-                                    pickup_timeout_seconds = max(0.5, min(pickup_timeout_seconds, 15.0))
-
-                                    try:
-                                        proxy_status_timeout_seconds = float(
-                                            get_config().get("userscript_proxy_status_timeout_seconds", 30)
-                                        )
-                                    except Exception:
-                                        proxy_status_timeout_seconds = 30.0
-                                    proxy_status_timeout_seconds = max(5.0, min(proxy_status_timeout_seconds, 300.0))
-
-                                    # Time between pickup and the proxy actually starting the upstream fetch. When the
-                                    # Camoufox proxy needs to perform anonymous signup / Turnstile preflight, this can
-                                    # legitimately take much longer than the upstream-status timeout.
-                                    try:
-                                        proxy_preflight_timeout_seconds = float(
-                                            get_config().get(
-                                                "userscript_proxy_preflight_timeout_seconds",
-                                                proxy_status_timeout_seconds,
-                                            )
-                                        )
-                                    except Exception:
-                                        proxy_preflight_timeout_seconds = proxy_status_timeout_seconds
-                                    proxy_preflight_timeout_seconds = max(
-                                        5.0, min(proxy_preflight_timeout_seconds, 600.0)
-                                    )
-
-                                    try:
-                                        proxy_signup_preflight_timeout_seconds = float(
-                                            get_config().get(
-                                                "userscript_proxy_signup_preflight_timeout_seconds",
-                                                240,
-                                            )
-                                        )
-                                    except Exception:
-                                        proxy_signup_preflight_timeout_seconds = 240.0
-                                    proxy_signup_preflight_timeout_seconds = max(
-                                        proxy_preflight_timeout_seconds,
-                                        min(proxy_signup_preflight_timeout_seconds, 900.0),
-                                    )
- 
-                                    started = time.monotonic()
-                                    proxy_status_timed_out = False
-                                    while True:
-                                        if status_event.is_set():
-                                            break
-                                        if isinstance(done_event, asyncio.Event) and done_event.is_set():
-                                            break
-                                        # If the proxy is already streaming lines, don't stall waiting for a separate
-                                        # status report.
-                                        if isinstance(lines_queue, asyncio.Queue) and not lines_queue.empty():
-                                            break
-                                        # If an error has already been recorded, stop waiting and let downstream handle it.
-                                        try:
-                                            if isinstance(proxy_job, dict) and proxy_job.get("error"):
-                                                break
-                                        except Exception:
-                                            pass
-
-                                        # Abort quickly if the client disconnected.
-                                        try:
-                                            if await request.is_disconnected():
-                                                try:
-                                                    await _finalize_userscript_proxy_job(
-                                                        proxy_job_id, error="client disconnected", remove=True
-                                                    )
-                                                except Exception:
-                                                    pass
-                                                return
-                                        except Exception:
-                                            pass
-
-                                        now_mono = time.monotonic()
-                                        elapsed = now_mono - started
-                                        picked_up = True
-                                        if isinstance(picked_up_event, asyncio.Event):
-                                            picked_up = bool(picked_up_event.is_set())
-
-                                        if (not picked_up) and elapsed >= pickup_timeout_seconds:
-                                            debug_print(
-                                                f"⚠️ Userscript proxy did not pick up job within {int(pickup_timeout_seconds)}s."
-                                            )
-                                            disable_userscript_for_request = True
-                                            try:
-                                                _mark_userscript_proxy_inactive()
-                                            except Exception:
-                                                pass
-                                            try:
-                                                await _finalize_userscript_proxy_job(
-                                                    proxy_job_id, error="userscript proxy pickup timeout", remove=True
-                                                )
-                                            except Exception:
-                                                pass
-                                            proxy_status_timed_out = True
-                                            break
-
-                                        if picked_up and isinstance(proxy_job, dict):
-                                            pickup_at = proxy_job.get("picked_up_at_monotonic")
-                                            try:
-                                                pickup_at_mono = float(pickup_at)
-                                            except Exception:
-                                                pickup_at_mono = 0.0
-                                            if pickup_at_mono <= 0:
-                                                pickup_at_mono = float(now_mono)
-                                                proxy_job["picked_up_at_monotonic"] = pickup_at_mono
-
-                                            upstream_fetch_started_at = proxy_job.get(
-                                                "upstream_fetch_started_at_monotonic"
-                                            )
-                                            try:
-                                                upstream_fetch_started_at_mono = float(
-                                                    upstream_fetch_started_at
-                                                )
-                                            except Exception:
-                                                upstream_fetch_started_at_mono = 0.0
-
-                                            if upstream_fetch_started_at_mono > 0:
-                                                status_elapsed = now_mono - upstream_fetch_started_at_mono
-                                                if status_elapsed < 0:
-                                                    status_elapsed = 0.0
-                                                if status_elapsed >= proxy_status_timeout_seconds:
-                                                    debug_print(
-                                                        f"⚠️ Userscript proxy did not report upstream status within {int(proxy_status_timeout_seconds)}s."
-                                                    )
-                                                    # Treat the proxy as unavailable for the rest of this request and fall back
-                                                    # to other transports (Chrome/Camoufox/httpx). Otherwise we'd keep queuing
-                                                    # jobs that will never be picked up and stall for a long time.
-                                                    disable_userscript_for_request = True
-                                                    try:
-                                                        _mark_userscript_proxy_inactive()
-                                                    except Exception:
-                                                        pass
-                                                    try:
-                                                        await _finalize_userscript_proxy_job(
-                                                            proxy_job_id,
-                                                            error="userscript proxy status timeout",
-                                                            remove=True,
-                                                        )
-                                                    except Exception:
-                                                        pass
-                                                    proxy_status_timed_out = True
-                                                    break
-                                            else:
-                                                phase = str(proxy_job.get("phase") or "")
-                                                preflight_timeout = proxy_preflight_timeout_seconds
-                                                if phase == "signup":
-                                                    preflight_timeout = proxy_signup_preflight_timeout_seconds
-                                                preflight_started_at_mono = pickup_at_mono
-                                                if phase == "fetch":
-                                                    upstream_started_at = proxy_job.get(
-                                                        "upstream_started_at_monotonic"
-                                                    )
-                                                    try:
-                                                        upstream_started_at_mono = float(
-                                                            upstream_started_at
-                                                        )
-                                                    except Exception:
-                                                        upstream_started_at_mono = 0.0
-                                                    if upstream_started_at_mono > 0:
-                                                        preflight_started_at_mono = (
-                                                            upstream_started_at_mono
-                                                        )
-
-                                                preflight_elapsed = now_mono - preflight_started_at_mono
-                                                if preflight_elapsed < 0:
-                                                    preflight_elapsed = 0.0
-                                                if preflight_elapsed >= preflight_timeout:
-                                                    phase_note = phase or "unknown"
-                                                    debug_print(
-                                                        f"⚠️ Userscript proxy did not start upstream fetch within {int(preflight_timeout)}s (phase={phase_note})."
-                                                    )
-                                                    disable_userscript_for_request = True
-                                                    try:
-                                                        _mark_userscript_proxy_inactive()
-                                                    except Exception:
-                                                        pass
-                                                    try:
-                                                        await _finalize_userscript_proxy_job(
-                                                            proxy_job_id,
-                                                            error="userscript proxy preflight timeout",
-                                                            remove=True,
-                                                        )
-                                                    except Exception:
-                                                        pass
-                                                    proxy_status_timed_out = True
-                                                    break
- 
-                                        yield ": keep-alive\n\n"
-                                        await asyncio.sleep(1.0)
-
-                                    if proxy_status_timed_out:
-                                        async for ka in wait_with_keepalive(0.5):
-                                            yield ka
-                                        continue
-                            
-                            async with stream_context as response:
-                                # Log status with human-readable message
-                                log_http_status(response.status_code, "LMArena API Stream")
-
-                                # Redirects break SSE streaming and usually indicate an origin change (arena.ai vs
-                                # lmarena.ai) or bot-mitigation. Switch to browser transports (userscript proxy when
-                                # active) and retry instead of trying to parse the redirect body as stream data.
-                                try:
-                                    status_int = int(getattr(response, "status_code", 0) or 0)
-                                except Exception:
-                                    status_int = 0
-                                if 300 <= status_int < 400:
-                                    location = ""
-                                    try:
-                                        location = str(
-                                            response.headers.get("location")
-                                            or response.headers.get("Location")
-                                            or ""
-                                        ).strip()
-                                    except Exception:
-                                        location = ""
-
-                                    if transport_used == "httpx":
-                                        debug_print(
-                                            f"Upstream returned redirect {status_int} ({location or 'no Location header'}). "
-                                            "Enabling browser transports and retrying..."
-                                        )
-                                        use_browser_transports = True
-                                    else:
-                                        debug_print(
-                                            f"Upstream returned redirect {status_int} ({location or 'no Location header'}). Retrying..."
-                                        )
-
-                                    async for ka in wait_with_keepalive(0.5):
-                                        yield ka
-                                    continue
-                                
-                                # Check for retry-able errors before processing stream
-                                if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-                                    retry_429_count += 1
-                                    if retry_429_count > 3:
-                                        error_chunk = {
-                                            "error": {
-                                                "message": "Too Many Requests (429) from upstream. Retries exhausted.",
-                                                "type": "rate_limit_error",
-                                                "code": HTTPStatus.TOO_MANY_REQUESTS,
-                                            }
-                                        }
-                                        yield f"data: {json.dumps(error_chunk)}\n\n"
-                                        yield "data: [DONE]\n\n"
-                                        return
-
-                                    retry_after = None
-                                    try:
-                                        retry_after = response.headers.get("Retry-After")
-                                    except Exception:
-                                        retry_after = None
-                                    if not retry_after:
-                                        try:
-                                            retry_after = response.headers.get("retry-after")
-                                        except Exception:
-                                            retry_after = None
-                                    retry_after_value = 0.0
-                                    if isinstance(retry_after, str):
-                                        try:
-                                            retry_after_value = float(retry_after.strip())
-                                        except Exception:
-                                            retry_after_value = 0.0
-                                    sleep_seconds = get_rate_limit_sleep_seconds(retry_after, attempt)
-                                    
-                                    debug_print(
-                                        f"⏱️  Stream attempt {attempt} - Upstream rate limited. Waiting {sleep_seconds}s..."
-                                    )
-                                    
-                                    # Rotate token on rate limit to avoid spinning on the same blocked account.
-                                    old_token = current_token
-                                    token_rotated = False
-                                    if current_token:
-                                        try:
-                                            rotation_exclude = set(failed_tokens)
-                                            rotation_exclude.add(current_token)
-                                            current_token = get_next_auth_token(
-                                                exclude_tokens=rotation_exclude, allow_ephemeral_fallback=False
-                                            )
-                                            headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                            token_rotated = True
-                                            debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
-                                        except HTTPException:
-                                            # Only one token (or all tokens excluded). Keep the current token and retry
-                                            # after backoff instead of failing fast.
-                                            debug_print("⚠️ No alternative token available; retrying with same token after backoff.")
-
-                                    # reCAPTCHA v3 tokens can be single-use and may expire while we back off.
-                                    # Clear it so the next browser fetch attempt mints a fresh token.
-                                    if isinstance(payload, dict):
-                                        payload["recaptchaV3Token"] = ""
-
-                                    # If we rotated tokens, allow a fast retry when the backoff would exceed the remaining
-                                    # stream deadline (common when one token is rate-limited but another isn't).
-                                    if token_rotated and current_token and current_token != old_token:
-                                        remaining_budget = float(stream_total_timeout_seconds) - float(
-                                            time.monotonic() - stream_started_at
-                                        )
-                                        if float(sleep_seconds) > max(0.0, remaining_budget):
-                                            sleep_seconds = min(float(sleep_seconds), 1.0)
-                                    
-                                    async for ka in wait_with_keepalive(sleep_seconds):
-                                        yield ka
-                                    continue
-                                
-                                elif response.status_code == HTTPStatus.FORBIDDEN:
-                                    # Userscript proxy note:
-                                    # The in-page fetch script can report an initial 403 while it mints/retries
-                                    # reCAPTCHA (v3 retry + v2 fallback) and may later update the status to 200
-                                    # without needing a new proxy job.
-                                    if transport_used == "userscript":
-                                        proxy_job_id = ""
-                                        try:
-                                            proxy_job_id = str(getattr(stream_context, "job_id", "") or "").strip()
-                                        except Exception:
-                                            proxy_job_id = ""
-
-                                        proxy_job = _USERSCRIPT_PROXY_JOBS.get(proxy_job_id) if proxy_job_id else None
-                                        proxy_done_event = None
-                                        if isinstance(proxy_job, dict):
-                                            proxy_done_event = proxy_job.get("done_event")
-
-                                        # Give the proxy a chance to finish its in-page reCAPTCHA retry path before we
-                                        # abandon this response and queue a new job (which can lead to pickup timeouts).
-                                        try:
-                                            grace_seconds = float(
-                                                get_config().get("userscript_proxy_recaptcha_grace_seconds", 25)
-                                            )
-                                        except Exception:
-                                            grace_seconds = 25.0
-                                        grace_seconds = max(0.0, min(grace_seconds, 90.0))
-
-                                        if (
-                                            grace_seconds > 0.0
-                                            and isinstance(proxy_done_event, asyncio.Event)
-                                            and not proxy_done_event.is_set()
-                                        ):
-                                            # Important: do not enqueue a new proxy job while the current one is still
-                                            # running. The internal Camoufox worker is single-threaded and will not pick
-                                            # up new jobs until `page.evaluate()` returns.
-                                            remaining_budget = float(stream_total_timeout_seconds) - float(
-                                                time.monotonic() - stream_started_at
-                                            )
-                                            remaining_budget = max(0.0, remaining_budget)
-                                            max_wait_seconds = min(max(float(grace_seconds), 200.0), remaining_budget)
-
-                                            debug_print(
-                                                f"⏳ Userscript proxy reported 403. Waiting up to {int(max_wait_seconds)}s for in-page retry..."
-                                            )
-                                            started = time.monotonic()
-                                            warned_extended = False
-                                            while (time.monotonic() - started) < float(max_wait_seconds):
-                                                if response.status_code != HTTPStatus.FORBIDDEN:
-                                                    debug_print(
-                                                        f"✅ Userscript proxy recovered from 403 (status: {response.status_code})."
-                                                    )
-                                                    break
-                                                if proxy_done_event.is_set():
-                                                    break
-                                                # If the proxy job already has an error, don't wait the full window.
-                                                try:
-                                                    if isinstance(proxy_job, dict) and proxy_job.get("error"):
-                                                        break
-                                                except Exception:
-                                                    pass
-                                                if (not warned_extended) and (time.monotonic() - started) >= float(
-                                                    grace_seconds
-                                                ):
-                                                    warned_extended = True
-                                                    debug_print(
-                                                        "⏳ Still 403 after grace window; waiting for proxy job completion..."
-                                                    )
-                                                yield ": keep-alive\n\n"
-                                                await asyncio.sleep(0.5)
-
-                                    # If the userscript proxy recovered (status changed after in-page retries),
-                                    # proceed to normal stream parsing below.
-                                    if response.status_code != HTTPStatus.FORBIDDEN:
-                                        pass
-                                    else:
-                                        retry_403_count += 1
-                                        if retry_403_count > 5:
-                                            error_chunk = {
-                                                "error": {
-                                                    "message": "Forbidden (403) from upstream. Retries exhausted.",
-                                                    "type": "forbidden_error",
-                                                    "code": HTTPStatus.FORBIDDEN,
-                                                }
-                                            }
-                                            yield f"data: {json.dumps(error_chunk)}\n\n"
-                                            yield "data: [DONE]\n\n"
-                                            return
-
-                                        body_text = ""
-                                        error_body = None
-                                        try:
-                                            body_bytes = await response.aread()
-                                            body_text = body_bytes.decode("utf-8", errors="replace")
-                                            error_body = json.loads(body_text)
-                                        except Exception:
-                                            error_body = None
-                                            # If it's not JSON, we'll use the body_text for keyword matching.
-
-                                        is_recaptcha_failure = False
-                                        try:
-                                            if (
-                                                isinstance(error_body, dict)
-                                                and error_body.get("error") == "recaptcha validation failed"
-                                            ):
-                                                is_recaptcha_failure = True
-                                            elif "recaptcha validation failed" in str(body_text).lower():
-                                                is_recaptcha_failure = True
-                                        except Exception:
-                                            is_recaptcha_failure = False
-
-                                        if transport_used == "userscript":
-                                            # The proxy is our only truly streaming browser transport. Prefer retrying
-                                            # it with a fresh in-page token mint over switching to buffered browser
-                                            # fetch fallbacks (which can stall SSE).
-                                            force_proxy_recaptcha_mint = True
-                                            if is_recaptcha_failure:
-                                                recaptcha_403_failures += 1
-                                                if recaptcha_403_failures >= 5:
-                                                    debug_print(
-                                                        "? Too many reCAPTCHA failures in userscript proxy. Failing fast."
-                                                    )
-                                                    error_chunk = {
-                                                        "error": {
-                                                            "message": (
-                                                                "Forbidden: reCAPTCHA validation failed repeatedly in userscript proxy."
-                                                            ),
-                                                            "type": "recaptcha_error",
-                                                            "code": HTTPStatus.FORBIDDEN,
-                                                        }
-                                                    }
-                                                    yield f"data: {json.dumps(error_chunk)}\n\n"
-                                                    yield "data: [DONE]\n\n"
-                                                    return
-
-                                            if isinstance(payload, dict):
-                                                payload["recaptchaV3Token"] = ""
-                                                payload.pop("recaptchaV2Token", None)
-
-                                            async for ka in wait_with_keepalive(1.5):
-                                                yield ka
-                                            continue
-
-                                        if is_recaptcha_failure:
-                                            # Track consecutive reCAPTCHA failures so we can escalate to browser
-                                            # transports even for non-strict models.
-                                            recaptcha_403_failures += 1
-                                            if recaptcha_403_last_transport == transport_used:
-                                                recaptcha_403_consecutive += 1
-                                            else:
-                                                recaptcha_403_consecutive = 1
-                                                recaptcha_403_last_transport = transport_used
-
-                                            if transport_used in ("chrome", "camoufox"):
-                                                try:
-                                                    debug_print(
-                                                        "Refreshing token/cookies (side-channel) after browser fetch 403..."
-                                                    )
-                                                    refresh_task = asyncio.create_task(
-                                                        refresh_recaptcha_token(force_new=True)
-                                                    )
-                                                    async for ka in wait_for_task(refresh_task):
-                                                        yield ka
-                                                    new_token = refresh_task.result()
-                                                except Exception:
-                                                    new_token = None
-                                                # Prefer reusing a fresh side-channel token on the next attempt; if we
-                                                # couldn't get one, fall back to in-page minting.
-                                                if isinstance(payload, dict):
-                                                    payload["recaptchaV3Token"] = new_token or ""
-                                            else:
-                                                debug_print("Refreshing token (side-channel)...")
-                                                try:
-                                                    refresh_task = asyncio.create_task(
-                                                        refresh_recaptcha_token(force_new=True)
-                                                    )
-                                                    async for ka in wait_for_task(refresh_task):
-                                                        yield ka
-                                                    new_token = refresh_task.result()
-                                                except Exception:
-                                                    new_token = None
-                                                if new_token and isinstance(payload, dict):
-                                                    payload["recaptchaV3Token"] = new_token
-
-                                            if recaptcha_403_consecutive >= 2 and transport_used == "chrome":
-                                                debug_print(
-                                                    "Switching to Camoufox-first after repeated Chrome reCAPTCHA failures."
-                                                )
-                                                use_browser_transports = True
-                                                prefer_chrome_transport = False
-                                                recaptcha_403_consecutive = 0
-                                                recaptcha_403_last_transport = None
-                                            elif recaptcha_403_consecutive >= 2 and transport_used != "chrome":
-                                                debug_print(
-                                                    "🌐 Switching to Chrome fetch transport after repeated reCAPTCHA failures."
-                                                )
-                                                use_browser_transports = True
-                                                prefer_chrome_transport = True
-                                                recaptcha_403_consecutive = 0
-                                                recaptcha_403_last_transport = None
-
-                                            async for ka in wait_with_keepalive(1.5):
-                                                yield ka
-                                            continue
-
-                                        # If 403 but not recaptcha, might be other auth issue, but let's retry anyway
-                                        async for ka in wait_with_keepalive(2.0):
-                                            yield ka
-                                        continue
-
-                                elif response.status_code == HTTPStatus.UNAUTHORIZED:
-                                    debug_print(f"🔒 Stream token expired")
-                                    # Add current token to failed set
-                                    failed_tokens.add(current_token)
-
-                                    # Best-effort: refresh the current base64 session in-memory before rotating.
-                                    refreshed_token: Optional[str] = None
-                                    if current_token:
-                                        try:
-                                            cfg_now = get_config()
-                                        except Exception:
-                                            cfg_now = {}
-                                        if not isinstance(cfg_now, dict):
-                                            cfg_now = {}
-                                        try:
-                                            refreshed_token = await refresh_arena_auth_token_via_lmarena_http(
-                                                current_token, cfg_now
-                                            )
-                                        except Exception:
-                                            refreshed_token = None
-                                        if not refreshed_token:
-                                            try:
-                                                refreshed_token = await refresh_arena_auth_token_via_supabase(current_token)
-                                            except Exception:
-                                                refreshed_token = None
-
-                                    if refreshed_token:
-                                        global EPHEMERAL_ARENA_AUTH_TOKEN
-                                        EPHEMERAL_ARENA_AUTH_TOKEN = refreshed_token
-                                        current_token = refreshed_token
-                                        headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                        # Ensure the next browser attempt mints a fresh token for the refreshed session.
-                                        if isinstance(payload, dict):
-                                            payload["recaptchaV3Token"] = ""
-                                        debug_print("🔄 Refreshed arena-auth-prod-v1 session after 401. Retrying...")
-                                        async for ka in wait_with_keepalive(1.0):
-                                            yield ka
-                                        continue
-                                    
-                                    try:
-                                        # Try with next available token (excluding failed ones)
-                                        current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                        headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                        debug_print(f"🔄 Retrying stream with next token: {current_token[:20]}...")
-                                        async for ka in wait_with_keepalive(1.0):
-                                            yield ka
-                                        continue
-                                    except HTTPException:
-                                        debug_print("No more tokens available for streaming request.")
-                                        error_chunk = {
-                                            "error": {
-                                                "message": (
-                                                    "Unauthorized: Your LMArena auth token has expired or is invalid. "
-                                                    "Please get a new auth token from the dashboard."
-                                                ),
-                                                "type": "authentication_error",
-                                                "code": HTTPStatus.UNAUTHORIZED,
-                                            }
-                                        }
-                                        yield f"data: {json.dumps(error_chunk)}\n\n"
-                                        yield "data: [DONE]\n\n"
-                                        return
-                                
-                                log_http_status(response.status_code, "Stream Connection")
-                                response.raise_for_status()
-                                
-                                # Wrapped iterator to yield keep-alives while waiting for upstream lines.
-                                # NOTE: Avoid asyncio.wait_for() here; cancelling __anext__ can break the iterator.
-                                async def _aiter_with_keepalive(it):
-                                    pending: Optional[asyncio.Task] = asyncio.create_task(it.__anext__())
-                                    try:
-                                        while True:
-                                            done, _ = await asyncio.wait({pending}, timeout=1.0)
-                                            if pending not in done:
-                                                yield None
-                                                continue
-                                            try:
-                                                item = pending.result()
-                                            except StopAsyncIteration:
-                                                break
-                                            pending = asyncio.create_task(it.__anext__())
-                                            yield item
-                                    finally:
-                                        if pending is not None and not pending.done():
-                                            pending.cancel()
-
-                                async for maybe_line in _aiter_with_keepalive(response.aiter_lines().__aiter__()):
-                                    if maybe_line is None:
-                                        yield ": keep-alive\n\n"
-                                        continue
-
-                                    line = str(maybe_line).strip()
-                                    # Normalize possible SSE framing (e.g. `data: a0:"..."`).
-                                    if line.startswith("data:"):
-                                        line = line[5:].lstrip()
-                                    if not line:
-                                        continue
-                                    
-                                    # Parse thinking/reasoning chunks: ag:"thinking text"
-                                    if line.startswith("ag:"):
-                                        chunk_data = line[3:]
-                                        try:
-                                            reasoning_chunk = json.loads(chunk_data)
-                                            reasoning_text += reasoning_chunk
-                                            
-                                            # Send SSE-formatted chunk with reasoning_content
-                                            chunk_response = {
-                                                "id": chunk_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": model_public_name,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {
-                                                        "reasoning_content": reasoning_chunk
-                                                    },
-                                                    "finish_reason": None
-                                                }]
-                                            }
-                                            yield f"data: {json.dumps(chunk_response)}\n\n"
-                                            
-                                        except json.JSONDecodeError:
-                                            continue
-                                    
-                                    # Parse text chunks: a0:"Hello "
-                                    elif line.startswith("a0:"):
-                                        chunk_data = line[3:]
-                                        try:
-                                            text_chunk = json.loads(chunk_data)
-                                            response_text += text_chunk
-                                            
-                                            # Send SSE-formatted chunk
-                                            chunk_response = {
-                                                "id": chunk_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": model_public_name,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {
-                                                        "content": text_chunk
-                                                    },
-                                                    "finish_reason": None
-                                                }]
-                                            }
-                                            yield f"data: {json.dumps(chunk_response)}\n\n"
-                                            
-                                        except json.JSONDecodeError:
-                                            continue
-                                    
-                                    # Parse image generation: a2:[{...}] (for image models)
-                                    elif line.startswith("a2:"):
-                                        image_data = line[3:]
-                                        try:
-                                            image_list = json.loads(image_data)
-                                            # OpenAI format: return URL in content
-                                            if isinstance(image_list, list) and len(image_list) > 0:
-                                                image_obj = image_list[0]
-                                                if image_obj.get('type') == 'image':
-                                                    image_url = image_obj.get('image', '')
-                                                    # Format as markdown for streaming
-                                                    response_text = f"![Generated Image]({image_url})"
-                                                    
-                                                    # Send the markdown-formatted image in a chunk
-                                                    chunk_response = {
-                                                        "id": chunk_id,
-                                                        "object": "chat.completion.chunk",
-                                                        "created": int(time.time()),
-                                                        "model": model_public_name,
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {
-                                                                "content": response_text
-                                                            },
-                                                            "finish_reason": None
-                                                        }]
-                                                    }
-                                                    yield f"data: {json.dumps(chunk_response)}\n\n"
-                                        except json.JSONDecodeError:
-                                            pass
-                                    
-                                    # Parse citations/tool calls: ac:{...} (for search models)
-                                    elif line.startswith("ac:"):
-                                        citation_data = line[3:]
-                                        try:
-                                            citation_obj = json.loads(citation_data)
-                                            # Extract source information from argsTextDelta
-                                            if 'argsTextDelta' in citation_obj:
-                                                args_data = json.loads(citation_obj['argsTextDelta'])
-                                                if 'source' in args_data:
-                                                    source = args_data['source']
-                                                    # Can be a single source or array of sources
-                                                    if isinstance(source, list):
-                                                        citations.extend(source)
-                                                    elif isinstance(source, dict):
-                                                        citations.append(source)
-                                            debug_print(f"  🔗 Citation added: {citation_obj.get('toolCallId')}")
-                                        except json.JSONDecodeError:
-                                            pass
-                                    
-                                    # Parse error messages
-                                    elif line.startswith("a3:"):
-                                        error_data = line[3:]
-                                        try:
-                                            error_message = json.loads(error_data)
-                                            print(f"  ❌ Error in stream: {error_message}")
-                                        except json.JSONDecodeError:
-                                            pass
-                                    
-                                    # Parse metadata for finish
-                                    elif line.startswith("ad:"):
-                                        metadata_data = line[3:]
-                                        try:
-                                            metadata = json.loads(metadata_data)
-                                            finish_reason = metadata.get("finishReason", "stop")
-                                            
-                                            # Send final chunk with finish_reason
-                                            final_chunk = {
-                                                "id": chunk_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": model_public_name,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {},
-                                                    "finish_reason": finish_reason
-                                                }]
-                                            }
-                                            yield f"data: {json.dumps(final_chunk)}\n\n"
-                                        except json.JSONDecodeError:
-                                            continue
-                                    
-                                    # Support for standard OpenAI-style JSON chunks (some proxies or new LMArena endpoints)
-                                    elif line.startswith("{"):
-                                        try:
-                                            chunk_obj = json.loads(line)
-                                            # If it looks like an OpenAI chunk, extract the delta content
-                                            if "choices" in chunk_obj and isinstance(chunk_obj["choices"], list) and len(chunk_obj["choices"]) > 0:
-                                                delta = chunk_obj["choices"][0].get("delta", {})
-                                                
-                                                # Handle thinking/reasoning
-                                                if "reasoning_content" in delta:
-                                                    r_chunk = str(delta["reasoning_content"] or "")
-                                                    reasoning_text += r_chunk
-                                                    chunk_response = {
-                                                        "id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_public_name,
-                                                        "choices": [{"index": 0, "delta": {"reasoning_content": r_chunk}, "finish_reason": None}]
-                                                    }
-                                                    yield f"data: {json.dumps(chunk_response)}\n\n"
-
-                                                # Handle text content
-                                                if "content" in delta:
-                                                    c_chunk = str(delta["content"] or "")
-                                                    response_text += c_chunk
-                                                    chunk_response = {
-                                                        "id": chunk_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_public_name,
-                                                        "choices": [{"index": 0, "delta": {"content": c_chunk}, "finish_reason": None}]
-                                                    }
-                                                    yield f"data: {json.dumps(chunk_response)}\n\n"
-                                        except Exception:
-                                            pass
-
-                                    else:
-                                        # Capture a small preview of unhandled upstream lines for troubleshooting.
-                                        if len(unhandled_preview) < 5:
-                                            unhandled_preview.append(line)
-                                        continue
-                            
-                            # If we got no usable deltas, treat it as an upstream failure and retry.
-                            if (not response_text.strip()) and (not reasoning_text.strip()) and (not citations):
-                                upstream_hint: Optional[str] = None
-                                proxy_status: Optional[int] = None
-                                proxy_headers: Optional[dict] = None
-                                if transport_used == "userscript":
-                                    try:
-                                        proxy_job_id = str(getattr(stream_context, "job_id", "") or "").strip()
-                                        proxy_job = _USERSCRIPT_PROXY_JOBS.get(proxy_job_id)
-                                        if isinstance(proxy_job, dict):
-                                            if proxy_job.get("error"):
-                                                upstream_hint = str(proxy_job.get("error") or "")
-                                            status = proxy_job.get("status_code")
-                                            headers = proxy_job.get("headers")
-                                            if isinstance(headers, dict):
-                                                proxy_headers = headers
-                                            if isinstance(status, int) and int(status) >= 400:
-                                                proxy_status = int(status)
-                                                upstream_hint = upstream_hint or f"Userscript proxy upstream HTTP {int(status)}"
-                                    except Exception:
-                                        pass
-
-                                if not upstream_hint and unhandled_preview:
-                                    # Common case: upstream returns a JSON error body (not a0:/ad: lines).
-                                    try:
-                                        obj = json.loads(unhandled_preview[0])
-                                        if isinstance(obj, dict):
-                                            upstream_hint = str(obj.get("error") or obj.get("message") or "")
-                                    except Exception:
-                                        pass
-                                    
-                                    if not upstream_hint:
-                                        upstream_hint = unhandled_preview[0][:500]
-
-                                debug_print(f"⚠️ Stream produced no content deltas (transport={transport_used}, attempt {attempt}). Retrying...")
-                                if upstream_hint:
-                                    debug_print(f"   Upstream hint: {upstream_hint[:200]}")
-                                    if "recaptcha" in upstream_hint.lower():
-                                        recaptcha_403_failures += 1
-                                        if recaptcha_403_failures >= 5:
-                                            debug_print("❌ Too many reCAPTCHA failures (detected in body). Failing fast.")
-                                            error_chunk = {
-                                                "error": {
-                                                    "message": f"Forbidden: reCAPTCHA validation failed. Upstream hint: {upstream_hint[:200]}",
-                                                    "type": "recaptcha_error",
-                                                    "code": HTTPStatus.FORBIDDEN,
-                                                }
-                                            }
-                                            yield f"data: {json.dumps(error_chunk)}\n\n"
-                                            yield "data: [DONE]\n\n"
-                                            return
-                                elif unhandled_preview:
-                                    debug_print(f"   Upstream preview: {unhandled_preview[0][:200]}")
-                                
-                                no_delta_failures += 1
-                                if no_delta_failures >= 10:
-                                    debug_print("❌ Too many attempts with no content produced. Failing fast.")
-                                    error_chunk = {
-                                        "error": {
-                                            "message": f"Upstream failure: The request produced no content after multiple retries. Last hint: {upstream_hint[:200] if upstream_hint else 'None'}",
-                                            "type": "upstream_error",
-                                            "code": HTTPStatus.BAD_GATEWAY,
-                                        }
-                                    }
-                                    yield f"data: {json.dumps(error_chunk)}\n\n"
-                                    yield "data: [DONE]\n\n"
-                                    return
-
-                                # If the userscript proxy actually returned an upstream HTTP error, don't spin forever
-                                # sending keep-alives: treat them as the equivalent upstream status and fall back.
-                                if transport_used == "userscript" and proxy_status in (
-                                    HTTPStatus.UNAUTHORIZED,
-                                    HTTPStatus.FORBIDDEN,
-                                ):
-                                    # Mirror the regular 401/403 handling, but based on the proxy job status instead
-                                    # of `response.status_code` (which can be stale for userscript jobs).
-                                    if proxy_status == HTTPStatus.UNAUTHORIZED:
-                                        debug_print("🔒 Userscript proxy upstream 401. Rotating auth token...")
-                                        failed_tokens.add(current_token)
-                                        # (Pruning disabled)
-
-                                        try:
-                                            current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                            headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                        except HTTPException:
-                                            error_chunk = {
-                                                "error": {
-                                                    "message": (
-                                                        "Unauthorized: Your LMArena auth token has expired or is invalid. "
-                                                        "Please get a new auth token from the dashboard."
-                                                    ),
-                                                    "type": "authentication_error",
-                                                    "code": HTTPStatus.UNAUTHORIZED,
-                                                }
-                                            }
-                                            yield f"data: {json.dumps(error_chunk)}\n\n"
-                                            yield "data: [DONE]\n\n"
-                                            return
-
-                                    if proxy_status == HTTPStatus.FORBIDDEN:
-                                        recaptcha_403_failures += 1
-                                        if recaptcha_403_failures >= 5:
-                                            debug_print("❌ Too many reCAPTCHA failures in userscript proxy. Failing fast.")
-                                            error_chunk = {
-                                                "error": {
-                                                    "message": "Forbidden: reCAPTCHA validation failed repeatedly in userscript proxy.",
-                                                    "type": "recaptcha_error",
-                                                    "code": HTTPStatus.FORBIDDEN,
-                                                }
-                                            }
-                                            yield f"data: {json.dumps(error_chunk)}\n\n"
-                                            yield "data: [DONE]\n\n"
-                                            return
-
-                                        # Common case: the proxy session gets flagged (reCAPTCHA). Retry with a fresh
-                                        # in-page token mint rather than switching to buffered browser fetch fallbacks.
-                                        force_proxy_recaptcha_mint = True
-                                        debug_print("🚫 Userscript proxy upstream 403: retrying userscript (fresh reCAPTCHA).")
-                                        if isinstance(payload, dict):
-                                            payload["recaptchaV3Token"] = ""
-                                            payload.pop("recaptchaV2Token", None)
-
-                                    yield ": keep-alive\n\n"
-                                    continue
-
-                                # If the proxy upstream is rate-limited, respect Retry-After/backoff.
-                                if transport_used == "userscript" and proxy_status == HTTPStatus.TOO_MANY_REQUESTS:
-                                    retry_after = None
-                                    if isinstance(proxy_headers, dict):
-                                        retry_after = proxy_headers.get("retry-after") or proxy_headers.get("Retry-After")
-                                    retry_after_value = 0.0
-                                    if isinstance(retry_after, str):
-                                        try:
-                                            retry_after_value = float(retry_after.strip())
-                                        except Exception:
-                                            retry_after_value = 0.0
-                                    sleep_seconds = get_rate_limit_sleep_seconds(retry_after, attempt)
-                                    debug_print(f"⏱️  Userscript proxy upstream 429. Waiting {sleep_seconds}s...")
-                                    
-                                    # Rotate token on userscript rate limit too.
-                                    old_token = current_token
-                                    token_rotated = False
-                                    try:
-                                        rotation_exclude = set(failed_tokens)
-                                        if current_token:
-                                            rotation_exclude.add(current_token)
-                                        current_token = get_next_auth_token(
-                                            exclude_tokens=rotation_exclude, allow_ephemeral_fallback=False
-                                        )
-                                        headers = get_request_headers_with_token(current_token, recaptcha_token)
-                                        token_rotated = True
-                                        debug_print(f"🔄 Retrying stream with next token (after proxy 429): {current_token[:20]}...")
-                                    except HTTPException:
-                                        # Only one token (or all tokens excluded). Keep the current token and retry
-                                        # after backoff instead of failing fast.
-                                        debug_print(
-                                            "⚠️ No alternative token available after userscript proxy rate limit; retrying with same token after backoff."
-                                        )
-
-                                    # reCAPTCHA v3 tokens can be single-use and may expire while we back off.
-                                    # Clear it so the next proxy attempt mints a fresh token in-page.
-                                    if isinstance(payload, dict):
-                                        payload["recaptchaV3Token"] = ""
-
-                                    # If we rotated tokens, allow a fast retry when waiting would blow past the remaining
-                                    # stream deadline (common when one token is rate-limited but another isn't).
-                                    if token_rotated and current_token and current_token != old_token:
-                                        remaining_budget = float(stream_total_timeout_seconds) - float(
-                                            time.monotonic() - stream_started_at
-                                        )
-                                        if float(sleep_seconds) > max(0.0, remaining_budget):
-                                            sleep_seconds = min(float(sleep_seconds), 1.0)
-
-                                    # If we still can't wait within the remaining deadline, fail now instead of sending
-                                    # keep-alives indefinitely.
-                                    if (time.monotonic() - stream_started_at + float(sleep_seconds)) > stream_total_timeout_seconds:
-                                        error_chunk = {
-                                            "error": {
-                                                "message": f"Upstream rate limit (429) would exceed stream deadline ({int(sleep_seconds)}s backoff).",
-                                                "type": "rate_limit_error",
-                                                "code": HTTPStatus.TOO_MANY_REQUESTS,
-                                            }
-                                        }
-                                        yield f"data: {json.dumps(error_chunk)}\n\n"
-                                        yield "data: [DONE]\n\n"
-                                        return
-
-                                    async for ka in wait_with_keepalive(sleep_seconds):
-                                        yield ka
-                                else:
-                                    # New-session create-evaluation retries must use fresh IDs. Reusing IDs after an
-                                    # upstream no-delta/error response can trigger 400 duplicate/invalid request errors.
-                                    if (
-                                        (not session)
-                                        and isinstance(payload, dict)
-                                        and http_method.upper() == "POST"
-                                        and STREAM_CREATE_EVALUATION_PATH in url
-                                    ):
-                                        session_id = str(uuid7())
-                                        user_msg_id = str(uuid7())
-                                        model_msg_id = str(uuid7())
-                                        model_b_msg_id = str(uuid7())
-                                        payload["id"] = session_id
-                                        payload["userMessageId"] = user_msg_id
-                                        payload["modelAMessageId"] = model_msg_id
-                                        payload["modelBMessageId"] = model_b_msg_id
-                                        debug_print("🔁 Retrying create-evaluation with fresh session/message IDs.")
-                                    async for ka in wait_with_keepalive(1.5):
-                                        yield ka
-                                continue
-
-                            # Update session - Store message history with IDs (including reasoning and citations if present)
-                            assistant_message = {
-                                "id": model_msg_id, 
-                                "role": "assistant", 
-                                "content": response_text.strip()
-                            }
-                            if reasoning_text:
-                                assistant_message["reasoning_content"] = reasoning_text.strip()
-                            if citations:
-                                # Deduplicate citations by URL
-                                unique_citations = []
-                                seen_urls = set()
-                                for citation in citations:
-                                    citation_url = citation.get('url')
-                                    if citation_url and citation_url not in seen_urls:
-                                        seen_urls.add(citation_url)
-                                        unique_citations.append(citation)
-                                assistant_message["citations"] = unique_citations
-                            
-                            if not session:
-                                chat_sessions[api_key_str][conversation_id] = {
-                                    "conversation_id": session_id,
-                                    "model": model_public_name,
-                                    "messages": [
-                                        {"id": user_msg_id, "role": "user", "content": prompt},
-                                        assistant_message
-                                    ]
-                                }
-                                debug_print(f"💾 Saved new session for conversation {conversation_id}")
-                            else:
-                                # Append new messages to history
-                                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    {"id": user_msg_id, "role": "user", "content": prompt}
-                                )
-                                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                                    assistant_message
-                                )
-                                debug_print(f"💾 Updated existing session for conversation {conversation_id}")
-                            
-                            yield "data: [DONE]\n\n"
-                            debug_print(f"✅ Stream completed - {len(response_text)} chars sent")
-                            return  # Success, exit retry loop
-                                
-                    except asyncio.CancelledError:
-                        # Client disconnected or server shutdown. Avoid leaking proxy jobs or surfacing noisy uvicorn
-                        # "response not completed" warnings on cancellation.
-                        try:
-                            if transport_used == "userscript":
-                                jid = str(getattr(stream_context, "job_id", "") or "").strip()
-                                if jid:
-                                    await _finalize_userscript_proxy_job(jid, error="client disconnected", remove=True)
-                        except Exception:
-                            pass
-                        return
-                    except httpx.HTTPStatusError as e:
-                        # Handle retry-able errors
-                        if e.response.status_code == 429:
-                            current_retry_attempt += 1
-                            if current_retry_attempt > max_retries:
-                                error_msg = "LMArena API error 429: Too many requests. Max retries exceeded. Terminating stream."
-                                debug_print(f"❌ {error_msg}")
-                                error_chunk = {
-                                    "error": {
-                                        "message": error_msg,
-                                        "type": "api_error",
-                                        "code": e.response.status_code,
-                                    }
-                                }
-                                yield f"data: {json.dumps(error_chunk)}\n\n"
-                                yield "data: [DONE]\n\n"
-                                return
-
-                            retry_after_header = e.response.headers.get("Retry-After")
-                            sleep_seconds = get_rate_limit_sleep_seconds(
-                                retry_after_header, current_retry_attempt
-                            )
-                            debug_print(
-                                f"⏱️ LMArena API returned 429 (Too Many Requests). "
-                                f"Retrying in {sleep_seconds} seconds (attempt {current_retry_attempt}/{max_retries})."
-                            )
-                            async for ka in wait_with_keepalive(sleep_seconds):
-                                yield ka
-                            continue # Continue to the next iteration of the while True loop
-                        elif e.response.status_code == 403:
-                            current_retry_attempt += 1
-                            if current_retry_attempt > max_retries:
-                                error_msg = "LMArena API error 403: Forbidden. Max retries exceeded. Terminating stream."
-                                debug_print(f"❌ {error_msg}")
-                                error_chunk = {
-                                    "error": {
-                                        "message": error_msg,
-                                        "type": "api_error",
-                                        "code": e.response.status_code,
-                                    }
-                                }
-                                yield f"data: {json.dumps(error_chunk)}\n\n"
-                                yield "data: [DONE]\n\n"
-                                return
-                            
-                            debug_print(
-                                f"🚫 LMArena API returned 403 (Forbidden). "
-                                f"Retrying with exponential backoff (attempt {current_retry_attempt}/{max_retries})."
-                            )
-                            sleep_seconds = get_general_backoff_seconds(current_retry_attempt)
-                            async for ka in wait_with_keepalive(sleep_seconds):
-                                yield ka
-                            continue # Continue to the next iteration of the while True loop
-                        elif e.response.status_code == 401:
-                            # Existing 401 handling (token rotation) will implicitly use the retry loop.
-                            # We need to ensure max_retries applies here too.
-                            current_retry_attempt += 1
-                            if current_retry_attempt > max_retries:
-                                error_msg = "LMArena API error 401: Unauthorized. Max retries exceeded. Terminating stream."
-                                debug_print(f"❌ {error_msg}")
-                                error_chunk = {
-                                    "error": {
-                                        "message": error_msg,
-                                        "type": "api_error",
-                                        "code": e.response.status_code,
-                                    }
-                                }
-                                yield f"data: {json.dumps(error_chunk)}\n\n"
-                                yield "data: [DONE]\n\n"
-                                return
-                            # The original code has `continue` here, which leads to `async for ka in wait_with_keepalive(2.0): yield ka`.
-                            # This is fine for 401 to allow token rotation and retry.
-                            async for ka in wait_with_keepalive(2.0):
-                                yield ka
-                            continue
-                        else:
-                            # Provide user-friendly error messages for non-retryable errors
-                            try:
-                                body_text = ""
-                                try:
-                                    raw = await e.response.aread()
-                                    if isinstance(raw, (bytes, bytearray)):
-                                        body_text = raw.decode("utf-8", errors="replace")
-                                    else:
-                                        body_text = str(raw)
-                                except Exception:
-                                    body_text = ""
-                                body_text = str(body_text or "").strip()
-                                if body_text:
-                                    preview = body_text[:800]
-                                    error_msg = f"LMArena API error {e.response.status_code}: {preview}"
-                                else:
-                                    error_msg = f"LMArena API error: {e.response.status_code}"
-                            except Exception:
-                                error_msg = f"LMArena API error: {e.response.status_code}"
-                            
-                            error_type = "api_error"
-                            
-                            debug_print(f"❌ {error_msg}")
-                            error_chunk = {
-                                "error": {
-                                    "message": error_msg,
-                                    "type": error_type,
-                                    "code": e.response.status_code
-                                }
-                            }
-                            yield f"data: {json.dumps(error_chunk)}\n\n"
-                            yield "data: [DONE]\n\n"
-                            return
-                    except Exception as e:
-                        debug_print(f"❌ Stream error: {str(e)}")
-                        # If it's a connection error, we might want to retry indefinitely too? 
-                        # For now, let's treat generic exceptions as transient if possible, or just fail safely.
-                        # Given "until real content deltas arrive", we should probably be aggressive with retries.
-                        # But legitimate internal errors should probably surface.
-                        # Let's retry on network-like errors if we can distinguish them.
-                        # For now, yield error.
-                        error_chunk = {
-                            "error": {
-                                "message": str(e),
-                                "type": "internal_error"
-                            }
-                        }
-                        yield f"data: {json.dumps(error_chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-            return StreamingResponse(generate_stream(), media_type="text/event-stream")
-        
-        # Handle non-streaming mode with retry
-        try:
-            response = None
-            if time.time() - last_userscript_poll < 15:
-                debug_print(f"🌐 Userscript Proxy is ACTIVE. Delegating non-streaming request...")
-                response = await fetch_via_proxy_queue(
-                    url=url,
-                    payload=payload if isinstance(payload, dict) else {},
-                    http_method=http_method,
-                    timeout_seconds=120,
-                    auth_token=current_token,
-                )
-                if response:
-                    # Raise for status to trigger the standard error handling block below if needed
-                    response.raise_for_status()
-                else:
-                    debug_print("⚠️ Userscript Proxy returned None. Falling back...")
-
-            if response is None:
-                if strict_chrome_fetch_model or force_browser_transports_in_stream:
-                    debug_print(f"🌐 Using Chrome fetch transport for non-streaming strict model ({model_public_name})...")
-                    # Chrome fetch transport has its own internal reCAPTCHA retries, 
-                    # but we add an outer loop here to handle token rotation (401) and rate limits (429).
-                    max_chrome_retries = 3
-                    for chrome_attempt in range(max_chrome_retries):
-                        response = await fetch_lmarena_stream_via_chrome(
-                            http_method=http_method,
-                            url=url,
-                            payload=payload if isinstance(payload, dict) else {},
-                            auth_token=current_token,
-                            timeout_seconds=120,
-                        )
-                        
-                        if response is None:
-                            debug_print(f"⚠️ Chrome fetch transport failed (attempt {chrome_attempt+1}). Trying Camoufox...")
-                            response = await fetch_lmarena_stream_via_camoufox(
-                                http_method=http_method,
-                                url=url,
-                                payload=payload if isinstance(payload, dict) else {},
-                                auth_token=current_token,
-                                timeout_seconds=120,
-                            )
-                            if response is None:
-                                break # Critical error
-                        
-                        if response.status_code == HTTPStatus.UNAUTHORIZED:
-                            debug_print(f"🔒 Token {current_token[:20]}... expired in Chrome fetch (attempt {chrome_attempt+1})")
-                            failed_tokens.add(current_token)
-                            # (Pruning disabled)
-                            if chrome_attempt < max_chrome_retries - 1:
-                                try:
-                                    current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                    debug_print(f"🔄 Rotating to next token: {current_token[:20]}...")
-                                    continue
-                                except HTTPException:
-                                    break
-                        elif response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-                            debug_print(f"⏱️  Rate limit in Chrome fetch (attempt {chrome_attempt+1})")
-                            if chrome_attempt < max_chrome_retries - 1:
-                                sleep_seconds = get_rate_limit_sleep_seconds(response.headers.get("Retry-After"), chrome_attempt)
-                                await asyncio.sleep(sleep_seconds)
-                                continue
-                        
-                        # If success or non-retryable error, break and use this response
-                        break
-                else:
-                    response = await make_request_with_retry(url, payload, http_method)
-            
-            if response is None:
-                debug_print("⚠️ Browser transports returned None; falling back to direct httpx.")
-                response = await make_request_with_retry(url, payload, http_method)
-
-            if response is None:
-                raise HTTPException(
-                    status_code=502,
-                    detail="Failed to fetch response from LMArena (transport returned None)",
-                )
-                
-            log_http_status(response.status_code, "LMArena API Response")
-            
-            # Use aread() to ensure we buffer streaming-capable responses (like BrowserFetchStreamResponse)
-            response_bytes = await response.aread()
-            response_text_body = response_bytes.decode("utf-8", errors="replace")
-            
-            debug_print(f"📏 Response length: {len(response_text_body)} characters")
-            debug_print(f"📋 Response headers: {dict(response.headers)}")
-            
-            debug_print(f"🔍 Processing response...")
-            debug_print(f"📄 First 500 chars of response:\n{response_text_body[:500]}")
-            
-            # Process response in lmarena format
-            # Format: ag:"thinking" for reasoning, a0:"text chunk" for content, ac:{...} for citations, ad:{...} for metadata
-            response_text = ""
-            reasoning_text = ""
-            citations = []
-            finish_reason = None
-            line_count = 0
-            text_chunks_found = 0
-            reasoning_chunks_found = 0
-            citation_chunks_found = 0
-            metadata_found = 0
-            
-            debug_print(f"📊 Parsing response lines...")
-            
-            error_message = None
-            for line in response_text_body.splitlines():
-                line_count += 1
-                line = line.strip()
-                if line.startswith("data: "):
-                    line = line[6:].strip()
-                if not line:
-                    continue
-                
-                # Parse thinking/reasoning chunks: ag:"thinking text"
-                if line.startswith("ag:"):
-                    chunk_data = line[3:]  # Remove "ag:" prefix
-                    reasoning_chunks_found += 1
-                    try:
-                        # Parse as JSON string (includes quotes)
-                        reasoning_chunk = json.loads(chunk_data)
-                        reasoning_text += reasoning_chunk
-                        if reasoning_chunks_found <= 3:  # Log first 3 reasoning chunks
-                            debug_print(f"  🧠 Reasoning chunk {reasoning_chunks_found}: {repr(reasoning_chunk[:50])}")
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse reasoning chunk on line {line_count}: {chunk_data[:100]} - {e}")
-                        continue
-                
-                # Parse text chunks: a0:"Hello "
-                elif line.startswith("a0:"):
-                    chunk_data = line[3:]  # Remove "a0:" prefix
-                    text_chunks_found += 1
-                    try:
-                        # Parse as JSON string (includes quotes)
-                        text_chunk = json.loads(chunk_data)
-                        response_text += text_chunk
-                        if text_chunks_found <= 3:  # Log first 3 chunks
-                            debug_print(f"  ✅ Chunk {text_chunks_found}: {repr(text_chunk[:50])}")
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse text chunk on line {line_count}: {chunk_data[:100]} - {e}")
-                        continue
-                
-                # Parse image generation: a2:[{...}] (for image models)
-                elif line.startswith("a2:"):
-                    image_data = line[3:]  # Remove "a2:" prefix
-                    try:
-                        image_list = json.loads(image_data)
-                        # OpenAI format expects URL in content
-                        if isinstance(image_list, list) and len(image_list) > 0:
-                            image_obj = image_list[0]
-                            if image_obj.get('type') == 'image':
-                                image_url = image_obj.get('image', '')
-                                # Format as markdown
-                                response_text = f"![Generated Image]({image_url})"
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse image data on line {line_count}: {image_data[:100]} - {e}")
-                        continue
-                
-                # Parse citations/tool calls: ac:{...} (for search models)
-                elif line.startswith("ac:"):
-                    citation_data = line[3:]  # Remove "ac:" prefix
-                    citation_chunks_found += 1
-                    try:
-                        citation_obj = json.loads(citation_data)
-                        # Extract source information from argsTextDelta
-                        if 'argsTextDelta' in citation_obj:
-                            args_data = json.loads(citation_obj['argsTextDelta'])
-                            if 'source' in args_data:
-                                source = args_data['source']
-                                # Can be a single source or array of sources
-                                if isinstance(source, list):
-                                    citations.extend(source)
-                                elif isinstance(source, dict):
-                                    citations.append(source)
-                        if citation_chunks_found <= 3:  # Log first 3 citations
-                            debug_print(f"  🔗 Citation chunk {citation_chunks_found}: {citation_obj.get('toolCallId')}")
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse citation chunk on line {line_count}: {citation_data[:100]} - {e}")
-                        continue
-                
-                # Parse error messages: a3:"An error occurred"
-                elif line.startswith("a3:"):
-                    error_data = line[3:]  # Remove "a3:" prefix
-                    try:
-                        error_message = json.loads(error_data)
-                        debug_print(f"  ❌ Error message received: {error_message}")
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse error message on line {line_count}: {error_data[:100]} - {e}")
-                        error_message = error_data
-                
-                # Parse metadata: ad:{"finishReason":"stop"}
-                elif line.startswith("ad:"):
-                    metadata_data = line[3:]  # Remove "ad:" prefix
-                    metadata_found += 1
-                    try:
-                        metadata = json.loads(metadata_data)
-                        finish_reason = metadata.get("finishReason")
-                        debug_print(f"  📋 Metadata found: finishReason={finish_reason}")
-                    except json.JSONDecodeError as e:
-                        debug_print(f"  ⚠️ Failed to parse metadata on line {line_count}: {metadata_data[:100]} - {e}")
-                        continue
-                elif line.strip():  # Non-empty line that doesn't match expected format
-                    if line_count <= 5:  # Log first 5 unexpected lines
-                        debug_print(f"  ❓ Unexpected line format {line_count}: {line[:100]}")
-
-            debug_print(f"\n📊 Parsing Summary:")
-            debug_print(f"  - Total lines: {line_count}")
-            debug_print(f"  - Reasoning chunks found: {reasoning_chunks_found}")
-            debug_print(f"  - Text chunks found: {text_chunks_found}")
-            debug_print(f"  - Citation chunks found: {citation_chunks_found}")
-            debug_print(f"  - Metadata entries: {metadata_found}")
-            debug_print(f"  - Final response length: {len(response_text)} chars")
-            debug_print(f"  - Final reasoning length: {len(reasoning_text)} chars")
-            debug_print(f"  - Citations found: {len(citations)}")
-            debug_print(f"  - Finish reason: {finish_reason}")
-            
-            if not response_text:
-                debug_print(f"\n⚠️  WARNING: Empty response text!")
-                debug_print(f"📄 Full raw response:\n{response_text_body}")
-                if error_message:
-                    error_detail = f"LMArena API error: {error_message}"
-                    print(f"❌ {error_detail}")
-                    # Return OpenAI-compatible error response
-                    return {
-                        "error": {
-                            "message": error_detail,
-                            "type": "upstream_error",
-                            "code": "lmarena_error"
-                        }
-                    }
-                else:
-                    error_detail = "LMArena API returned empty response. This could be due to: invalid auth token, expired cf_clearance, model unavailable, or API rate limiting."
-                    debug_print(f"❌ {error_detail}")
-                    # Return OpenAI-compatible error response
-                    return {
-                        "error": {
-                            "message": error_detail,
-                            "type": "upstream_error",
-                            "code": "empty_response"
-                        }
-                    }
-            else:
-                debug_print(f"✅ Response text preview: {response_text[:200]}...")
-            
-            # Update session - Store message history with IDs (including reasoning and citations if present)
-            assistant_message = {
-                "id": model_msg_id, 
-                "role": "assistant", 
-                "content": response_text.strip()
-            }
-            if reasoning_text:
-                assistant_message["reasoning_content"] = reasoning_text.strip()
-            if citations:
-                # Deduplicate citations by URL
-                unique_citations = []
-                seen_urls = set()
-                for citation in citations:
-                    citation_url = citation.get('url')
-                    if citation_url and citation_url not in seen_urls:
-                        seen_urls.add(citation_url)
-                        unique_citations.append(citation)
-                assistant_message["citations"] = unique_citations
-            
-            if not session:
-                chat_sessions[api_key_str][conversation_id] = {
-                    "conversation_id": session_id,
-                    "model": model_public_name,
-                    "messages": [
-                        {"id": user_msg_id, "role": "user", "content": prompt},
-                        assistant_message
-                    ]
-                }
-                debug_print(f"💾 Saved new session for conversation {conversation_id}")
-            else:
-                # Append new messages to history
-                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                    {"id": user_msg_id, "role": "user", "content": prompt}
-                )
-                chat_sessions[api_key_str][conversation_id]["messages"].append(
-                    assistant_message
-                )
-                debug_print(f"💾 Updated existing session for conversation {conversation_id}")
-
-            # Build message object with reasoning and citations if present
-            message_obj = {
-                "role": "assistant",
-                "content": response_text.strip(),
-            }
-            if reasoning_text:
-                message_obj["reasoning_content"] = reasoning_text.strip()
-            if citations:
-                # Deduplicate citations by URL
-                unique_citations = []
-                seen_urls = set()
-                for citation in citations:
-                    citation_url = citation.get('url')
-                    if citation_url and citation_url not in seen_urls:
-                        seen_urls.add(citation_url)
-                        unique_citations.append(citation)
-                message_obj["citations"] = unique_citations
-                
-                # Add citations as markdown footnotes
-                if unique_citations:
-                    footnotes = "\n\n---\n\n**Sources:**\n\n"
-                    for i, citation in enumerate(unique_citations, 1):
-                        title = citation.get('title', 'Untitled')
-                        url = citation.get('url', '')
-                        footnotes += f"{i}. [{title}]({url})\n"
-                    message_obj["content"] = response_text.strip() + footnotes
-            
-            # Image models already have markdown formatting from parsing
-            # No additional conversion needed
-            
-            # Calculate token counts (including reasoning tokens)
-            prompt_tokens = len(prompt)
-            completion_tokens = len(response_text)
-            reasoning_tokens = len(reasoning_text)
-            total_tokens = prompt_tokens + completion_tokens + reasoning_tokens
-            
-            # Build usage object with reasoning tokens if present
-            usage_obj = {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens
-            }
-            if reasoning_tokens > 0:
-                usage_obj["reasoning_tokens"] = reasoning_tokens
-            
-            final_response = {
-                "id": f"chatcmpl-{uuid.uuid4()}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model_public_name,
-                "conversation_id": conversation_id,
-                "choices": [{
-                    "index": 0,
-                    "message": message_obj,
-                    "finish_reason": "stop"
-                }],
-                "usage": usage_obj
-            }
-            
-            debug_print(f"\n✅ REQUEST COMPLETED SUCCESSFULLY")
-            debug_print("="*80 + "\n")
-            
-            return final_response
-
-        except httpx.HTTPStatusError as e:
-            # Log error status
-            log_http_status(e.response.status_code, "Error Response")
-            
-            # Try to parse JSON error response from LMArena
-            lmarena_error = None
-            try:
-                error_body = e.response.json()
-                if isinstance(error_body, dict) and "error" in error_body:
-                    lmarena_error = error_body["error"]
-                    debug_print(f"📛 LMArena error message: {lmarena_error}")
-            except:
-                pass
-            
-            # Provide user-friendly error messages
-            if e.response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-                error_detail = "Rate limit exceeded on LMArena. Please try again in a few moments."
-                error_type = "rate_limit_error"
-            elif e.response.status_code == HTTPStatus.UNAUTHORIZED:
-                error_detail = "Unauthorized: Your LMArena auth token has expired or is invalid. Please get a new auth token from the dashboard."
-                error_type = "authentication_error"
-            elif e.response.status_code == HTTPStatus.FORBIDDEN:
-                error_detail = f"Forbidden: Access to this resource is denied. {e.response.text}"
-                error_type = "forbidden_error"
-            elif e.response.status_code == HTTPStatus.NOT_FOUND:
-                error_detail = "Not Found: The requested resource doesn't exist."
-                error_type = "not_found_error"
-            elif e.response.status_code == HTTPStatus.BAD_REQUEST:
-                # Use LMArena's error message if available
-                if lmarena_error:
-                    error_detail = f"Bad Request: {lmarena_error}"
-                else:
-                    error_detail = f"Bad Request: Invalid request parameters. {e.response.text}"
-                error_type = "bad_request_error"
-            elif e.response.status_code >= 500:
-                error_detail = f"Server Error: LMArena API returned {e.response.status_code}"
-                error_type = "server_error"
-            else:
-                error_detail = f"LMArena API error {e.response.status_code}: {e.response.text}"
-                error_type = "upstream_error"
-            
-            print(f"\n❌ HTTP STATUS ERROR")
-            print(f"📛 Error detail: {error_detail}")
-            print(f"📤 Request URL: {url}")
-            debug_print(f"📤 Request payload (truncated): {json.dumps(payload, indent=2)[:500]}")
-            debug_print(f"📥 Response text: {e.response.text[:500]}")
-            print("="*80 + "\n")
-            
-            # Return OpenAI-compatible error response
-            return {
-                "error": {
-                    "message": error_detail,
-                    "type": error_type,
-                    "code": f"http_{e.response.status_code}"
-                }
-            }
-        
-        except httpx.TimeoutException as e:
-            print(f"\n⏱️  TIMEOUT ERROR")
-            print(f"📛 Request timed out after 120 seconds")
-            print(f"📤 Request URL: {url}")
-            print("="*80 + "\n")
-            # Return OpenAI-compatible error response
-            return {
-                "error": {
-                    "message": "Request to LMArena API timed out after 120 seconds",
-                    "type": "timeout_error",
-                    "code": "request_timeout"
-                }
-            }
-        
-        except Exception as e:
-            print(f"\n❌ UNEXPECTED ERROR IN HTTP CLIENT")
-            print(f"📛 Error type: {type(e).__name__}")
-            print(f"📛 Error message: {str(e)}")
-            print(f"📤 Request URL: {url}")
-            print("="*80 + "\n")
-            # Return OpenAI-compatible error response
-            return {
-                "error": {
-                    "message": f"Unexpected error: {str(e)}",
-                    "type": "internal_error",
-                    "code": type(e).__name__.lower()
-                }
-            }
-                
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"\n❌ TOP-LEVEL EXCEPTION")
-
-
-# Anthropic API Models
-from pydantic import BaseModel
-from typing import Any
-
-class AnthropicMessageRequest(BaseModel):
-    model: str
-    messages: List[Dict[str, Any]]
-    max_tokens: int
-    system: Optional[str] = None
-    temperature: Optional[float] = None
-    stream: Optional[bool] = False
-
-
-@app.post("/api/v1/messages")
-async def anthropic_messages(request: AnthropicMessageRequest, raw_request: Request, api_key: dict = Depends(rate_limit_api_key)):
-    """
-    Anthropic Messages API endpoint.
-    Translates Anthropic-style requests to OpenAI-style and processes through LMArena.
-    """
-    debug_print("\n" + "="*80)
-    debug_print("🟣 ANTHROPIC MESSAGES REQUEST RECEIVED")
-    debug_print("="*80)
-    debug_print(f"🤖 Model: {request.model}")
-    debug_print(f"💬 Messages: {len(request.messages)}")
-    debug_print(f"🌊 Stream: {request.stream}")
-
-    # Convert Anthropic messages to OpenAI format
-    openai_messages = []
-    for msg in request.messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            # Handle content blocks
-            text_parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-            content = "\n".join(text_parts)
-        openai_messages.append({"role": role, "content": content})
-
-    # Add system message if present
-    if request.system:
-        openai_messages.insert(0, {"role": "system", "content": request.system})
-
-    # Build OpenAI-style request body
-    openai_body = {
-        "model": request.model,
-        "messages": openai_messages,
-        "max_tokens": request.max_tokens,
-        "stream": request.stream,
-    }
-    if request.temperature is not None:
-        openai_body["temperature"] = request.temperature
-
-    debug_print(f"📦 Converted to OpenAI format")
-
-    # Create a mock request object for the chat completions handler
-    class MockRequest:
-        def __init__(self, body):
-            self._body = body
-
-        async def json(self):
-            return self._body
-
-        async def is_disconnected(self):
-            return await raw_request.is_disconnected()
-
-    mock_request = MockRequest(openai_body)
-
-    if request.stream:
-        # Streaming response - convert OpenAI SSE to Anthropic format
-        async def anthropic_stream_generator():
-            message_id = f"msg_{uuid.uuid4()}"
-            accumulated_text = ""
-            buffer = ""
-            
-            # Send message_start
-            yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': message_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': request.model, 'stop_reason': None, 'usage': {'input_tokens': sum(len(str(m.get('content', ''))) for m in openai_messages), 'output_tokens': 0}}})}\n\n"
-
-            # Send content_block_start
-            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-
-            try:
-                result = await api_chat_completions(mock_request, api_key)
-
-                # Return error for dict response (error case)
-                if isinstance(result, dict) and result.get("error"):
-                    yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'message': result['error'].get('message', 'Unknown error'), 'type': result['error'].get('type', 'invalid_request_error')}})}\n\n"
-                    return
-                
-                if isinstance(result, StreamingResponse):
-                    async for chunk in result.body_iterator:
-                        chunk_str = chunk.decode('utf-8') if isinstance(chunk, bytes) else str(chunk)
-                        buffer += chunk_str
-                        while '\n' in buffer:
-                            line, buffer = buffer.split('\n', 1)
-                            line = line.strip()
-                            if not line.startswith('data: '):
-                                continue
-                            data = line[6:]
-                            if data == '[DONE]':
-                                break
-                            try:
-                                chunk_data = json.loads(data)
-                                delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-                                if "content" in delta:
-                                    content = delta["content"]
-                                    accumulated_text += content
-                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
-                            except json.JSONDecodeError:
-                                continue
-                else:
-                    yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'message': 'Unexpected non-streaming response from API', 'type': 'internal_error'}})}\n\n"
-                    return
-
-            except Exception as e:
-                yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'message': str(e), 'type': 'internal_error'}})}\n\n"
-                return
-
-            # Send content_block_stop
-            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-
-            # Send message_delta
-            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': len(accumulated_text)}})}\n\n"
-
-            # Send message_stop
-            yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-
-        return StreamingResponse(
-            anthropic_stream_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
-            }
-        )
-    else:
-        # Non-streaming response
-        result = await api_chat_completions(mock_request, api_key)
-
-        if isinstance(result, StreamingResponse):
-            # Read streaming response
-            full_text = ""
-            async for chunk in result.body_iterator:
-                chunk_str = chunk.decode('utf-8') if isinstance(chunk, bytes) else str(chunk)
-                for line in chunk_str.strip().split('\n'):
-                    if line.startswith('data: '):
-                        data = line[6:]
-                        if data == '[DONE]':
-                            break
-                        try:
-                            chunk_data = json.loads(data)
-                            delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-                            if "content" in delta:
-                                full_text += delta["content"]
-                        except json.JSONDecodeError:
-                            continue
-
-            return {
-                "id": f"msg_{uuid.uuid4()}",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": full_text}],
-                "model": request.model,
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 0, "output_tokens": len(full_text.split())}
-            }
-
-        if isinstance(result, dict) and "error" in result:
-            raise HTTPException(status_code=400, detail=result["error"].get("message", "Unknown error"))
-
-        # Convert OpenAI response to Anthropic format
-        choices = result.get("choices", [])
-        content = ""
-        if choices:
-            content = choices[0].get("message", {}).get("content", "")
-
-        return {
-            "id": result.get("id", f"msg_{uuid.uuid4()}"),
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "text", "text": content}],
-            "model": request.model,
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": result.get("usage", {}).get("prompt_tokens", 0), "output_tokens": result.get("usage", {}).get("completion_tokens", len(content))}
-        }
-
-
-if __name__ == "__main__":
-    # Avoid crashes on Windows consoles with non-UTF8 code pages (e.g., GBK) when printing emojis.
-    try:
-        import sys
-
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        open(LOG_FILE, "w").close()
     except Exception:
         pass
+    log("INFO", "Debug logs cleared")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
-    print("=" * 60)
-    print("🚀 LMArena Bridge Server Starting...")
-    print("=" * 60)
-    print(f"📍 Dashboard: http://localhost:{PORT}/dashboard")
-    print(f"🔐 Login: http://localhost:{PORT}/login")
-    print(f"📚 API Base URL: http://localhost:{PORT}/api/v1")
-    print("=" * 60)
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+
+@app.post("/keeper/config")
+async def keeper_config(request: Request, jar_id: str = Form(...), login_method: str = Form("email"),
+                        email: str = Form(""), password: str = Form(""), keeper_enabled: Optional[str] = Form(None)):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    def upd(jars):
+        for j in jars:
+            if j["id"] == jar_id:
+                j["login_method"] = "google" if login_method == "google" else "email"
+                j["email"] = email.strip()
+                j["password"] = password
+                j["keeper_enabled"] = bool(keeper_enabled)
+                log("OK", f"Keeper config saved for '{j.get('name')}' ({j['login_method']}, keep-alive={j['keeper_enabled']})")
+    mutate_jars(upd)
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/keeper/live")
+async def keeper_live(request: Request, jar_id: str = Form(...)):
+    if not await get_current_session(request):
+        return RedirectResponse(url="/login")
+    ok, msg = await keeper.start_live(jar_id)
+    log("INFO", f"Live browser: {msg}")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/keeper/relogin")
+async def keeper_relogin(request: Request, jar_id: str = Form(...)):
+    if not await get_current_session(request):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    s = keeper.sessions.get(jar_id)
+    if s and s.running:
+        s.next_retry = 0
+        asyncio.create_task(s.relogin())
+        log("INFO", f"[{s.name}] Manual re-login triggered")
+        return {"status": "ok", "message": "Relogin initiated"}
+    else:
+        jar = next((j for j in load_jars() if j["id"] == jar_id), None)
+        if jar:
+            s = KeeperSession(jar, headless=jar.get("keeper_headless", True))
+            keeper.sessions[jar_id] = s
+            async def start_and_relogin():
+                await s.start()
+                if s.running:
+                    await s.relogin()
+            asyncio.create_task(start_and_relogin())
+            log("INFO", f"Started keeper for '{jar.get('name')}' and triggered relogin")
+            return {"status": "ok", "message": "Keeper launched and relogin initiated"}
+        else:
+            log("WARN", "Account not found for relogin")
+            return {"status": "error", "message": "Account not found"}
+
+
+@app.get("/keeper/status")
+async def keeper_status_api(request: Request):
+    if not await get_current_session(request):
+        return {"sessions": []}
+    st = load_state()
+    local = {s["jar_id"]: s for s in keeper.status()}
+    merged = {s["jar_id"]: s for s in st.get("keeper_status", [])}
+    merged.update(local)
+    return {"sessions": list(merged.values()), "owner_pid": st.get("keeper_pid")}
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Bridgena v1.0 — Arena.ai Bridge Server")
+    parser.add_argument("-w", "--workers", type=int, default=None, help="Number of uvicorn workers (default: 1, max: number of accounts)")
+    parser.add_argument("-p", "--port", type=int, default=PORT, help="Port to bind")
+    args = parser.parse_args()
+
+    jars_count = len(load_jars())
+    requested = args.workers if args.workers is not None else 1
+    # Allow any number of requested workers, so they can share accounts
+    effective_workers = max(1, requested)
+
+    print("=" * 62)
+    print("  Bridgena v1.0 — Arena.ai Bridge")
+    print("=" * 62)
+    print(f"  * Chat WebUI  : http://localhost:{args.port}/chat")
+    print(f"  * Dashboard   : http://localhost:{args.port}/dashboard")
+    print(f"  * OpenAI Base : http://localhost:{args.port}/v1")
+    print(f"  * Workers     : {effective_workers} (Accounts: {jars_count})")
+    print("=" * 62)
+
+    if effective_workers > 1:
+        module = Path(__file__).stem
+        uvicorn.run(f"{module}:app", host="0.0.0.0", port=args.port, workers=effective_workers)
+    else:
+        uvicorn.run(app, host="0.0.0.0", port=args.port)
