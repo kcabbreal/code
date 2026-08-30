@@ -559,13 +559,18 @@ def build_request_headers(jar: dict) -> dict:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
     )
-    return {
+    headers = {
         "Content-Type": "application/json", "Cookie": cookie_header,
         "Origin": ARENA_BASE, "Referer": f"{ARENA_BASE}/text/direct",
         "User-Agent": ua, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
-        "sec-ch-ua": '"Chromium";v="133", "Not(A:Brand";v="99"',
         "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
     }
+    # Cloudflare blocks Firefox if it sends Chrome-specific sec-ch-ua headers
+    if "Firefox" not in ua:
+        headers["sec-ch-ua"] = '"Chromium";v="133", "Not(A:Brand";v="99"'
+        headers["sec-ch-ua-mobile"] = "?0"
+        headers["sec-ch-ua-platform"] = '"Windows"'
+    return headers
 
 
 # ============================================================
