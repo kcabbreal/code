@@ -2345,30 +2345,30 @@ async def _stream_once(client: httpx.AsyncClient, url: str, payload: dict, heade
             line = line.strip()
             if not line:
                 continue
-            if line.startswith("a0:"):
+            if line.startswith(("a0:", "0:")):
                 try:
-                    t = json.loads(line[3:])
+                    t = json.loads(line[line.index(":")+1:])
                     content += t
                     yield ("content", t)
                 except json.JSONDecodeError:
                     continue
-            elif line.startswith("ag:"):
+            elif line.startswith(("ag:", "g:")):
                 try:
-                    t = json.loads(line[3:])
+                    t = json.loads(line[line.index(":")+1:])
                     reasoning += t
                     yield ("reasoning", t)
                 except json.JSONDecodeError:
                     continue
-            elif line.startswith("a3:"):
+            elif line.startswith(("a3:", "3:", "e:")):
                 try:
-                    err = json.loads(line[3:])
+                    err = json.loads(line[line.index(":")+1:])
                     error_text = err if isinstance(err, str) else json.dumps(err)
                 except json.JSONDecodeError:
-                    error_text = line[3:]
+                    error_text = line[line.index(":")+1:]
                 log("ERROR", f"Upstream error frame: {error_text}")
-            elif line.startswith("ad:"):
+            elif line.startswith(("ad:", "d:")):
                 try:
-                    md = json.loads(line[3:])
+                    md = json.loads(line[line.index(":")+1:])
                     yield ("finish", md.get("finishReason", "stop"))
                 except json.JSONDecodeError:
                     continue
@@ -2467,21 +2467,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                             prior_messages=None, is_api=False, request_user_count=None):
     jar_id = jar["id"]
     s = keeper.sessions.get(jar_id)
-    if not s or not s.running or not s.page or s.page.is_closed():
-        try:
-            if s:
-                await s.start()
-            else:
-                await keeper.sync()
-                s = keeper.sessions.get(jar_id)
-                if s and not s.running:
-                    await s.start()
-        except Exception as e:
-            log("WARN", f"Could not start browser session for '{jar_id}': {e}")
-
-    bridge = s if (s and s.running and s.page and not s.page.is_closed()) else None
-    if bridge:
-        log("INFO", f"[{bridge.name}] Routing via live browser-bridge transport")
+    bridge = s if (s and s.running and getattr(s, "use_for_chats", False)) else None
 
     headers = None
     if bridge is None:
@@ -2919,7 +2905,7 @@ async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 
     # Arena route
-    models = get_models()
+    models = get_selectable_models()
     model_obj = next((m for m in models if m.get("publicName") == model_name or m.get("id") == model_name), None)
     if not model_obj:
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
