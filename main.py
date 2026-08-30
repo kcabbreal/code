@@ -795,6 +795,7 @@ async def get_initial_data() -> list:
     mutate_state(mark_start)
 
     # Try browser-based fetch first (has session cookies)
+    fetched_models = []
     for jar_candidate in load_jars():
         s = keeper.sessions.get(jar_candidate.get("id"))
         if s and s.running and s.page and not s.page.is_closed():
