@@ -996,14 +996,21 @@ class KeeperSession:
     Cross-platform stealth engine compatible with Windows, macOS, Linux, and Pterodactyl/Docker containers.
     Supports Edge (fastest), Chrome, Chromium, and bundled headless binaries with humanized mouse/keyboard trajectories."""
 
-    def __init__(self, jar: dict, headless: bool = True, keep_forever: bool = False):
+    def __init__(self, jar: dict, headless: Optional[bool] = None, keep_forever: bool = False):
         self.jar_id = jar["id"]
         self.name = jar.get("name", self.jar_id)
         self.login_method = jar.get("login_method") or "email"
         self.email = jar.get("email") or ""
         self.password = jar.get("password") or ""
         self.user_agent = jar.get("user_agent") or None
-        self.headless = headless
+        if headless is not None:
+            self.headless = headless
+        elif "keeper_headless" in jar:
+            self.headless = bool(jar["keeper_headless"])
+        elif os.environ.get("BRIDGENA_HEADLESS", "").lower() in ("1", "true", "yes"):
+            self.headless = True
+        else:
+            self.headless = False
         self.keep_forever = keep_forever
         self.humanize = bool(jar.get("keeper_humanize", True))
 
@@ -1813,8 +1820,7 @@ class KeeperSession:
                 line = await queue.get()
                 if line is None:
                     break
-                if line.startswith("data: ") or line.startswith("event: "):
-                    yield line
+                yield line
             if eval_task.done() and eval_task.exception():
                 raise RuntimeError(f"Bridge evaluate exception: {eval_task.exception()}")
             status_code = meta.get("status", 0)
@@ -2067,7 +2073,7 @@ class SessionKeeper:
         for jid, jar in wanted.items():
             s = self.sessions.get(jid)
             if s is None:
-                s = KeeperSession(jar, headless=jar.get("keeper_headless", True))
+                s = KeeperSession(jar, headless=jar.get("keeper_headless", None))
                 self.sessions[jid] = s
                 asyncio.create_task(s.start())
             else:
@@ -2169,30 +2175,55 @@ async def _parse_bridge_stream(session: KeeperSession, url: str, payload: dict, 
         line = line.strip()
         if not line:
             continue
-        if line.startswith("a0:"):
+        
+        # Standard SSE format support
+        if line.startswith("data: "):
+            d = line[6:].strip()
+            if d == "[DONE]":
+                break
             try:
-                t = json.loads(line[3:])
+                parsed = json.loads(d)
+                delta = parsed.get("choices", [{}])[0].get("delta", {})
+                if delta.get("content"):
+                    content += delta["content"]
+                    yield ("content", delta["content"])
+                if delta.get("reasoning_content") or delta.get("thought"):
+                    t = delta.get("reasoning_content") or delta.get("thought")
+                    reasoning += t
+                    yield ("reasoning", t)
+                continue
+            except Exception:
+                pass
+
+        # Next.js / Arena RSC Stream Frame Formats
+        if line.startswith("a0:") or line.startswith("0:"):
+            prefix_len = 3 if line.startswith("a0:") else 2
+            try:
+                t = json.loads(line[prefix_len:])
                 content += t
                 yield ("content", t)
             except json.JSONDecodeError:
                 continue
-        elif line.startswith("ag:"):
+        elif line.startswith("ag:") or line.startswith("g:"):
+            prefix_len = 3 if line.startswith("ag:") else 2
             try:
-                t = json.loads(line[3:])
+                t = json.loads(line[prefix_len:])
                 reasoning += t
                 yield ("reasoning", t)
             except json.JSONDecodeError:
                 continue
-        elif line.startswith("a3:"):
+        elif line.startswith("a3:") or line.startswith("3:") or line.startswith("e:"):
+            prefix_len = 3 if line.startswith("a3:") else 2
             try:
-                err = json.loads(line[3:])
+                err = json.loads(line[prefix_len:])
                 error_text = err if isinstance(err, str) else json.dumps(err)
             except json.JSONDecodeError:
-                error_text = line[3:]
+                error_text = line[prefix_len:]
             log("ERROR", f"Arena stream error frame: {error_text}")
-        elif line.startswith("ad:"):
+        elif line.startswith("ad:") or line.startswith("d:"):
+            prefix_len = 3 if line.startswith("ad:") else 2
             try:
-                md = json.loads(line[3:])
+                md = json.loads(line[prefix_len:])
                 yield ("finish", md.get("finishReason", "stop"))
             except json.JSONDecodeError:
                 continue
@@ -2436,10 +2467,21 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                             prior_messages=None, is_api=False, request_user_count=None):
     jar_id = jar["id"]
     s = keeper.sessions.get(jar_id)
-    bridge = None
-    if s and s.running and s.page and not s.page.is_closed() and s.last_health_ok and (time.time() - s.last_health_ok) < 900:
-        bridge = s
-        log("INFO", f"[{s.name}] Routing via browser-bridge transport")
+    if not s or not s.running or not s.page or s.page.is_closed():
+        try:
+            if s:
+                await s.start()
+            else:
+                await keeper.sync()
+                s = keeper.sessions.get(jar_id)
+                if s and not s.running:
+                    await s.start()
+        except Exception as e:
+            log("WARN", f"Could not start browser session for '{jar_id}': {e}")
+
+    bridge = s if (s and s.running and s.page and not s.page.is_closed()) else None
+    if bridge:
+        log("INFO", f"[{bridge.name}] Routing via live browser-bridge transport")
 
     headers = None
     if bridge is None:
