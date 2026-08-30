@@ -889,6 +889,29 @@ async def get_initial_data() -> list:
         except Exception as e:
             log("WARN", f"Direct HTML models fetch failed: {e}")
 
+    # 3. Fallback: Launch a temporary browser context just to fetch models
+    if not fetched_models:
+        log("INFO", "Direct HTTP fetch failed. Spawning temporary browser to bypass Cloudflare for models...")
+        try:
+            if async_playwright is not None:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+                    page = await browser.new_page()
+                    await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                    await asyncio.sleep(3)
+                    try:
+                        await page.wait_for_function("() => document.title.indexOf('Just a moment') === -1", timeout=15000)
+                    except Exception:
+                        pass
+                    page_html = await page.content()
+                    models = extract_models_from_html(page_html)
+                    if len(models) > 50:
+                        fetched_models = models
+                        log("OK", f"Models extracted via temporary browser ({len(fetched_models)} models)")
+                    await browser.close()
+        except Exception as e:
+            log("WARN", f"Temporary browser fetch failed: {e}")
+
     if fetched_models:
         save_models(fetched_models)
         def mark_done(s):
