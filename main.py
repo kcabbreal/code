@@ -28,8 +28,9 @@ from fastapi import (
     Request, Response, UploadFile, status,
 )
 from fastapi.responses import (
-    HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse,
+    HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, FileResponse
 )
+import glob
 from fastapi.security import APIKeyHeader
 
 try:
@@ -1111,13 +1112,28 @@ class KeeperSession:
             if await modal_title.count() > 0 and await modal_title.is_visible():
                 return False
 
-            # 3. Check actual unified history API status
+            # 3. Check for typical auth cookies directly in the browser context
+            cookies = await page.context.cookies()
+            auth_cookie_names = ["arena-auth", "arena-auth-prod-v1.0", "arena-auth-prod-v1.1", "__session", "session", "authToken", "clerk-db-jwt"]
+            has_auth = any(any(n in c["name"] for n in auth_cookie_names) for c in cookies)
+            if has_auth:
+                return True
+                
+            # 4. Fallback: Check if the user profile avatar or settings button is present
+            profile_btn = page.locator("button:has(svg), button[aria-label='User Profile'], button[aria-label='Settings']").last
+            if await profile_btn.count() > 0:
+                # If we're on the main page and no login button is visible, we're likely logged in
+                if "arena.ai" in page.url:
+                    return True
+
+            # 5. Check actual unified history API status
             status_code = await page.evaluate(
                 "async () => { try { const r = await fetch('/api/history/unified?limit=1', "
                 "{credentials:'include'}); return r.status; } catch(e) { return 0; } }"
             )
             if status_code == 200:
                 return True
+                    
         except Exception:
             pass
         return False
@@ -1169,6 +1185,13 @@ class KeeperSession:
                     continue
 
             if not modal_already_open:
+                # Force open sidebar if collapsed, so Log In text mounts
+                try:
+                    await page.locator("button[aria-label*='sidebar' i]").first.click(timeout=3000)
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    pass
+
                 # Try to click Log In button in the page
                 login_selectors = [
                     "button:has-text('Log In')",
@@ -1182,8 +1205,8 @@ class KeeperSession:
                 for sel in login_selectors:
                     try:
                         btn = page.locator(sel).first
-                        if await btn.count() > 0 and await btn.is_visible():
-                            await btn.click(timeout=5000)
+                        if await btn.count() > 0:
+                            await btn.click(timeout=5000, force=True)
                             clicked = True
                             self._set_step("[2/6] Clicked Log In button, waiting for modal...")
                             break
@@ -2535,6 +2558,59 @@ async def verify_api_key(request: Request,
 
 
 # ============================================================
+# DEBUG ROUTES
+# ============================================================
+
+@app.get("/screenshots")
+async def list_screenshots():
+    files = glob.glob("*.png")
+    files.sort(key=os.path.getmtime, reverse=True)
+    html = "<h1>Screenshots</h1><ul>"
+    for f in files:
+        html += f'<li><a href="/screenshots/{f}">{f}</a></li>'
+    html += "</ul>"
+    return HTMLResponse(html)
+
+@app.get("/screenshots/{filename}")
+async def get_screenshot(filename: str):
+    if not os.path.exists(filename) or not filename.endswith(".png"):
+        return Response(status_code=404)
+    return FileResponse(filename)
+
+@app.get("/vnc")
+async def vnc_viewer():
+    html = """
+    <html>
+    <head><title>Live Browser View</title></head>
+    <body style="margin:0; background:#222; text-align:center;">
+        <h3 style="color:white; font-family:sans-serif">Live Browser View (Auto-refresh)</h3>
+        <img id="screen" src="/vnc/frame" style="max-width:100%; border: 1px solid #444;" />
+        <script>
+            setInterval(() => {
+                document.getElementById('screen').src = '/vnc/frame?' + new Date().getTime();
+            }, 1000);
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+@app.get("/vnc/frame")
+async def vnc_frame():
+    active_page = None
+    for k, v in keeper.sessions.items():
+        if v.page and not v.page.is_closed():
+            active_page = v.page
+            break
+    if not active_page:
+        return Response("No active browser", status_code=404)
+    try:
+        img_bytes = await active_page.screenshot(type="jpeg", quality=60)
+        return Response(content=img_bytes, media_type="image/jpeg")
+    except Exception as e:
+        return Response(str(e), status_code=500)
+
+# ============================================================
 # ROOT ROUTE
 # ============================================================
 
@@ -2592,11 +2668,24 @@ async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
     # OX Alpha route
     if model_name in OX_ALIASES:
         record_usage(OX_MODEL_ID)
+        
+        sanitized_messages = []
+        for m in messages:
+            r = m.get("role", "user")
+            if r == "system": r = "user"
+            c = m.get("content", "")
+            if not sanitized_messages:
+                sanitized_messages.append({"role": r, "content": c})
+            elif sanitized_messages[-1]["role"] == r:
+                sanitized_messages[-1]["content"] += "\n\n" + c
+            else:
+                sanitized_messages.append({"role": r, "content": c})
+        
         if stream:
             async def sse_gen():
                 comp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
                 ts = int(time.time())
-                async for t, chunk in stream_oxalpha(messages, model=model_name):
+                async for t, chunk in stream_oxalpha(sanitized_messages, model=model_name):
                     if t == "content":
                         yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
                     elif t == "reasoning":
@@ -2608,7 +2697,7 @@ async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
             return StreamingResponse(sse_gen(), media_type="text/event-stream")
         else:
             full_content, full_reasoning = "", ""
-            async for t, chunk in stream_oxalpha(messages, model=model_name):
+            async for t, chunk in stream_oxalpha(sanitized_messages, model=model_name):
                 if t == "content":
                     full_content += chunk
                 elif t == "reasoning":
