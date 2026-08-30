@@ -1729,7 +1729,7 @@ class KeeperSession:
                     "--disable-software-rasterizer",
                     "--no-first-run",
                     "--no-default-browser-check",
-                    "--window-size=1440,900",
+                    "--window-size=1920,1080",
                 ]
 
                 channels_to_try = ["chromium", None, "chrome", "msedge"]
@@ -1788,7 +1788,7 @@ class KeeperSession:
                 profile_dir = os.path.join(PROFILES_DIR, self.jar_id)
                 os.makedirs(profile_dir, exist_ok=True)
                 self.context = await self.browser.new_context(
-                    viewport={"width": 1440, "height": 900},
+                    viewport={"width": 1920, "height": 1080},
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
                     storage_state=os.path.join(profile_dir, "state.json") if os.path.exists(os.path.join(profile_dir, "state.json")) else None,
                 )
@@ -1797,8 +1797,11 @@ class KeeperSession:
             elif AsyncCamoufox is not None:
                 cm = AsyncCamoufox(headless=self.headless, humanize=self.humanize)
                 self.browser = await cm.__aenter__()
-                self.context = self.browser.contexts[0] if self.browser.contexts else await self.browser.new_context()
+                self.context = self.browser.contexts[0] if self.browser.contexts else await self.browser.new_context(
+                    viewport={"width": 1920, "height": 1080}
+                )
                 self.page = await self.context.new_page()
+                await self.page.set_viewport_size({"width": 1920, "height": 1080})
             else:
                 self.status = "error"
                 self.error = "No browser engine available"
