@@ -794,26 +794,9 @@ async def get_initial_data() -> list:
         s["refresh_started"] = now
     mutate_state(mark_start)
 
-    jar = acquire_jar()
-    headers = build_request_headers(jar) if jar else {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-    }
-    fetched_models = []
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(f"{ARENA_BASE}/api/models", headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    fetched_models = data
-                elif isinstance(data, dict) and "models" in data:
-                    fetched_models = data["models"]
-    except Exception as e:
-        log("WARN", f"Direct models fetch failed: {e}")
-
-    if not fetched_models and jar:
-        s = keeper.sessions.get(jar.get("id"))
+    # Try browser-based fetch first (has session cookies)
+    for jar_candidate in load_jars():
+        s = keeper.sessions.get(jar_candidate.get("id"))
         if s and s.running and s.page and not s.page.is_closed():
             try:
                 models_raw = await s.page.evaluate("""async () => {
@@ -822,8 +805,30 @@ async def get_initial_data() -> list:
                 }""")
                 if isinstance(models_raw, list) and len(models_raw) > 0:
                     fetched_models = models_raw
+                    log("OK", f"Models fetched via browser session ({len(fetched_models)} models)")
             except Exception:
                 pass
+            if fetched_models:
+                break
+
+    # Fallback to direct HTTP fetch
+    if not fetched_models:
+        jar = acquire_jar()
+        headers = build_request_headers(jar) if jar else {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(f"{ARENA_BASE}/api/models", headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        fetched_models = data
+                    elif isinstance(data, dict) and "models" in data:
+                        fetched_models = data["models"]
+        except Exception as e:
+            log("WARN", f"Direct models fetch failed: {e}")
 
     if fetched_models:
         save_models(fetched_models)
@@ -966,6 +971,10 @@ class KeeperSession:
         self._auth_sig_cache = None
         self._cur_x = 200.0
         self._cur_y = 200.0
+        # Page pool for concurrent requests
+        self._page_pool: list = []  # list of extra pages
+        self._page_pool_lock = asyncio.Lock()
+        self._max_pool_pages = 4  # max extra pages beyond self.page
 
     def _set_step(self, step_text: str):
         """Record and broadcast a detailed login/keeper progress step."""
@@ -1537,9 +1546,10 @@ class KeeperSession:
             if not page or page.is_closed():
                 return
             try:
-                size = page.viewport_size or {"width": 1440, "height": 900}
-                tx = random.randint(100, max(101, size["width"] - 100))
-                ty = random.randint(100, max(101, size["height"] - 100))
+                size = page.viewport_size or {"width": 1920, "height": 1080}
+                # Stay in the main content area (avoid sidebar on left ~300px)
+                tx = random.randint(350, max(351, size["width"] - 100))
+                ty = random.randint(150, max(151, size["height"] - 150))
                 await self._human_move(page, tx, ty, steps=8)
                 await page.mouse.wheel(0, random.randint(-50, 150))
             except Exception:
@@ -1637,12 +1647,60 @@ class KeeperSession:
         if time.time() >= self.next_retry:
             await self.relogin()
 
-    # --- Bridge Streaming Fetch ---
+    # --- Bridge Page Pool & Streaming Fetch ---
+
+    async def _acquire_page(self):
+        """Get a page for a bridge request. Uses pooled tabs for concurrency."""
+        async with self._page_pool_lock:
+            # Try to grab an idle page from the pool
+            for i, (pg, busy) in enumerate(self._page_pool):
+                if not busy and pg and not pg.is_closed():
+                    self._page_pool[i] = (pg, True)
+                    return pg, i
+            # No idle pages — create a new tab if under limit
+            if len(self._page_pool) < self._max_pool_pages and self.context:
+                try:
+                    new_page = await self.context.new_page()
+                    await new_page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                    await asyncio.sleep(0.5)
+                    idx = len(self._page_pool)
+                    self._page_pool.append((new_page, True))
+                    log("INFO", f"[{self.name}] Spawned new tab #{idx + 1} for concurrent request")
+                    return new_page, idx
+                except Exception as e:
+                    log("WARN", f"[{self.name}] Failed to create extra tab: {e}")
+            # Fallback: use main page (will still work, just shares console)
+            return self.page, -1
+
+    async def _release_page(self, idx):
+        """Mark a pooled page as idle."""
+        if idx >= 0:
+            async with self._page_pool_lock:
+                if idx < len(self._page_pool):
+                    pg, _ = self._page_pool[idx]
+                    self._page_pool[idx] = (pg, False)
+
+    async def _cleanup_pool(self):
+        """Close all idle pool pages (called when no active requests)."""
+        async with self._page_pool_lock:
+            remaining = []
+            for pg, busy in self._page_pool:
+                if busy:
+                    remaining.append((pg, busy))
+                else:
+                    try:
+                        if pg and not pg.is_closed():
+                            await pg.close()
+                    except Exception:
+                        pass
+            self._page_pool = remaining
 
     async def bridge_fetch(self, url: str, payload: dict):
-        page = self.page
-        if not page or page.is_closed():
+        if not self.context or not self.page or self.page.is_closed():
             raise RuntimeError("Keeper browser page is closed")
+
+        # Acquire a page (main page or a pooled tab)
+        page, pool_idx = await self._acquire_page()
         req_id = uuid.uuid4().hex[:8]
         queue: asyncio.Queue = asyncio.Queue()
         meta = {}
@@ -1706,6 +1764,10 @@ class KeeperSession:
         finally:
             self.active_requests -= 1
             page.remove_listener("console", on_console)
+            await self._release_page(pool_idx)
+            # Clean up idle pool pages when no more active requests
+            if self.active_requests == 0:
+                asyncio.create_task(self._cleanup_pool())
 
     # --- Cross-Platform Browser Lifecycle ---
 
@@ -1854,6 +1916,7 @@ class KeeperSession:
         try:
             if self.page: await self._harvest_cookies()
         except Exception: pass
+        self._page_pool.clear()
         try:
             if self.context: await self.context.close()
         except Exception: pass
@@ -4238,7 +4301,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                 const { done, value } = await reader.read();
                 if (done) break;
                 buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\\n');
+                const lines = buffer.split('\n');
                 buffer = lines.pop() || '';
 
                 for (const line of lines) {
