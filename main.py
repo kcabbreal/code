@@ -1200,38 +1200,37 @@ class KeeperSession:
     async def _verify_auth_state(self, page) -> bool:
         """Thorough check to verify whether user is genuinely logged into arena.ai."""
         try:
-            # 1. If Login button is visible on page, we are NOT logged in
-            login_btn = page.locator("button:has-text('Log In'), a:has-text('Log In')").first
-            if await login_btn.count() > 0 and await login_btn.is_visible():
-                return False
-
-            # 2. If 'Log In or Create' modal is visible, we are NOT logged in
-            modal_title = page.locator("text='Log In or Create'").first
-            if await modal_title.count() > 0 and await modal_title.is_visible():
-                return False
-
-            # 3. Check for typical auth cookies directly in the browser context
+            # 1. Most reliable method: check if there's an active auth cookie!
             cookies = await page.context.cookies()
-            auth_cookie_names = ["arena-auth", "arena-auth-prod-v1.0", "arena-auth-prod-v1.1", "__session", "session", "authToken", "clerk-db-jwt"]
+            auth_cookie_names = ["arena-auth-prod", "arena-auth", "__session", "clerk-db-jwt", "session", "authToken"]
             has_auth = any(any(n in c["name"] for n in auth_cookie_names) for c in cookies)
             if has_auth:
                 return True
                 
-            # 4. Fallback: Check if the user profile avatar or settings button is present
-            profile_btn = page.locator("button:has(svg), button[aria-label='User Profile'], button[aria-label='Settings']").last
-            if await profile_btn.count() > 0:
-                # If we're on the main page and no login button is visible, we're likely logged in
-                if "arena.ai" in page.url:
-                    return True
+            # If no obvious auth cookie, check the DOM safely.
+            # 2. Check for the user profile avatar or 'Log Out'
+            profile_btn = page.locator("button:has-text('Log Out'), a:has-text('Log Out'), button:has-text('Sign Out'), button[aria-label='User Profile']").first
+            if await profile_btn.count() > 0 and await profile_btn.is_visible():
+                return True
 
-            # 5. Check actual unified history API status
+            # 3. Check actual unified history API status (fallback)
             status_code = await page.evaluate(
                 "async () => { try { const r = await fetch('/api/history/unified?limit=1', "
                 "{credentials:'include'}); return r.status; } catch(e) { return 0; } }"
             )
             if status_code == 200:
                 return True
-                    
+                
+            # 4. If 'Log In or Create' modal is visible, we are NOT logged in
+            modal_title = page.locator("text='Log In or Create'").first
+            if await modal_title.count() > 0 and await modal_title.is_visible():
+                return False
+
+            # 5. If Login button is visible on page, we are NOT logged in
+            login_btn = page.locator("button:has-text('Log In'), a:has-text('Log In')").first
+            if await login_btn.count() > 0 and await login_btn.is_visible():
+                return False
+
         except Exception:
             pass
         return False
@@ -1602,12 +1601,21 @@ class KeeperSession:
                         or find_cookie(simplified, "arena-auth-prod-v1") or "")
             sig = hashlib.sha256(auth_val.encode()).hexdigest()[:10] if auth_val else "none"
 
+            # Grab exact User-Agent to prevent Cloudflare 403 mismatch in httpx
+            ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            try:
+                if self.page and not self.page.is_closed():
+                    ua = await self.page.evaluate("navigator.userAgent")
+            except Exception:
+                pass
+
             def upd(jars: list):
                 for j in jars:
                     if j["id"] != self.jar_id: continue
                     if simplified:
                         j["cookies"] = simplified
                         j["expired"] = False
+                        j["user_agent"] = ua
             mutate_jars(upd)
 
             if sig != self._auth_sig_cache:
@@ -2495,10 +2503,13 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
     headers = None
     if bridge is None:
         live = await get_live_cookies(jar_id)
-        if live and (find_cookie(live, "arena-auth-prod-v1.0") or find_cookie(live, "arena-auth-prod-v1.1") or find_cookie(live, "arena-auth-prod-v1")):
-            jar = dict(jar)
-            jar["cookies"] = live
-            jar["expired"] = False
+        if live:
+            auth_cookie_names = ["arena-auth-prod", "arena-auth", "__session", "clerk-db-jwt", "session", "authToken"]
+            has_auth = any(any(n in c["name"] for n in auth_cookie_names) for c in live)
+            if has_auth:
+                jar = dict(jar)
+                jar["cookies"] = live
+                jar["expired"] = False
         headers = build_request_headers(jar)
 
     for attempt in (0, 1):
