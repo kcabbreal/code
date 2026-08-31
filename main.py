@@ -548,39 +548,47 @@ def jar_available(jar: dict, now: float = None) -> bool:
         return False
     return True
 
-def acquire_jar() -> Optional[dict]:
+def acquire_jar(exclude: set = None) -> Optional[dict]:
     """Pick the least-recently-used available jar. If no jars are free
     (all rate-limited or expired), fall back to sharing any enabled jar
-    with a valid keeper session as a last resort."""
+    with a valid keeper session as a last resort.
+    exclude: optional set of jar ids to skip (already tried this request)."""
     now = time.time()
+    exclude = exclude or set()
     chosen = {}
     def pick(jars: list):
         best = None
         # 1. Try to find a fully available jar (not limited, not expired, has auth)
         for j in jars:
+            if j.get("id") in exclude:
+                continue
             if jar_available(j, now):
                 if best is None or j.get("last_used", 0) < best.get("last_used", 0):
                     best = j
         # 2. Fallback: if no available jar, share the least-used enabled jar with a live session
         if best is None:
             for j in jars:
+                if j.get("id") in exclude:
+                    continue
                 if not j.get("enabled", True):
                     continue
-                # Prefer jars with auth cookies even if rate-limited recently (recaptcha ≠ unhealthy)
                 if jar_has_auth(j) and j.get("limited_until", 0) < now:
                     if best is None or j.get("last_used", 0) < best.get("last_used", 0):
                         best = j
             if best is None:
                 for j in jars:
+                    if j.get("id") in exclude:
+                        continue
                     if not j.get("enabled", True):
                         continue
                     session = keeper.sessions.get(j.get("id"))
                     if session and session.running:
                         if best is None or j.get("last_used", 0) < best.get("last_used", 0):
                             best = j
-            # Last resort: any enabled jar with auth, ignore limited_until
             if best is None:
                 for j in jars:
+                    if j.get("id") in exclude:
+                        continue
                     if j.get("enabled", True) and jar_has_auth(j):
                         if best is None or j.get("last_used", 0) < best.get("last_used", 0):
                             best = j
@@ -3611,9 +3619,6 @@ async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
     model_id = model_obj["id"]
     model_public_name = model_obj.get("publicName", model_name)
     model_caps = model_obj.get("capabilities", {})
-    jar = acquire_jar()
-    if not jar:
-        raise HTTPException(status_code=503, detail="No healthy accounts available.")
     record_usage(model_public_name)
     prior_messages = []
     last_msg = messages[-1]
@@ -3622,54 +3627,149 @@ async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
         c_text, _ = await process_message_content(msg.get("content", ""), model_caps)
         prior_messages.append({"role": msg.get("role", "user"), "content": c_text})
     user_count = sum(1 for m in messages if m.get("role") == "user")
-    # Stable conversation key across turns (hash of first user message + model), matching old bridge behavior
     first_user = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
     if isinstance(first_user, list):
         first_user = str(first_user)
     req_hash = hashlib.sha256(f"{model_public_name}:{str(first_user)[:200]}".encode()).hexdigest()[:16]
     conv_key = f"api:{req_hash}"
 
+    HOLD_MSG = "[API] Please hold, we're getting multiple requests at the moment. Your model will answer shortly..."
+    # Errors that should trigger trying another account (not hard client errors)
+    RETRYABLE = ("rate limit", "429", "recaptcha", "502", "503", "session expired", "empty response",
+                 "network error", "timeout", "limited", "no healthy", "unauthorized", "403", "401")
+
+    def _is_retryable(err: str) -> bool:
+        low = (err or "").lower()
+        return any(k in low for k in RETRYABLE)
+
     if stream:
         async def sse_gen():
             comp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
             ts = int(time.time())
-            try:
-                async for ev in stream_arena_chat(model_id, model_public_name, prompt_text, attachments, conv_key, jar,
-                                                  prior_messages=prior_messages, is_api=True, request_user_count=user_count):
-                    t, v = ev
-                    if t == "content":
-                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'content': v}, 'finish_reason': None}]})}\n\n"
-                    elif t == "reasoning":
-                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'reasoning_content': v}, 'finish_reason': None}]})}\n\n"
-                    elif t == "error":
-                        err_obj = {"error": {"message": str(v), "type": "upstream_error"}}
-                        yield f"data: {json.dumps(err_obj)}\n\n"
+            tried = set()
+            hold_sent = False
+            last_err = "No healthy accounts available."
+            max_tries = max(1, len(load_jars()) or 1)
+
+            for attempt_i in range(max_tries):
+                jar = acquire_jar(exclude=tried)
+                if not jar:
+                    break
+                jid = jar.get("id")
+                tried.add(jid)
+
+                got_content = False
+                try:
+                    async for ev in stream_arena_chat(
+                        model_id, model_public_name, prompt_text, attachments, conv_key, jar,
+                        prior_messages=prior_messages, is_api=True, request_user_count=user_count,
+                    ):
+                        t, v = ev
+                        if t == "content":
+                            got_content = True
+                            yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'content': v}, 'finish_reason': None}]})}\n\n"
+                        elif t == "reasoning":
+                            got_content = True
+                            yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'reasoning_content': v}, 'finish_reason': None}]})}\n\n"
+                        elif t == "error":
+                            last_err = str(v)
+                            if got_content:
+                                # Already started answering — surface error and stop
+                                yield f"data: {json.dumps({'error': {'message': last_err, 'type': 'upstream_error'}})}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+                            if _is_retryable(last_err) and attempt_i + 1 < max_tries:
+                                if not hold_sent:
+                                    hold_sent = True
+                                    yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'content': HOLD_MSG + chr(10) + chr(10)}, 'finish_reason': None}]})}\n\n"
+                                log("WARN", f"Account {jid} failed ({last_err[:120]}) — trying another")
+                                break  # next jar
+                            yield f"data: {json.dumps({'error': {'message': last_err, 'type': 'upstream_error'}})}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        elif t == "finish":
+                            yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': v}]})}\n\n"
+                        elif t == "done":
+                            pass
+                    else:
+                        # stream finished without error break
+                        if got_content:
+                            yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        # no content, no error — try next
+                        last_err = "empty response"
+                        if not hold_sent:
+                            hold_sent = True
+                            yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'content': HOLD_MSG + chr(10) + chr(10)}, 'finish_reason': None}]})}\n\n"
+                        continue
+                except Exception as e:
+                    last_err = str(e)
+                    if got_content:
+                        yield f"data: {json.dumps({'error': {'message': last_err, 'type': 'internal_error'}})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
-                    elif t == "finish":
-                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': v}]})}\n\n"
-                
-                # Final chunk if no explicit finish was received
-                yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'content': str(e)}, 'finish_reason': 'stop'}]})}\n\n"
-                yield "data: [DONE]\n\n"
+                    if _is_retryable(last_err) and attempt_i + 1 < max_tries:
+                        if not hold_sent:
+                            hold_sent = True
+                            yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'content': HOLD_MSG + chr(10) + chr(10)}, 'finish_reason': None}]})}\n\n"
+                        continue
+                    yield f"data: {json.dumps({'error': {'message': last_err, 'type': 'internal_error'}})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+            yield f"data: {json.dumps({'error': {'message': last_err, 'type': 'upstream_error'}})}\n\n"
+            yield "data: [DONE]\n\n"
+
         return StreamingResponse(sse_gen(), media_type="text/event-stream")
     else:
+        tried = set()
+        last_err = "No healthy accounts available."
+        max_tries = max(1, len(load_jars()) or 1)
         full_content, full_reasoning = "", ""
-        async for ev in stream_arena_chat(model_id, model_public_name, prompt_text, attachments, conv_key, jar,
-                                          prior_messages=prior_messages, is_api=True, request_user_count=user_count):
-            t, v = ev
-            if t == "content":
-                full_content += v
-            elif t == "reasoning":
-                full_reasoning += v
-            elif t == "error":
-                raise HTTPException(status_code=502, detail=v)
-        return {"id": f"chatcmpl-{uuid.uuid4().hex[:12]}", "object": "chat.completion", "created": int(time.time()),
-                "model": model_public_name, "choices": [{"index": 0, "message": {"role": "assistant", "content": full_content, "reasoning_content": full_reasoning or None}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+        for attempt_i in range(max_tries):
+            jar = acquire_jar(exclude=tried)
+            if not jar:
+                break
+            tried.add(jar.get("id"))
+            full_content, full_reasoning = "", ""
+            failed = False
+            async for ev in stream_arena_chat(
+                model_id, model_public_name, prompt_text, attachments, conv_key, jar,
+                prior_messages=prior_messages, is_api=True, request_user_count=user_count,
+            ):
+                t, v = ev
+                if t == "content":
+                    full_content += v
+                elif t == "reasoning":
+                    full_reasoning += v
+                elif t == "error":
+                    last_err = str(v)
+                    failed = True
+                    break
+            if not failed and (full_content or full_reasoning):
+                return {
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model_public_name,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": full_content,
+                            "reasoning_content": full_reasoning or None,
+                        },
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                }
+            if failed and _is_retryable(last_err):
+                log("WARN", f"Account failed ({last_err[:120]}) — trying another")
+                continue
+            if failed:
+                raise HTTPException(status_code=502, detail=last_err)
+        raise HTTPException(status_code=503, detail=last_err)
 
 
 # ============================================================
