@@ -593,7 +593,7 @@ def build_request_headers(jar: dict) -> dict:
         "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
     )
     return {
-        "Content-Type": "application/json", "Cookie": cookie_header,
+        "Content-Type": "text/plain;charset=UTF-8", "Cookie": cookie_header,
         "Origin": ARENA_BASE, "Referer": f"{ARENA_BASE}/text/direct",
         "User-Agent": ua, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
         "sec-ch-ua": '"Chromium";v="133", "Not(A:Brand";v="99"',
@@ -1875,7 +1875,7 @@ class KeeperSession:
 
 
     async def mint_recaptcha_token(self, timeout_s: float = 12.0) -> Optional[str]:
-        """Mint a recaptchaV3Token from the live page (for the token cache)."""
+        """Mint a recaptchaV3Token from the live page (tries multiple sitekeys/actions)."""
         page = self.page
         if not page or page.is_closed():
             return None
@@ -1886,24 +1886,63 @@ class KeeperSession:
                 await asyncio.sleep(1.0)
             token = await page.evaluate(
                 """async () => {
+                    const KNOWN = [
+                        '6Led_uYrAAAAAIP_9E8Ais_67Z6Vp4vdf40p8SQU',
+                        '6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I',
+                        '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0',
+                    ];
+                    const ACTIONS = ['chat_submit', 'battle', 'submit'];
+                    const discovered = [];
                     try {
-                        const el = document.querySelector(
-                            'textarea[name="g-recaptcha-response"], #g-recaptcha-response'
-                        );
-                        if (el && el.value && el.value.length > 20) return el.value;
-                        const g = window.grecaptcha;
-                        if (!g) return null;
-                        const run = (g.enterprise && g.enterprise.execute)
-                            ? (sk, o) => g.enterprise.execute(sk, o)
-                            : (g.execute ? (sk, o) => g.execute(sk, o) : null);
-                        if (!run) return null;
-                        const sitekey = '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0';
-                        const t = await Promise.race([
-                            run(sitekey, { action: 'chat_submit' }),
-                            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 12000)),
+                        for (const s of document.querySelectorAll('script[src*="recaptcha"]')) {
+                            const m = (s.src || '').match(/[?&](?:k|render)=([^&]+)/);
+                            if (m && m[1]) discovered.push(m[1]);
+                        }
+                        for (const el of document.querySelectorAll('[data-sitekey]')) {
+                            const k = el.getAttribute('data-sitekey');
+                            if (k) discovered.push(k);
+                        }
+                    } catch (e) {}
+                    const keys = [...new Set([...discovered, ...KNOWN])];
+                    const waitG = async (ms) => {
+                        const t0 = Date.now();
+                        while (Date.now() - t0 < ms) {
+                            const g = window.grecaptcha;
+                            if (g && ((g.enterprise && g.enterprise.execute) || g.execute)) return g;
+                            await new Promise(r => setTimeout(r, 250));
+                        }
+                        return null;
+                    };
+                    let g = await waitG(15000);
+                    if (!g) {
+                        try {
+                            const s = document.createElement('script');
+                            s.src = 'https://www.google.com/recaptcha/enterprise.js?render=' + encodeURIComponent(keys[0]);
+                            s.async = true;
+                            document.head.appendChild(s);
+                        } catch (e) {}
+                        g = await waitG(15000);
+                    }
+                    if (!g) return null;
+                    const api = (g.enterprise && g.enterprise.execute) ? g.enterprise : g;
+                    try {
+                        await Promise.race([
+                            new Promise(res => { try { api.ready(res); } catch (e) { res(); } }),
+                            new Promise(res => setTimeout(res, 5000)),
                         ]);
-                        return (t && typeof t === 'string' && t.length > 20) ? t : null;
-                    } catch (e) { return null; }
+                    } catch (e) {}
+                    for (const sk of keys) {
+                        for (const act of ACTIONS) {
+                            try {
+                                const t = await Promise.race([
+                                    api.execute(sk, { action: act }),
+                                    new Promise((_, rej) => setTimeout(() => rej(new Error('t')), 12000)),
+                                ]);
+                                if (t && typeof t === 'string' && t.length > 20) return t;
+                            } catch (e) {}
+                        }
+                    }
+                    return null;
                 }"""
             )
             if token:
@@ -2688,56 +2727,111 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     await asyncio.sleep(1.0)
 
                 result = await page.evaluate(
-                    """async ({ url, payload, sitekey }) => {
-                        // 1) Mint recaptchaV3Token in-page
-                        let token = null;
+                    """async ({ url, payload }) => {
+                        const KNOWN_KEYS = [
+                            '6Led_uYrAAAAAIP_9E8Ais_67Z6Vp4vdf40p8SQU',
+                            '6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I',
+                            '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0',
+                        ];
+                        const ACTIONS = ['chat_submit', 'battle', 'submit'];
+
+                        // Discover sitekey from page
+                        const discovered = [];
                         try {
-                            const el = document.querySelector(
-                                'textarea[name="g-recaptcha-response"], #g-recaptcha-response'
-                            );
-                            if (el && el.value && el.value.length > 20) token = el.value;
-                            if (!token && window.grecaptcha) {
+                            for (const s of document.querySelectorAll('script[src*="recaptcha"]')) {
+                                const m = (s.src || '').match(/[?&](?:k|render)=([^&]+)/);
+                                if (m && m[1]) discovered.push(m[1]);
+                            }
+                            for (const el of document.querySelectorAll('[data-sitekey]')) {
+                                const k = el.getAttribute('data-sitekey');
+                                if (k) discovered.push(k);
+                            }
+                        } catch (e) {}
+                        const sitekeys = [...new Set([...discovered, ...KNOWN_KEYS])];
+
+                        // Wait for grecaptcha
+                        const waitG = async (ms) => {
+                            const t0 = Date.now();
+                            while (Date.now() - t0 < ms) {
                                 const g = window.grecaptcha;
-                                const run = (g.enterprise && g.enterprise.execute)
-                                    ? (sk, o) => g.enterprise.execute(sk, o)
-                                    : (g.execute ? (sk, o) => g.execute(sk, o) : null);
-                                if (run) {
-                                    token = await Promise.race([
-                                        run(sitekey, { action: 'chat_submit' }),
+                                if (g && ((g.enterprise && g.enterprise.execute) || g.execute)) return g;
+                                await new Promise(r => setTimeout(r, 250));
+                            }
+                            return null;
+                        };
+                        let g = await waitG(20000);
+                        if (!g) {
+                            // Inject enterprise script with first key and retry
+                            try {
+                                const key = sitekeys[0];
+                                const s = document.createElement('script');
+                                s.src = 'https://www.google.com/recaptcha/enterprise.js?render=' + encodeURIComponent(key);
+                                s.async = true;
+                                document.head.appendChild(s);
+                            } catch (e) {}
+                            g = await waitG(20000);
+                        }
+                        if (!g) return { ok: false, status: 0, error: 'grecaptcha not available' };
+
+                        const api = (g.enterprise && g.enterprise.execute) ? g.enterprise : g;
+
+                        // ready() with timeout
+                        try {
+                            await Promise.race([
+                                new Promise(res => { try { api.ready(res); } catch (e) { res(); } }),
+                                new Promise(res => setTimeout(res, 5000)),
+                            ]);
+                        } catch (e) {}
+
+                        let token = null;
+                        let usedKey = null;
+                        let usedAction = null;
+                        for (const sk of sitekeys) {
+                            for (const act of ACTIONS) {
+                                try {
+                                    const t = await Promise.race([
+                                        api.execute(sk, { action: act }),
                                         new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 15000)),
                                     ]);
-                                }
+                                    if (t && typeof t === 'string' && t.length > 20) {
+                                        token = t; usedKey = sk; usedAction = act; break;
+                                    }
+                                } catch (e) {}
                             }
-                        } catch (e) {
-                            return { ok: false, status: 0, error: 'token: ' + (e && e.message) };
+                            if (token) break;
                         }
-                        if (!token || token.length < 20) {
-                            return { ok: false, status: 0, error: 'no recaptcha token from grecaptcha' };
-                        }
+                        if (!token) return { ok: false, status: 0, error: 'failed to mint recaptcha token' };
+
                         payload.recaptchaV3Token = token;
 
-                        // 2) Same-origin fetch with credentials (real cookies)
                         try {
                             const r = await fetch(url, {
                                 method: 'POST',
                                 credentials: 'include',
-                                headers: { 'Content-Type': 'application/json' },
+                                headers: {
+                                    'Content-Type': 'text/plain;charset=UTF-8',
+                                    'Accept': '*/*',
+                                },
                                 body: JSON.stringify(payload),
                             });
                             const text = await r.text();
-                            return { ok: r.ok, status: r.status, body: text };
+                            return {
+                                ok: r.ok,
+                                status: r.status,
+                                body: text,
+                                sitekey: usedKey,
+                                action: usedAction,
+                                tokenLen: token.length,
+                            };
                         } catch (e) {
                             return { ok: false, status: 0, error: 'fetch: ' + (e && e.message) };
                         }
                     }""",
-                    {
-                        "url": url,
-                        "payload": base,
-                        "sitekey": "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0",
-                    },
+                    {"url": url, "payload": base},
                 )
 
                 if not result:
+
                     raise RuntimeError("bridge evaluate returned nothing")
 
                 if not result.get("ok"):
