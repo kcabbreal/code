@@ -2562,27 +2562,23 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             }
             url = f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
 
-            token = None
-            if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
-                # Ensure we are on an arena page so grecaptcha / extension content-scripts are active
-                try:
-                    if "arena.ai" not in (s.page.url or ""):
-                        await s.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
-                        await asyncio.sleep(1.5)
-                except Exception:
-                    pass
+        # ---- Always mint a fresh reCAPTCHA v3 token when a keeper page is available ----
+        token = None
+        if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
+            try:
+                if "arena.ai" not in (s.page.url or ""):
+                    await s.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                    await asyncio.sleep(1.0)
+            except Exception:
+                pass
 
-                # Known working sitekeys (arena.ai / lmarena); try primary then fallback
-                sitekeys = [
-                    "6Led_uYrAAAAAIP_9E8Ais_67Z6Vp4vdf40p8SQU",
-                    "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0",
-                    "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I",
-                ]
-                for attempt in range(30):
-                    try:
-                        token = await s.page.evaluate(
-                            """async (sitekeys) => {
+            sitekey = "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0"
+            for attempt in range(20):
+                try:
+                    token = await s.page.evaluate(
+                        """async (sitekey) => {
             try {
+                // Prefer any value an extension already wrote into the DOM
                 const el = document.querySelector(
                     'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
                 );
@@ -2596,55 +2592,39 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     if (t && t.length > 20) return t;
                 }
 
-                const runner = (g.enterprise && g.enterprise.execute)
-                    ? g.enterprise.execute.bind(g.enterprise)
-                    : (g.execute ? g.execute.bind(g) : null);
-                if (!runner) return null;
+                const run = (g.enterprise && g.enterprise.execute)
+                    ? (sk, opts) => g.enterprise.execute(sk, opts)
+                    : (g.execute ? (sk, opts) => g.execute(sk, opts) : null);
+                if (!run) return null;
 
-                const actions = ['chat_submit', 'chat', 'submit'];
-                for (const sitekey of sitekeys) {
-                    for (const action of actions) {
-                        try {
-                            const t = await Promise.race([
-                                runner(sitekey, { action }),
-                                new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
-                            ]);
-                            if (t && typeof t === 'string' && t.length > 20) return t;
-                        } catch (e) {}
-                    }
-                }
+                // Arena uses action chat_submit (confirmed by g4f / Arena API Bridge)
+                const t = await Promise.race([
+                    run(sitekey, { action: 'chat_submit' }),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 12000)),
+                ]);
+                if (t && typeof t === 'string' && t.length > 20) return t;
             } catch (e) {}
             return null;
         }""",
-                            sitekeys,
-                        )
-                    except Exception as e:
-                        log("WARN", f"[{getattr(s,'name',jar_id)}] grecaptcha eval error: {e}")
-                    if token:
-                        break
-                    await asyncio.sleep(1.0)
-
-                if not token:
-                    log("WARN", f"[{getattr(s,'name',jar_id)}] reCAPTCHA token not obtained after retries")
-                    yield (
-                        "error",
-                        "502: reCAPTCHA token missing — ensure BRIDGENA_CAPTCHA_EXT points to an unpacked "
-                        "captcha solver extension, keeper is running, and the extension can solve on arena.ai",
+                        sitekey,
                     )
-                    return
-            else:
-                yield (
-                    "error",
-                    "502: reCAPTCHA token missing — no active keeper session. "
-                    "Enable keeper for an account and set BRIDGENA_CAPTCHA_EXT to an unpacked extension path.",
-                )
-                return
+                except Exception as e:
+                    log("WARN", f"[{getattr(s, 'name', jar_id)}] grecaptcha eval: {e}")
+                if token:
+                    break
+                await asyncio.sleep(0.8)
 
-            if token:
-                base["recaptchaToken"] = token
-                base["recaptcha"] = token
-                base["captchaToken"] = token
-                base["g-recaptcha-response"] = token
+        if not token:
+            yield (
+                "error",
+                "502: reCAPTCHA token missing — start a keeper session (with BRIDGENA_CAPTCHA_EXT "
+                "pointing at an unpacked solver extension) so grecaptcha.enterprise.execute can run",
+            )
+            return
+
+        # Arena expects this exact field name
+        base["recaptchaV3Token"] = token
+        log("INFO", f"[{jar_id}] Attached recaptchaV3Token ({len(token)} chars)")
 
         user_message = {"content": content_to_send}
         if attachments:
@@ -2753,6 +2733,30 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     text = raw.decode("utf-8", errors="ignore")
                     
                     log("ERROR", f"Status {resp.status_code}, URL {url}, Mode {base.get('mode')}, modelAId {model_id}, Body: {text[:1500]}")
+                    # Refresh token and retry once on recaptcha rejection
+                    if attempt == 0 and "recaptcha" in text.lower():
+                        log("WARN", f"[{jar_id}] recaptcha rejected — minting fresh token and retrying")
+                        # force re-mint on next loop iteration by clearing and continuing
+                        if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
+                            try:
+                                fresh = await s.page.evaluate(
+                                    """async () => {
+                    const sitekey = '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0';
+                    const g = window.grecaptcha;
+                    if (!g) return null;
+                    const run = (g.enterprise && g.enterprise.execute)
+                        ? (sk, o) => g.enterprise.execute(sk, o)
+                        : (g.execute ? (sk, o) => g.execute(sk, o) : null);
+                    if (!run) return null;
+                    return await run(sitekey, { action: 'chat_submit' });
+                }"""
+                                )
+                                if fresh and len(fresh) > 20:
+                                    base["recaptchaV3Token"] = fresh
+                                    log("INFO", f"[{jar_id}] Fresh recaptchaV3Token ({len(fresh)} chars) — retrying")
+                                    continue
+                            except Exception as e:
+                                log("WARN", f"[{jar_id}] token refresh failed: {e}")
                     yield ("error", f"{resp.status_code}: {text[:400] or '(empty body)'}")
                     return
 
