@@ -1208,6 +1208,37 @@ class KeeperSession:
     async def _verify_auth_state(self, page) -> bool:
         """Thorough check to verify whether user is genuinely logged into arena.ai."""
         try:
+            # 0. Fast path: auth cookies in the browser context (most reliable)
+            try:
+                cookies = await page.context.cookies()
+                auth_cookie_names = (
+                    "arena-auth-prod-v1.0", "arena-auth-prod-v1.1", "arena-auth-prod-v1",
+                    "arena-auth", "__session", "session", "authToken", "clerk-db-jwt",
+                )
+                has_auth = any(
+                    any(n in (c.get("name") or "") for n in auth_cookie_names)
+                    for c in cookies
+                )
+                if has_auth:
+                    # Confirm the session is not just a stale cookie by probing the API
+                    status_code = await page.evaluate(
+                        """async () => {
+                            try {
+                                const r = await fetch('/api/history/unified?limit=1', {credentials:'include'});
+                                return r.status;
+                            } catch(e) { return 0; }
+                        }"""
+                    )
+                    if status_code == 200:
+                        return True
+                    # Cookie present but API rejects -> treat as not logged in
+                    if status_code in (401, 403):
+                        return False
+                    # Network glitch: still trust the cookie
+                    return True
+            except Exception:
+                pass
+
             # 1. If page contains expected email near footer/chip -> logged in
             if self.email:
                 try:
@@ -1217,39 +1248,51 @@ class KeeperSession:
                 except Exception:
                     pass
 
-            # 2. If Login button is visible on page, we are NOT logged in
-            login_btn = page.locator("button:has-text('Log In'), a:has-text('Log In'), button:has-text('Sign In'), a:has-text('Sign In'), button:has-text('Login'), a:has-text('Login')").first
-            if await login_btn.count() > 0 and await login_btn.is_visible():
-                return False
+            # 2. Explicit "not logged in" UI signals
+            login_btn = page.locator(
+                "button:has-text('Log In'), a:has-text('Log In'), "
+                "button:has-text('Sign In'), a:has-text('Sign In'), "
+                "button:has-text('Login'), a:has-text('Login')"
+            ).first
+            try:
+                if await login_btn.count() > 0 and await login_btn.is_visible():
+                    return False
+            except Exception:
+                pass
 
-            # If 'Log In or Create' modal is visible, we are NOT logged in
             modal_title = page.locator("text='Log In or Create'").first
-            if await modal_title.count() > 0 and await modal_title.is_visible():
-                return False
+            try:
+                if await modal_title.count() > 0 and await modal_title.is_visible():
+                    return False
+            except Exception:
+                pass
 
-            # 3. Check for typical auth cookies directly in the browser context
-            cookies = await page.context.cookies()
-            auth_cookie_names = ["arena-auth", "arena-auth-prod-v1.0", "arena-auth-prod-v1.1", "__session", "session", "authToken", "clerk-db-jwt"]
-            has_auth = any(any(n in c["name"] for n in auth_cookie_names) for c in cookies)
-            if has_auth:
-                return True
-                
-            # 4. Fallback: Check if the user profile avatar or settings button is present
-            profile_btn = page.locator("button:has(svg), button[aria-label='User Profile'], button[aria-label='Settings']").last
-            if await profile_btn.count() > 0 and "arena.ai" in (page.url or ""):
-                return True
+            # 3. Profile / settings affordances
+            try:
+                profile_btn = page.locator(
+                    "button[aria-label='User Profile'], button[aria-label='Settings'], "
+                    "[data-testid*='user'], [data-testid*='profile']"
+                ).first
+                if await profile_btn.count() > 0 and "arena.ai" in (page.url or ""):
+                    return True
+            except Exception:
+                pass
 
-            # 5. Check actual unified history API status
+            # 4. Final API probe
             status_code = await page.evaluate(
-                "async () => { try { const r = await fetch('/api/history/unified?limit=1', "
-                "{credentials:'include'}); return r.status; } catch(e) { return 0; } }"
+                """async () => {
+                    try {
+                        const r = await fetch('/api/history/unified?limit=1', {credentials:'include'});
+                        return r.status;
+                    } catch(e) { return 0; }
+                }"""
             )
             if status_code == 200:
                 return True
-                    
+
         except Exception:
             pass
-        await self._screenshot(page, "unverified_auth_state")
+        # Do not screenshot every negative check — only on explicit failures
         return False
     async def _screenshot(self, page, tag: str):
         try:
@@ -1291,7 +1334,8 @@ class KeeperSession:
     async def _login_email_native(self) -> Tuple[bool, str]:
         """Multi-step email + password login on arena.ai modal.
         Uses instant fill for speed and reliability.
-        Handles: Log In button -> email input -> Continue with email -> password -> Login."""
+        Handles: Log In button -> email input -> Continue with email -> password -> Login.
+        Short-circuits when the session is already authenticated."""
         page = self.page
         if not page or page.is_closed():
             return False, "Browser page is closed"
@@ -1301,6 +1345,17 @@ class KeeperSession:
         await self._inject_visual_cursor(page)
 
         try:
+            # ---- STEP 0: Already logged in? ----
+            self._set_step("[0/6] Checking existing session...")
+            await self._ensure_sidebar_cookie()
+            if ARENA_BASE not in (page.url or ""):
+                await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                await self._wait_cloudflare(page)
+            if await self._verify_auth_state(page):
+                await self._harvest_cookies()
+                self._set_step("[SUCCESS] Already authenticated — skipping login form")
+                return True, "Already logged in"
+
             # ---- STEP 1: Navigate ----
             self._set_step("[1/6] Navigating to arena.ai...")
             await self._ensure_sidebar_cookie()
@@ -1308,6 +1363,12 @@ class KeeperSession:
             await self._wait_cloudflare(page)
             await self._handle_turnstile(page)
             await asyncio.sleep(2)
+
+            # Re-check after navigation (cookies may have restored)
+            if await self._verify_auth_state(page):
+                await self._harvest_cookies()
+                self._set_step("[SUCCESS] Session restored after navigation")
+                return True, "Already logged in"
 
             # ---- Dismiss any promo banners blocking the UI ----
             await self._dismiss_promos(page)
@@ -1704,6 +1765,19 @@ class KeeperSession:
                     self._schedule_retry()
                     return False
 
+                # Fast path: already authenticated (e.g. cookies still valid)
+                try:
+                    if await self._verify_auth_state(page):
+                        await self._harvest_cookies()
+                        self.status = "running"
+                        self.fail_count = 0
+                        self.next_retry = 0
+                        self._set_step("[SUCCESS] Session already valid — no re-login needed")
+                        log("OK", f"[{self.name}] Relogin skipped — already authenticated")
+                        return True
+                except Exception:
+                    pass
+
                 if not (self.email and self.password):
                     self.error = "No credentials configured — enter email:password in dashboard"
                     self._set_step(f"[ERROR] {self.error}")
@@ -1906,23 +1980,44 @@ class KeeperSession:
                 ]
 
                 if has_ext:
+                    # Official Playwright approach: channel="chromium" enables extensions
+                    # even in headless / new-headless mode. Force headed only when user
+                    # explicitly requested a live window.
                     self._set_step("Launching persistent context with Captcha Extension...")
-                    ext_args = common_args + [
+                    want_headless = self.headless and not self.keep_forever
+                    ext_args = list(common_args) + [
                         f"--disable-extensions-except={ext_path}",
-                        f"--load-extension={ext_path}"
+                        f"--load-extension={ext_path}",
+                        # Required on modern Chrome so --load-extension is not ignored
+                        "--disable-features=DisableLoadExtensionCommandLineSwitch",
                     ]
-                    self.context = await self.playwright.chromium.launch_persistent_context(
+                    if want_headless:
+                        # New headless mode supports extensions when channel=chromium
+                        ext_args.append("--headless=new")
+                    launch_kwargs = dict(
                         user_data_dir=profile_dir,
-                        headless=False,
+                        channel="chromium",
+                        headless=want_headless,
                         ignore_default_args=["--disable-extensions"],
                         args=ext_args,
                         viewport={"width": 1920, "height": 1080},
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0"
+                        user_agent=(
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+                        ),
                     )
+                    try:
+                        self.context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+                    except Exception as e_ext:
+                        log("WARN", f"[{self.name}] Extension launch failed ({e_ext}); retrying headed")
+                        launch_kwargs["headless"] = False
+                        launch_kwargs["args"] = [a for a in ext_args if not a.startswith("--headless")]
+                        self.context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+                        self.headless = False
                     self.browser = None
                     self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
                     launched = True
-                    log("OK", f"[{self.name}] Captcha extension loaded from {ext_path}")
+                    log("OK", f"[{self.name}] Captcha extension loaded from {ext_path} (headless={self.headless})")
                 else:
                     if ext_path:
                         log("WARN", f"[{self.name}] BRIDGENA_CAPTCHA_EXT set but manifest.json not found in {ext_path}")
@@ -2469,49 +2564,79 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
 
             token = None
             if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
-                for _ in range(45):
+                # Ensure we are on an arena page so grecaptcha / extension content-scripts are active
+                try:
+                    if "arena.ai" not in (s.page.url or ""):
+                        await s.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                        await asyncio.sleep(1.5)
+                except Exception:
+                    pass
+
+                sitekey = "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0"
+                for attempt in range(30):
                     try:
-                        token = await s.page.evaluate("""async () => {
+                        token = await s.page.evaluate(
+                            """async (sitekey) => {
             try {
+                // Prefer any pre-solved response the extension may have written
+                const el = document.querySelector(
+                    'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
+                );
+                if (el && el.value && el.value.length > 20) return el.value;
+
                 const g = window.grecaptcha;
-                if (g) {
-                    if (g.getResponse) {
-                        const t = g.getResponse();
-                        if (t) return t;
-                    }
-                    // Trigger Enterprise/V3 execution (Raptor will intercept and solve if challenged)
-                    const sitekey = '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0';
-                    if (g.enterprise && g.enterprise.execute) {
-                        return await g.enterprise.execute(sitekey, {action: 'chat'});
-                    }
-                    if (g.execute) {
-                        return await g.execute(sitekey, {action: 'chat'});
-                    }
+                if (!g) return null;
+
+                if (typeof g.getResponse === 'function') {
+                    const t = g.getResponse();
+                    if (t && t.length > 20) return t;
                 }
-            } catch(e) {}
-            const el = document.querySelector(
-                'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
-            );
-            if (el && el.value) return el.value;
+
+                // Enterprise / V3 path — captcha extensions (Raptor, etc.) intercept execute()
+                const runner = (g.enterprise && g.enterprise.execute)
+                    ? g.enterprise.execute.bind(g.enterprise)
+                    : (g.execute ? g.execute.bind(g) : null);
+                if (runner) {
+                    const t = await Promise.race([
+                        runner(sitekey, { action: 'chat' }),
+                        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 12000)),
+                    ]);
+                    if (t && typeof t === 'string' && t.length > 20) return t;
+                }
+            } catch (e) {
+                // Extension may still be solving; return null so we retry
+            }
             return null;
-        }""")
-                    except Exception:
-                        pass
-                    if token: break
+        }""",
+                            sitekey,
+                        )
+                    except Exception as e:
+                        log("WARN", f"[{getattr(s,'name',jar_id)}] grecaptcha eval error: {e}")
+                    if token:
+                        break
                     await asyncio.sleep(1.0)
-                
+
                 if not token:
-                    yield ("error", "502: reCAPTCHA token missing — headed keeper + BRIDGENA_CAPTCHA_EXT, open Live Browser, wait for Raptor to solve")
+                    log("WARN", f"[{getattr(s,'name',jar_id)}] reCAPTCHA token not obtained after retries")
+                    yield (
+                        "error",
+                        "502: reCAPTCHA token missing — ensure BRIDGENA_CAPTCHA_EXT points to an unpacked "
+                        "captcha solver extension, keeper is running, and the extension can solve on arena.ai",
+                    )
                     return
-            
+            else:
+                yield (
+                    "error",
+                    "502: reCAPTCHA token missing — no active keeper session. "
+                    "Enable keeper for an account and set BRIDGENA_CAPTCHA_EXT to an unpacked extension path.",
+                )
+                return
+
             if token:
                 base["recaptchaToken"] = token
                 base["recaptcha"] = token
                 base["captchaToken"] = token
                 base["g-recaptcha-response"] = token
-            else:
-                # Still fail if there's no keeper running to provide the token
-                yield ("error", "502: reCAPTCHA token missing — no headed keeper running to solve recaptcha")
                 return
 
         user_message = {"content": content_to_send}
@@ -3048,7 +3173,7 @@ async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
 # UI - MINIMALIST AUTHENTICATION & LOGIN (/login)
 # ============================================================
 
-LOGIN_TEMPLATE = """<!DOCTYPE html>
+LOGIN_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -3269,7 +3394,7 @@ async def logout(request: Request):
 # UI - MINIMALIST OPENWEBUI / CHATGPT CHAT WORKSPACE (/chat)
 # ============================================================
 
-CHAT_TEMPLATE = """<!DOCTYPE html>
+CHAT_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -3571,8 +3696,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                 return marked.parse(text);
             }
         } catch(e) {}
-        return escapeHtml(text).replace(/
-/g, '<br>');
+        return escapeHtml(text).replace(/\n/g, '<br>');
     }
 
     function toggleSidebar() {
@@ -3809,16 +3933,18 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         box.querySelectorAll('pre').forEach(pre => {
             if (!pre.querySelector('.code-header-bar')) {
                 const codeEl = pre.querySelector('code');
-                const lang = (codeEl?.className?.match(/language-(\w+)/) || [, 'code'])[1];
+                const lang = (codeEl && codeEl.className && codeEl.className.match(/language-(\w+)/) || [null, 'code'])[1];
                 const header = document.createElement('div');
                 header.className = 'code-header-bar';
-                header.innerHTML = `<span>${escapeHtml(lang)}</span><button class="code-copy-btn" onclick="copyCode(this)"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg> Copy</button>`;
-                pre.insertBefore(header, codeEl);
+                header.innerHTML = '<span>' + escapeHtml(lang) + '</span><button class="code-copy-btn" onclick="copyCode(this)">Copy</button>';
+                if (codeEl) pre.insertBefore(header, codeEl);
+                else pre.insertBefore(header, pre.firstChild);
             }
         });
+        try { if (typeof hljs !== 'undefined') hljs.highlightAll(); } catch(e) {}
 
         const scrollArea = document.getElementById('chatScrollArea');
-        scrollArea.scrollTop = scrollArea.scrollHeight;
+        if (scrollArea) scrollArea.scrollTop = scrollArea.scrollHeight;
     }
 
     function escapeHtml(str) {
@@ -3884,7 +4010,11 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         abortController = new AbortController();
 
         try {
-            const history = conv.messages.slice(0, -1).map(m => ({ role: m.role, content: m.content }));
+            // Only send completed messages (exclude the empty assistant placeholder)
+            const history = conv.messages
+                .slice(0, -1)
+                .filter(m => m && m.content)
+                .map(m => ({ role: m.role, content: m.content }));
             const r = await fetch('/v1/chat/completions', {
                 method: 'POST',
                 credentials: 'include',
@@ -3913,8 +4043,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                 const { done, value } = await reader.read();
                 if (done) break;
                 buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('
-');
+                const lines = buffer.split('\n');
                 buffer = lines.pop() || '';
 
                 for (const line of lines) {
@@ -4022,7 +4151,7 @@ async def chat_api_models(request: Request):
 # UI - MINIMALIST CONTROL CENTER DASHBOARD (/dashboard)
 # ============================================================
 
-DASHBOARD_TEMPLATE = """<!DOCTYPE html>
+DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -4047,10 +4176,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Inter', -apple-system, sans-serif;
-            background: var(--bg-base);
+            background: radial-gradient(ellipse at top, #161616 0%, var(--bg-base) 55%);
             color: var(--text-main);
             min-height: 100vh;
-            padding: 24px 32px;
+            padding: 28px 36px 48px;
             font-size: 14px;
             letter-spacing: -0.15px;
             -webkit-font-smoothing: antialiased;
@@ -4088,9 +4217,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
         .stat-card {
-            background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
-            padding: 20px; display: flex; flex-direction: column; gap: 8px;
+            background: linear-gradient(180deg, #1f1f1f 0%, var(--bg-card) 100%);
+            border: 1px solid var(--border); border-radius: 14px;
+            padding: 22px; display: flex; flex-direction: column; gap: 8px;
+            box-shadow: 0 1px 0 rgba(255,255,255,0.03) inset;
+            transition: border-color 0.15s, transform 0.15s;
         }
+        .stat-card:hover { border-color: #3a3a3a; transform: translateY(-1px); }
         .stat-card-header { display: flex; align-items: center; justify-content: space-between; color: var(--text-muted); font-size: 13px; font-weight: 500; }
         .stat-card .val { font-size: 28px; font-weight: 600; color: var(--text-main); font-feature-settings: 'tnum'; }
         .stat-card .desc { font-size: 12.5px; color: var(--text-faint); }
@@ -4109,7 +4242,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         .tab-content { display: none; flex-direction: column; gap: 24px; }
         .tab-content.active { display: flex; }
 
-        .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
+        .card {
+            background: var(--bg-card); border: 1px solid var(--border); border-radius: 14px;
+            padding: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+        }
         .card h2 { font-size: 18px; font-weight: 600; color: var(--text-main); margin-bottom: 16px; }
         .card-header-bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
         .card-header-bar h2 { margin-bottom: 0; }
