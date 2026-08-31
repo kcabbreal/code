@@ -2537,15 +2537,15 @@ async def generate_title(user_msg: str, assistant_reply: str) -> str:
 async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key, jar,
                             prior_messages=None, is_api=False, request_user_count=None):
     """
-    Stream a chat completion from Arena using jar cookies over plain HTTP.
-    Session keeper is NOT required for this path — it only maintains/refreshes cookies.
-    Mirrors the old LMArena Bridge request shape.
+    Stream a chat completion from Arena.
+    When a keeper session is running, the request is made *inside* the real browser
+    page (token + fetch in the same context) — matching how arena.ai itself works.
+    Cookies-only HTTP is used only as a fallback.
     """
     jar_id = jar["id"]
-
-    # Prefer freshest cookies from a running keeper if one happens to be up,
-    # but never require a live browser for completions.
     s = keeper.sessions.get(jar_id)
+
+    # Refresh jar cookies from live keeper when available
     if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
         try:
             live = await get_live_cookies(jar_id)
@@ -2561,7 +2561,6 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
 
     def _curl_headers(j):
         headers = build_request_headers(j)
-        # curl_cffi sets its own UA / sec-ch headers when impersonating
         for k in list(headers.keys()):
             if k.lower() in (
                 "user-agent", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
@@ -2569,6 +2568,59 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             ):
                 headers.pop(k, None)
         return headers
+
+    async def _parse_arena_lines(line_iter):
+        """Yield (kind, value) from Arena stream lines. kind in content|reasoning|error|finish."""
+        response_text = ""
+        reasoning_text = ""
+        error_message = None
+        async for line in line_iter:
+            line = (line or "").strip()
+            if not line:
+                continue
+            if line.startswith("data: "):
+                line = line[6:].strip()
+                if not line or line == "[DONE]":
+                    continue
+            colon = line.find(":")
+            if colon < 0:
+                continue
+            prefix, payload = line[:colon], line[colon + 1:]
+            if prefix in ("a0", "0"):
+                try:
+                    t = json.loads(payload)
+                    if isinstance(t, str):
+                        response_text += t
+                        yield ("content", t)
+                except json.JSONDecodeError:
+                    continue
+            elif prefix in ("ag", "g"):
+                try:
+                    t = json.loads(payload)
+                    if isinstance(t, str):
+                        reasoning_text += t
+                        yield ("reasoning", t)
+                except json.JSONDecodeError:
+                    continue
+            elif prefix in ("a3", "3", "e"):
+                try:
+                    err = json.loads(payload)
+                    error_message = err if isinstance(err, str) else json.dumps(err)
+                except json.JSONDecodeError:
+                    error_message = payload
+                yield ("error", f"Stream Error: {error_message}")
+                return
+            elif prefix in ("ad", "d"):
+                try:
+                    md = json.loads(payload)
+                    yield ("finish", md.get("finishReason", "stop"))
+                except json.JSONDecodeError:
+                    continue
+        if not response_text and not reasoning_text:
+            yield ("error", f"Arena error: {error_message}" if error_message
+                   else "502: Arena returned empty response")
+            return
+        yield ("_done", {"content": response_text, "reasoning": reasoning_text})
 
     for attempt in (0, 1):
         conv = get_conversation(conv_key)
@@ -2616,34 +2668,182 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             user_message["experimental_attachments"] = attachments
         base["userMessage"] = user_message
 
-        # Arena always sends recaptchaV3Token (confirmed via browser spy).
-        # Prefer a cached token from the keeper background loop; mint live only if needed.
+        response_text = ""
+        reasoning_text = ""
+
+        # ========== Preferred path: in-browser fetch (real page + real token) ==========
+        use_bridge = (
+            s is not None
+            and s.running
+            and getattr(s, "page", None) is not None
+            and not s.page.is_closed()
+        )
+
+        if use_bridge:
+            try:
+                # Mint token + POST entirely inside the page so the token is valid for this context
+                page = s.page
+                if "arena.ai" not in (page.url or ""):
+                    await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                    await asyncio.sleep(1.0)
+
+                result = await page.evaluate(
+                    """async ({ url, payload, sitekey }) => {
+                        // 1) Mint recaptchaV3Token in-page
+                        let token = null;
+                        try {
+                            const el = document.querySelector(
+                                'textarea[name="g-recaptcha-response"], #g-recaptcha-response'
+                            );
+                            if (el && el.value && el.value.length > 20) token = el.value;
+                            if (!token && window.grecaptcha) {
+                                const g = window.grecaptcha;
+                                const run = (g.enterprise && g.enterprise.execute)
+                                    ? (sk, o) => g.enterprise.execute(sk, o)
+                                    : (g.execute ? (sk, o) => g.execute(sk, o) : null);
+                                if (run) {
+                                    token = await Promise.race([
+                                        run(sitekey, { action: 'chat_submit' }),
+                                        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 15000)),
+                                    ]);
+                                }
+                            }
+                        } catch (e) {
+                            return { ok: false, status: 0, error: 'token: ' + (e && e.message) };
+                        }
+                        if (!token || token.length < 20) {
+                            return { ok: false, status: 0, error: 'no recaptcha token from grecaptcha' };
+                        }
+                        payload.recaptchaV3Token = token;
+
+                        // 2) Same-origin fetch with credentials (real cookies)
+                        try {
+                            const r = await fetch(url, {
+                                method: 'POST',
+                                credentials: 'include',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(payload),
+                            });
+                            const text = await r.text();
+                            return { ok: r.ok, status: r.status, body: text };
+                        } catch (e) {
+                            return { ok: false, status: 0, error: 'fetch: ' + (e && e.message) };
+                        }
+                    }""",
+                    {
+                        "url": url,
+                        "payload": base,
+                        "sitekey": "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0",
+                    },
+                )
+
+                if not result:
+                    raise RuntimeError("bridge evaluate returned nothing")
+
+                if not result.get("ok"):
+                    status = result.get("status") or 0
+                    body = (result.get("body") or result.get("error") or "")[:500]
+                    log("ERROR", f"[{jar_id}] in-page fetch HTTP {status}: {body[:300]}")
+                    low = body.lower()
+
+                    if status == 429 or "rate limit" in low or "prompt rate limit" in low:
+                        mark_jar_status(jar_id, "limited")
+                        yield ("error", f"{status}: rate limited — cooling down")
+                        return
+
+                    if "recaptcha" in low or "no recaptcha" in low:
+                        if attempt == 0:
+                            await asyncio.sleep(1.5)
+                            continue
+                        yield ("error", f"{status or 403}: recaptcha validation failed")
+                        return
+
+                    if status in (401, 403) and "recaptcha" not in low:
+                        # Stale evaluation / transient — clear binding, retry as new
+                        def _clear(state):
+                            c = state.get("conversations", {}).get(conv_key)
+                            if c and "arena" in c:
+                                c["arena"].pop(model_name, None)
+                        try:
+                            mutate_state(_clear)
+                        except Exception:
+                            pass
+                        if attempt == 0:
+                            continue
+                        yield ("error", f"{status}: {body[:300]}")
+                        return
+
+                    if status == 404 and "model" in low:
+                        yield ("error", f"404: Model not found upstream — refresh model catalog")
+                        return
+
+                    yield ("error", f"{status}: {body[:400]}")
+                    return
+
+                # Parse successful body as Arena stream lines
+                body_text = result.get("body") or ""
+                async def _lines():
+                    for ln in body_text.splitlines():
+                        yield ln
+
+                done_meta = None
+                async for kind, val in _parse_arena_lines(_lines()):
+                    if kind == "_done":
+                        done_meta = val
+                    elif kind == "error":
+                        yield ("error", val)
+                        return
+                    else:
+                        if kind == "content":
+                            response_text += val
+                        elif kind == "reasoning":
+                            reasoning_text += val
+                        yield (kind, val)
+
+                if not response_text and not reasoning_text:
+                    yield ("error", "502: Arena returned empty response")
+                    return
+
+                conv2 = get_conversation(conv_key)
+                conv2["arena"][model_name] = {"arena_id": base["id"], "mode": base.get("mode") or "direct-battle"}
+                conv2["model"] = model_name
+                if is_api and request_user_count is not None:
+                    conv2["user_count"] = request_user_count
+                if not is_api:
+                    conv2["history"].append({"role": "user", "content": prompt})
+                    conv2["history"].append({
+                        "role": "assistant",
+                        "content": response_text.strip() or reasoning_text.strip(),
+                    })
+                    conv2["history"] = conv2["history"][-200:]
+                save_conversation(conv_key, conv2)
+                # Keep jar cookies in sync after successful in-page request
+                try:
+                    await s._harvest_cookies()
+                except Exception:
+                    pass
+                yield ("done", {"mode": base.get("mode"), "content_len": len(response_text)})
+                return
+
+            except Exception as e:
+                log("WARN", f"[{jar_id}] in-page bridge failed: {e} — falling back to HTTP")
+
+        # ========== Fallback: HTTP with jar cookies (+ cached token if any) ==========
         token = None
         if s and s.running:
             token = s.get_cached_recaptcha_token(max_age=90)
-            if not token and getattr(s, "page", None) and not s.page.is_closed():
+            if not token:
                 try:
                     token = await s.mint_recaptcha_token()
-                except Exception as e:
-                    log("WARN", f"[{jar_id}] live mint failed: {e}")
-        if not token:
-            yield (
-                "error",
-                "502: recaptchaV3Token unavailable — enable keeper for this account so it can "
-                "mint tokens in the background (login once; completions still use HTTP + cookies)",
-            )
-            return
-        base["recaptchaV3Token"] = token
-        # Tokens are single-use — clear cache so the keeper mints a fresh one next time
-        if s is not None:
-            s._recaptcha_token = None
-            s._recaptcha_token_at = 0
+                except Exception:
+                    pass
+        if token:
+            base["recaptchaV3Token"] = token
+            if s is not None:
+                s._recaptcha_token = None
+                s._recaptcha_token_at = 0
 
-        response_text = ""
-        reasoning_text = ""
-        error_message = None
         headers = _curl_headers(jar)
-
         try:
             async with AsyncSession(impersonate="chrome131") as client:
                 try:
@@ -2657,144 +2857,66 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     async for chunk in resp.aiter_content():
                         raw += chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8", errors="ignore")
                     text = raw.decode("utf-8", errors="ignore")
-                    log("ERROR", f"Status {resp.status_code}, URL {url}, Body: {text[:800]}")
+                    log("ERROR", f"HTTP Status {resp.status_code}, Body: {text[:800]}")
                     low = text.lower()
-
-                    # --- Rate limit (never touch auth state) ---
-                    if resp.status_code == 429 or "rate limit" in low or "prompt rate limit" in low:
+                    if resp.status_code == 429 or "rate limit" in low:
                         mark_jar_status(jar_id, "limited")
-                        yield ("error", f"{resp.status_code}: rate limited — cooling down")
+                        yield ("error", f"{resp.status_code}: rate limited")
                         return
-
-                    # --- reCAPTCHA failure (never mark jar expired) ---
                     if "recaptcha" in low:
-                        if attempt == 0 and s and s.running:
-                            try:
-                                # Force-clear cache and mint a brand-new token
-                                s._recaptcha_token = None
-                                s._recaptcha_token_at = 0
-                                fresh = await s.mint_recaptcha_token()
-                                if fresh and len(fresh) > 20:
-                                    base["recaptchaV3Token"] = fresh
-                                    s._recaptcha_token = None  # single-use
-                                    log("INFO", f"[{jar_id}] Fresh recaptchaV3Token after 403 — retrying")
-                                    continue
-                            except Exception as e:
-                                log("WARN", f"[{jar_id}] recaptcha remint failed: {e}")
-                        yield ("error", f"{resp.status_code}: recaptcha validation failed — keeper will mint a new token shortly, retry")
+                        yield ("error", f"{resp.status_code}: recaptcha validation failed — use keeper (headless or live)")
                         return
-
-                    # --- True auth failure only ---
-                    auth_fail = (
-                        "unauthorized" in low
-                        or "not authenticated" in low
-                        or "please log in" in low
-                        or "session expired" in low
-                        or (resp.status_code in (401, 403) and "recaptcha" not in low and "rate" not in low)
-                    )
-                    if auth_fail:
-                        still_ok = False
-                        if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
-                            try:
-                                still_ok = await s._verify_auth_state(s.page)
-                            except Exception:
-                                pass
-                        if still_ok or follow:
-                            log("WARN", f"[{jar_id}] HTTP {resp.status_code} but session still valid — clearing conv binding")
-                            def _clear(state):
-                                c = state.get("conversations", {}).get(conv_key)
-                                if c and "arena" in c:
-                                    c["arena"].pop(model_name, None)
-                            try:
-                                mutate_state(_clear)
-                            except Exception:
-                                pass
-                            if attempt == 0:
-                                continue
-                            yield ("error", f"{resp.status_code}: {text[:300]}")
-                            return
-                        mark_jar_status(jar_id, "expired")
-                        yield ("error", f"{resp.status_code}: session expired — re-login via keeper")
+                    if resp.status_code == 404 and "model" in low:
+                        yield ("error", "404: Model not found — refresh catalog from dashboard")
                         return
-
-                    yield ("error", f"{resp.status_code}: {text[:400] or '(empty body)'}")
+                    yield ("error", f"{resp.status_code}: {text[:400]}")
                     return
 
-
                 buffer = b""
-                async for chunk in resp.aiter_content():
-                    if not chunk:
-                        continue
-                    if isinstance(chunk, str):
-                        chunk = chunk.encode("utf-8", errors="ignore")
-                    buffer += chunk
-                    while b"\n" in buffer:
-                        line_bytes, buffer = buffer.split(b"\n", 1)
-                        line = line_bytes.decode("utf-8", errors="ignore").strip()
-                        if not line:
-                            continue
-                        if line.startswith("data: "):
-                            line = line[6:].strip()
-                            if not line or line == "[DONE]":
-                                continue
-                        colon = line.find(":")
-                        if colon < 0:
-                            continue
-                        prefix, payload = line[:colon], line[colon + 1:]
-                        if prefix in ("a0", "0"):
-                            try:
-                                t = json.loads(payload)
-                                if isinstance(t, str):
-                                    response_text += t
-                                    yield ("content", t)
-                            except json.JSONDecodeError:
-                                continue
-                        elif prefix in ("ag", "g"):
-                            try:
-                                t = json.loads(payload)
-                                if isinstance(t, str):
-                                    reasoning_text += t
-                                    yield ("reasoning", t)
-                            except json.JSONDecodeError:
-                                continue
-                        elif prefix in ("a3", "3", "e"):
-                            try:
-                                err = json.loads(payload)
-                                error_message = err if isinstance(err, str) else json.dumps(err)
-                            except json.JSONDecodeError:
-                                error_message = payload
-                            yield ("error", f"Stream Error: {error_message}")
-                            return
-                        elif prefix in ("ad", "d"):
-                            try:
-                                md = json.loads(payload)
-                                yield ("finish", md.get("finishReason", "stop"))
-                            except json.JSONDecodeError:
-                                continue
 
-            if not response_text and not reasoning_text:
-                yield ("error", f"Arena error: {error_message}" if error_message
-                       else "502: Arena returned empty response (auth may be expired)")
+                async def _http_lines():
+                    nonlocal buffer
+                    async for chunk in resp.aiter_content():
+                        if not chunk:
+                            continue
+                        if isinstance(chunk, str):
+                            chunk = chunk.encode("utf-8", errors="ignore")
+                        buffer += chunk
+                        while b"\n" in buffer:
+                            line_bytes, buffer = buffer.split(b"\n", 1)
+                            yield line_bytes.decode("utf-8", errors="ignore")
+
+                async for kind, val in _parse_arena_lines(_http_lines()):
+                    if kind == "_done":
+                        response_text = val["content"]
+                        reasoning_text = val["reasoning"]
+                    elif kind == "error":
+                        yield ("error", val)
+                        return
+                    else:
+                        yield (kind, val)
+
+                if not response_text and not reasoning_text:
+                    yield ("error", "502: Arena returned empty response")
+                    return
+
+                conv2 = get_conversation(conv_key)
+                conv2["arena"][model_name] = {"arena_id": base["id"], "mode": base.get("mode") or "direct-battle"}
+                conv2["model"] = model_name
+                if is_api and request_user_count is not None:
+                    conv2["user_count"] = request_user_count
+                if not is_api:
+                    conv2["history"].append({"role": "user", "content": prompt})
+                    conv2["history"].append({
+                        "role": "assistant",
+                        "content": response_text.strip() or reasoning_text.strip(),
+                    })
+                    conv2["history"] = conv2["history"][-200:]
+                save_conversation(conv_key, conv2)
+                yield ("done", {"mode": base.get("mode"), "content_len": len(response_text)})
                 return
-
-            conv2 = get_conversation(conv_key)
-            conv2["arena"][model_name] = {"arena_id": base["id"], "mode": base.get("mode") or "direct-battle"}
-            conv2["model"] = model_name
-            if is_api and request_user_count is not None:
-                conv2["user_count"] = request_user_count
-            if not is_api:
-                conv2["history"].append({"role": "user", "content": prompt})
-                conv2["history"].append({
-                    "role": "assistant",
-                    "content": response_text.strip() or reasoning_text.strip(),
-                })
-                conv2["history"] = conv2["history"][-200:]
-            save_conversation(conv_key, conv2)
-            yield ("done", {"mode": "direct", "content_len": len(response_text), "reasoning_len": len(reasoning_text)})
-            return
-
         except Exception as e:
-            log("ERROR", f"[{jar_id}] stream_arena_chat exception: {e}")
+            log("ERROR", f"[{jar_id}] HTTP path exception: {e}")
             if attempt == 0:
                 continue
             yield ("error", f"502: {type(e).__name__}: {e}")
