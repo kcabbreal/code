@@ -1,6 +1,5 @@
 """
-Bridgena v1.0 — OpenAI-Compatible Bridge for arena.ai
-Multi-worker · Session Keeper · Browser Bridge · Low Resource
+hallo
 """
 import argparse
 import asyncio
@@ -1873,7 +1872,56 @@ class KeeperSession:
                         pass
             self._page_pool = remaining
 
+
+    async def mint_recaptcha_token(self, timeout_s: float = 12.0) -> Optional[str]:
+        """Mint a recaptchaV3Token from the live page (for the token cache)."""
+        page = self.page
+        if not page or page.is_closed():
+            return None
+        try:
+            if "arena.ai" not in (page.url or ""):
+                await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                await self._wait_cloudflare(page)
+                await asyncio.sleep(1.0)
+            token = await page.evaluate(
+                """async () => {
+                    try {
+                        const el = document.querySelector(
+                            'textarea[name="g-recaptcha-response"], #g-recaptcha-response'
+                        );
+                        if (el && el.value && el.value.length > 20) return el.value;
+                        const g = window.grecaptcha;
+                        if (!g) return null;
+                        const run = (g.enterprise && g.enterprise.execute)
+                            ? (sk, o) => g.enterprise.execute(sk, o)
+                            : (g.execute ? (sk, o) => g.execute(sk, o) : null);
+                        if (!run) return null;
+                        const sitekey = '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0';
+                        const t = await Promise.race([
+                            run(sitekey, { action: 'chat_submit' }),
+                            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 12000)),
+                        ]);
+                        return (t && typeof t === 'string' && t.length > 20) ? t : null;
+                    } catch (e) { return null; }
+                }"""
+            )
+            if token:
+                self._recaptcha_token = token
+                self._recaptcha_token_at = time.time()
+                return token
+        except Exception as e:
+            log("WARN", f"[{self.name}] mint_recaptcha_token: {e}")
+        return None
+
+    def get_cached_recaptcha_token(self, max_age: float = 90.0) -> Optional[str]:
+        tok = getattr(self, "_recaptcha_token", None)
+        at = getattr(self, "_recaptcha_token_at", 0)
+        if tok and (time.time() - at) < max_age:
+            return tok
+        return None
+
     async def bridge_fetch(self, url: str, payload: dict):
+
         if not self.context or not self.page or self.page.is_closed():
             raise RuntimeError("Keeper browser page is closed")
 
@@ -2175,6 +2223,15 @@ class KeeperSession:
         while self.running:
             try:
                 await self._do_activity()
+                # Keep a fresh recaptcha token in cache for API requests (no per-request browser needed)
+                if self.active_requests == 0 and not self._action_lock.locked():
+                    cached = self.get_cached_recaptcha_token(max_age=60)
+                    if not cached and self.status == "running":
+                        try:
+                            async with self._action_lock:
+                                await self.mint_recaptcha_token()
+                        except Exception:
+                            pass
                 if (time.time() - self.last_nav > random.uniform(KEEPER_NAV_MIN, KEEPER_NAV_MAX)
                         and self.active_requests == 0 and not self._action_lock.locked()):
                     async with self._action_lock:
@@ -2554,36 +2611,24 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             user_message["experimental_attachments"] = attachments
         base["userMessage"] = user_message
 
-        # Optional: if a keeper page is already open, try to attach a recaptcha
-        # token. Never block the request if we cannot get one.
-        if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
-            try:
-                token = await s.page.evaluate(
-                    """async () => {
-                        try {
-                            const el = document.querySelector(
-                                'textarea[name="g-recaptcha-response"], #g-recaptcha-response'
-                            );
-                            if (el && el.value && el.value.length > 20) return el.value;
-                            const g = window.grecaptcha;
-                            if (!g) return null;
-                            const run = (g.enterprise && g.enterprise.execute)
-                                ? (sk, o) => g.enterprise.execute(sk, o)
-                                : (g.execute ? (sk, o) => g.execute(sk, o) : null);
-                            if (!run) return null;
-                            const sitekey = '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0';
-                            const t = await Promise.race([
-                                run(sitekey, { action: 'chat_submit' }),
-                                new Promise((_, rej) => setTimeout(() => rej(new Error('t')), 8000)),
-                            ]);
-                            return (t && t.length > 20) ? t : null;
-                        } catch (e) { return null; }
-                    }"""
-                )
-                if token:
-                    base["recaptchaV3Token"] = token
-            except Exception:
-                pass
+        # Arena always sends recaptchaV3Token (confirmed via browser spy).
+        # Prefer a cached token from the keeper background loop; mint live only if needed.
+        token = None
+        if s and s.running:
+            token = s.get_cached_recaptcha_token(max_age=90)
+            if not token and getattr(s, "page", None) and not s.page.is_closed():
+                try:
+                    token = await s.mint_recaptcha_token()
+                except Exception as e:
+                    log("WARN", f"[{jar_id}] live mint failed: {e}")
+        if not token:
+            yield (
+                "error",
+                "502: recaptchaV3Token unavailable — enable keeper for this account so it can "
+                "mint tokens in the background (login once; completions still use HTTP + cookies)",
+            )
+            return
+        base["recaptchaV3Token"] = token
 
         response_text = ""
         reasoning_text = ""
@@ -4887,7 +4932,7 @@ if __name__ == "__main__":
     effective_workers = max(1, requested)
 
     print("=" * 62)
-    print("  Bridgena v1.0 — Arena.ai Bridge")
+    print("  Bridgena v6.7 — Arena.ai Bridge")
     print("=" * 62)
     print(f"  * Chat WebUI  : http://localhost:{args.port}/chat")
     print(f"  * Dashboard   : http://localhost:{args.port}/dashboard")
