@@ -14,6 +14,8 @@ import random
 import re
 import secrets
 import sys
+import subprocess
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -22,6 +24,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
+from curl_cffi.requests import AsyncSession
+import hashlib
 import uvicorn
 from fastapi import (
     Depends, FastAPI, File, Form, Header, HTTPException,
@@ -312,6 +316,12 @@ def is_model_selectable(model: dict) -> bool:
     for key in GATING_FALSE_KEYS:
         if model.get(key) is False:
             return False
+    
+    # Filter out models that are hidden or unranked by Arena (Number.MAX_SAFE_INTEGER)
+    rank_chat = model.get("rankByModality", {}).get("chat", 1)
+    if rank_chat >= 9007199254740991:
+        return False
+        
     return True
 
 
@@ -559,18 +569,13 @@ def build_request_headers(jar: dict) -> dict:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
     )
-    headers = {
+    return {
         "Content-Type": "application/json", "Cookie": cookie_header,
         "Origin": ARENA_BASE, "Referer": f"{ARENA_BASE}/text/direct",
         "User-Agent": ua, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
+        "sec-ch-ua": '"Chromium";v="133", "Not(A:Brand";v="99"',
         "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
     }
-    # Cloudflare blocks Firefox if it sends Chrome-specific sec-ch-ua headers
-    if "Firefox" not in ua:
-        headers["sec-ch-ua"] = '"Chromium";v="133", "Not(A:Brand";v="99"'
-        headers["sec-ch-ua-mobile"] = "?0"
-        headers["sec-ch-ua-platform"] = '"Windows"'
-    return headers
 
 
 # ============================================================
@@ -789,65 +794,32 @@ async def stream_oxalpha(messages: list, model: str = OX_UPSTREAM_MODEL):
 # ARENA MODEL CATALOG FETCHING (RSC PAYLOAD EXTRACTOR)
 # ============================================================
 
-def extract_models_from_html(html: str) -> list:
-    if not html:
-        return []
-    
-    # 1. Search for Next.js RSC self.__next_f.push chunks
-    pushes = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.DOTALL)
-    for p in pushes:
-        try:
-            unescaped = p.encode("utf-8").decode("unicode_escape", errors="ignore")
-        except Exception:
-            unescaped = p
-        
-        if '"initialModels"' in unescaped or '"models"' in unescaped:
-            idx = unescaped.find('"initialModels":')
-            if idx == -1:
-                idx = unescaped.find('"models":')
-            if idx != -1:
-                start_arr = unescaped.find('[', idx)
-                if start_arr != -1:
-                    depth, end_arr, in_str, escape = 0, -1, False, False
-                    for i in range(start_arr, len(unescaped)):
-                        c = unescaped[i]
-                        if escape:
-                            escape = False
-                            continue
-                        if c == '\\':
-                            escape = True
-                            continue
-                        if c == '"':
-                            in_str = not in_str
-                            continue
-                        if not in_str:
-                            if c == '[':
-                                depth += 1
-                            elif c == ']':
-                                depth -= 1
-                                if depth == 0:
-                                    end_arr = i + 1
-                                    break
-                    if end_arr != -1:
-                        try:
-                            models = json.loads(unescaped[start_arr:end_arr])
-                            if isinstance(models, list) and len(models) > 20:
-                                return models
-                        except Exception:
-                            pass
-
-    # 2. Fallback: regex for JSON array containing models with publicName / organization
-    match = re.search(r'\[\{"id":"[0-9a-f\-]+","organization":.*?"userSelectable":true\}\]', html)
-    if match:
-        try:
-            models = json.loads(match.group(0))
-            if isinstance(models, list) and len(models) > 20:
-                return models
-        except Exception:
-            pass
-
-    return []
-
+async def refresh_models_via_worker(worker):
+    """Fetch models using an idle worker by navigating to LMArena homepage."""
+    log("INFO", f"[{worker.name}] Refreshing models via worker navigation...")
+    try:
+        await worker.page.goto(ARENA_BASE, wait_until="domcontentloaded", timeout=30000)
+        body = await worker.page.content()
+        match = re.search(r'{\"initialModels\":(\[.*?\]),\"initialModel[A-Z]Id', body, re.DOTALL)
+        if match:
+            raw_json = match.group(1).encode().decode('unicode_escape')
+            models_data = json.loads(raw_json)
+            
+            # Filter valid text models
+            filtered = []
+            for m in models_data:
+                caps = m.get("outputCapabilities", {})
+                if caps.get("text") is True and m.get("organization"):
+                    filtered.append(m)
+            
+            if filtered:
+                save_models(filtered)
+                log("OK", f"Model catalog refreshed via worker ({len(filtered)} models)")
+                return filtered
+        log("WARN", "Regex failed to find models in page source.")
+    except Exception as e:
+        log("ERROR", f"Failed to refresh models: {e}")
+    return get_models()
 
 async def get_initial_data() -> list:
     state = load_state()
@@ -861,76 +833,25 @@ async def get_initial_data() -> list:
 
     fetched_models = []
 
-    # 1. Try browser-based extraction from active page content
+    # 1. Try browser-based extraction using the worker
     for jar_candidate in load_jars():
         s = keeper.sessions.get(jar_candidate.get("id"))
         if s and s.running and s.page and not s.page.is_closed():
-            try:
-                page_html = await s.page.content()
-                models = extract_models_from_html(page_html)
-                if len(models) > 50:
-                    fetched_models = models
-                    log("OK", f"Models extracted via browser session DOM ({len(fetched_models)} models)")
-                    break
-            except Exception as e:
-                log("DEBUG", f"Browser DOM model extraction attempt failed: {e}")
+            fetched_models = await refresh_models_via_worker(s)
+            if fetched_models and len(fetched_models) > 50:
+                break
 
-    # 2. Direct HTTP GET to https://arena.ai/ to parse live RSC stream
-    if not fetched_models:
-        jar = acquire_jar()
-        headers = build_request_headers(jar) if jar else {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                resp = await client.get(f"{ARENA_BASE}/", headers=headers)
-                if resp.status_code == 200:
-                    models = extract_models_from_html(resp.text)
-                    if len(models) > 50:
-                        fetched_models = models
-                        log("OK", f"Models fetched via direct HTTP HTML parse ({len(fetched_models)} models)")
-        except Exception as e:
-            log("WARN", f"Direct HTML models fetch failed: {e}")
-
-    # 3. Fallback: Launch a temporary browser context just to fetch models
-    if not fetched_models:
-        log("INFO", "Direct HTTP fetch failed. Spawning temporary browser to bypass Cloudflare for models...")
-        try:
-            if async_playwright is not None:
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
-                    page = await browser.new_page()
-                    await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
-                    await asyncio.sleep(3)
-                    try:
-                        await page.wait_for_function("() => document.title.indexOf('Just a moment') === -1", timeout=15000)
-                    except Exception:
-                        pass
-                    page_html = await page.content()
-                    models = extract_models_from_html(page_html)
-                    if len(models) > 50:
-                        fetched_models = models
-                        log("OK", f"Models extracted via temporary browser ({len(fetched_models)} models)")
-                    await browser.close()
-        except Exception as e:
-            log("WARN", f"Temporary browser fetch failed: {e}")
-
-    if fetched_models:
-        save_models(fetched_models)
+    if fetched_models and len(fetched_models) > 50:
         def mark_done(s):
             s["last_refresh"] = time.time()
             s["refresh_started"] = 0
         mutate_state(mark_done)
-        log("OK", f"Model catalog refreshed ({len(fetched_models)} models)")
         return fetched_models
 
     def mark_fail(s):
         s["refresh_started"] = 0
     mutate_state(mark_fail)
     return get_models()
-
 
 # ============================================================
 # SESSION KEEPER — SELECTORS & HELPERS
@@ -1205,37 +1126,47 @@ class KeeperSession:
     async def _verify_auth_state(self, page) -> bool:
         """Thorough check to verify whether user is genuinely logged into arena.ai."""
         try:
-            # 1. Most reliable method: check if there's an active auth cookie!
+            # 0. Check for email bar at bottom
+            if self.email:
+                try:
+                    email_loc = page.locator(f"text=/{self.email}/i").first
+                    if await email_loc.count() > 0 and await email_loc.is_visible():
+                        return True
+                except:
+                    pass
+
+            # 1. If Login button is visible on page, we are NOT logged in
+            login_btn = page.locator("button:has-text('Log In'), a:has-text('Log In')").first
+            if await login_btn.count() > 0 and await login_btn.is_visible():
+                return False
+
+            # 2. If 'Log In or Create' modal is visible, we are NOT logged in
+            modal_title = page.locator("text='Log In or Create'").first
+            if await modal_title.count() > 0 and await modal_title.is_visible():
+                return False
+
+            # 3. Check for typical auth cookies directly in the browser context
             cookies = await page.context.cookies()
-            auth_cookie_names = ["arena-auth-prod", "arena-auth", "__session", "clerk-db-jwt", "session", "authToken"]
+            auth_cookie_names = ["arena-auth", "arena-auth-prod-v1.0", "arena-auth-prod-v1.1", "__session", "session", "authToken", "clerk-db-jwt"]
             has_auth = any(any(n in c["name"] for n in auth_cookie_names) for c in cookies)
             if has_auth:
                 return True
                 
-            # If no obvious auth cookie, check the DOM safely.
-            # 2. Check for the user profile avatar or 'Log Out'
-            profile_btn = page.locator("button:has-text('Log Out'), a:has-text('Log Out'), button:has-text('Sign Out'), button[aria-label='User Profile']").first
-            if await profile_btn.count() > 0 and await profile_btn.is_visible():
-                return True
+            # 4. Fallback: Check if the user profile avatar or settings button is present
+            profile_btn = page.locator("button:has(svg), button[aria-label='User Profile'], button[aria-label='Settings']").last
+            if await profile_btn.count() > 0:
+                # If we're on the main page and no login button is visible, we're likely logged in
+                if "arena.ai" in page.url:
+                    return True
 
-            # 3. Check actual unified history API status (fallback)
+            # 5. Check actual unified history API status
             status_code = await page.evaluate(
                 "async () => { try { const r = await fetch('/api/history/unified?limit=1', "
                 "{credentials:'include'}); return r.status; } catch(e) { return 0; } }"
             )
             if status_code == 200:
                 return True
-                
-            # 4. If 'Log In or Create' modal is visible, we are NOT logged in
-            modal_title = page.locator("text='Log In or Create'").first
-            if await modal_title.count() > 0 and await modal_title.is_visible():
-                return False
-
-            # 5. If Login button is visible on page, we are NOT logged in
-            login_btn = page.locator("button:has-text('Log In'), a:has-text('Log In')").first
-            if await login_btn.count() > 0 and await login_btn.is_visible():
-                return False
-
+                    
         except Exception:
             pass
         return False
@@ -1606,21 +1537,12 @@ class KeeperSession:
                         or find_cookie(simplified, "arena-auth-prod-v1") or "")
             sig = hashlib.sha256(auth_val.encode()).hexdigest()[:10] if auth_val else "none"
 
-            # Grab exact User-Agent to prevent Cloudflare 403 mismatch in httpx
-            ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
-            try:
-                if self.page and not self.page.is_closed():
-                    ua = await self.page.evaluate("navigator.userAgent")
-            except Exception:
-                pass
-
             def upd(jars: list):
                 for j in jars:
                     if j["id"] != self.jar_id: continue
                     if simplified:
                         j["cookies"] = simplified
                         j["expired"] = False
-                        j["user_agent"] = ua
             mutate_jars(upd)
 
             if sig != self._auth_sig_cache:
@@ -1875,6 +1797,17 @@ class KeeperSession:
     async def start(self) -> bool:
         if self.running:
             return True
+            
+        if sys.platform.startswith("linux"):
+            os.environ["DISPLAY"] = ":99"
+            try:
+                subprocess.run(["pgrep", "Xvfb"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except subprocess.CalledProcessError:
+                try:
+                    subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1920x1080x24"])
+                except Exception:
+                    pass
+                    
         self.status = "starting"
         self.error = None
         self._set_step("Initializing stealth browser engine...")
@@ -1951,14 +1884,14 @@ class KeeperSession:
                 profile_dir = os.path.join(PROFILES_DIR, self.jar_id)
                 os.makedirs(profile_dir, exist_ok=True)
                 self.context = await self.browser.new_context(
-                    viewport={"width": 1920, "height": 1080},
+                    viewport={"width": 1920, "height": 1080}, screen={"width": 1920, "height": 1080},
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
                     storage_state=os.path.join(profile_dir, "state.json") if os.path.exists(os.path.join(profile_dir, "state.json")) else None,
                 )
                 self.page = await self.context.new_page()
                 await self.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
             elif AsyncCamoufox is not None:
-                cm = AsyncCamoufox(headless=self.headless, humanize=self.humanize)
+                cm = AsyncCamoufox(headless=self.headless, humanize=False)
                 self.browser = await cm.__aenter__()
                 self.context = self.browser.contexts[0] if self.browser.contexts else await self.browser.new_context(
                     viewport={"width": 1920, "height": 1080}
@@ -2269,168 +2202,6 @@ async def _parse_bridge_stream(session: KeeperSession, url: str, payload: dict, 
     yield ("end", {"content": content, "reasoning": reasoning, "mode": mode})
 
 
-async def _stream_once_bridge(session: KeeperSession, url: str, payload: dict, model_name: str,
-                              preferred_modes: list, is_followup: bool):
-    last_err = "No attempts made"
-    for mode in (preferred_modes or ARENA_MODES):
-        p = dict(payload)
-        p["mode"] = mode
-        try:
-            async for event in _parse_bridge_stream(session, url, p, model_name):
-                yield event
-            log("OK", f"Browser-bridge stream complete — mode='{mode}' jar='{session.jar_id}'")
-            return
-        except BridgeHTTPError as e:
-            last_err = f"{e.status} {e.body[:200]}"
-            body = e.body or ""
-            if e.status in (400, 422):
-                if "not available for user selection" in body:
-                    block_model(model_name)
-                    raise HTTPException(status_code=403, detail=f"'{model_name}' is not selectable.")
-                if "model not found" in body.lower():
-                    asyncio.create_task(get_initial_data())
-                    raise HTTPException(status_code=404, detail="Arena model list is refreshing.")
-                log("WARN", f"Bridge mode='{mode}' rejected: {last_err}")
-                continue
-            if e.status == 429:
-                mark_jar_status(session.jar_id, "limited")
-                raise HTTPException(status_code=429, detail="Arena rate limit reached.")
-            if e.status in (401, 403):
-                mark_jar_status(session.jar_id, "expired")
-                asyncio.create_task(session.poke())
-                raise HTTPException(status_code=502, detail="Arena authentication expired.")
-            raise HTTPException(status_code=502, detail=f"Arena error {e.status}: {body[:300]}")
-        except HTTPException as e:
-            d = str(e.detail)
-            if is_followup and "model" not in d.lower() and ("not found" in d.lower() or "conversation" in d.lower()):
-                raise ConversationLost(d)
-            raise
-    raise HTTPException(status_code=502, detail=f"Arena rejected on all modes: {last_err}")
-
-
-async def _open_arena_stream(client: httpx.AsyncClient, url: str, payload: dict, headers: dict,
-                             jar_id: str, model_public_name: str = "", preferred_modes: list = None):
-    attempts = []
-    for mode in (preferred_modes or ARENA_MODES):
-        attempt_payload = dict(payload)
-        attempt_payload["mode"] = mode
-        try:
-            req = client.build_request("POST", url, json=attempt_payload, headers=headers)
-            resp = await client.send(req, stream=True)
-        except httpx.TimeoutException:
-            attempts.append((mode, "timeout", "Request timed out"))
-            continue
-        except Exception as e:
-            attempts.append((mode, "network", str(e)))
-            continue
-        if resp.status_code in (400, 422):
-            try:
-                await resp.aread()
-                body = resp.text[:600]
-            except Exception:
-                body = "<unreadable>"
-            await resp.aclose()
-            if "not available for user selection" in body:
-                if model_public_name:
-                    block_model(model_public_name)
-                raise HTTPException(status_code=403, detail=f"'{model_public_name}' is not selectable.")
-            if "model not found" in body.lower():
-                asyncio.create_task(get_initial_data())
-                raise HTTPException(status_code=404, detail="Arena model not found. Refreshing.")
-            attempts.append((mode, resp.status_code, body))
-            continue
-        if resp.status_code == 429:
-            try:
-                await resp.aread()
-            except Exception:
-                pass
-            await resp.aclose()
-            if jar_id:
-                mark_jar_status(jar_id, "limited")
-            raise HTTPException(status_code=429, detail="Arena rate limit reached.")
-        if resp.status_code in (401, 403):
-            try:
-                await resp.aread()
-            except Exception:
-                pass
-            await resp.aclose()
-            if jar_id:
-                mark_jar_status(jar_id, "expired")
-            raise HTTPException(status_code=502, detail="Arena authentication expired.")
-        if resp.status_code >= 400:
-            try:
-                await resp.aread()
-                body = resp.text[:400]
-            except Exception:
-                body = ""
-            await resp.aclose()
-            raise HTTPException(status_code=502, detail=f"Arena error {resp.status_code}: {body}")
-        return resp, attempt_payload
-    detail = " | ".join(f"mode={m}: {s} {b[:100]}" for m, s, b in attempts)
-    raise HTTPException(status_code=502, detail=f"All modes failed: {detail}")
-
-
-async def _stream_once(client: httpx.AsyncClient, url: str, payload: dict, headers: dict,
-                       jar_id: str, model_name: str, is_followup: bool):
-    response = None
-    try:
-        response, used = await _open_arena_stream(client, url, payload, headers, jar_id, model_name)
-        mode = used["mode"]
-        content, reasoning, error_text = "", "", None
-        async for line in response.aiter_lines():
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(("a0:", "0:")):
-                try:
-                    t = json.loads(line[line.index(":")+1:])
-                    content += t
-                    yield ("content", t)
-                except json.JSONDecodeError:
-                    continue
-            elif line.startswith(("ag:", "g:")):
-                try:
-                    t = json.loads(line[line.index(":")+1:])
-                    reasoning += t
-                    yield ("reasoning", t)
-                except json.JSONDecodeError:
-                    continue
-            elif line.startswith(("a3:", "3:", "e:")):
-                try:
-                    err = json.loads(line[line.index(":")+1:])
-                    error_text = err if isinstance(err, str) else json.dumps(err)
-                except json.JSONDecodeError:
-                    error_text = line[line.index(":")+1:]
-                log("ERROR", f"Upstream error frame: {error_text}")
-            elif line.startswith(("ad:", "d:")):
-                try:
-                    md = json.loads(line[line.index(":")+1:])
-                    yield ("finish", md.get("finishReason", "stop"))
-                except json.JSONDecodeError:
-                    continue
-        if not content and not reasoning:
-            if error_text:
-                yield ("error", _friendly_arena_error(error_text, model_name))
-            else:
-                yield ("error", "Arena returned an empty response.")
-        yield ("end", {"content": content, "reasoning": reasoning, "mode": mode})
-    except HTTPException as e:
-        d = str(e.detail)
-        if is_followup and "model" not in d.lower() and ("not found" in d.lower() or "conversation" in d.lower()):
-            raise ConversationLost(d)
-        raise
-    finally:
-        if response is not None:
-            try:
-                await response.aclose()
-            except Exception:
-                pass
-
-
-# ============================================================
-# COMPACTION & CONTEXT PRESERVATION
-# ============================================================
-
 async def arena_oneoff(model_id: str, model_name: str, prompt: str, jar: dict) -> Optional[str]:
     try:
         headers = build_request_headers(jar)
@@ -2503,19 +2274,42 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                             prior_messages=None, is_api=False, request_user_count=None):
     jar_id = jar["id"]
     s = keeper.sessions.get(jar_id)
-    bridge = s if (s and s.running and getattr(s, "use_for_chats", False)) else None
+    if not s or not s.running:
+        yield ("error", f"Worker for jar {jar_id} is not running.")
+        return
 
-    headers = None
-    if bridge is None:
-        live = await get_live_cookies(jar_id)
-        if live:
-            auth_cookie_names = ["arena-auth-prod", "arena-auth", "__session", "clerk-db-jwt", "session", "authToken"]
-            has_auth = any(any(n in c["name"] for n in auth_cookie_names) for c in live)
-            if has_auth:
-                jar = dict(jar)
-                jar["cookies"] = live
-                jar["expired"] = False
-        headers = build_request_headers(jar)
+    # Check cookie age, harvest if older than 15 mins
+    now = time.time()
+    last_harvest = getattr(s, "last_harvest_time", 0)
+    if now - last_harvest > 900:  # 15 minutes
+        log("INFO", f"[{s.name}] Cookies older than 15m, triggering harvest...")
+        await s._harvest_cookies()
+        s.last_harvest_time = time.time()
+
+    live = await get_live_cookies(jar_id)
+    if not live:
+        yield ("error", "Worker has no live cookies.")
+        return
+        
+    cf_clearance = next((c["value"] for c in live if c["name"] == "cf_clearance"), "")
+    auth_token = next((c["value"] for c in live if c["name"] in ["arena-auth-prod-v1.0", "arena-auth-prod-v1.1", "arena-auth-prod-v1"]), "")
+    
+    if not auth_token:
+        yield ("error", "Worker is missing arena-auth token.")
+        return
+        
+    headers = {
+        "Content-Type": "application/json",
+        "Cookie": f"cf_clearance={cf_clearance}; arena-auth-prod-v1={auth_token}",
+        "Origin": ARENA_BASE,
+        "Referer": f"{ARENA_BASE}/?mode=direct",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    }
+    
+    api_key_str = jar_id # Use jar_id as api key string for hash since we don't pass api key here
+    first_user_message = (prompt if not prior_messages else (prior_messages[0].get("content","") if isinstance(prior_messages[0], dict) else ""))
+    conversation_key = f"{api_key_str}_{model_name}_{first_user_message[:100]}"
+    conversation_id = hashlib.sha256(conversation_key.encode()).hexdigest()[:16]
 
     for attempt in (0, 1):
         conv = get_conversation(conv_key)
@@ -2528,59 +2322,38 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
         if follow:
             content_to_send = prompt
             base = {
-                "modelAId": model_id, "userMessageId": str(uuid7()),
-                "modelAMessageId": str(uuid7()), "modality": "chat",
                 "id": model_conv["arena_id"],
+                "mode": "direct",
+                "modelAId": model_id, 
+                "userMessageId": str(uuid7()),
+                "modelAMessageId": str(uuid7()), 
+                "modality": "chat",
             }
             url = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/{model_conv['arena_id']}"
-            m = model_conv.get("mode", "direct-battle")
-            preferred = [m] + [x for x in ARENA_MODES if x != m]
         else:
             prior = list(prior_messages) if is_api else list(conv.get("history") or [])
             prior = [x for x in prior if isinstance(x, dict) and x.get("content")]
-            total_chars = sum(len(x["content"]) for x in prior)
-            compacted = False
-            if total_chars > COMPACT_THRESHOLD:
-                fingerprint = f"{len(prior)}:{prior[-1]['content'][:40] if prior else ''}"
-                summary = None
-                cache = conv.get("compact_cache") or {}
-                if cache.get("fingerprint") == fingerprint and cache.get("summary"):
-                    summary = cache["summary"]
-                else:
-                    log("INFO", f"Compacting conversation '{conv_key}' ({total_chars} chars)…")
-                    summary = await compact_via_arena(prior, model_id, model_name, jar)
-                    if summary:
-                        conv["compact_cache"] = {"fingerprint": fingerprint, "summary": summary}
-                        save_conversation(conv_key, conv)
-                if summary:
-                    prior = [{"role": "system", "content": "Summary of previous discussion:\n" + summary}] + prior[-KEEP_RECENT_MSGS:]
-                    compacted = True
-                    notices.append("Context limit reached — earlier turns were compacted.")
-                else:
-                    prior = prior[-KEEP_RECENT_MSGS:]
-                    compacted = True
-                    notices.append("Context limit reached — only recent messages kept.")
-                if not is_api:
-                    conv["history"] = prior
-                    save_conversation(conv_key, conv)
             preamble = build_preamble(prior)
             if preamble:
                 content_to_send = (
                     "=== PREVIOUS CONVERSATION (context) ===\n\n"
                     f"{preamble}\n\n"
-                    "=== CURRENT USER MESSAGE — REPLY TO THIS ===\n\n"
+                    "=== CURRENT USER MESSAGE  REPLY TO THIS ===\n\n"
                     f"{prompt}"
                 )
-                if not compacted:
-                    notices.append(f"Model changed or fresh turn — preserved {len(prior)} turns.")
             else:
                 content_to_send = prompt
+            
+            # Use tracked conversation ID for fresh chats
             base = {
-                "modelAId": model_id, "userMessageId": str(uuid7()),
-                "modelAMessageId": str(uuid7()), "modality": "chat", "id": str(uuid7()),
+                "id": conversation_id,
+                "mode": "direct",
+                "modelAId": model_id, 
+                "userMessageId": str(uuid7()),
+                "modelAMessageId": str(uuid7()), 
+                "modality": "chat",
             }
             url = f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
-            preferred = ARENA_MODES
 
         user_message = {"content": content_to_send}
         if attachments:
@@ -2588,43 +2361,109 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
         base["userMessage"] = user_message
 
         try:
-            final = None
             for n in notices:
                 yield ("notice", n)
-            if bridge:
-                async for ev in _stream_once_bridge(bridge, url, base, model_name, preferred, follow):
-                    if ev[0] == "end":
-                        final = ev[1]
-                    else:
-                        yield ev
-            else:
-                async with httpx.AsyncClient(timeout=90.0) as client:
-                    async for ev in _stream_once(client, url, base, headers, jar_id, model_name, follow):
-                        if ev[0] == "end":
-                            final = ev[1]
-                        else:
-                            yield ev
-            if final:
-                if final["content"].strip() or final["reasoning"].strip():
-                    conv2 = get_conversation(conv_key)
-                    conv2["arena"][model_name] = {"arena_id": base["id"], "mode": final["mode"]}
-                    conv2["model"] = model_name
-                    if is_api and request_user_count is not None:
-                        conv2["user_count"] = request_user_count
-                    if not is_api:
-                        conv2["history"].append({"role": "user", "content": prompt})
-                        conv2["history"].append({"role": "assistant", "content": final["content"].strip() or final["reasoning"].strip()})
-                        conv2["history"] = conv2["history"][-200:]
-                    save_conversation(conv_key, conv2)
-                yield ("done", {"mode": final["mode"], "content_len": len(final["content"]), "reasoning_len": len(final["reasoning"])})
+                
+            response_text = ""
+            reasoning_text = ""
+            error_message = None
+            finish_reason = None
+            
+            async with AsyncSession(impersonate="chrome131") as client:
+                try:
+                    resp = await client.post(url, json=base, headers=headers, stream=True, timeout=120.0)
+                except Exception as e:
+                    yield ("error", f"Network error: {str(e)}")
+                    return
+                    
+                if resp.status_code in (401, 403):
+                    body = await resp.aread()
+                    if b"cloudflare" in body.lower():
+                        yield ("error", "502: Cloudflare block (should not happen with curl_cffi  check impersonation target)")
+                        return
+                    mark_jar_status(jar_id, "expired")
+                    yield ("error", f"502: Arena session expired for worker {jar_id}, triggering re-harvest")
+                    # Force a reharvest since it failed
+                    await s._harvest_cookies()
+                    s.last_harvest_time = time.time()
+                    return
+                elif resp.status_code == 429:
+                    yield ("error", "429: LMArena rate limit")
+                    return
+                elif resp.status_code != 200:
+                    body = await resp.aread()
+                    yield ("error", f"{resp.status_code}: {body.decode('utf-8', errors='ignore')[:200]}")
+                    return
+                
+                buffer = b""
+                async for chunk in resp.aiter_content(chunk_size=1024):
+                    if not chunk:
+                        continue
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line_bytes, buffer = buffer.split(b"\n", 1)
+                        line = line_bytes.decode("utf-8", errors="ignore").strip()
+                        if not line:
+                            continue
+                        if line.startswith("a0:") or line.startswith("0:"):
+                            try:
+                                t = json.loads(line[line.index(":")+1:])
+                                response_text += t
+                                yield ("content", t)
+                            except json.JSONDecodeError:
+                                continue
+                        elif line.startswith("ag:") or line.startswith("g:"):
+                            try:
+                                t = json.loads(line[line.index(":")+1:])
+                                reasoning_text += t
+                                yield ("reasoning", t)
+                            except json.JSONDecodeError:
+                                continue
+                        elif line.startswith("a3:") or line.startswith("3:") or line.startswith("e:"):
+                            try:
+                                err = json.loads(line[line.index(":")+1:])
+                                error_message = err if isinstance(err, str) else json.dumps(err)
+                            except json.JSONDecodeError:
+                                error_message = line[line.index(":")+1:]
+                        elif line.startswith("ad:") or line.startswith("d:"):
+                            try:
+                                md = json.loads(line[line.index(":")+1:])
+                                finish_reason = md.get("finishReason", "stop")
+                                yield ("finish", finish_reason)
+                            except json.JSONDecodeError:
+                                continue
+                                
+                resp.close()
+
+            if not response_text and not reasoning_text:
+                if error_message:
+                    yield ("error", f"Arena error: {error_message}")
+                else:
+                    yield ("error", "502: LMArena returned empty response (auth may be silently expired)")
+                return
+
+            conv2 = get_conversation(conv_key)
+            conv2["arena"][model_name] = {"arena_id": base["id"], "mode": "direct"}
+            conv2["model"] = model_name
+            if is_api and request_user_count is not None:
+                conv2["user_count"] = request_user_count
+            if not is_api:
+                conv2["history"].append({"role": "user", "content": prompt})
+                conv2["history"].append({"role": "assistant", "content": response_text.strip() or reasoning_text.strip()})
+                conv2["history"] = conv2["history"][-200:]
+            save_conversation(conv_key, conv2)
+            
+            yield ("done", {"mode": "direct", "content_len": len(response_text), "reasoning_len": len(reasoning_text)})
             return
+            
         except ConversationLost as e:
-            log("WARN", f"Upstream session lost — falling back ({str(e)[:120]})")
+            log("WARN", f"Upstream session lost  falling back ({str(e)[:120]})")
             conv2 = get_conversation(conv_key)
             conv2["arena"].pop(model_name, None)
             save_conversation(conv_key, conv2)
             continue
     yield ("error", "Arena request failed to resolve.")
+
 
 
 # ============================================================
@@ -2819,12 +2658,18 @@ async def vnc_viewer():
     html = """
     <html>
     <head><title>Live Browser View</title></head>
-    <body style="margin:0; background:#222; text-align:center;">
-        <h3 style="color:white; font-family:sans-serif">Live Browser View (Auto-refresh)</h3>
-        <img id="screen" src="/vnc/frame" style="max-width:100%; border: 1px solid #444;" />
+    <body style="margin:0; background:#222; overflow:hidden; display:flex; flex-direction:column; height:100vh;">
+        <div style="background:#111; color:white; padding:10px; font-family:sans-serif; text-align:center; font-size:14px; flex-shrink:0;">
+            Live Browser View (Auto-refresh 1fps) &bull; Resolution: 1920x1080
+        </div>
+        <div style="flex-grow:1; display:flex; justify-content:center; align-items:center; background:#000;">
+            <img id="screen" src="/vnc/frame" style="max-width:100%; max-height:100%; object-fit:contain;" />
+        </div>
         <script>
             setInterval(() => {
-                document.getElementById('screen').src = '/vnc/frame?' + new Date().getTime();
+                const img = new Image();
+                img.onload = () => { document.getElementById('screen').src = img.src; };
+                img.src = '/vnc/frame?' + new Date().getTime();
             }, 1000);
         </script>
     </body>
@@ -5342,7 +5187,7 @@ async def keeper_live(request: Request, jar_id: str = Form(...)):
         return RedirectResponse(url="/login")
     ok, msg = await keeper.start_live(jar_id)
     log("INFO", f"Live browser: {msg}")
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(url="/vnc", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.post("/keeper/relogin")
