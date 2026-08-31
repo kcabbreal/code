@@ -2476,33 +2476,46 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     return
 
                 buffer = b""
+                preview_text = ""
                 async for chunk in resp.aiter_content():
                     if not chunk:
                         continue
                     if isinstance(chunk, str):
                         chunk = chunk.encode("utf-8", errors="ignore")
                     buffer += chunk
+                    
+                    if len(preview_text) < 1500:
+                        preview_text += chunk.decode("utf-8", errors="ignore")
+
                     while b"\n" in buffer:
                         line_bytes, buffer = buffer.split(b"\n", 1)
                         line = line_bytes.decode("utf-8", errors="ignore").strip()
                         if not line:
                             continue
+                        
+                        if line.startswith("data: "):
+                            line = line[6:].strip()
+                            if not line: continue
+                            
                         colon = line.find(":")
                         if colon < 0:
                             continue
+                            
                         prefix, payload = line[:colon], line[colon + 1:]
                         if prefix in ("a0", "0"):
                             try:
                                 t = json.loads(payload)
-                                response_text += t
-                                yield ("content", t)
+                                if isinstance(t, str):
+                                    response_text += t
+                                    yield ("content", t)
                             except json.JSONDecodeError:
                                 continue
                         elif prefix in ("ag", "g"):
                             try:
                                 t = json.loads(payload)
-                                reasoning_text += t
-                                yield ("reasoning", t)
+                                if isinstance(t, str):
+                                    reasoning_text += t
+                                    yield ("reasoning", t)
                             except json.JSONDecodeError:
                                 continue
                         elif prefix in ("a3", "3", "e"):
@@ -2511,12 +2524,16 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                                 error_message = err if isinstance(err, str) else json.dumps(err)
                             except json.JSONDecodeError:
                                 error_message = payload
+                            yield ("error", f"Stream Error: {error_message}")
+                            return
                         elif prefix in ("ad", "d"):
                             try:
                                 md = json.loads(payload)
                                 yield ("finish", md.get("finishReason", "stop"))
                             except json.JSONDecodeError:
                                 continue
+
+                log("INFO", f"[{jar_id}] Stream preview: {preview_text[:1500]}")
 
             if not response_text and not reasoning_text:
                 yield ("error", f"Arena error: {error_message}" if error_message else
@@ -2870,7 +2887,14 @@ async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
                     elif t == "reasoning":
                         yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_name, 'choices': [{'index': 0, 'delta': {'reasoning_content': chunk}, 'finish_reason': None}]})}\n\n"
                     elif t == "error":
-                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': 'stop'}]})}\n\n"
+                        err_obj = {"error": {"message": str(chunk), "type": "upstream_error"}}
+                        yield f"data: {json.dumps(err_obj)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    elif t == "finish":
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': chunk}]})}\n\n"
+                
+                # If we didn't explicitly get a 'finish' tag, send a final stop
                 yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
             return StreamingResponse(sse_gen(), media_type="text/event-stream")
@@ -2922,7 +2946,14 @@ async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
                     elif t == "reasoning":
                         yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'reasoning_content': v}, 'finish_reason': None}]})}\n\n"
                     elif t == "error":
-                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {'content': v}, 'finish_reason': 'stop'}]})}\n\n"
+                        err_obj = {"error": {"message": str(v), "type": "upstream_error"}}
+                        yield f"data: {json.dumps(err_obj)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    elif t == "finish":
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': v}]})}\n\n"
+                
+                # Final chunk if no explicit finish was received
                 yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': ts, 'model': model_public_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
@@ -4325,6 +4356,11 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
                     if (dataStr === '[DONE]') continue;
                     try {
                         const parsed = JSON.parse(dataStr);
+                        if (parsed.error) {
+                            assistantMsg.content += '\n\n<span style="color:#ef4444">**Error**: ' + (parsed.error.message || JSON.stringify(parsed.error)) + '</span>';
+                            renderMessages();
+                            continue;
+                        }
                         const delta = parsed.choices?.[0]?.delta;
                         if (delta?.content) {
                             assistantMsg.content += delta.content;
