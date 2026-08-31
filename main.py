@@ -314,14 +314,8 @@ def is_model_selectable(model: dict) -> bool:
         if model.get(key) is True:
             return False
     for key in GATING_FALSE_KEYS:
-        if model.get(key) is False:
+        if key in model and model.get(key) is False:
             return False
-    
-    # Filter out models that are hidden or unranked by Arena (Number.MAX_SAFE_INTEGER)
-    rank_chat = model.get("rankByModality", {}).get("chat", 1)
-    if rank_chat >= 9007199254740991:
-        return False
-        
     return True
 
 
@@ -334,8 +328,8 @@ def get_selectable_models() -> list:
             continue
         if not is_model_selectable(model):
             continue
-        caps = model.get("capabilities", {}).get("outputCapabilities", {})
-        if caps and caps.get("text") is False:
+        caps = (model.get("capabilities") or {}).get("outputCapabilities") or model.get("outputCapabilities") or {}
+        if caps.get("text") is False:
             continue
         mc = dict(model)
         mc["publicName"] = name
