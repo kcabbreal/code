@@ -1111,6 +1111,10 @@ class KeeperSession:
         self._cur_x, self._cur_y = target_x, target_y
         self.last_activity = time.time()
 
+    async def stop(self):
+        self.running = False
+        self._set_step("Keeper stopped")
+
     async def _human_click(self, page, locator, timeout_ms: int = 4000) -> bool:
         """Move cursor to element and click naturally."""
         try:
@@ -1875,6 +1879,12 @@ class KeeperSession:
             if async_playwright is not None:
                 self.playwright = await async_playwright().start()
                 launched = False
+                
+                profile_dir = os.path.join(PROFILES_DIR, self.jar_id)
+                os.makedirs(profile_dir, exist_ok=True)
+                
+                ext_path = os.environ.get("BRIDGENA_CAPTCHA_EXT", "")
+                has_ext = ext_path and os.path.exists(os.path.join(ext_path, "manifest.json"))
 
                 common_args = [
                     "--disable-blink-features=AutomationControlled",
@@ -1888,66 +1898,85 @@ class KeeperSession:
                     "--window-size=1920,1080",
                 ]
 
-                channels_to_try = ["chromium", None, "chrome", "msedge"]
-                for channel in channels_to_try:
-                    try:
-                        launch_kw = {"headless": self.headless, "args": common_args}
-                        if channel:
-                            launch_kw["channel"] = channel
-                        self.browser = await self.playwright.chromium.launch(**launch_kw)
-                        launched = True
-                        self._set_step(f"Stealth engine started ({channel or 'bundled chromium'})")
-                        break
-                    except Exception:
-                        continue
-
-                if not launched:
-                    for bin_path in [
-                        "/usr/bin/chromium",
-                        "/usr/bin/chromium-browser",
-                        "/usr/bin/google-chrome",
-                        "/usr/bin/google-chrome-stable",
-                        "/snap/bin/chromium",
-                    ]:
-                        if os.path.exists(bin_path):
-                            try:
-                                self.browser = await self.playwright.chromium.launch(
-                                    executable_path=bin_path, headless=self.headless, args=common_args
-                                )
-                                launched = True
-                                self._set_step(f"Stealth engine started via container binary ({bin_path})")
-                                break
-                            except Exception:
-                                pass
-
-                if not launched:
-                    try:
-                        self.browser = await self.playwright.firefox.launch(headless=self.headless)
-                        launched = True
-                        self._set_step("Stealth engine started (Firefox fallback)")
-                    except Exception:
-                        pass
-
-                if not launched and AsyncCamoufox is not None:
-                    self.browser = await AsyncCamoufox(headless=self.headless).__aenter__()
+                if has_ext:
+                    self._set_step("Launching persistent context with Captcha Extension...")
+                    ext_args = common_args + [
+                        f"--disable-extensions-except={ext_path}",
+                        f"--load-extension={ext_path}"
+                    ]
+                    self.context = await self.playwright.chromium.launch_persistent_context(
+                        user_data_dir=profile_dir,
+                        headless=False,
+                        ignore_default_args=["--disable-extensions"],
+                        args=ext_args,
+                        viewport={"width": 1920, "height": 1080},
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0"
+                    )
+                    self.browser = None
+                    self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
                     launched = True
-                    self._set_step("Stealth engine started (Camoufox fallback)")
+                    log("OK", f"[{self.name}] Captcha extension loaded from {ext_path}")
+                else:
+                    if ext_path:
+                        log("WARN", f"[{self.name}] BRIDGENA_CAPTCHA_EXT set but manifest.json not found in {ext_path}")
+                    
+                    channels_to_try = ["chromium", None, "chrome", "msedge"]
+                    for channel in channels_to_try:
+                        try:
+                            launch_kw = {"headless": self.headless, "args": common_args}
+                            if channel:
+                                launch_kw["channel"] = channel
+                            self.browser = await self.playwright.chromium.launch(**launch_kw)
+                            launched = True
+                            self._set_step(f"Stealth engine started ({channel or 'bundled chromium'})")
+                            break
+                        except Exception:
+                            continue
 
-                if not launched:
-                    self.status = "error"
-                    self.error = "No browser engine found. Run 'playwright install chromium' or install Edge/Chrome."
-                    self._set_step(f"ERROR: {self.error}")
-                    log("ERROR", f"[{self.name}] {self.error}")
-                    return False
+                    if not launched:
+                        for bin_path in [
+                            "/usr/bin/chromium",
+                            "/usr/bin/chromium-browser",
+                            "/usr/bin/google-chrome",
+                            "/usr/bin/google-chrome-stable",
+                            "/snap/bin/chromium",
+                        ]:
+                            if os.path.exists(bin_path):
+                                try:
+                                    self.browser = await self.playwright.chromium.launch(
+                                        executable_path=bin_path, headless=self.headless, args=common_args
+                                    )
+                                    launched = True
+                                    self._set_step(f"Stealth engine started via container binary ({bin_path})")
+                                    break
+                                except Exception:
+                                    pass
 
-                # Use persistent profile directory per account for cookie/session isolation
-                profile_dir = os.path.join(PROFILES_DIR, self.jar_id)
-                os.makedirs(profile_dir, exist_ok=True)
-                self.context = await self.browser.new_context(
-                    viewport={"width": 1920, "height": 1080}, screen={"width": 1920, "height": 1080},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
-                    storage_state=os.path.join(profile_dir, "state.json") if os.path.exists(os.path.join(profile_dir, "state.json")) else None,
-                )
+                    if not launched:
+                        try:
+                            self.browser = await self.playwright.firefox.launch(headless=self.headless)
+                            launched = True
+                            self._set_step("Stealth engine started (Firefox fallback)")
+                        except Exception:
+                            pass
+
+                    if not launched and AsyncCamoufox is not None:
+                        self.browser = await AsyncCamoufox(headless=self.headless).__aenter__()
+                        launched = True
+                        self._set_step("Stealth engine started (Camoufox fallback)")
+
+                    if not launched:
+                        self.status = "error"
+                        self.error = "No browser engine found. Run 'playwright install chromium' or install Edge/Chrome."
+                        self._set_step(f"ERROR: {self.error}")
+                        log("ERROR", f"[{self.name}] {self.error}")
+                        return False
+
+                    self.context = await self.browser.new_context(
+                        viewport={"width": 1920, "height": 1080}, screen={"width": 1920, "height": 1080},
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+                        storage_state=os.path.join(profile_dir, "state.json") if os.path.exists(os.path.join(profile_dir, "state.json")) else None,
+                    )
                 self.page = await self.context.new_page()
                 await self.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
             elif AsyncCamoufox is not None:
@@ -2421,13 +2450,48 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 content_to_send = prompt
             base = {
                 "id": str(uuid7()),
-                "mode": "direct",
+                "mode": "direct-battle",
                 "modelAId": model_id,
                 "userMessageId": str(uuid7()),
                 "modelAMessageId": str(uuid7()),
                 "modality": "chat",
             }
             url = f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
+
+            token = None
+            if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
+                for _ in range(45):
+                    try:
+                        token = await s.page.evaluate("""() => {
+                          try {
+                            const g = window.grecaptcha;
+                            if (g && g.getResponse) {
+                              const t = g.getResponse();
+                              if (t) return t;
+                            }
+                          } catch (e) {}
+                          const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response');
+                          if (el && el.value) return el.value;
+                          return null;
+                        }""")
+                    except Exception:
+                        pass
+                    if token: break
+                    await asyncio.sleep(1.0)
+                
+                if not token:
+                    yield ("error", "502: reCAPTCHA token missing — headed keeper + BRIDGENA_CAPTCHA_EXT, open Live Browser, wait for Raptor to solve")
+                    return
+            
+            if token:
+                base["recaptchaToken"] = token
+                base["recaptcha"] = token
+                base["captchaToken"] = token
+                base["g-recaptcha-response"] = token
+            else:
+                # Still fail if there's no keeper running to provide the token
+                yield ("error", "502: reCAPTCHA token missing — no headed keeper running to solve recaptcha")
+                return
 
         user_message = {"content": content_to_send}
         if attachments:
@@ -2447,32 +2511,40 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     yield ("error", f"Network error: {str(e)}")
                     return
 
-                if resp.status_code in (401, 403):
-                    text = _resp_text(resp)
-                    if "cloudflare" in text.lower() or "just a moment" in text.lower():
-                        yield ("error", "502: Cloudflare block — curl_cffi impersonation mismatch")
-                        return
-                    if s and s.running:
-                        await s._harvest_cookies()
-                        s.last_harvest_time = time.time()
-                        live2 = await get_live_cookies(jar_id)
-                        if live2:
-                            jar = dict(jar)
-                            jar["cookies"] = live2
-                    if attempt == 0:
-                        log("WARN", f"[{jar_id}] HTTP {resp.status_code} — harvested, retrying")
-                        continue
-                    mark_jar_status(jar_id, "expired")
-                    yield ("error", f"502: Arena session expired for {jar_id} after retry")
-                    return
-
-                if resp.status_code == 429:
-                    mark_jar_status(jar_id, "limited")
-                    yield ("error", "429: Arena rate limit")
-                    return
-
                 if resp.status_code != 200:
-                    yield ("error", f"{resp.status_code}: {_resp_text(resp)[:200]}")
+                    raw = b""
+                    async for chunk in resp.aiter_content():
+                        raw += chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8", errors="ignore")
+                    text = raw.decode("utf-8", errors="ignore")
+                    log("ERROR", f"Status {resp.status_code}, URL {url}, Mode {base.get('mode')}, modelAId {model_id}, Body: {text[:1500]}")
+                    
+                    if resp.status_code in (401, 403):
+                        if "cloudflare" in text.lower() or "just a moment" in text.lower():
+                            yield ("error", "502: Cloudflare block — curl_cffi impersonation mismatch")
+                            return
+                        if "recaptcha" in text.lower() or "captcha" in text.lower():
+                            yield ("error", f"{resp.status_code}: {text[:400] or '(empty body)'}")
+                            return
+                        if s and s.running:
+                            await s._harvest_cookies()
+                            s.last_harvest_time = time.time()
+                            live2 = await get_live_cookies(jar_id)
+                            if live2:
+                                jar = dict(jar)
+                                jar["cookies"] = live2
+                        if attempt == 0:
+                            log("WARN", f"[{jar_id}] HTTP {resp.status_code} — harvested, retrying")
+                            continue
+                        mark_jar_status(jar_id, "expired")
+                        yield ("error", f"502: Arena session expired for {jar_id} after retry")
+                        return
+
+                    if resp.status_code == 429:
+                        mark_jar_status(jar_id, "limited")
+                        yield ("error", "429: Arena rate limit")
+                        return
+
+                    yield ("error", f"{resp.status_code}: {text[:400] or '(empty body)'}")
                     return
 
                 buffer = b""
