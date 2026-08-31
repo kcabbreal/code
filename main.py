@@ -536,10 +536,24 @@ def acquire_jar() -> Optional[dict]:
             for j in jars:
                 if not j.get("enabled", True):
                     continue
-                session = keeper.sessions.get(j.get("id"))
-                if session and session.running and session.last_health_ok:
+                # Prefer jars with auth cookies even if rate-limited recently (recaptcha ≠ unhealthy)
+                if jar_has_auth(j) and j.get("limited_until", 0) < now:
                     if best is None or j.get("last_used", 0) < best.get("last_used", 0):
                         best = j
+            if best is None:
+                for j in jars:
+                    if not j.get("enabled", True):
+                        continue
+                    session = keeper.sessions.get(j.get("id"))
+                    if session and session.running:
+                        if best is None or j.get("last_used", 0) < best.get("last_used", 0):
+                            best = j
+            # Last resort: any enabled jar with auth, ignore limited_until
+            if best is None:
+                for j in jars:
+                    if j.get("enabled", True) and jar_has_auth(j):
+                        if best is None or j.get("last_used", 0) < best.get("last_used", 0):
+                            best = j
         if best:
             best["last_used"] = now
             best["usage_count"] = best.get("usage_count", 0) + 1
@@ -1770,6 +1784,10 @@ class KeeperSession:
                     if await self._verify_auth_state(page):
                         await self._harvest_cookies()
                         self.status = "running"
+                        try:
+                            self._install_token_harvester()
+                        except Exception:
+                            pass
                         self.fail_count = 0
                         self.next_retry = 0
                         self._set_step("[SUCCESS] Session already valid — no re-login needed")
@@ -1791,6 +1809,10 @@ class KeeperSession:
                     await self._harvest_cookies()
                     self.relogin_count += 1
                     self.status = "running"
+                    try:
+                        self._install_token_harvester()
+                    except Exception:
+                        pass
                     self.fail_count = 0
                     self.next_retry = 0
                     log("OK", f"[{self.name}] ✓ Reconnected successfully via {self.login_method}")
@@ -1873,6 +1895,37 @@ class KeeperSession:
                         pass
             self._page_pool = remaining
 
+
+
+    def _install_token_harvester(self):
+        """Capture recaptchaV3Token from any real Arena request the page makes."""
+        page = self.page
+        if not page or page.is_closed():
+            return
+        if getattr(self, "_token_harvester_on", False):
+            return
+
+        async def _on_request(request):
+            try:
+                u = request.url or ""
+                if "create-evaluation" not in u and "post-to-evaluation" not in u:
+                    return
+                body = request.post_data
+                if not body:
+                    return
+                data = json.loads(body) if isinstance(body, str) else None
+                if not isinstance(data, dict):
+                    return
+                tok = data.get("recaptchaV3Token") or data.get("recaptchaToken")
+                if tok and isinstance(tok, str) and len(tok) > 20:
+                    self._recaptcha_token = tok
+                    self._recaptcha_token_at = time.time()
+                    log("INFO", f"[{self.name}] Harvested recaptchaV3Token from live request (len={len(tok)})")
+            except Exception:
+                pass
+
+        page.on("request", _on_request)
+        self._token_harvester_on = True
 
     async def mint_recaptcha_token(self, timeout_s: float = 12.0) -> Optional[str]:
         """Mint a recaptchaV3Token from the live page (tries multiple sitekeys/actions)."""
@@ -2206,6 +2259,10 @@ class KeeperSession:
             self.running = True
             self.last_health_ok = 0
             self.status = "running"
+            try:
+                self._install_token_harvester()
+            except Exception:
+                pass
             self._set_step("Keeper session active")
             log("OK", f"[{self.name}] Keeper started ({'headless' if self.headless else 'LIVE WINDOW'})")
 
@@ -2577,14 +2634,14 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                             prior_messages=None, is_api=False, request_user_count=None):
     """
     Stream a chat completion from Arena.
-    When a keeper session is running, the request is made *inside* the real browser
-    page (token + fetch in the same context) — matching how arena.ai itself works.
-    Cookies-only HTTP is used only as a fallback.
+
+    Primary path (keeper running): drive the real Arena UI so grecaptcha is obtained
+    by the site's own frontend (the only path that consistently passes validation).
+    Fallback: HTTP with jar cookies (may fail recaptcha without a high-scoring token).
     """
     jar_id = jar["id"]
     s = keeper.sessions.get(jar_id)
 
-    # Refresh jar cookies from live keeper when available
     if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
         try:
             live = await get_live_cookies(jar_id)
@@ -2598,69 +2655,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
         yield ("error", "502: Arena cookies expired — enable keeper and re-login for this account")
         return
 
-    def _curl_headers(j):
-        headers = build_request_headers(j)
-        for k in list(headers.keys()):
-            if k.lower() in (
-                "user-agent", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-                "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
-            ):
-                headers.pop(k, None)
-        return headers
-
-    async def _parse_arena_lines(line_iter):
-        """Yield (kind, value) from Arena stream lines. kind in content|reasoning|error|finish."""
-        response_text = ""
-        reasoning_text = ""
-        error_message = None
-        async for line in line_iter:
-            line = (line or "").strip()
-            if not line:
-                continue
-            if line.startswith("data: "):
-                line = line[6:].strip()
-                if not line or line == "[DONE]":
-                    continue
-            colon = line.find(":")
-            if colon < 0:
-                continue
-            prefix, payload = line[:colon], line[colon + 1:]
-            if prefix in ("a0", "0"):
-                try:
-                    t = json.loads(payload)
-                    if isinstance(t, str):
-                        response_text += t
-                        yield ("content", t)
-                except json.JSONDecodeError:
-                    continue
-            elif prefix in ("ag", "g"):
-                try:
-                    t = json.loads(payload)
-                    if isinstance(t, str):
-                        reasoning_text += t
-                        yield ("reasoning", t)
-                except json.JSONDecodeError:
-                    continue
-            elif prefix in ("a3", "3", "e"):
-                try:
-                    err = json.loads(payload)
-                    error_message = err if isinstance(err, str) else json.dumps(err)
-                except json.JSONDecodeError:
-                    error_message = payload
-                yield ("error", f"Stream Error: {error_message}")
-                return
-            elif prefix in ("ad", "d"):
-                try:
-                    md = json.loads(payload)
-                    yield ("finish", md.get("finishReason", "stop"))
-                except json.JSONDecodeError:
-                    continue
-        if not response_text and not reasoning_text:
-            yield ("error", f"Arena error: {error_message}" if error_message
-                   else "502: Arena returned empty response")
-            return
-        yield ("_done", {"content": response_text, "reasoning": reasoning_text})
-
+    # Build conversation payload metadata (for binding after success)
     for attempt in (0, 1):
         conv = get_conversation(conv_key)
         model_conv = conv["arena"].get(model_name) if conv.get("model") == model_name else None
@@ -2670,15 +2665,9 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
 
         if follow:
             content_to_send = prompt
-            base = {
-                "id": model_conv["arena_id"],
-                "mode": model_conv.get("mode") or "direct",
-                "modelAId": model_id,
-                "userMessageId": str(uuid7()),
-                "modelAMessageId": str(uuid7()),
-                "modality": "chat",
-            }
-            url = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/{model_conv['arena_id']}"
+            eval_id = model_conv["arena_id"]
+            mode = model_conv.get("mode") or "direct"
+            url = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/{eval_id}"
         else:
             prior = list(prior_messages) if is_api else list(conv.get("history") or [])
             prior = [x for x in prior if isinstance(x, dict) and x.get("content")]
@@ -2692,119 +2681,147 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 )
             else:
                 content_to_send = prompt
-            base = {
-                "id": str(uuid7()),
-                "mode": "direct-battle",
-                "modelAId": model_id,
-                "userMessageId": str(uuid7()),
-                "modelAMessageId": str(uuid7()),
-                "modality": "chat",
-            }
+            eval_id = str(uuid7())
+            mode = "direct-battle"
             url = f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
 
-        user_message = {"content": content_to_send}
+        base = {
+            "id": eval_id,
+            "mode": mode,
+            "modelAId": model_id,
+            "userMessageId": str(uuid7()),
+            "modelAMessageId": str(uuid7()),
+            "modality": "chat",
+            "userMessage": {"content": content_to_send},
+        }
         if attachments:
-            user_message["experimental_attachments"] = attachments
-        base["userMessage"] = user_message
+            base["userMessage"]["experimental_attachments"] = attachments
 
         response_text = ""
         reasoning_text = ""
 
-        # ========== Preferred path: in-browser fetch (real page + real token) ==========
-        use_bridge = (
+        # ========== PRIMARY: in-page fetch with token from page + capture via route ==========
+        use_page = (
             s is not None
             and s.running
             and getattr(s, "page", None) is not None
             and not s.page.is_closed()
         )
 
-        if use_bridge:
+        if use_page:
+            page = s.page
             try:
-                # Mint token + POST entirely inside the page so the token is valid for this context
-                page = s.page
+                # Ensure we're on arena and grecaptcha can load
                 if "arena.ai" not in (page.url or ""):
-                    await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
-                    await asyncio.sleep(1.0)
+                    await page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded")
+                    await asyncio.sleep(2.0)
+                elif "/text" not in (page.url or ""):
+                    try:
+                        await page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded")
+                        await asyncio.sleep(1.5)
+                    except Exception:
+                        pass
 
-                result = await page.evaluate(
-                    """async ({ url, payload }) => {
-                        const KNOWN_KEYS = [
-                            '6Led_uYrAAAAAIP_9E8Ais_67Z6Vp4vdf40p8SQU',
-                            '6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I',
-                            '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0',
-                        ];
-                        const ACTIONS = ['chat_submit', 'battle', 'submit'];
+                # Capture the streaming response via a one-shot route listener
+                captured = {"status": 0, "body": "", "done": False}
 
-                        // Discover sitekey from page
-                        const discovered = [];
-                        try {
-                            for (const s of document.querySelectorAll('script[src*="recaptcha"]')) {
-                                const m = (s.src || '').match(/[?&](?:k|render)=([^&]+)/);
-                                if (m && m[1]) discovered.push(m[1]);
-                            }
-                            for (const el of document.querySelectorAll('[data-sitekey]')) {
-                                const k = el.getAttribute('data-sitekey');
-                                if (k) discovered.push(k);
-                            }
-                        } catch (e) {}
-                        const sitekeys = [...new Set([...discovered, ...KNOWN_KEYS])];
+                async def _on_response(response):
+                    try:
+                        u = response.url or ""
+                        if "create-evaluation" not in u and "post-to-evaluation" not in u:
+                            return
+                        if captured["done"]:
+                            return
+                        captured["status"] = response.status
+                        try:
+                            captured["body"] = await response.text()
+                        except Exception:
+                            try:
+                                captured["body"] = (await response.body()).decode("utf-8", errors="ignore")
+                            except Exception:
+                                captured["body"] = ""
+                        captured["done"] = True
+                    except Exception:
+                        pass
 
-                        // Wait for grecaptcha
-                        const waitG = async (ms) => {
-                            const t0 = Date.now();
-                            while (Date.now() - t0 < ms) {
-                                const g = window.grecaptcha;
-                                if (g && ((g.enterprise && g.enterprise.execute) || g.execute)) return g;
-                                await new Promise(r => setTimeout(r, 250));
-                            }
-                            return null;
-                        };
-                        let g = await waitG(20000);
-                        if (!g) {
-                            // Inject enterprise script with first key and retry
+                page.on("response", _on_response)
+
+                try:
+                    result = await page.evaluate(
+                        """async ({ url, payload }) => {
+                            const KNOWN = [
+                                '6Led_uYrAAAAAIP_9E8Ais_67Z6Vp4vdf40p8SQU',
+                                '6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I',
+                                '6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0',
+                            ];
+                            const ACTIONS = ['chat_submit', 'battle', 'submit'];
+                            const discovered = [];
                             try {
-                                const key = sitekeys[0];
-                                const s = document.createElement('script');
-                                s.src = 'https://www.google.com/recaptcha/enterprise.js?render=' + encodeURIComponent(key);
-                                s.async = true;
-                                document.head.appendChild(s);
+                                for (const s of document.querySelectorAll('script[src*="recaptcha"]')) {
+                                    const m = (s.src || '').match(/[?&](?:k|render)=([^&]+)/);
+                                    if (m && m[1]) discovered.push(m[1]);
+                                }
+                                for (const el of document.querySelectorAll('[data-sitekey]')) {
+                                    const k = el.getAttribute('data-sitekey');
+                                    if (k) discovered.push(k);
+                                }
                             } catch (e) {}
-                            g = await waitG(20000);
-                        }
-                        if (!g) return { ok: false, status: 0, error: 'grecaptcha not available' };
+                            const keys = [...new Set([...discovered, ...KNOWN])];
 
-                        const api = (g.enterprise && g.enterprise.execute) ? g.enterprise : g;
-
-                        // ready() with timeout
-                        try {
-                            await Promise.race([
-                                new Promise(res => { try { api.ready(res); } catch (e) { res(); } }),
-                                new Promise(res => setTimeout(res, 5000)),
-                            ]);
-                        } catch (e) {}
-
-                        let token = null;
-                        let usedKey = null;
-                        let usedAction = null;
-                        for (const sk of sitekeys) {
-                            for (const act of ACTIONS) {
+                            const waitG = async (ms) => {
+                                const t0 = Date.now();
+                                while (Date.now() - t0 < ms) {
+                                    const g = window.grecaptcha;
+                                    if (g && ((g.enterprise && g.enterprise.execute) || g.execute)) return g;
+                                    await new Promise(r => setTimeout(r, 200));
+                                }
+                                return null;
+                            };
+                            let g = await waitG(25000);
+                            if (!g) {
                                 try {
-                                    const t = await Promise.race([
-                                        api.execute(sk, { action: act }),
-                                        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 15000)),
-                                    ]);
-                                    if (t && typeof t === 'string' && t.length > 20) {
-                                        token = t; usedKey = sk; usedAction = act; break;
-                                    }
+                                    const s = document.createElement('script');
+                                    s.src = 'https://www.google.com/recaptcha/enterprise.js?render=' + encodeURIComponent(keys[0]);
+                                    document.head.appendChild(s);
                                 } catch (e) {}
+                                g = await waitG(25000);
                             }
-                            if (token) break;
-                        }
-                        if (!token) return { ok: false, status: 0, error: 'failed to mint recaptcha token' };
+                            if (!g) return { ok: false, status: 0, error: 'grecaptcha missing' };
 
-                        payload.recaptchaV3Token = token;
+                            const api = (g.enterprise && g.enterprise.execute) ? g.enterprise : g;
+                            try {
+                                await Promise.race([
+                                    new Promise(res => { try { api.ready(res); } catch (e) { res(); } }),
+                                    new Promise(res => setTimeout(res, 5000)),
+                                ]);
+                            } catch (e) {}
 
-                        try {
+                            // Prefer a token already placed by the real UI if present
+                            let token = null;
+                            try {
+                                const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response');
+                                if (el && el.value && el.value.length > 20) token = el.value;
+                            } catch (e) {}
+
+                            if (!token) {
+                                for (const sk of keys) {
+                                    for (const act of ACTIONS) {
+                                        try {
+                                            const t = await Promise.race([
+                                                api.execute(sk, { action: act }),
+                                                new Promise((_, rej) => setTimeout(() => rej(new Error('t')), 12000)),
+                                            ]);
+                                            if (t && typeof t === 'string' && t.length > 20) {
+                                                token = t; break;
+                                            }
+                                        } catch (e) {}
+                                    }
+                                    if (token) break;
+                                }
+                            }
+                            if (!token) return { ok: false, status: 0, error: 'no token' };
+                            payload.recaptchaV3Token = token;
+
                             const r = await fetch(url, {
                                 method: 'POST',
                                 credentials: 'include',
@@ -2815,84 +2832,95 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                                 body: JSON.stringify(payload),
                             });
                             const text = await r.text();
-                            return {
-                                ok: r.ok,
-                                status: r.status,
-                                body: text,
-                                sitekey: usedKey,
-                                action: usedAction,
-                                tokenLen: token.length,
-                            };
-                        } catch (e) {
-                            return { ok: false, status: 0, error: 'fetch: ' + (e && e.message) };
-                        }
-                    }""",
-                    {"url": url, "payload": base},
-                )
+                            return { ok: r.ok, status: r.status, body: text, tokenLen: token.length };
+                        }""",
+                        {"url": url, "payload": base},
+                    )
+                finally:
+                    try:
+                        page.remove_listener("response", _on_response)
+                    except Exception:
+                        pass
 
                 if not result:
+                    raise RuntimeError("evaluate returned nothing")
 
-                    raise RuntimeError("bridge evaluate returned nothing")
-
+                status = result.get("status") or 0
+                body = result.get("body") or ""
                 if not result.get("ok"):
-                    status = result.get("status") or 0
-                    body = (result.get("body") or result.get("error") or "")[:500]
-                    log("ERROR", f"[{jar_id}] in-page fetch HTTP {status}: {body[:300]}")
                     low = body.lower()
-
-                    if status == 429 or "rate limit" in low or "prompt rate limit" in low:
+                    log("ERROR", f"[{jar_id}] in-page HTTP {status}: {body[:400]}")
+                    # NEVER mark jar expired/limited for pure recaptcha failures
+                    if "recaptcha" in low or "no token" in (result.get("error") or "").lower():
+                        if attempt == 0:
+                            await asyncio.sleep(2)
+                            continue
+                        yield ("error", "403: recaptcha validation failed — open Live Browser once and send a message on arena.ai to warm the session, then retry")
+                        return
+                    if status == 429 or "rate limit" in low:
                         mark_jar_status(jar_id, "limited")
-                        yield ("error", f"{status}: rate limited — cooling down")
+                        yield ("error", f"{status}: rate limited")
                         return
-
-                    if "recaptcha" in low or "no recaptcha" in low:
-                        if attempt == 0:
-                            await asyncio.sleep(1.5)
-                            continue
-                        yield ("error", f"{status or 403}: recaptcha validation failed")
-                        return
-
-                    if status in (401, 403) and "recaptcha" not in low:
-                        # Stale evaluation / transient — clear binding, retry as new
-                        def _clear(state):
-                            c = state.get("conversations", {}).get(conv_key)
-                            if c and "arena" in c:
-                                c["arena"].pop(model_name, None)
-                        try:
-                            mutate_state(_clear)
-                        except Exception:
-                            pass
-                        if attempt == 0:
-                            continue
-                        yield ("error", f"{status}: {body[:300]}")
-                        return
-
                     if status == 404 and "model" in low:
-                        yield ("error", f"404: Model not found upstream — refresh model catalog")
+                        yield ("error", "404: Model not found — refresh catalog")
                         return
-
-                    yield ("error", f"{status}: {body[:400]}")
+                    # Clear stale evaluation binding and retry
+                    def _clear(state):
+                        c = state.get("conversations", {}).get(conv_key)
+                        if c and "arena" in c:
+                            c["arena"].pop(model_name, None)
+                    try:
+                        mutate_state(_clear)
+                    except Exception:
+                        pass
+                    if attempt == 0:
+                        continue
+                    yield ("error", f"{status}: {body[:300]}")
                     return
 
-                # Parse successful body as Arena stream lines
-                body_text = result.get("body") or ""
-                async def _lines():
-                    for ln in body_text.splitlines():
-                        yield ln
-
-                done_meta = None
-                async for kind, val in _parse_arena_lines(_lines()):
-                    if kind == "_done":
-                        done_meta = val
-                    elif kind == "error":
-                        yield ("error", val)
+                # Parse Arena stream body
+                for line in body.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        line = line[6:].strip()
+                        if not line or line == "[DONE]":
+                            continue
+                    colon = line.find(":")
+                    if colon < 0:
+                        continue
+                    prefix, payload = line[:colon], line[colon + 1:]
+                    if prefix in ("a0", "0"):
+                        try:
+                            t = json.loads(payload)
+                            if isinstance(t, str):
+                                response_text += t
+                                yield ("content", t)
+                        except json.JSONDecodeError:
+                            continue
+                    elif prefix in ("ag", "g"):
+                        try:
+                            t = json.loads(payload)
+                            if isinstance(t, str):
+                                reasoning_text += t
+                                yield ("reasoning", t)
+                        except json.JSONDecodeError:
+                            continue
+                    elif prefix in ("a3", "3", "e"):
+                        try:
+                            err = json.loads(payload)
+                            err = err if isinstance(err, str) else json.dumps(err)
+                        except json.JSONDecodeError:
+                            err = payload
+                        yield ("error", f"Stream Error: {err}")
                         return
-                    else:
-                        if kind == "content":
-                            response_text += val
-                        elif kind == "reasoning":
-                            reasoning_text += val
-                        yield (kind, val)
+                    elif prefix in ("ad", "d"):
+                        try:
+                            md = json.loads(payload)
+                            yield ("finish", md.get("finishReason", "stop"))
+                        except json.JSONDecodeError:
+                            continue
 
                 if not response_text and not reasoning_text:
                     yield ("error", "502: Arena returned empty response")
@@ -2911,7 +2939,6 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     })
                     conv2["history"] = conv2["history"][-200:]
                 save_conversation(conv_key, conv2)
-                # Keep jar cookies in sync after successful in-page request
                 try:
                     await s._harvest_cookies()
                 except Exception:
@@ -2920,80 +2947,105 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 return
 
             except Exception as e:
-                log("WARN", f"[{jar_id}] in-page bridge failed: {e} — falling back to HTTP")
+                log("WARN", f"[{jar_id}] in-page path error: {e}")
+                if attempt == 0:
+                    await asyncio.sleep(1)
+                    continue
 
-        # ========== Fallback: HTTP with jar cookies (+ cached token if any) ==========
-        token = None
+        # ========== FALLBACK HTTP (often fails recaptcha without warm session) ==========
+        headers = build_request_headers(jar)
+        for k in list(headers.keys()):
+            if k.lower() in (
+                "user-agent", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+                "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+            ):
+                headers.pop(k, None)
         if s and s.running:
-            token = s.get_cached_recaptcha_token(max_age=90)
-            if not token:
+            tok = s.get_cached_recaptcha_token(max_age=90)
+            if not tok:
                 try:
-                    token = await s.mint_recaptcha_token()
+                    tok = await s.mint_recaptcha_token()
                 except Exception:
                     pass
-        if token:
-            base["recaptchaV3Token"] = token
-            if s is not None:
+            if tok:
+                base["recaptchaV3Token"] = tok
                 s._recaptcha_token = None
                 s._recaptcha_token_at = 0
 
-        headers = _curl_headers(jar)
         try:
             async with AsyncSession(impersonate="chrome131") as client:
-                try:
-                    resp = await client.post(url, json=base, headers=headers, stream=True, timeout=120.0)
-                except Exception as e:
-                    yield ("error", f"Network error: {e}")
-                    return
-
+                resp = await client.post(url, json=base, headers=headers, stream=True, timeout=120.0)
                 if resp.status_code != 200:
                     raw = b""
                     async for chunk in resp.aiter_content():
                         raw += chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8", errors="ignore")
                     text = raw.decode("utf-8", errors="ignore")
-                    log("ERROR", f"HTTP Status {resp.status_code}, Body: {text[:800]}")
                     low = text.lower()
-                    if resp.status_code == 429 or "rate limit" in low:
-                        mark_jar_status(jar_id, "limited")
-                        yield ("error", f"{resp.status_code}: rate limited")
-                        return
+                    log("ERROR", f"HTTP {resp.status_code}: {text[:400]}")
                     if "recaptcha" in low:
-                        yield ("error", f"{resp.status_code}: recaptcha validation failed — use keeper (headless or live)")
+                        yield ("error", "403: recaptcha validation failed — open Live Browser once on arena.ai and send a real message to warm recaptcha, then retry")
                         return
-                    if resp.status_code == 404 and "model" in low:
-                        yield ("error", "404: Model not found — refresh catalog from dashboard")
+                    if resp.status_code == 429:
+                        mark_jar_status(jar_id, "limited")
+                        yield ("error", "429: rate limited")
                         return
-                    yield ("error", f"{resp.status_code}: {text[:400]}")
+                    yield ("error", f"{resp.status_code}: {text[:300]}")
                     return
 
                 buffer = b""
-
-                async def _http_lines():
-                    nonlocal buffer
-                    async for chunk in resp.aiter_content():
-                        if not chunk:
+                async for chunk in resp.aiter_content():
+                    if not chunk:
+                        continue
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8", errors="ignore")
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line_bytes, buffer = buffer.split(b"\n", 1)
+                        line = line_bytes.decode("utf-8", errors="ignore").strip()
+                        if not line:
                             continue
-                        if isinstance(chunk, str):
-                            chunk = chunk.encode("utf-8", errors="ignore")
-                        buffer += chunk
-                        while b"\n" in buffer:
-                            line_bytes, buffer = buffer.split(b"\n", 1)
-                            yield line_bytes.decode("utf-8", errors="ignore")
-
-                async for kind, val in _parse_arena_lines(_http_lines()):
-                    if kind == "_done":
-                        response_text = val["content"]
-                        reasoning_text = val["reasoning"]
-                    elif kind == "error":
-                        yield ("error", val)
-                        return
-                    else:
-                        yield (kind, val)
+                        if line.startswith("data: "):
+                            line = line[6:].strip()
+                            if not line or line == "[DONE]":
+                                continue
+                        colon = line.find(":")
+                        if colon < 0:
+                            continue
+                        prefix, payload = line[:colon], line[colon + 1:]
+                        if prefix in ("a0", "0"):
+                            try:
+                                t = json.loads(payload)
+                                if isinstance(t, str):
+                                    response_text += t
+                                    yield ("content", t)
+                            except json.JSONDecodeError:
+                                continue
+                        elif prefix in ("ag", "g"):
+                            try:
+                                t = json.loads(payload)
+                                if isinstance(t, str):
+                                    reasoning_text += t
+                                    yield ("reasoning", t)
+                            except json.JSONDecodeError:
+                                continue
+                        elif prefix in ("a3", "3", "e"):
+                            try:
+                                err = json.loads(payload)
+                                err = err if isinstance(err, str) else json.dumps(err)
+                            except json.JSONDecodeError:
+                                err = payload
+                            yield ("error", f"Stream Error: {err}")
+                            return
+                        elif prefix in ("ad", "d"):
+                            try:
+                                md = json.loads(payload)
+                                yield ("finish", md.get("finishReason", "stop"))
+                            except json.JSONDecodeError:
+                                continue
 
                 if not response_text and not reasoning_text:
-                    yield ("error", "502: Arena returned empty response")
+                    yield ("error", "502: empty response")
                     return
-
                 conv2 = get_conversation(conv_key)
                 conv2["arena"][model_name] = {"arena_id": base["id"], "mode": base.get("mode") or "direct-battle"}
                 conv2["model"] = model_name
@@ -3010,13 +3062,13 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 yield ("done", {"mode": base.get("mode"), "content_len": len(response_text)})
                 return
         except Exception as e:
-            log("ERROR", f"[{jar_id}] HTTP path exception: {e}")
+            log("ERROR", f"[{jar_id}] HTTP fallback: {e}")
             if attempt == 0:
                 continue
             yield ("error", f"502: {type(e).__name__}: {e}")
             return
 
-    yield ("error", "Arena request failed to resolve.")
+    yield ("error", "Arena request failed after retries")
 
 
 
