@@ -1,5 +1,6 @@
 """
-hallo
+Bridgena v1.0 — OpenAI-Compatible Bridge for arena.ai
+Multi-worker · Session Keeper · Browser Bridge · Low Resource
 """
 import argparse
 import asyncio
@@ -2576,7 +2577,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             content_to_send = prompt
             base = {
                 "id": model_conv["arena_id"],
-                "mode": "direct",
+                "mode": model_conv.get("mode") or "direct",
                 "modelAId": model_id,
                 "userMessageId": str(uuid7()),
                 "modelAMessageId": str(uuid7()),
@@ -2629,6 +2630,10 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             )
             return
         base["recaptchaV3Token"] = token
+        # Tokens are single-use — clear cache so the keeper mints a fresh one next time
+        if s is not None:
+            s._recaptcha_token = None
+            s._recaptcha_token_at = 0
 
         response_text = ""
         reasoning_text = ""
@@ -2651,11 +2656,51 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     log("ERROR", f"Status {resp.status_code}, URL {url}, Body: {text[:800]}")
 
                     # Auth / rate-limit handling
-                    if resp.status_code in (401, 403) or "unauthorized" in text.lower():
-                        mark_jar_status(jar_id, "expired")
-                        yield ("error", f"{resp.status_code}: session expired — re-login via keeper")
-                        return
-                    if resp.status_code == 429 or "rate" in text.lower() or "limit" in text.lower():
+                    low = text.lower()
+                    if resp.status_code in (401, 403) or "unauthorized" in low or "not authenticated" in low:
+                        # Only mark jar expired if this was a NEW evaluation (create).
+                        # Follow-up 401/403 is often a stale evaluation id, not dead cookies.
+                        if not follow and ("auth" in low or "login" in low or "unauthorized" in low or resp.status_code in (401, 403)):
+                            # Double-check: if live browser still has auth, don't kill the jar
+                            still_ok = False
+                            if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
+                                try:
+                                    still_ok = await s._verify_auth_state(s.page)
+                                except Exception:
+                                    pass
+                            if still_ok:
+                                log("WARN", f"[{jar_id}] HTTP {resp.status_code} but keeper still authenticated — not marking expired")
+                                # Clear broken conversation binding so next try starts fresh
+                                def _clear(state):
+                                    c = state.get("conversations", {}).get(conv_key)
+                                    if c and "arena" in c:
+                                        c["arena"].pop(model_name, None)
+                                try:
+                                    mutate_state(_clear)
+                                except Exception:
+                                    pass
+                                if attempt == 0:
+                                    continue
+                            else:
+                                mark_jar_status(jar_id, "expired")
+                                yield ("error", f"{resp.status_code}: session expired — re-login via keeper")
+                                return
+                        else:
+                            # Follow path failed — drop arena binding and retry as new conversation
+                            log("WARN", f"[{jar_id}] follow-up failed ({resp.status_code}) — retrying as new evaluation")
+                            def _clear2(state):
+                                c = state.get("conversations", {}).get(conv_key)
+                                if c and "arena" in c:
+                                    c["arena"].pop(model_name, None)
+                            try:
+                                mutate_state(_clear2)
+                            except Exception:
+                                pass
+                            if attempt == 0:
+                                continue
+                            yield ("error", f"{resp.status_code}: {text[:400] or '(empty body)'}")
+                            return
+                    if resp.status_code == 429 or "rate" in low or "limit" in low:
                         mark_jar_status(jar_id, "limited")
                         yield ("error", f"{resp.status_code}: rate limited")
                         return
@@ -2744,7 +2789,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 return
 
             conv2 = get_conversation(conv_key)
-            conv2["arena"][model_name] = {"arena_id": base["id"], "mode": "direct"}
+            conv2["arena"][model_name] = {"arena_id": base["id"], "mode": base.get("mode") or "direct-battle"}
             conv2["model"] = model_name
             if is_api and request_user_count is not None:
                 conv2["user_count"] = request_user_count
@@ -3134,7 +3179,11 @@ async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
         c_text, _ = await process_message_content(msg.get("content", ""), model_caps)
         prior_messages.append({"role": msg.get("role", "user"), "content": c_text})
     user_count = sum(1 for m in messages if m.get("role") == "user")
-    req_hash = hashlib.sha256(json.dumps([m.get("content") for m in messages[:-1]], default=str).encode()).hexdigest()[:16]
+    # Stable conversation key across turns (hash of first user message + model), matching old bridge behavior
+    first_user = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+    if isinstance(first_user, list):
+        first_user = str(first_user)
+    req_hash = hashlib.sha256(f"{model_public_name}:{str(first_user)[:200]}".encode()).hexdigest()[:16]
     conv_key = f"api:{req_hash}"
 
     if stream:
@@ -4932,7 +4981,7 @@ if __name__ == "__main__":
     effective_workers = max(1, requested)
 
     print("=" * 62)
-    print("  Bridgena v6.7 — Arena.ai Bridge")
+    print("  Bridgena v1.0 — Arena.ai Bridge")
     print("=" * 62)
     print(f"  * Chat WebUI  : http://localhost:{args.port}/chat")
     print(f"  * Dashboard   : http://localhost:{args.port}/dashboard")
