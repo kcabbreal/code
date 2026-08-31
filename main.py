@@ -2293,7 +2293,11 @@ class SessionKeeper:
         for jid, jar in wanted.items():
             s = self.sessions.get(jid)
             if s is None:
-                s = KeeperSession(jar, headless=jar.get("keeper_headless", None))
+                # Default headless — visible window only via /keeper/live
+                headless = jar.get("keeper_headless", True)
+                if headless is None:
+                    headless = True
+                s = KeeperSession(jar, headless=bool(headless))
                 self.sessions[jid] = s
                 asyncio.create_task(s.start())
             else:
@@ -2654,83 +2658,68 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                         raw += chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8", errors="ignore")
                     text = raw.decode("utf-8", errors="ignore")
                     log("ERROR", f"Status {resp.status_code}, URL {url}, Body: {text[:800]}")
-
-                    # Auth / rate-limit handling
                     low = text.lower()
-                    if resp.status_code in (401, 403) or "unauthorized" in low or "not authenticated" in low:
-                        # Only mark jar expired if this was a NEW evaluation (create).
-                        # Follow-up 401/403 is often a stale evaluation id, not dead cookies.
-                        if not follow and ("auth" in low or "login" in low or "unauthorized" in low or resp.status_code in (401, 403)):
-                            # Double-check: if live browser still has auth, don't kill the jar
-                            still_ok = False
-                            if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
-                                try:
-                                    still_ok = await s._verify_auth_state(s.page)
-                                except Exception:
-                                    pass
-                            if still_ok:
-                                log("WARN", f"[{jar_id}] HTTP {resp.status_code} but keeper still authenticated — not marking expired")
-                                # Clear broken conversation binding so next try starts fresh
-                                def _clear(state):
-                                    c = state.get("conversations", {}).get(conv_key)
-                                    if c and "arena" in c:
-                                        c["arena"].pop(model_name, None)
-                                try:
-                                    mutate_state(_clear)
-                                except Exception:
-                                    pass
-                                if attempt == 0:
+
+                    # --- Rate limit (never touch auth state) ---
+                    if resp.status_code == 429 or "rate limit" in low or "prompt rate limit" in low:
+                        mark_jar_status(jar_id, "limited")
+                        yield ("error", f"{resp.status_code}: rate limited — cooling down")
+                        return
+
+                    # --- reCAPTCHA failure (never mark jar expired) ---
+                    if "recaptcha" in low:
+                        if attempt == 0 and s and s.running:
+                            try:
+                                # Force-clear cache and mint a brand-new token
+                                s._recaptcha_token = None
+                                s._recaptcha_token_at = 0
+                                fresh = await s.mint_recaptcha_token()
+                                if fresh and len(fresh) > 20:
+                                    base["recaptchaV3Token"] = fresh
+                                    s._recaptcha_token = None  # single-use
+                                    log("INFO", f"[{jar_id}] Fresh recaptchaV3Token after 403 — retrying")
                                     continue
-                            else:
-                                mark_jar_status(jar_id, "expired")
-                                yield ("error", f"{resp.status_code}: session expired — re-login via keeper")
-                                return
-                        else:
-                            # Follow path failed — drop arena binding and retry as new conversation
-                            log("WARN", f"[{jar_id}] follow-up failed ({resp.status_code}) — retrying as new evaluation")
-                            def _clear2(state):
+                            except Exception as e:
+                                log("WARN", f"[{jar_id}] recaptcha remint failed: {e}")
+                        yield ("error", f"{resp.status_code}: recaptcha validation failed — keeper will mint a new token shortly, retry")
+                        return
+
+                    # --- True auth failure only ---
+                    auth_fail = (
+                        "unauthorized" in low
+                        or "not authenticated" in low
+                        or "please log in" in low
+                        or "session expired" in low
+                        or (resp.status_code in (401, 403) and "recaptcha" not in low and "rate" not in low)
+                    )
+                    if auth_fail:
+                        still_ok = False
+                        if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
+                            try:
+                                still_ok = await s._verify_auth_state(s.page)
+                            except Exception:
+                                pass
+                        if still_ok or follow:
+                            log("WARN", f"[{jar_id}] HTTP {resp.status_code} but session still valid — clearing conv binding")
+                            def _clear(state):
                                 c = state.get("conversations", {}).get(conv_key)
                                 if c and "arena" in c:
                                     c["arena"].pop(model_name, None)
                             try:
-                                mutate_state(_clear2)
+                                mutate_state(_clear)
                             except Exception:
                                 pass
                             if attempt == 0:
                                 continue
-                            yield ("error", f"{resp.status_code}: {text[:400] or '(empty body)'}")
+                            yield ("error", f"{resp.status_code}: {text[:300]}")
                             return
-                    if resp.status_code == 429 or "rate" in low or "limit" in low:
-                        mark_jar_status(jar_id, "limited")
-                        yield ("error", f"{resp.status_code}: rate limited")
-                        return
-
-                    # Retry once on recaptcha rejection if keeper can mint a token
-                    if attempt == 0 and "recaptcha" in text.lower():
-                        if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
-                            try:
-                                fresh = await s.page.evaluate(
-                                    """async () => {
-                                        const g = window.grecaptcha;
-                                        if (!g) return null;
-                                        const run = (g.enterprise && g.enterprise.execute)
-                                            ? (sk, o) => g.enterprise.execute(sk, o)
-                                            : (g.execute ? (sk, o) => g.execute(sk, o) : null);
-                                        if (!run) return null;
-                                        return await run('6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0', { action: 'chat_submit' });
-                                    }"""
-                                )
-                                if fresh and len(fresh) > 20:
-                                    base["recaptchaV3Token"] = fresh
-                                    log("INFO", f"[{jar_id}] Fresh recaptchaV3Token — retrying")
-                                    continue
-                            except Exception:
-                                pass
-                        yield ("error", f"{resp.status_code}: recaptcha validation failed (optional: run keeper for token)")
+                        mark_jar_status(jar_id, "expired")
+                        yield ("error", f"{resp.status_code}: session expired — re-login via keeper")
                         return
 
                     yield ("error", f"{resp.status_code}: {text[:400] or '(empty body)'}")
                     return
+
 
                 buffer = b""
                 async for chunk in resp.aiter_content():
@@ -2931,6 +2920,7 @@ async def auto_login_on_boot():
         for j in jars_list:
             if j.get("email") and j.get("password") and j.get("enabled", True):
                 j["keeper_enabled"] = True
+                j["keeper_headless"] = True  # never open visible windows on boot
     mutate_jars(enable_keepers)
 
     # Give the election loop time to pick them up
