@@ -2400,7 +2400,7 @@ async def arena_oneoff(model_id: str, model_name: str, prompt: str, jar: dict) -
         raw_headers = build_request_headers(jar)
         headers = {k: v for k, v in raw_headers.items() if k not in ["User-Agent", "sec-ch-ua", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site"]}
         base = {
-            "id": str(uuid7()), "mode": "direct", "modelAId": model_id,
+            "id": str(uuid7()), "mode": "direct-battle", "modelAId": model_id,
             "userMessageId": str(uuid7()), "modelAMessageId": str(uuid7()),
             "userMessage": {"content": prompt}, "modality": "chat",
         }
@@ -2541,7 +2541,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 content_to_send = prompt
             base = {
                 "id": str(uuid7()),
-                "mode": "direct",
+                "mode": "direct-battle",
                 "modelAId": model_id,
                 "userMessageId": str(uuid7()),
                 "modelAMessageId": str(uuid7()),
