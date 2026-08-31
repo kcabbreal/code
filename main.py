@@ -2463,17 +2463,25 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 for _ in range(45):
                     try:
                         token = await s.page.evaluate("""() => {
-                          try {
-                            const g = window.grecaptcha;
-                            if (g && g.getResponse) {
-                              const t = g.getResponse();
-                              if (t) return t;
-                            }
-                          } catch (e) {}
-                          const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response');
-                          if (el && el.value) return el.value;
-                          return null;
-                        }""")
+            try {
+                const g = window.grecaptcha;
+                if (g) {
+                    if (g.getResponse) {
+                        const t = g.getResponse();
+                        if (t) return t;
+                    }
+                    // also try execute for v3
+                    if (g.execute) {
+                        // sitekey may be in DOM or known
+                    }
+                }
+            } catch(e) {}
+            const el = document.querySelector(
+                'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
+            );
+            if (el && el.value) return el.value;
+            return null;
+        }""")
                     except Exception:
                         pass
                     if token: break
