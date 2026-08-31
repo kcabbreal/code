@@ -22,6 +22,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+try:
+    from recaptcha_solver import RecaptchaSolver
+except Exception:
+    RecaptchaSolver = None  # type: ignore
+
 import hashlib
 import httpx
 from curl_cffi.requests import AsyncSession
@@ -55,6 +60,31 @@ ARENA_BASE = "https://arena.ai"
 ARENA_MODES = ["direct-battle", "direct"]
 MAX_PROMPT = 50000
 COOLDOWN_SEC = 45 * 60
+
+# ONNX image solver for reCAPTCHA v2 challenges (optional; needs models/ + onnxruntime)
+_RECAPTCHA_MODELS = os.environ.get(
+    "BRIDGENA_RECAPTCHA_MODELS",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "recaptcha_solver", "models"),
+)
+_recaptcha_solver = None
+
+def get_recaptcha_solver():
+    global _recaptcha_solver
+    if _recaptcha_solver is not None:
+        return _recaptcha_solver
+    if RecaptchaSolver is None:
+        return None
+    try:
+        s = RecaptchaSolver(models_dir=_RECAPTCHA_MODELS)
+        if s.available():
+            _recaptcha_solver = s
+            log("OK", f"reCAPTCHA image solver loaded from {_RECAPTCHA_MODELS}")
+            return s
+        log("WARN", f"reCAPTCHA models not found in {_RECAPTCHA_MODELS} (need type.onnx, grid.onnx)")
+    except Exception as e:
+        log("WARN", f"reCAPTCHA solver init failed: {e}")
+    return None
+
 REFRESH_INTERVAL = 3600
 
 COMPACT_THRESHOLD = 30000
@@ -1897,6 +1927,153 @@ class KeeperSession:
 
 
 
+
+    async def solve_recaptcha_image_challenge(self) -> Optional[str]:
+        """Detect a visible reCAPTCHA image challenge, solve with ONNX, return token if any."""
+        page = self.page
+        if not page or page.is_closed():
+            return None
+        solver = get_recaptcha_solver()
+        if not solver:
+            return None
+
+        try:
+            # Find challenge iframe(s)
+            frames = page.frames
+            challenge = None
+            for fr in frames:
+                try:
+                    u = fr.url or ""
+                    if "recaptcha" in u and ("bframe" in u or "challenge" in u):
+                        challenge = fr
+                        break
+                except Exception:
+                    continue
+            if not challenge:
+                # Try clicking the checkbox to trigger challenge
+                for fr in frames:
+                    try:
+                        u = fr.url or ""
+                        if "recaptcha" in u and "anchor" in u:
+                            cb = await fr.query_selector("#recaptcha-anchor, .recaptcha-checkbox-border")
+                            if cb:
+                                await cb.click()
+                                await asyncio.sleep(2.0)
+                                break
+                    except Exception:
+                        continue
+                for fr in page.frames:
+                    try:
+                        u = fr.url or ""
+                        if "recaptcha" in u and ("bframe" in u or "challenge" in u):
+                            challenge = fr
+                            break
+                    except Exception:
+                        continue
+            if not challenge:
+                return None
+
+            # Read task text
+            task = ""
+            for sel in [".rc-imageselect-desc-text", ".rc-imageselect-desc", "strong"]:
+                try:
+                    el = await challenge.query_selector(sel)
+                    if el:
+                        task = (await el.inner_text() or "").strip()
+                        if task:
+                            break
+                except Exception:
+                    continue
+            if not task:
+                return None
+
+            # Determine grid type and grab image(s)
+            tiles = await challenge.query_selector_all(".rc-image-tile-wrapper img, #rc-imageselect-target img")
+            if not tiles:
+                return None
+
+            # Prefer full table screenshot for 3x3/4x4
+            table = await challenge.query_selector("#rc-imageselect-target, .rc-imageselect-table")
+            image_sources = []
+            grid = None
+            n = len(tiles)
+            if n >= 16:
+                grid = "4x4"
+            elif n >= 9:
+                grid = "3x3"
+            else:
+                grid = None
+
+            if table:
+                try:
+                    png = await table.screenshot()
+                    image_sources = [png]
+                except Exception:
+                    pass
+            if not image_sources:
+                for t in tiles:
+                    try:
+                        src_attr = await t.get_attribute("src")
+                        if src_attr:
+                            image_sources.append(src_attr)
+                    except Exception:
+                        continue
+            if not image_sources:
+                return None
+
+            result = solver.recognize(task=task, image_sources=image_sources, grid=grid or "3x3")
+            if not result or result.get("error") or not result.get("data"):
+                log("WARN", f"[{self.name}] image solver: {result}")
+                return None
+
+            selections = result["data"]
+            # Click selected tiles
+            clickable = await challenge.query_selector_all(
+                ".rc-imageselect-tile, .rc-image-tile-wrapper, td"
+            )
+            if not clickable:
+                clickable = tiles
+
+            for i, selected in enumerate(selections):
+                if not selected:
+                    continue
+                if i >= len(clickable):
+                    break
+                try:
+                    await clickable[i].click()
+                    await asyncio.sleep(random.uniform(0.15, 0.45))
+                except Exception:
+                    pass
+
+            # Click verify
+            for sel in ["#recaptcha-verify-button", ".rc-button-default"]:
+                try:
+                    btn = await challenge.query_selector(sel)
+                    if btn:
+                        await btn.click()
+                        break
+                except Exception:
+                    continue
+
+            await asyncio.sleep(2.5)
+
+            # Read token from response textarea on main page or frames
+            for fr in [page] + list(page.frames):
+                try:
+                    el = await fr.query_selector("textarea[name='g-recaptcha-response'], #g-recaptcha-response")
+                    if el:
+                        val = await el.input_value()
+                        if val and len(val) > 20:
+                            self._recaptcha_token = val
+                            self._recaptcha_token_at = time.time()
+                            log("OK", f"[{self.name}] Image challenge solved, token len={len(val)}")
+                            return val
+                except Exception:
+                    continue
+        except Exception as e:
+            log("WARN", f"[{self.name}] solve_recaptcha_image_challenge: {e}")
+        return None
+
     def _install_token_harvester(self):
         """Capture recaptchaV3Token from any real Arena request the page makes."""
         page = self.page
@@ -2852,10 +3029,18 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     log("ERROR", f"[{jar_id}] in-page HTTP {status}: {body[:400]}")
                     # NEVER mark jar expired/limited for pure recaptcha failures
                     if "recaptcha" in low or "no token" in (result.get("error") or "").lower():
-                        if attempt == 0:
-                            await asyncio.sleep(2)
+                        # Try ONNX image challenge solver once
+                        if attempt == 0 and s and s.running:
+                            try:
+                                img_tok = await s.solve_recaptcha_image_challenge()
+                                if img_tok:
+                                    log("INFO", f"[{jar_id}] Got token from image solver — retrying")
+                                    continue
+                            except Exception as e:
+                                log("WARN", f"[{jar_id}] image solver path: {e}")
+                            await asyncio.sleep(1.5)
                             continue
-                        yield ("error", "403: recaptcha validation failed — open Live Browser once and send a message on arena.ai to warm the session, then retry")
+                        yield ("error", "403: recaptcha validation failed — place type.onnx/grid.onnx in recaptcha_solver/models or warm via Live Browser")
                         return
                     if status == 429 or "rate limit" in low:
                         mark_jar_status(jar_id, "limited")
