@@ -2572,13 +2572,17 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 except Exception:
                     pass
 
-                sitekey = "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0"
+                # Known working sitekeys (arena.ai / lmarena); try primary then fallback
+                sitekeys = [
+                    "6Led_uYrAAAAAIP_9E8Ais_67Z6Vp4vdf40p8SQU",
+                    "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0",
+                    "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I",
+                ]
                 for attempt in range(30):
                     try:
                         token = await s.page.evaluate(
-                            """async (sitekey) => {
+                            """async (sitekeys) => {
             try {
-                // Prefer any pre-solved response the extension may have written
                 const el = document.querySelector(
                     'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
                 );
@@ -2592,23 +2596,27 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     if (t && t.length > 20) return t;
                 }
 
-                // Enterprise / V3 path — captcha extensions (Raptor, etc.) intercept execute()
                 const runner = (g.enterprise && g.enterprise.execute)
                     ? g.enterprise.execute.bind(g.enterprise)
                     : (g.execute ? g.execute.bind(g) : null);
-                if (runner) {
-                    const t = await Promise.race([
-                        runner(sitekey, { action: 'chat' }),
-                        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 12000)),
-                    ]);
-                    if (t && typeof t === 'string' && t.length > 20) return t;
+                if (!runner) return null;
+
+                const actions = ['chat_submit', 'chat', 'submit'];
+                for (const sitekey of sitekeys) {
+                    for (const action of actions) {
+                        try {
+                            const t = await Promise.race([
+                                runner(sitekey, { action }),
+                                new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+                            ]);
+                            if (t && typeof t === 'string' && t.length > 20) return t;
+                        } catch (e) {}
+                    }
                 }
-            } catch (e) {
-                // Extension may still be solving; return null so we retry
-            }
+            } catch (e) {}
             return null;
         }""",
-                            sitekey,
+                            sitekeys,
                         )
                     except Exception as e:
                         log("WARN", f"[{getattr(s,'name',jar_id)}] grecaptcha eval error: {e}")
@@ -2637,7 +2645,6 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 base["recaptcha"] = token
                 base["captchaToken"] = token
                 base["g-recaptcha-response"] = token
-                return
 
         user_message = {"content": content_to_send}
         if attachments:
@@ -2648,6 +2655,88 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             response_text = ""
             reasoning_text = ""
             error_message = None
+
+            # Prefer in-browser fetch when keeper is live (cookies + captcha in real page context)
+            use_bridge = (
+                s is not None
+                and s.running
+                and getattr(s, "page", None) is not None
+                and not s.page.is_closed()
+            )
+
+            if use_bridge:
+                try:
+                    async for line in s.bridge_fetch(url, base):
+                        line = (line or "").strip()
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            line = line[6:].strip()
+                            if not line or line == "[DONE]":
+                                continue
+                        colon = line.find(":")
+                        if colon < 0:
+                            continue
+                        prefix, payload = line[:colon], line[colon + 1:]
+                        if prefix in ("a0", "0"):
+                            try:
+                                t = json.loads(payload)
+                                if isinstance(t, str):
+                                    response_text += t
+                                    yield ("content", t)
+                            except json.JSONDecodeError:
+                                continue
+                        elif prefix in ("ag", "g"):
+                            try:
+                                t = json.loads(payload)
+                                if isinstance(t, str):
+                                    reasoning_text += t
+                                    yield ("reasoning", t)
+                            except json.JSONDecodeError:
+                                continue
+                        elif prefix in ("a3", "3", "e"):
+                            try:
+                                err = json.loads(payload)
+                                error_message = err if isinstance(err, str) else json.dumps(err)
+                            except json.JSONDecodeError:
+                                error_message = payload
+                            yield ("error", f"Stream Error: {error_message}")
+                            return
+                        elif prefix in ("ad", "d"):
+                            try:
+                                md = json.loads(payload)
+                                yield ("finish", md.get("finishReason", "stop"))
+                            except json.JSONDecodeError:
+                                continue
+                    if response_text or reasoning_text:
+                        conv2 = get_conversation(conv_key)
+                        conv2["arena"][model_name] = {"arena_id": base["id"], "mode": "direct"}
+                        conv2["model"] = model_name
+                        if is_api and request_user_count is not None:
+                            conv2["user_count"] = request_user_count
+                        if not is_api:
+                            conv2["history"].append({"role": "user", "content": prompt})
+                            conv2["history"].append({
+                                "role": "assistant",
+                                "content": response_text.strip() or reasoning_text.strip(),
+                            })
+                            conv2["history"] = conv2["history"][-200:]
+                        save_conversation(conv_key, conv2)
+                        yield ("done", {"mode": "direct", "content_len": len(response_text), "reasoning_len": len(reasoning_text)})
+                        return
+                    if error_message:
+                        yield ("error", f"Arena error: {error_message}")
+                        return
+                    log("WARN", f"[{jar_id}] bridge_fetch returned empty — falling back to curl_cffi")
+                except BridgeHTTPError as be:
+                    log("WARN", f"[{jar_id}] bridge HTTP {be.status}: {be.body[:200]} — falling back")
+                    if be.status in (401, 403):
+                        mark_jar_status(jar_id, "expired")
+                        yield ("error", f"{be.status}: session expired")
+                        return
+                except Exception as be:
+                    log("WARN", f"[{jar_id}] bridge_fetch failed: {be} — falling back to curl_cffi")
+
             headers = _curl_headers(jar)
 
             async with AsyncSession(impersonate="chrome131") as client:
@@ -3021,7 +3110,10 @@ async def list_models(_auth=Depends(verify_api_key)):
     data = []
     ts = int(time.time())
     for m in arena_m:
-        data.append({"id": m.get("publicName"), "object": "model", "created": ts, "owned_by": m.get("organization", "arena.ai")})
+        mid = m.get("publicName") or m.get("id") or m.get("name")
+        if not mid:
+            continue
+        data.append({"id": mid, "object": "model", "created": ts, "owned_by": m.get("organization", "arena.ai")})
     for m in ox_m:
         data.append({"id": m["id"], "object": "model", "created": ts, "owned_by": m["owned_by"]})
     return {"object": "list", "data": data}
@@ -4053,9 +4145,7 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
                     try {
                         const parsed = JSON.parse(dataStr);
                         if (parsed.error) {
-                            assistantMsg.content += '
-
-<span style="color:#ef4444">**Error**: ' + (parsed.error.message || JSON.stringify(parsed.error)) + '</span>';
+                            assistantMsg.content += '\n\n<span style="color:#ef4444">**Error**: ' + (parsed.error.message || JSON.stringify(parsed.error)) + '</span>';
                             renderMessages();
                             continue;
                         }
@@ -4072,9 +4162,7 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
             }
         } catch (e) {
             if (e.name !== 'AbortError') {
-                assistantMsg.content += '
-
-*(Generation interrupted: ' + e.message + ')*';
+                assistantMsg.content += '\n\n*(Generation interrupted: ' + e.message + ')*';
             }
         } finally {
             if (stopBtn) stopBtn.classList.remove('visible');
@@ -4138,7 +4226,8 @@ async def chat_page(request: Request):
 async def chat_api_models(request: Request):
     if not await get_current_session(request):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
-    data = [{"id": m.get("publicName"), "owned_by": m.get("organization", "Arena")} for m in get_selectable_models()]
+    data = [{"id": m.get("publicName") or m.get("id") or m.get("name"), "owned_by": m.get("organization", "Arena")} for m in get_selectable_models()]
+    data = [x for x in data if x.get("id")]
     for om in oxalpha_models():
         data.append({"id": om["id"], "owned_by": om["owned_by"]})
     jars = load_jars()
