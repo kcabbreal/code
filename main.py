@@ -689,19 +689,50 @@ def build_request_headers(jar: dict) -> dict:
 # ============================================================
 
 def _normalize_proxy(raw: str) -> Optional[str]:
-    """Accept host:port, user:pass@host:port, http://..., socks5://..., socks4://..."""
+    """Normalize many common proxy string formats to a URL.
+
+    Supported:
+      http://user:pass@host:port
+      socks5://user:pass@host:port
+      socks4://host:port
+      user:pass@host:port
+      host:port:user:pass          ← common provider format
+      host:port:user:pass:http    ← with scheme suffix
+      host:port
+    """
     if not raw or not isinstance(raw, str):
         return None
     p = raw.strip()
     if not p or p.startswith("#"):
         return None
     low = p.lower()
-    if "://" not in p:
-        # bare host:port or user:pass@host:port → default http
-        p = "http://" + p
-    elif low.startswith("socks5h://"):
-        p = "socks5://" + p.split("://", 1)[1]  # curl_cffi uses socks5
-    return p
+
+    if low.startswith("socks5h://"):
+        return "socks5://" + p.split("://", 1)[1]
+
+    if "://" in p:
+        return p  # already a URL
+
+    # user:pass@host:port
+    if "@" in p:
+        return "http://" + p
+
+    parts = p.split(":")
+    # host:port:user:pass  OR  host:port:user:pass:scheme
+    if len(parts) >= 4:
+        host, port, user, password = parts[0], parts[1], parts[2], parts[3]
+        scheme = "http"
+        if len(parts) >= 5 and parts[4].lower() in ("http", "https", "socks5", "socks4", "socks5h"):
+            scheme = parts[4].lower().replace("socks5h", "socks5")
+        if not port.isdigit():
+            return None
+        return f"{scheme}://{user}:{password}@{host}:{port}"
+
+    # host:port
+    if len(parts) == 2 and parts[1].isdigit():
+        return f"http://{parts[0]}:{parts[1]}"
+
+    return None
 
 
 def get_proxy_pool() -> list:
