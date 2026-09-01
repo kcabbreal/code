@@ -326,6 +326,7 @@ def get_config() -> dict:
     config.setdefault("password", "admin")
     config.setdefault("api_keys", [])
     config.setdefault("workers", 1)
+    config.setdefault("proxies", [])  # ["http://user:pass@host:port", ...]
     return config
 
 
@@ -526,6 +527,7 @@ def _new_jar(name: str, cookies: list, email: str = "", password: str = "",
         "login_method": login_method, "email": email, "password": password,
         "keeper_enabled": keeper_enabled, "keeper_headless": True,
         "keeper_humanize": False,
+        "proxy": "",  # optional per-account: http://user:pass@host:port
     }
     mutate_jars(lambda jars: jars.append(jar))
     return jar, found
@@ -680,6 +682,115 @@ def build_request_headers(jar: dict) -> dict:
         "sec-ch-ua": '"Chromium";v="133", "Not(A:Brand";v="99"',
         "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
     }
+
+
+# ============================================================
+# PROXY SUPPORT (per-jar or global pool — fixes IP rate-limits)
+# ============================================================
+
+def _normalize_proxy(raw: str) -> Optional[str]:
+    """Accept host:port, user:pass@host:port, http://..., socks5://..., socks4://..."""
+    if not raw or not isinstance(raw, str):
+        return None
+    p = raw.strip()
+    if not p or p.startswith("#"):
+        return None
+    low = p.lower()
+    if "://" not in p:
+        # bare host:port or user:pass@host:port → default http
+        p = "http://" + p
+    elif low.startswith("socks5h://"):
+        p = "socks5://" + p.split("://", 1)[1]  # curl_cffi uses socks5
+    return p
+
+
+def get_proxy_pool() -> list:
+    """Load proxies from proxies.txt (preferred) and/or config.json.
+
+    proxies.txt (same folder as main.py), one per line:
+      socks5://user:pass@host:port
+      http://user:pass@host:port
+      socks4://host:port
+      user:pass@host:port
+      host:port
+    Lines starting with # are ignored.
+    """
+    out = []
+    seen = set()
+
+    def _add(item):
+        n = _normalize_proxy(item if isinstance(item, str) else str(item))
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+
+    # 1) proxies.txt next to the app / cwd
+    for candidate in (
+        "proxies.txt",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt"),
+        os.path.join(os.getcwd(), "proxies.txt"),
+    ):
+        try:
+            if os.path.isfile(candidate):
+                with open(candidate, encoding="utf-8") as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if not ln or ln.startswith("#"):
+                            continue
+                        _add(ln)
+                break
+        except Exception:
+            pass
+
+    # 2) config.json proxies list
+    try:
+        cfg = get_config()
+        raw = cfg.get("proxies") or cfg.get("proxy_list") or []
+        if isinstance(raw, str):
+            raw = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        for item in raw:
+            _add(item)
+    except Exception:
+        pass
+
+    return out
+
+
+def jar_proxy(jar: dict) -> Optional[str]:
+    """Proxy for this account: jar.proxy → else rotate from global pool by jar id."""
+    if not jar:
+        return None
+    explicit = jar.get("proxy") or jar.get("proxy_url")
+    n = _normalize_proxy(explicit) if explicit else None
+    if n:
+        return n
+    pool = get_proxy_pool()
+    if not pool:
+        return None
+    # Stable assignment per jar so the same account keeps the same exit IP
+    jid = str(jar.get("id") or jar.get("name") or "x")
+    idx = int(hashlib.md5(jid.encode()).hexdigest()[:8], 16) % len(pool)
+    return pool[idx]
+
+
+def playwright_proxy_from_url(proxy_url: str) -> Optional[dict]:
+    """Convert proxy URL to Playwright proxy dict."""
+    if not proxy_url:
+        return None
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(proxy_url)
+        server = f"{u.scheme}://{u.hostname}"
+        if u.port:
+            server += f":{u.port}"
+        out = {"server": server}
+        if u.username:
+            out["username"] = u.username
+        if u.password:
+            out["password"] = u.password
+        return out
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -2171,6 +2282,14 @@ class KeeperSession:
                     "--window-size=1920,1080",
                 ]
 
+                # Per-account / pool proxy for the live browser (bypasses IP rate-limits)
+                _jar_for_proxy = next((j for j in load_jars() if j.get("id") == self.jar_id), {"id": self.jar_id})
+                _proxy_url = jar_proxy(_jar_for_proxy)
+                _pw_proxy = playwright_proxy_from_url(_proxy_url) if _proxy_url else None
+                if _pw_proxy:
+                    self._set_step(f"Browser proxy: {_proxy_url.split('@')[-1] if '@' in _proxy_url else _proxy_url}")
+                    log("INFO", f"[{self.name}] Keeper using proxy {_proxy_url.split('@')[-1] if '@' in (_proxy_url or '') else _proxy_url}")
+
                 if has_ext:
                     # Extensions require a persistent context AND cannot load under
                     # classic (old) headless mode — Chromium disables the extension
@@ -2190,14 +2309,17 @@ class KeeperSession:
                     ]
                     if self.headless:
                         ext_args.append("--headless=new")
-                    self.context = await self.playwright.chromium.launch_persistent_context(
+                    _pc_kw = dict(
                         user_data_dir=profile_dir,
                         headless=False,  # always False here: headlessness is via --headless=new above
                         ignore_default_args=["--disable-extensions"],
                         args=ext_args,
                         viewport={"width": 1920, "height": 1080},
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0"
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
                     )
+                    if _pw_proxy:
+                        _pc_kw["proxy"] = _pw_proxy
+                    self.context = await self.playwright.chromium.launch_persistent_context(**_pc_kw)
                     self.browser = None
                     self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
                     launched = True
@@ -2213,6 +2335,8 @@ class KeeperSession:
                             launch_kw = {"headless": self.headless, "args": common_args}
                             if channel:
                                 launch_kw["channel"] = channel
+                            if _pw_proxy:
+                                launch_kw["proxy"] = _pw_proxy
                             self.browser = await self.playwright.chromium.launch(**launch_kw)
                             launched = True
                             self._set_step(f"Stealth engine started ({channel or 'bundled chromium'})")
@@ -2893,7 +3017,12 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
 
         try:
             headers = _curl_headers(jar)
-            async with AsyncSession(impersonate="chrome131") as client:
+            proxy = jar_proxy(jar)
+            session_kw = {"impersonate": "chrome131"}
+            if proxy:
+                session_kw["proxy"] = proxy
+                log("INFO", f"[{jar_id}] Using proxy {proxy.split('@')[-1] if '@' in proxy else proxy}")
+            async with AsyncSession(**session_kw) as client:
                 try:
                     resp = await client.post(url, json=base, headers=headers, stream=True, timeout=120.0)
                 except Exception as e:
@@ -2952,7 +3081,19 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                                 base["captchaToken"] = token
                                 base["g-recaptcha-response"] = token
                         if same_jar_429 < 3:
-                            continue  # same jar
+                            # Rotate to next proxy in pool while keeping same jar (IP change)
+                            pool = get_proxy_pool()
+                            if pool and len(pool) > 1:
+                                cur = jar_proxy(jar) or ""
+                                try:
+                                    idx = pool.index(cur)
+                                except ValueError:
+                                    idx = 0
+                                nxt = pool[(idx + same_jar_429) % len(pool)]
+                                jar = dict(jar)
+                                jar["proxy"] = nxt
+                                log("INFO", f"[{jar_id}] 429 → next proxy {nxt.split('@')[-1]}")
+                            continue  # same jar, possibly new proxy
                         # One alternate jar only
                         next_jar = acquire_jar(prefer_live=True)
                         if next_jar and next_jar["id"] not in tried_jar_ids:
@@ -5966,6 +6107,7 @@ if __name__ == "__main__":
     print(f"  * Dashboard   : http://localhost:{args.port}/dashboard")
     print(f"  * OpenAI Base : http://localhost:{args.port}/v1")
     print(f"  * Workers     : {effective_workers} (Accounts: {jars_count})")
+    print(f"  * Proxies     : {len(get_proxy_pool())} loaded (proxies.txt / config)")
     if effective_workers > 1:
         print("  ! WARNING    : workers > 1 → Live Browser / keepers only work")
         print("                 inside the process that started them.")
