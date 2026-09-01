@@ -1102,6 +1102,7 @@ class KeeperSession:
         self.fail_count = 0
         self.next_retry = 0.0
         self.relogin_count = 0
+        self._nav_fail_count = 0
         self.active_requests = 0
         self._auth_sig_cache = None
         self._cur_x = 200.0
@@ -2142,12 +2143,22 @@ class KeeperSession:
                             await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded", timeout=45000)
                             await self._wait_cloudflare(self.page)
                             self.last_nav = time.time()
+                            self._nav_fail_count = 0
                     except Exception as e:
-                        # A slow/timed-out keep-alive nav is not fatal — arena.ai
-                        # can just be briefly slow. Log it and let the loop try
-                        # again on its next pass instead of tearing down and
-                        # relaunching the whole browser session over it.
-                        log("WARN", f"[{self.name}] Keep-alive navigation failed ({type(e).__name__}: {e}) — will retry next cycle")
+                        self._nav_fail_count += 1
+                        if self._nav_fail_count >= 3:
+                            # Not just a one-off blip anymore — the page is
+                            # genuinely stuck (e.g. wedged on a Cloudflare
+                            # check or a dead navigation). A single restart
+                            # recovers this; tolerating it forever would leave
+                            # the browser silently broken (grecaptcha never
+                            # loads, chat requests fail with missing token).
+                            log("WARN", f"[{self.name}] Keep-alive navigation failed {self._nav_fail_count}x in a row ({type(e).__name__}: {e}) — restarting browser")
+                            self._nav_fail_count = 0
+                            await self.restart()
+                            continue
+                        else:
+                            log("WARN", f"[{self.name}] Keep-alive navigation failed ({type(e).__name__}: {e}) — will retry next cycle ({self._nav_fail_count}/3)")
                 if time.time() - self.last_health_ok > KEEPER_HEALTH_INTERVAL:
                     if not await self.check_health():
                         if time.time() >= self.next_retry:
