@@ -63,7 +63,7 @@ PORT = int(os.environ.get("BRIDGENA_PORT", "8000"))
 ARENA_BASE = "https://arena.ai"
 ARENA_MODES = ["direct-battle", "direct"]
 MAX_PROMPT = 50000
-COOLDOWN_SEC = 3 * 60  # 3 min soft cooldown; live keepers can bypass
+COOLDOWN_SEC = 60  # 1 min soft preference only — never hard-locks accounts
 REFRESH_INTERVAL = 3600
 
 COMPACT_THRESHOLD = 30000
@@ -552,30 +552,21 @@ def jar_has_cf(jar: dict) -> bool:
 
 # [Antigravity IDE Verified: Fix 1 (jar_available) Applied]
 def jar_available(jar: dict, now: float = None) -> bool:
-    """True if this jar can be used for a request.
+    """Usable if enabled and has auth cookies OR a live keeper session.
 
-    A jar marked limited is still available when it has a live healthy
-    keeper session — the browser being up means the account is not
-    truly dead, so we do not force a long lockout.
+    limited_until is ONLY a soft preference in acquire_jar scoring — it must
+    never hard-block an account that still has valid cookies / a live browser.
     """
     now = now or time.time()
     if not jar.get("enabled", True):
         return False
-    if not jar_has_auth(jar):
-        # Still allow if a live session exists (cookies may refresh)
-        s = keeper.sessions.get(jar.get("id"))
-        if not (s and s.running and getattr(s, "page", None) and not s.page.is_closed()):
-            return False
-    if jar.get("limited_until", 0) >= now:
-        s = keeper.sessions.get(jar.get("id"))
-        live_ok = bool(
-            s and s.running
-            and getattr(s, "page", None) and not s.page.is_closed()
-            and s.last_health_ok and (now - s.last_health_ok) < 900
-        )
-        if not live_ok:
-            return False
-    return True
+    if jar_has_auth(jar):
+        return True
+    s = keeper.sessions.get(jar.get("id"))
+    if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
+        return True
+    return False
+
 
 def acquire_jar(prefer_live: bool = True) -> Optional[dict]:
     """Pick the best jar for a request.
@@ -2695,6 +2686,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
       - Jar rotation on 401/403/429
     """
     jar_id = jar["id"]
+    stream_arena_chat._cleared_once = False
 
     def _curl_headers(j):
         headers = build_request_headers(j)
@@ -2923,38 +2915,37 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                         return
 
                     if resp.status_code == 429:
+                        # Soft mark only — does not hard-block (see jar_available)
                         mark_jar_status(jar_id, "limited")
                         next_jar = acquire_jar(prefer_live=True)
                         if next_jar and next_jar["id"] not in tried_jar_ids:
-                            log("WARN", f"[{jar_id}] Rate-limited — rotating to '{next_jar.get('name')}'")
+                            log("WARN", f"[{jar_id}] Arena 429 — rotating to '{next_jar.get('name')}'")
                             jar = next_jar
                             jar_id = jar["id"]
                             tried_jar_ids.add(jar_id)
                             jar = await _refresh_cookies_from_live(jar, jar_id)
                             continue
-                        # Last resort: clear soft limited flags on jars that still
-                        # have a live keeper, then retry once with a fresh pick.
-                        cleared = []
-                        def _clear_live_limited(jars):
+                        # Clear ALL soft limited flags and allow one full re-pass
+                        def _clear_all_limited(jars):
                             for j in jars:
-                                s = keeper.sessions.get(j.get("id"))
-                                if not (s and s.running):
-                                    continue
-                                if j.get("limited_until", 0) > time.time():
-                                    j["limited_until"] = 0
+                                j["limited_until"] = 0
+                                if j.get("status") == "limited":
                                     j["status"] = "ok"
-                                    cleared.append(j.get("name") or j.get("id"))
-                        mutate_jars(_clear_live_limited)
-                        if cleared:
-                            log("WARN", f"Soft-cleared limited on live jars: {cleared} — retrying")
-                            next_jar = acquire_jar(prefer_live=True)
-                            if next_jar and next_jar["id"] not in tried_jar_ids:
-                                jar = next_jar
-                                jar_id = jar["id"]
-                                tried_jar_ids.add(jar_id)
-                                jar = await _refresh_cookies_from_live(jar, jar_id)
-                                continue
-                        yield ("error", "429: Arena rate limit — every account is currently limited")
+                        mutate_jars(_clear_all_limited)
+                        if getattr(stream_arena_chat, "_cleared_once", False):
+                            yield ("error", "429: Arena is rate-limiting right now. Wait 30-60s and retry.")
+                            return
+                        stream_arena_chat._cleared_once = True
+                        log("WARN", "Cleared all soft limited flags — retrying full account pool")
+                        tried_jar_ids.clear()
+                        next_jar = acquire_jar(prefer_live=True)
+                        if next_jar:
+                            jar = next_jar
+                            jar_id = jar["id"]
+                            tried_jar_ids.add(jar_id)
+                            jar = await _refresh_cookies_from_live(jar, jar_id)
+                            continue
+                        yield ("error", "429: Arena rate limit and no accounts available")
                         return
 
                     # Captcha rejection — try to grab a fresh token and retry once
