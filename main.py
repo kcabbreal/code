@@ -2581,26 +2581,38 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             url = f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
 
             # New evaluations need a live browser context (captcha / CF).
-            # Do NOT attempt curl_cffi + token scraping — it is unreliable.
             if not use_bridge:
-                # Try to rotate to a jar that *does* have a live keeper
-                next_jar = acquire_jar(prefer_live=True)
-                if next_jar and next_jar["id"] not in tried_jar_ids:
-                    ns = keeper.sessions.get(next_jar["id"])
-                    if _has_live_bridge(ns):
-                        log("INFO", f"Rotating to live-keeper jar '{next_jar.get('name')}' for create-evaluation")
-                        jar = next_jar
-                        jar_id = jar["id"]
+                # Scan ALL running keepers — do not rely only on acquire_jar order
+                found = None
+                for sid, sess in list(keeper.sessions.items()):
+                    if sid in tried_jar_ids:
+                        continue
+                    if _has_live_bridge(sess):
+                        found = (sid, sess)
+                        break
+                if found:
+                    sid, sess = found
+                    jar_match = next((j for j in load_jars() if j.get("id") == sid), None)
+                    if jar_match:
+                        log("INFO", f"Using live keeper '{sess.name}' for create-evaluation")
+                        jar = dict(jar_match)
+                        jar_id = sid
                         tried_jar_ids.add(jar_id)
-                        s = ns
+                        s = sess
                         use_bridge = True
+                        # refresh cookies from this session
+                        try:
+                            live_c = await get_live_cookies(jar_id)
+                            if live_c:
+                                jar["cookies"] = live_c
+                        except Exception:
+                            pass
                         continue
                 yield (
                     "error",
                     "502: No live browser session available for a new chat. "
-                    "Open Dashboard → Accounts → Live Browser on at least one account, "
-                    "wait until status is 'running', then retry. "
-                    "(Keepers must run in the same process — use --workers 1)"
+                    "Open Dashboard → Accounts → click Live Browser on an account, "
+                    "wait until status is running, then retry. Use --workers 1."
                 )
                 return
 
@@ -2608,6 +2620,34 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
         if attachments:
             user_message["experimental_attachments"] = attachments
         base["userMessage"] = user_message
+
+        # Optional: if we have a live page, try to pull a recaptcha token and
+        # attach it. Never block on this — bridge works without it for many
+        # authenticated sessions, but some Arena edges still expect the field.
+        if use_bridge and s and not follow:
+            try:
+                token = await s.page.evaluate("""() => {
+                    try {
+                        if (window.grecaptcha && window.grecaptcha.getResponse) {
+                            const t = window.grecaptcha.getResponse();
+                            if (t) return t;
+                        }
+                    } catch (e) {}
+                    try {
+                        const el = document.querySelector(
+                            'textarea[name="g-recaptcha-response"], #g-recaptcha-response'
+                        );
+                        if (el && el.value) return el.value;
+                    } catch (e) {}
+                    return null;
+                }""")
+                if token:
+                    base["recaptchaToken"] = token
+                    base["recaptcha"] = token
+                    base["captchaToken"] = token
+                    log("INFO", f"[{jar_id}] Attached recaptcha token ({len(token)} chars)")
+            except Exception as e:
+                log("WARN", f"[{jar_id}] Optional captcha read failed: {e}")
 
         response_text = ""
         reasoning_text = ""
