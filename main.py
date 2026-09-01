@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import html
 import json
 import math
 import mimetypes
@@ -18,6 +19,7 @@ import subprocess
 import os
 import time
 import uuid
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -860,37 +862,65 @@ async def refresh_models_via_worker(worker):
         log("ERROR", f"Failed to refresh models: {e}")
     return get_models()
 
-async def get_initial_data() -> list:
+async def refresh_model_catalog() -> dict:
+    """Attempt to refresh the model catalog and return a structured result
+    describing whether it actually worked and, if not, why — instead of
+    silently falling back to the stale catalog with zero visibility."""
     state = load_state()
     now = time.time()
     if now - state.get("refresh_started", 0) < 30:
-        return get_models()
+        return {
+            "ok": False, "models": get_models(),
+            "reason": "A refresh is already in progress (debounced ~30s) — try again shortly.",
+        }
 
     def mark_start(s):
         s["refresh_started"] = now
     mutate_state(mark_start)
 
     fetched_models = []
-
-    # 1. Try browser-based extraction using the worker
-    for jar_candidate in load_jars():
-        s = keeper.sessions.get(jar_candidate.get("id"))
-        if s and s.running and s.page and not s.page.is_closed():
-            fetched_models = await refresh_models_via_worker(s)
-            if fetched_models and len(fetched_models) > 50:
-                break
+    tried_any_worker = False
+    try:
+        # 1. Try browser-based extraction using the worker
+        for jar_candidate in load_jars():
+            s = keeper.sessions.get(jar_candidate.get("id"))
+            if s and s.running and s.page and not s.page.is_closed():
+                tried_any_worker = True
+                fetched_models = await refresh_models_via_worker(s)
+                if fetched_models and len(fetched_models) > 50:
+                    break
+    except Exception as e:
+        def mark_fail_exc(s):
+            s["refresh_started"] = 0
+        mutate_state(mark_fail_exc)
+        return {"ok": False, "models": get_models(), "reason": f"Refresh crashed: {type(e).__name__}: {e}"}
 
     if fetched_models and len(fetched_models) > 50:
         def mark_done(s):
             s["last_refresh"] = time.time()
             s["refresh_started"] = 0
         mutate_state(mark_done)
-        return fetched_models
+        return {
+            "ok": True, "models": fetched_models,
+            "reason": f"Refreshed successfully — {len(fetched_models)} models loaded.",
+        }
 
     def mark_fail(s):
         s["refresh_started"] = 0
     mutate_state(mark_fail)
-    return get_models()
+
+    if not tried_any_worker:
+        reason = "No live keeper session with an open browser page was available to fetch the catalog."
+    else:
+        reason = "Fetched the page but couldn't extract a valid model list (regex/parse failure) — catalog left unchanged."
+    return {"ok": False, "models": get_models(), "reason": reason}
+
+
+async def get_initial_data() -> list:
+    """Backward-compatible wrapper for callers that just want the model list
+    (boot sequence, periodic refresher) without the structured result."""
+    result = await refresh_model_catalog()
+    return result["models"]
 # ============================================================
 # SESSION KEEPER — SELECTORS & HELPERS
 # ============================================================
@@ -4882,9 +4912,31 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             z-index: 999;
         }
         .toast-popup.show { display: flex; }
+
+        .refresh-banner {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            border-radius: 10px;
+            font-size: 13.5px;
+            margin-bottom: 20px;
+        }
+        .refresh-banner.ok {
+            background: rgba(34, 197, 94, 0.1);
+            border: 1px solid rgba(34, 197, 94, 0.25);
+            color: #4ade80;
+        }
+        .refresh-banner.fail {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.25);
+            color: #f87171;
+        }
     </style>
 </head>
 <body>
+
+    __REFRESH_BANNER__
 
     <!-- TOP HEADER -->
     <div class="dash-header">
@@ -5205,9 +5257,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page(request: Request):
+async def dashboard_page(request: Request, refresh: Optional[str] = None, refresh_msg: Optional[str] = None):
     if not await get_current_session(request):
         return RedirectResponse(url="/login")
+
+    banner_html = ""
+    if refresh in ("ok", "fail") and refresh_msg:
+        safe_msg = html.escape(refresh_msg)
+        icon = "✓" if refresh == "ok" else "⚠"
+        banner_html = f'<div class="refresh-banner {refresh}">{icon} Catalog refresh: {safe_msg}</div>'
+
     jars = load_jars()
     now = time.time()
     healthy_jars = sum(1 for j in jars if jar_available(j, now))
@@ -5276,8 +5335,9 @@ async def dashboard_page(request: Request):
             <td>{has_vision}</td>
         </tr>""")
 
-    html = (
+    html_out = (
         DASHBOARD_TEMPLATE
+        .replace("__REFRESH_BANNER__", banner_html)
         .replace("__HEALTHY_JARS__", str(healthy_jars))
         .replace("__TOTAL_JARS__", str(len(jars)))
         .replace("__ACTIVE_KEEPERS__", str(active_keepers))
@@ -5287,7 +5347,7 @@ async def dashboard_page(request: Request):
         .replace("__KEYS_ROWS__", "".join(keys_rows) if keys_rows else "<tr><td colspan='4' style='text-align:center;color:var(--text-muted);padding:24px'>No API keys created</td></tr>")
         .replace("__MODELS_ROWS__", "".join(models_rows) if models_rows else "<tr><td colspan='3' style='text-align:center;color:var(--text-muted);padding:24px'>No models loaded</td></tr>")
     )
-    return HTMLResponse(html)
+    return HTMLResponse(html_out)
 
 
 # ============================================================
@@ -5405,8 +5465,17 @@ async def oxalpha_refresh(request: Request):
 async def refresh_tokens(request: Request):
     if not await get_current_session(request):
         return RedirectResponse(url="/login")
-    await get_initial_data()
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+    result = await refresh_model_catalog()
+    if result["ok"]:
+        log("OK", f"Manual catalog refresh: {result['reason']}")
+    else:
+        log("WARN", f"Manual catalog refresh failed: {result['reason']}")
+    status_flag = "ok" if result["ok"] else "fail"
+    msg = quote(result["reason"])
+    return RedirectResponse(
+        url=f"/dashboard?refresh={status_flag}&refresh_msg={msg}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 @app.post("/create-key")
