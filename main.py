@@ -72,6 +72,7 @@ OX_SESSION_TTL = 20 * 60
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
+MODELS_RAW_DEBUG_FILE = "models_raw_debug.json"
 STATE_FILE = "state.json"
 JARS_FILE = "cookie_jars.json"
 LOG_FILE = "logs.jsonl"
@@ -836,7 +837,16 @@ async def refresh_models_via_worker(worker):
                 raw_match = raw_match.rsplit(',', 1)[0]
             raw_json = raw_match.encode().decode('unicode_escape')
             models_data = json.loads(raw_json)
-            
+
+            # Always dump the raw, unfiltered payload so we can inspect the
+            # exact fields Arena sends for any given model (e.g. to figure
+            # out why an internal/test model like "gpt-5.4-no-system-prompt"
+            # isn't being caught by is_model_selectable()).
+            try:
+                atomic_write(MODELS_RAW_DEBUG_FILE, models_data)
+            except Exception as e:
+                log("WARN", f"Failed to write raw model debug dump: {e}")
+
             hidden = [m.get("publicName") or m.get("id") for m in models_data if not is_model_selectable(m)]
             kept = [m.get("publicName") or m.get("id") for m in models_data if is_model_selectable(m)]
             log("INFO", f"Model filter kept={len(kept)} hidden={len(hidden)} hidden_sample={hidden[:20]}")
@@ -3145,7 +3155,7 @@ async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
 # UI - MINIMALIST AUTHENTICATION & LOGIN (/login)
 # ============================================================
 
-LOGIN_TEMPLATE = """<!DOCTYPE html>
+LOGIN_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -3366,7 +3376,7 @@ async def logout(request: Request):
 # UI - MINIMALIST OPENWEBUI / CHATGPT CHAT WORKSPACE (/chat)
 # ============================================================
 
-CHAT_TEMPLATE = """<!DOCTYPE html>
+CHAT_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -4407,7 +4417,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
         box.querySelectorAll('pre').forEach(pre => {
             if (!pre.querySelector('.code-header-bar')) {
                 const codeEl = pre.querySelector('code');
-                const lang = (codeEl?.className?.match(/language-(\\w+)/) || [, 'code'])[1];
+                const lang = (codeEl?.className?.match(/language-(\w+)/) || [, 'code'])[1];
                 const header = document.createElement('div');
                 header.className = 'code-header-bar';
                 header.innerHTML = `<span>${escapeHtml(lang)}</span><button class="code-copy-btn" onclick="copyCode(this)"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg> Copy</button>`;
@@ -4424,7 +4434,7 @@ CHAT_TEMPLATE = """<!DOCTYPE html>
     }
 
     function escapeAttr(str) {
-        return (str || '').toString().replace(/'/g, "\\'");
+        return (str || '').toString().replace(/'/g, "\'");
     }
 
     function useSuggestion(text) {
@@ -4615,7 +4625,7 @@ async def chat_api_models(request: Request):
 # UI - MINIMALIST CONTROL CENTER DASHBOARD (/dashboard)
 # ============================================================
 
-DASHBOARD_TEMPLATE = """<!DOCTYPE html>
+DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -5507,6 +5517,25 @@ async def debug_logs_data(request: Request):
     if not await get_current_session(request):
         return {"logs": []}
     return {"logs": read_logs(120)}
+
+
+@app.get("/debug/raw-models")
+async def debug_raw_models(request: Request, q: Optional[str] = None):
+    """Inspect the raw, unfiltered model payload Arena returns (before our
+    selectable-filter runs). Pass ?q=some-model-name to search by publicName/id.
+    Requires a dashboard session — populated after the next successful
+    catalog refresh (see MODELS_RAW_DEBUG_FILE)."""
+    if not await get_current_session(request):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    try:
+        with open(MODELS_RAW_DEBUG_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return JSONResponse(content={"error": "No raw model dump yet — trigger a catalog refresh first.", "models": []})
+    if q:
+        ql = q.lower()
+        raw = [m for m in raw if ql in str(m.get("publicName", "")).lower() or ql in str(m.get("id", "")).lower()]
+    return JSONResponse(content={"count": len(raw), "models": raw})
 
 
 @app.post("/clear-logs")
