@@ -519,32 +519,63 @@ def jar_available(jar: dict, now: float = None) -> bool:
         return False
     return True
 
-def acquire_jar() -> Optional[dict]:
-    """Pick the least-recently-used available jar. If no jars are free
-    (all rate-limited or expired), fall back to sharing any enabled jar
-    with a valid keeper session as a last resort."""
+def acquire_jar(prefer_live: bool = True) -> Optional[dict]:
+    """Pick the best jar for a request.
+
+    Priority when prefer_live=True (default, needed for new chats / captcha):
+      1. Enabled + auth + has a running live (headed) keeper session
+      2. Enabled + auth + has any running keeper session
+      3. Fully available jar (not rate-limited, has auth cookies)
+      4. Last resort: any enabled jar that still has a live session
+
+    This makes the browser-bridge path the default whenever possible so we
+    never need to scrape reCAPTCHA tokens from a page that isn't attached.
+    """
     now = time.time()
     chosen = {}
+
+    def _score(j: dict) -> tuple:
+        """Higher is better. Returns a sort key (prefer higher)."""
+        sid = j.get("id")
+        s = keeper.sessions.get(sid) if sid else None
+        has_session = bool(s and s.running and getattr(s, "page", None) and not s.page.is_closed())
+        is_live = has_session and (not getattr(s, "headless", True))
+        healthy = bool(s and s.last_health_ok and (now - s.last_health_ok) < 900)
+        available = jar_available(j, now)
+        # last_used is inverted so older = higher priority
+        recency = -float(j.get("last_used", 0) or 0)
+        return (
+            1 if (prefer_live and is_live and healthy) else 0,
+            1 if (prefer_live and has_session and healthy) else 0,
+            1 if available else 0,
+            1 if has_session else 0,
+            recency,
+        )
+
     def pick(jars: list):
-        best = None
-        # 1. Try to find a fully available jar (not limited, not expired, has auth)
-        for j in jars:
-            if jar_available(j, now):
-                if best is None or j.get("last_used", 0) < best.get("last_used", 0):
+        candidates = [j for j in jars if j.get("enabled", True)]
+        if not candidates:
+            return
+        # Sort by score descending
+        candidates.sort(key=_score, reverse=True)
+        best = candidates[0]
+        # Only accept if it at least has auth or a live session
+        sid = best.get("id")
+        s = keeper.sessions.get(sid) if sid else None
+        has_session = bool(s and s.running)
+        if not jar_has_auth(best) and not has_session:
+            # Try to find any jar that has either auth cookies or a live session
+            for j in candidates[1:]:
+                sj = keeper.sessions.get(j.get("id"))
+                if jar_has_auth(j) or (sj and sj.running):
                     best = j
-        # 2. Fallback: if no available jar, share the least-used enabled jar with a live session
-        if best is None:
-            for j in jars:
-                if not j.get("enabled", True):
-                    continue
-                session = keeper.sessions.get(j.get("id"))
-                if session and session.running and session.last_health_ok:
-                    if best is None or j.get("last_used", 0) < best.get("last_used", 0):
-                        best = j
-        if best:
-            best["last_used"] = now
-            best["usage_count"] = best.get("usage_count", 0) + 1
-            chosen["jar"] = best
+                    break
+            else:
+                return
+        best["last_used"] = now
+        best["usage_count"] = best.get("usage_count", 0) + 1
+        chosen["jar"] = best
+
     mutate_jars(pick)
     return chosen.get("jar")
 
@@ -2359,6 +2390,8 @@ async def _parse_bridge_stream(session: KeeperSession, url: str, payload: dict, 
             except json.JSONDecodeError:
                 error_text = line[prefix_len:]
             log("ERROR", f"Arena stream error frame: {error_text}")
+            yield ("error", _friendly_arena_error(error_text, model_name))
+            return
         elif line.startswith("ad:") or line.startswith("d:"):
             prefix_len = 3 if line.startswith("ad:") else 2
             try:
@@ -2369,6 +2402,7 @@ async def _parse_bridge_stream(session: KeeperSession, url: str, payload: dict, 
     if not content and not reasoning:
         yield ("error", _friendly_arena_error(error_text, model_name) if error_text
                else "Arena returned an empty response.")
+        return
     yield ("end", {"content": content, "reasoning": reasoning, "mode": mode})
 
 
@@ -2448,19 +2482,26 @@ async def generate_title(user_msg: str, assistant_reply: str) -> str:
 # MASTER CHAT ROUTER
 # ============================================================
 
-# [Antigravity IDE Verified: Fix 1 (stream_arena_chat) Applied]
+# [Bridgena Fix] Prefer browser-bridge path — no manual reCAPTCHA scraping
 async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key, jar,
                             prior_messages=None, is_api=False, request_user_count=None):
-    # ============================================================
-    # YES, THIS IS THE EXACT VERBATIM curl_cffi IMPLEMENTATION
-    # I bypassed the IDE diff earlier by running a Python script
-    # to write this directly to disk. I am adding this comment
-    # so the IDE diff shows you the context of this function.
-    # ============================================================
+    """Stream a chat turn against Arena.
+
+    Strategy:
+      1. Prefer the in-browser bridge (page.evaluate fetch) when a live
+         keeper session exists for the jar. Cookies + captcha context are
+         already present — no token scraping required.
+      2. Fall back to curl_cffi only for follow-up turns (post-to-evaluation)
+         when we already have a valid arena_id, or when no live session exists
+         and the request is a simple follow-up.
+      3. New evaluations (create-evaluation) *require* a live keeper. If none
+         is available we fail with a clear actionable error instead of the old
+         "reCAPTCHA token missing" message.
+    """
     jar_id = jar["id"]
     s = keeper.sessions.get(jar_id)
 
-    live = None
+    # Keep cookies fresh from a live session when available
     if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
         now = time.time()
         last_harvest = getattr(s, "last_harvest_time", 0)
@@ -2469,25 +2510,9 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             await s._harvest_cookies()
             s.last_harvest_time = time.time()
         live = await get_live_cookies(jar_id)
-
-    if live:
-        jar = dict(jar)
-        jar["cookies"] = live
-
-    if not jar_has_auth(jar):
-        yield ("error", "502: Arena cookies expired — enable keeper and re-login for this account")
-        return
-
-
-    def _resp_text(resp) -> str:
-        t = getattr(resp, "text", None)
-        if isinstance(t, str) and t:
-            return t
-        ac = getattr(resp, "acontent", None)
-        c = getattr(resp, "content", None)
-        if isinstance(c, (bytes, bytearray)):
-            return c.decode("utf-8", errors="ignore")
-        return ""
+        if live:
+            jar = dict(jar)
+            jar["cookies"] = live
 
     def _curl_headers(j):
         headers = build_request_headers(j)
@@ -2499,10 +2524,22 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 headers.pop(k, None)
         return headers
 
+    def _has_live_bridge(session) -> bool:
+        return bool(
+            session
+            and session.running
+            and getattr(session, "page", None)
+            and not session.page.is_closed()
+        )
+
     tried_jar_ids = {jar_id}
-    max_attempts = max(2, len(load_jars()))  # try every jar in the pool at least once
+    max_attempts = max(3, len(load_jars()) + 1)
 
     for attempt in range(max_attempts):
+        # Re-resolve session each attempt (jar may have rotated)
+        s = keeper.sessions.get(jar_id)
+        use_bridge = _has_live_bridge(s)
+
         conv = get_conversation(conv_key)
         model_conv = conv["arena"].get(model_name) if conv.get("model") == model_name else None
         follow = model_conv is not None
@@ -2543,47 +2580,28 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             }
             url = f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
 
-            token = None
-            if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
-                for _ in range(45):
-                    try:
-                        token = await s.page.evaluate("""() => {
-            try {
-                const g = window.grecaptcha;
-                if (g) {
-                    if (g.getResponse) {
-                        const t = g.getResponse();
-                        if (t) return t;
-                    }
-                    // also try execute for v3
-                    if (g.execute) {
-                        // sitekey may be in DOM or known
-                    }
-                }
-            } catch(e) {}
-            const el = document.querySelector(
-                'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
-            );
-            if (el && el.value) return el.value;
-            return null;
-        }""")
-                    except Exception:
-                        pass
-                    if token: break
-                    await asyncio.sleep(1.0)
-                
-                if not token:
-                    yield ("error", "502: reCAPTCHA token missing — headed keeper + BRIDGENA_CAPTCHA_EXT, open Live Browser, wait for Raptor to solve")
-                    return
-            
-            if token:
-                base["recaptchaToken"] = token
-                base["recaptcha"] = token
-                base["captchaToken"] = token
-                base["g-recaptcha-response"] = token
-            else:
-                # Still fail if there's no keeper running to provide the token
-                yield ("error", "502: reCAPTCHA token missing — no headed keeper running to solve recaptcha")
+            # New evaluations need a live browser context (captcha / CF).
+            # Do NOT attempt curl_cffi + token scraping — it is unreliable.
+            if not use_bridge:
+                # Try to rotate to a jar that *does* have a live keeper
+                next_jar = acquire_jar(prefer_live=True)
+                if next_jar and next_jar["id"] not in tried_jar_ids:
+                    ns = keeper.sessions.get(next_jar["id"])
+                    if _has_live_bridge(ns):
+                        log("INFO", f"Rotating to live-keeper jar '{next_jar.get('name')}' for create-evaluation")
+                        jar = next_jar
+                        jar_id = jar["id"]
+                        tried_jar_ids.add(jar_id)
+                        s = ns
+                        use_bridge = True
+                        continue
+                yield (
+                    "error",
+                    "502: No live browser session available for a new chat. "
+                    "Open Dashboard → Accounts → Live Browser on at least one account, "
+                    "wait until status is 'running', then retry. "
+                    "(Keepers must run in the same process — use --workers 1)"
+                )
                 return
 
         user_message = {"content": content_to_send}
@@ -2591,12 +2609,103 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             user_message["experimental_attachments"] = attachments
         base["userMessage"] = user_message
 
-        try:
-            response_text = ""
-            reasoning_text = ""
-            error_message = None
-            headers = _curl_headers(jar)
+        response_text = ""
+        reasoning_text = ""
+        error_message = None
 
+        try:
+            # ── PATH A: Browser bridge (preferred) ──────────────────────────
+            if use_bridge:
+                log("INFO", f"[{jar_id}] Using browser-bridge path ({'follow' if follow else 'create'})")
+                try:
+                    async for ev in _parse_bridge_stream(s, url, base, model_name):
+                        t = ev[0] if isinstance(ev, (tuple, list)) else None
+                        v = ev[1] if isinstance(ev, (tuple, list)) and len(ev) > 1 else None
+                        if t == "content":
+                            response_text += v or ""
+                            yield ("content", v)
+                        elif t == "reasoning":
+                            reasoning_text += v or ""
+                            yield ("reasoning", v)
+                        elif t == "error":
+                            error_message = str(v)
+                            # Auth / captcha style failures → try another jar
+                            low = error_message.lower()
+                            if any(k in low for k in ("401", "403", "captcha", "recaptcha", "unauthorized", "expired")):
+                                mark_jar_status(jar_id, "expired")
+                                next_jar = acquire_jar(prefer_live=True)
+                                if next_jar and next_jar["id"] not in tried_jar_ids:
+                                    log("WARN", f"[{jar_id}] Bridge auth failure — rotating to '{next_jar.get('name')}'")
+                                    jar = next_jar
+                                    jar_id = jar["id"]
+                                    tried_jar_ids.add(jar_id)
+                                    break  # retry outer loop
+                            yield ("error", error_message)
+                            return
+                        elif t == "finish":
+                            yield ("finish", v or "stop")
+                        elif t == "end":
+                            # final summary from parser
+                            pass
+                    else:
+                        # stream finished normally (no break)
+                        if not response_text and not reasoning_text:
+                            yield ("error", error_message or "502: Arena returned empty response via bridge")
+                            return
+                        # persist conversation state
+                        conv2 = get_conversation(conv_key)
+                        conv2["arena"][model_name] = {"arena_id": base["id"], "mode": "direct"}
+                        conv2["model"] = model_name
+                        if is_api and request_user_count is not None:
+                            conv2["user_count"] = request_user_count
+                        if not is_api:
+                            conv2["history"].append({"role": "user", "content": prompt})
+                            conv2["history"].append({
+                                "role": "assistant",
+                                "content": response_text.strip() or reasoning_text.strip(),
+                            })
+                            conv2["history"] = conv2["history"][-200:]
+                        save_conversation(conv_key, conv2)
+                        yield ("done", {"mode": "direct", "content_len": len(response_text), "reasoning_len": len(reasoning_text)})
+                        return
+                    # if we broke out due to rotation, continue outer loop
+                    continue
+                except BridgeHTTPError as e:
+                    log("ERROR", f"[{jar_id}] Bridge HTTP {e.status}: {e.body[:300]}")
+                    if e.status in (401, 403):
+                        mark_jar_status(jar_id, "expired")
+                        next_jar = acquire_jar(prefer_live=True)
+                        if next_jar and next_jar["id"] not in tried_jar_ids:
+                            jar = next_jar
+                            jar_id = jar["id"]
+                            tried_jar_ids.add(jar_id)
+                            continue
+                    if e.status == 429:
+                        mark_jar_status(jar_id, "limited")
+                        next_jar = acquire_jar(prefer_live=True)
+                        if next_jar and next_jar["id"] not in tried_jar_ids:
+                            jar = next_jar
+                            jar_id = jar["id"]
+                            tried_jar_ids.add(jar_id)
+                            continue
+                        yield ("error", "429: Arena rate limit — every account is currently limited")
+                        return
+                    yield ("error", f"{e.status}: {e.body[:400] or '(empty body)'}")
+                    return
+                except Exception as e:
+                    log("ERROR", f"[{jar_id}] Bridge path crashed: {type(e).__name__}: {e}")
+                    # Fall through to curl only for follow-ups
+                    if not follow:
+                        yield ("error", f"502: Browser bridge failed: {type(e).__name__}: {e}")
+                        return
+                    use_bridge = False  # try curl for this follow-up
+
+            # ── PATH B: curl_cffi (follow-ups or bridge unavailable) ────────
+            if not jar_has_auth(jar):
+                yield ("error", "502: Arena cookies expired — enable keeper and re-login for this account")
+                return
+
+            headers = _curl_headers(jar)
             async with AsyncSession(impersonate="chrome131") as client:
                 try:
                     resp = await client.post(url, json=base, headers=headers, stream=True, timeout=120.0)
@@ -2613,86 +2722,52 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
 
                     if resp.status_code in (401, 403):
                         if "cloudflare" in text.lower() or "just a moment" in text.lower():
-                            yield ("error", "502: Cloudflare block — curl_cffi impersonation mismatch")
+                            yield ("error", "502: Cloudflare block — open Live Browser for this account")
                             return
-                        if "recaptcha" in text.lower() or "captcha" in text.lower():
-                            yield ("error", f"{resp.status_code}: {text[:400] or '(empty body)'}")
-                            return
-                        if s and s.running:
-                            await s._harvest_cookies()
-                            s.last_harvest_time = time.time()
-                            live2 = await get_live_cookies(jar_id)
-                            if live2:
-                                jar = dict(jar)
-                                jar["cookies"] = live2
-                                if jar_has_auth(jar):
-                                    log("WARN", f"[{jar_id}] HTTP {resp.status_code} — harvested fresh cookies, retrying same jar")
-                                    continue
-                        # Same-jar harvest didn't help (or no live session) — this
-                        # account's session is actually dead. Mark it and rotate
-                        # to a different jar from the pool instead of giving up.
                         mark_jar_status(jar_id, "expired")
-                        next_jar = acquire_jar()
+                        next_jar = acquire_jar(prefer_live=True)
                         if next_jar and next_jar["id"] not in tried_jar_ids:
-                            log("WARN", f"[{jar_id}] Session expired — rotating to jar '{next_jar.get('name', next_jar['id'])}'")
+                            log("WARN", f"[{jar_id}] Session expired — rotating to '{next_jar.get('name')}'")
                             jar = next_jar
                             jar_id = jar["id"]
                             tried_jar_ids.add(jar_id)
-                            s = keeper.sessions.get(jar_id)
-                            live3 = await get_live_cookies(jar_id) if s and s.running else None
-                            if live3:
-                                jar = dict(jar)
-                                jar["cookies"] = live3
                             continue
-                        yield ("error", f"502: Arena session expired for {jar_id} — no other healthy accounts left in pool")
+                        yield ("error", f"502: Arena session expired — no other healthy accounts left")
                         return
 
                     if resp.status_code == 429:
                         mark_jar_status(jar_id, "limited")
-                        next_jar = acquire_jar()
+                        next_jar = acquire_jar(prefer_live=True)
                         if next_jar and next_jar["id"] not in tried_jar_ids:
-                            log("WARN", f"[{jar_id}] Rate-limited (429) — rotating to jar '{next_jar.get('name', next_jar['id'])}'")
                             jar = next_jar
                             jar_id = jar["id"]
                             tried_jar_ids.add(jar_id)
-                            s = keeper.sessions.get(jar_id)
-                            live3 = await get_live_cookies(jar_id) if s and s.running else None
-                            if live3:
-                                jar = dict(jar)
-                                jar["cookies"] = live3
                             continue
-                        yield ("error", "429: Arena rate limit — every account in the pool is currently limited")
+                        yield ("error", "429: Arena rate limit — every account is currently limited")
                         return
 
                     yield ("error", f"{resp.status_code}: {text[:400] or '(empty body)'}")
                     return
 
                 buffer = b""
-                preview_text = ""
                 async for chunk in resp.aiter_content():
                     if not chunk:
                         continue
                     if isinstance(chunk, str):
                         chunk = chunk.encode("utf-8", errors="ignore")
                     buffer += chunk
-                    
-                    if len(preview_text) < 1500:
-                        preview_text += chunk.decode("utf-8", errors="ignore")
-
                     while b"\n" in buffer:
                         line_bytes, buffer = buffer.split(b"\n", 1)
                         line = line_bytes.decode("utf-8", errors="ignore").strip()
                         if not line:
                             continue
-                        
                         if line.startswith("data: "):
                             line = line[6:].strip()
-                            if not line: continue
-                            
+                            if not line:
+                                continue
                         colon = line.find(":")
                         if colon < 0:
                             continue
-                            
                         prefix, payload = line[:colon], line[colon + 1:]
                         if prefix in ("a0", "0"):
                             try:
@@ -2725,11 +2800,8 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                             except json.JSONDecodeError:
                                 continue
 
-                log("INFO", f"[{jar_id}] Stream preview: {preview_text[:1500]}")
-
             if not response_text and not reasoning_text:
-                yield ("error", f"Arena error: {error_message}" if error_message else
-                       "502: Arena returned empty response (auth may be silently expired)")
+                yield ("error", error_message or "502: Arena returned empty response")
                 return
 
             conv2 = get_conversation(conv_key)
@@ -2754,8 +2826,13 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             conv2["arena"].pop(model_name, None)
             save_conversation(conv_key, conv2)
             continue
+        except Exception as e:
+            log("ERROR", f"[{jar_id}] stream_arena_chat exception: {type(e).__name__}: {e}")
+            yield ("error", f"502: {type(e).__name__}: {e}")
+            return
 
-    yield ("error", "Arena request failed to resolve.")
+    yield ("error", "Arena request failed after trying all available accounts.")
+
 
 # ============================================================
 # IMAGE UPLOAD PIPELINE
@@ -5649,6 +5726,10 @@ if __name__ == "__main__":
     print(f"  * Dashboard   : http://localhost:{args.port}/dashboard")
     print(f"  * OpenAI Base : http://localhost:{args.port}/v1")
     print(f"  * Workers     : {effective_workers} (Accounts: {jars_count})")
+    if effective_workers > 1:
+        print("  ! WARNING    : workers > 1 → Live Browser / keepers only work")
+        print("                 inside the process that started them.")
+        print("                 For reliable captcha/live sessions use: --workers 1")
     print("=" * 62)
 
     if effective_workers > 1:
