@@ -61,6 +61,10 @@ except ImportError:
 
 PORT = int(os.environ.get("BRIDGENA_PORT", "8000"))
 ARENA_BASE = "https://arena.ai"
+# Browser UA must equal curl_cffi's chrome131 UA: Cloudflare binds cf_clearance to
+# (IP, UA). Mismatch => the keeper passes while every curl request gets challenged.
+KEEPER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 ARENA_MODES = ["direct-battle", "direct"]
 MAX_PROMPT = 50000
 COOLDOWN_SEC = 60  # 1 min soft preference only — never hard-locks accounts
@@ -1049,6 +1053,34 @@ def pick_live_proxy(jar: Optional[dict], *, purpose: str = "") -> Optional[str]:
 
 async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "") -> Optional[str]:
     return await asyncio.to_thread(pick_live_proxy, jar, purpose=purpose)
+
+
+async def anchor_proxy_to_keeper(jar_id, proxy):
+    """Return (proxy, cycled). Align curl with the running keeper's exit IP, because
+    cf_clearance is IP-bound: prefer the browser's live exit (re-pin curl to it and the
+    clearance survives); only if that exit is DEAD do we cycle the keeper onto curl's new
+    proxy, which re-solves the challenge there and re-harvests cookies."""
+    s = keeper.sessions.get(jar_id) if jar_id else None
+    if not (s and getattr(s, "running", False)):
+        return proxy, False
+    used = getattr(s, "_used_proxy", "") or ""
+    if not used or used == proxy:
+        return proxy, False
+    if await asyncio.to_thread(proxy_alive, used):
+        if jar_id:
+            assign_jar_proxy(jar_id, used)   # curl follows the browser; don't disturb the clearance
+        return used, False
+    if proxy is None:
+        return None, False   # nothing healthy anywhere — direct; browser tunnel may still linger
+    log("WARN", f"[{jar_id}] keeper's proxy {used.split('@')[-1]} is dead — cycling keeper onto "
+                f"{proxy.split('@')[-1]} to realign IP+cookies")
+    try:
+        await s.restart()
+        s.last_harvest_time = 0
+    except Exception as e:
+        log("WARN", f"[{jar_id}] keeper cycle failed: {e}")
+    return proxy, True
+
 # <<< PROXY FAILOVER END >>>
 
 
@@ -2579,7 +2611,7 @@ class KeeperSession:
                         ignore_default_args=["--disable-extensions"],
                         args=ext_args,
                         viewport={"width": 1920, "height": 1080},
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+                        user_agent=KEEPER_UA,  # must match curl_cffi impersonate="chrome131" — cf_clearance is UA-bound
                     )
                     if _pw_proxy:
                         _pc_kw["proxy"] = _pw_proxy
@@ -2649,7 +2681,7 @@ class KeeperSession:
 
                     self.context = await self.browser.new_context(
                         viewport={"width": 1920, "height": 1080}, screen={"width": 1920, "height": 1080},
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+                        user_agent=KEEPER_UA,  # must match curl_cffi impersonate="chrome131" — cf_clearance is UA-bound
                         storage_state=os.path.join(profile_dir, "state.json") if os.path.exists(os.path.join(profile_dir, "state.json")) else None,
                     )
                 self.page = await self.context.new_page()
@@ -3310,6 +3342,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
         pass
 
     tried_jar_ids = {jar_id}
+    cf_clear_attempts = 0
     same_jar_429 = 0  # consecutive 429s on current jar
     max_attempts = 6  # fixed budget — do NOT burn entire pool on IP rate-limits
 
@@ -3391,6 +3424,11 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
         try:
             headers = _curl_headers(jar)
             proxy = await apick_live_proxy(jar, purpose="api")
+            proxy, _cycled = await anchor_proxy_to_keeper(jar_id, proxy)
+            if _cycled:
+                jar = await _refresh_cookies_from_live(jar, jar_id)   # fresh clearance+auth from the new exit
+            elif proxy:
+                jar = dict(jar); jar["proxy"] = proxy; jar["_last_proxy"] = proxy
             if proxy:
                 log("INFO", f"[{jar_id}] curl via proxy {proxy.split('@')[-1] if '@' in proxy else proxy}")
             else:
@@ -3423,7 +3461,24 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
 
                     if resp.status_code in (401, 403):
                         if "cloudflare" in body.lower() or "just a moment" in body.lower():
-                            yield ("error", "502: Cloudflare block — open Live Browser / refresh cookies for this account")
+                            # cf_clearance is bound to IP+UA: a healthy VNC browser
+                            # does NOT mean curl is cleared. One self-repair per
+                            # request: cycle the keeper (it re-solves the challenge
+                            # on the current exit) then re-harvest and retry.
+                            if cf_clear_attempts < 1 and keeper.sessions.get(jar_id):
+                                cf_clear_attempts += 1
+                                s_ = keeper.sessions.get(jar_id)
+                                log("WARN", f"[{jar_id}] CF challenge on curl exit "
+                                            f"{proxy.split('@')[-1] if proxy else 'DIRECT'} — cycling keeper to re-clear")
+                                try:
+                                    await s_.restart()
+                                    s_.last_harvest_time = 0
+                                except Exception as e:
+                                    log("WARN", f"[{jar_id}] keeper cycle failed: {e}")
+                                jar = await _refresh_cookies_from_live(jar, jar_id)
+                                continue
+                            yield ("error", "502: Cloudflare block persists after keeper re-clear — this exit IP "
+                                            "is flagged; rotate to another proxy or solve in Live Browser (VNC)")
                             return
                         # Harvest + retry same jar once, then rotate
                         jar = await _refresh_cookies_from_live(jar, jar_id)
