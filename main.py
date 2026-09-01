@@ -787,12 +787,10 @@ def get_proxy_pool() -> list:
     return out
 
 
-# Round-robin cursor for the global proxy pool (process-local, multi-worker each has own)
 _proxy_rr_index = 0
-_proxy_rr_lock = None  # lazy asyncio/threading-free; mutate under FileLock if needed
 
 def next_pool_proxy() -> Optional[str]:
-    """Round-robin next proxy from proxies.txt / config pool."""
+    """Next proxy in round-robin order from the pool."""
     global _proxy_rr_index
     pool = get_proxy_pool()
     if not pool:
@@ -802,27 +800,60 @@ def next_pool_proxy() -> Optional[str]:
     return pool[idx]
 
 
-def jar_proxy(jar: dict, *, rotate: bool = False) -> Optional[str]:
-    """Proxy for this request.
+def assign_jar_proxy(jar_id: str, proxy_url: str) -> None:
+    """Persist proxy on the jar so curl + keeper share the same exit IP."""
+    def upd(jars):
+        for j in jars:
+            if j.get("id") == jar_id:
+                j["proxy"] = proxy_url
+                j["_last_proxy"] = proxy_url
+                break
+    try:
+        mutate_jars(upd)
+    except Exception:
+        pass
 
-    Priority:
-      1. jar["proxy"] / jar["proxy_url"] if set (sticky per-account)
-      2. jar["_proxy_once"] temporary override (set on 429 rotate)
-      3. Round-robin from global pool (proxies.txt)
+
+def jar_proxy(jar: dict, *, rotate: bool = False) -> Optional[str]:
+    """Sticky proxy per account; rotate to next pool entry when rotate=True.
+
+    Same jar → same IP so cookies/cf_clearance stay valid.
+    On 429 call jar_proxy(jar, rotate=True) to move that account to a new IP.
     """
     if not jar:
-        return next_pool_proxy() if rotate else next_pool_proxy()
-    once = jar.get("_proxy_once")
-    if once:
-        n = _normalize_proxy(once)
-        if n:
-            return n
-    explicit = jar.get("proxy") or jar.get("proxy_url")
-    if explicit:
-        n = _normalize_proxy(explicit)
-        if n:
-            return n
-    return next_pool_proxy()
+        return next_pool_proxy()
+    pool = get_proxy_pool()
+
+    if rotate and pool:
+        cur = _normalize_proxy(jar.get("proxy") or jar.get("_last_proxy") or jar.get("_proxy_once") or "")
+        try:
+            idx = pool.index(cur) if cur in pool else -1
+        except Exception:
+            idx = -1
+        chosen = pool[(idx + 1) % len(pool)]
+        jar["proxy"] = chosen
+        jar["_last_proxy"] = chosen
+        jar["_proxy_once"] = chosen
+        if jar.get("id"):
+            assign_jar_proxy(jar["id"], chosen)
+        return chosen
+
+    # Sticky: explicit proxy, else assign one from pool by jar order and persist
+    explicit = jar.get("proxy") or jar.get("proxy_url") or jar.get("_last_proxy") or jar.get("_proxy_once")
+    chosen = _normalize_proxy(explicit) if explicit else None
+    if chosen:
+        return chosen
+    if not pool:
+        return None
+    # First time: assign stable proxy by hashing jar id, persist it
+    jid = str(jar.get("id") or jar.get("name") or "x")
+    idx = int(hashlib.md5(jid.encode()).hexdigest()[:8], 16) % len(pool)
+    chosen = pool[idx]
+    jar["proxy"] = chosen
+    jar["_last_proxy"] = chosen
+    if jar.get("id"):
+        assign_jar_proxy(jar["id"], chosen)
+    return chosen
 
 
 def playwright_proxy_from_url(proxy_url: str) -> Optional[dict]:
@@ -2336,7 +2367,8 @@ class KeeperSession:
 
                 # Per-account / pool proxy for the live browser (bypasses IP rate-limits)
                 _jar_for_proxy = next((j for j in load_jars() if j.get("id") == self.jar_id), {"id": self.jar_id})
-                _proxy_url = jar_proxy(_jar_for_proxy)
+                # Prefer last proxy used for this jar so browser IP matches curl cookies
+                _proxy_url = _normalize_proxy(_jar_for_proxy.get("_last_proxy") or "") or jar_proxy(_jar_for_proxy)
                 _pw_proxy = playwright_proxy_from_url(_proxy_url) if _proxy_url else None
                 if _pw_proxy:
                     self._set_step(f"Browser proxy: {_proxy_url.split('@')[-1] if '@' in _proxy_url else _proxy_url}")
@@ -2851,6 +2883,93 @@ async def generate_title(user_msg: str, assistant_reply: str) -> str:
 # ============================================================
 
 # Chat completions — classic curl_cffi path (no browser tabs)
+
+async def _stream_via_existing_page(session, url: str, payload: dict, model_name: str):
+    """POST from the keeper's already-open page (NO new tabs). Closest to official site."""
+    page = session.page
+    if not page or page.is_closed():
+        yield ("error", "No open page on keeper")
+        return
+    try:
+        # Ensure we're on arena so cookies/origin match
+        cur = page.url or ""
+        if "arena.ai" not in cur and "lmarena.ai" not in cur:
+            try:
+                await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded", timeout=20000)
+            except Exception:
+                pass
+        result = await page.evaluate(
+            """async ({url, payload}) => {
+                try {
+                    const resp = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Accept': 'text/event-stream,*/*',
+                        },
+                        body: JSON.stringify(payload),
+                        credentials: 'include',
+                    });
+                    const text = await resp.text();
+                    return { status: resp.status, body: text };
+                } catch (e) {
+                    return { status: 0, body: String(e) };
+                }
+            }""",
+            {"url": url, "payload": payload},
+        )
+    except Exception as e:
+        yield ("error", f"In-page fetch failed: {e}")
+        return
+
+    status = (result or {}).get("status") or 0
+    body = (result or {}).get("body") or ""
+    if status != 200:
+        yield ("http_error", status, body)
+        return
+
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("data: "):
+            line = line[6:].strip()
+            if not line:
+                continue
+        colon = line.find(":")
+        if colon < 0:
+            continue
+        prefix, payload_s = line[:colon], line[colon + 1:]
+        if prefix in ("a0", "0"):
+            try:
+                t = json.loads(payload_s)
+                if isinstance(t, str):
+                    yield ("content", t)
+            except json.JSONDecodeError:
+                continue
+        elif prefix in ("ag", "g"):
+            try:
+                t = json.loads(payload_s)
+                if isinstance(t, str):
+                    yield ("reasoning", t)
+            except json.JSONDecodeError:
+                continue
+        elif prefix in ("a3", "3", "e"):
+            try:
+                err = json.loads(payload_s)
+                msg = err if isinstance(err, str) else json.dumps(err)
+            except json.JSONDecodeError:
+                msg = payload_s
+            yield ("error", f"Stream Error: {msg}")
+            return
+        elif prefix in ("ad", "d"):
+            try:
+                md = json.loads(payload_s)
+                yield ("finish", md.get("finishReason", "stop"))
+            except json.JSONDecodeError:
+                continue
+
+
 async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key, jar,
                             prior_messages=None, is_api=False, request_user_count=None):
     """Stream a chat turn using curl_cffi + jar cookies.
@@ -2974,13 +3093,12 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
 
     # Fresh cookies from live keeper if possible
     jar = await _refresh_cookies_from_live(jar, jar_id)
-    # Round-robin a proxy onto this request (unless jar has sticky proxy set)
-    if not (jar.get("proxy") or jar.get("proxy_url")):
-        rr = next_pool_proxy()
-        if rr:
-            jar = dict(jar)
-            jar["_proxy_once"] = rr
-            log("INFO", f"[{jar_id}] RR proxy → {rr.split('@')[-1] if '@' in rr else rr}")
+    # Ensure this jar has a sticky proxy (cookies must match exit IP)
+    p = jar_proxy(jar)
+    if p:
+        jar = dict(jar)
+        jar["proxy"] = p
+        log("INFO", f"[{jar_id}] proxy → {p.split('@')[-1] if '@' in p else p}")
 
     # Drop stale soft-limits so a previous 429 doesn't poison the pool
     def _clear_stale_limits(jars):
@@ -3077,10 +3195,14 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
         try:
             headers = _curl_headers(jar)
             proxy = jar_proxy(jar)
-            session_kw = {"impersonate": "chrome131"}
+            session_kw = {"impersonate": "chrome131", "timeout": 120.0}
             if proxy:
+                # curl_cffi accepts proxy= URL; also set both schemes for safety
                 session_kw["proxy"] = proxy
-                log("INFO", f"[{jar_id}] Using proxy {proxy.split('@')[-1] if '@' in proxy else proxy}")
+                session_kw["proxies"] = {"http": proxy, "https": proxy}
+                log("INFO", f"[{jar_id}] curl via proxy {proxy.split('@')[-1] if '@' in proxy else proxy}")
+            else:
+                log("WARN", f"[{jar_id}] No proxy — using server IP (easy to rate-limit)")
             async with AsyncSession(**session_kw) as client:
                 try:
                     resp = await client.post(url, json=base, headers=headers, stream=True, timeout=120.0)
@@ -3140,14 +3262,10 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                                 base["captchaToken"] = token
                                 base["g-recaptcha-response"] = token
                         if same_jar_429 < 3:
-                            # Always advance round-robin proxy on 429 (new exit IP)
-                            nxt = next_pool_proxy()
+                            jar = dict(jar)
+                            nxt = jar_proxy(jar, rotate=True)
                             if nxt:
-                                jar = dict(jar)
-                                jar["_proxy_once"] = nxt
-                                # clear sticky so RR wins for this request chain
-                                jar.pop("proxy", None)
-                                log("INFO", f"[{jar_id}] 429 → RR proxy {nxt.split('@')[-1] if '@' in nxt else nxt}")
+                                log("INFO", f"[{jar_id}] 429 → rotated proxy {nxt.split('@')[-1] if '@' in nxt else nxt}")
                             continue  # same jar, new IP
                         # One alternate jar only
                         next_jar = acquire_jar(prefer_live=True)
