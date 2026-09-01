@@ -907,6 +907,33 @@ PROBE_DEAD_TTL = 300.0      # re-probe a failed proxy at most once per 5 min
 PROBE_BUDGET = 12           # live probes per sweep (cached verdicts are free)
 PROBE_MAX_PARALLEL = 8
 _proxy_probe_cache: Dict[str, Tuple[bool, float]] = {}
+_proxy_assign_cursor = 0   # shared round-robin position for ALL pinning paths
+
+
+def _rotation_mode() -> str:
+    """config.json "proxy_rotation": "assignment" (default, CF-safe) | "request".
+    "request" rotates the exit on EVERY pick — maximum IP spread, but it invalidates
+    cf_clearance each time and the keeper must re-clear (up to one ~1-min cycle per
+    request). Only flip it if Arena is IP-limiting you harder than CF is."""
+    try:
+        m = str(get_config().get("proxy_rotation") or "assignment").strip().lower()
+        return m if m in ("assignment", "request") else "assignment"
+    except Exception:
+        return "assignment"
+
+
+def _bump_cursor(chosen: Optional[str]) -> None:
+    """Park the shared cursor just after the node we handed out, so the NEXT
+    assignment (any jar, curl or keeper) lands on a different proxy. 1:1 spread,
+    no md5 collisions, wraps around the pool."""
+    global _proxy_assign_cursor
+    if not chosen:
+        return
+    try:
+        pool = get_proxy_pool()
+        _proxy_assign_cursor = (pool.index(chosen) + 1) % len(pool) if chosen in pool else _proxy_assign_cursor + 1
+    except Exception:
+        _proxy_assign_cursor += 1
 
 
 def _probe_hostport() -> Tuple[str, int]:
@@ -982,19 +1009,22 @@ def proxy_alive(proxy_url: str, *, force: bool = False) -> bool:
 def mark_proxy_dead(proxy_url: str, ttl: float = PROBE_DEAD_TTL) -> None:
     if proxy_url:
         _proxy_probe_cache[proxy_url] = (False, time.time() + ttl)
+        _bump_cursor(_normalize_proxy(proxy_url))  # skip dead node in future assignments
 
 
-def proxy_candidates(jar: Optional[dict]) -> List[str]:
-    """Sticky proxy first, then the whole pool rotated by a per-jar offset so
-    accounts spread across the list instead of stampeding the first entry."""
+def proxy_candidates(jar: Optional[dict], *, prefer_sticky: bool = True) -> List[str]:
+    """Sweep order: the jar's live pin first (keeps cf_clearance valid), then the
+    pool starting at the shared RR cursor. The old per-jar md5 offset collided
+    (2 accounts on the same slot, pool entries left idle) — the cursor can't:
+    every hand-out advances it exactly one step."""
     pool = get_proxy_pool()
     out: List[str] = []
-    sticky = _normalize_proxy((jar or {}).get("proxy") or (jar or {}).get("_last_proxy") or "")
-    if sticky:
-        out.append(sticky)
+    if prefer_sticky:
+        sticky = _normalize_proxy((jar or {}).get("proxy") or (jar or {}).get("_last_proxy") or "")
+        if sticky:
+            out.append(sticky)
     if pool:
-        jid = str((jar or {}).get("id") or (jar or {}).get("name") or "x")
-        st = int(hashlib.md5(jid.encode()).hexdigest()[:8], 16) % len(pool)
+        st = _proxy_assign_cursor % len(pool)
         for i in range(len(pool)):
             c = pool[(st + i) % len(pool)]
             if c not in out:
@@ -1002,11 +1032,17 @@ def proxy_candidates(jar: Optional[dict]) -> List[str]:
     return out
 
 
-def pick_live_proxy(jar: Optional[dict], *, purpose: str = "") -> Optional[str]:
+def pick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = False) -> Optional[str]:
     """Return the first proxy that actually tunnels to Arena and PIN it to the
     jar (so curl + keeper keep one exit IP). None = nothing tunnels -> go direct.
-    Dead nodes cost one probe per PROBE_DEAD_TTL, not per request."""
-    cands = proxy_candidates(jar)
+    Dead nodes cost one probe per PROBE_DEAD_TTL, not per request.
+    rotate=True (429 / death / provider swap): ignore the current pin, take the
+    next live entry at the shared cursor. mode="request": same for EVERY call."""
+    global _proxy_assign_cursor
+    mode = _rotation_mode()
+    if mode == "request" and get_proxy_pool():
+        _proxy_assign_cursor += 1
+    cands = proxy_candidates(jar, prefer_sticky=(mode != "request" and not rotate))
     if not cands:
         return None
     chosen = None
@@ -1044,6 +1080,7 @@ def pick_live_proxy(jar: Optional[dict], *, purpose: str = "") -> Optional[str]:
             jar["_last_proxy"] = chosen
             if jid:
                 assign_jar_proxy(jid, chosen)
+        _bump_cursor(chosen)   # next assignment (any jar) gets a different node
         return chosen
     if get_proxy_pool():
         log("WARN", f"[{jid or 'global'}] {len(cands)} proxy candidates probed, none tunnel to Arena "
@@ -1051,8 +1088,8 @@ def pick_live_proxy(jar: Optional[dict], *, purpose: str = "") -> Optional[str]:
     return None
 
 
-async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "") -> Optional[str]:
-    return await asyncio.to_thread(pick_live_proxy, jar, purpose=purpose)
+async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = False) -> Optional[str]:
+    return await asyncio.to_thread(pick_live_proxy, jar, purpose=purpose, rotate=rotate)
 
 
 async def anchor_proxy_to_keeper(jar_id, proxy):
@@ -1060,6 +1097,8 @@ async def anchor_proxy_to_keeper(jar_id, proxy):
     cf_clearance is IP-bound: prefer the browser's live exit (re-pin curl to it and the
     clearance survives); only if that exit is DEAD do we cycle the keeper onto curl's new
     proxy, which re-solves the challenge there and re-harvests cookies."""
+    if _rotation_mode() == "request":
+        return proxy, False   # per-request rotation is intentional exit churn; don't drag curl back
     s = keeper.sessions.get(jar_id) if jar_id else None
     if not (s and getattr(s, "running", False)):
         return proxy, False
@@ -3321,12 +3360,11 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
 
     # Fresh cookies from live keeper if possible
     jar = await _refresh_cookies_from_live(jar, jar_id)
-    # Ensure this jar has a sticky proxy (cookies must match exit IP)
-    p = jar_proxy(jar)
-    if p:
-        jar = dict(jar)
-        jar["proxy"] = p
-        log("INFO", f"[{jar_id}] proxy → {p.split('@')[-1] if '@' in p else p}")
+    # NOTE: no pre-pin here anymore. jar_proxy()'s md5 hashing assigned (and
+    # persisted) a pool slot per jar BEFORE the live sweep ran, so the sweep
+    # short-circuited on "sticky alive" forever — that was the not-round-
+    # robbing bug. Proxy selection now happens per attempt: apick_live_proxy
+    # (shared RR cursor) + anchor_proxy_to_keeper (cf_clearance IP alignment).
 
     # Drop stale soft-limits so a previous 429 doesn't poison the pool
     def _clear_stale_limits(jars):
@@ -3522,9 +3560,9 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                                 base["g-recaptcha-response"] = token
                         if same_jar_429 < 3:
                             jar = dict(jar)
-                            nxt = jar_proxy(jar, rotate=True)
+                            nxt = await apick_live_proxy(jar, purpose="429", rotate=True)
                             if nxt:
-                                log("INFO", f"[{jar_id}] 429 → rotated proxy {nxt.split('@')[-1] if '@' in nxt else nxt}")
+                                log("INFO", f"[{jar_id}] 429 → rotated (probed-live) proxy {nxt.split('@')[-1] if '@' in nxt else nxt}")
                             continue  # same jar, new IP
                         # One alternate jar only
                         next_jar = acquire_jar(prefer_live=True)
