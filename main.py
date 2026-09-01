@@ -3197,9 +3197,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             proxy = jar_proxy(jar)
             session_kw = {"impersonate": "chrome131", "timeout": 120.0}
             if proxy:
-                # curl_cffi accepts proxy= URL; also set both schemes for safety
-                session_kw["proxy"] = proxy
-                session_kw["proxies"] = {"http": proxy, "https": proxy}
+                session_kw["proxy"] = proxy  # curl_cffi: use proxy=, not both
                 log("INFO", f"[{jar_id}] curl via proxy {proxy.split('@')[-1] if '@' in proxy else proxy}")
             else:
                 log("WARN", f"[{jar_id}] No proxy — using server IP (easy to rate-limit)")
