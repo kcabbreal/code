@@ -2799,8 +2799,22 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
     # Fresh cookies from live keeper if possible
     jar = await _refresh_cookies_from_live(jar, jar_id)
 
+    # Drop stale soft-limits so a previous 429 doesn't poison the pool
+    def _clear_stale_limits(jars):
+        now = time.time()
+        for j in jars:
+            if j.get("limited_until", 0) and j["limited_until"] < now + 3600:
+                j["limited_until"] = 0
+                if j.get("status") == "limited":
+                    j["status"] = "ok"
+    try:
+        mutate_jars(_clear_stale_limits)
+    except Exception:
+        pass
+
     tried_jar_ids = {jar_id}
-    max_attempts = max(3, len(load_jars()) + 1)
+    same_jar_429 = 0  # consecutive 429s on current jar
+    max_attempts = 6  # fixed budget — do NOT burn entire pool on IP rate-limits
 
     for attempt in range(max_attempts):
         conv = get_conversation(conv_key)
@@ -2915,37 +2929,41 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                         return
 
                     if resp.status_code == 429:
-                        # Soft mark only — does not hard-block (see jar_available)
-                        mark_jar_status(jar_id, "limited")
-                        next_jar = acquire_jar(prefer_live=True)
-                        if next_jar and next_jar["id"] not in tried_jar_ids:
-                            log("WARN", f"[{jar_id}] Arena 429 — rotating to '{next_jar.get('name')}'")
-                            jar = next_jar
-                            jar_id = jar["id"]
-                            tried_jar_ids.add(jar_id)
-                            jar = await _refresh_cookies_from_live(jar, jar_id)
-                            continue
-                        # Clear ALL soft limited flags and allow one full re-pass
-                        def _clear_all_limited(jars):
+                        # IP-level limits are common: rotating every jar instantly makes it worse.
+                        # Retry same jar with backoff, then at most ONE other jar.
+                        same_jar_429 += 1
+                        wait_s = min(8, 1.5 * same_jar_429)
+                        log("WARN", f"[{jar_id}] Arena 429 — waiting {wait_s:.1f}s then retry (try {same_jar_429})")
+                        # Never hard-lock the pool
+                        def _soft_clear(jars):
                             for j in jars:
                                 j["limited_until"] = 0
                                 if j.get("status") == "limited":
                                     j["status"] = "ok"
-                        mutate_jars(_clear_all_limited)
-                        if getattr(stream_arena_chat, "_cleared_once", False):
-                            yield ("error", "429: Arena is rate-limiting right now. Wait 30-60s and retry.")
-                            return
-                        stream_arena_chat._cleared_once = True
-                        log("WARN", "Cleared all soft limited flags — retrying full account pool")
-                        tried_jar_ids.clear()
+                        mutate_jars(_soft_clear)
+                        await asyncio.sleep(wait_s)
+                        jar = await _refresh_cookies_from_live(jar, jar_id)
+                        # refresh captcha token for next create attempt
+                        if not follow:
+                            token = await _get_recaptcha_token()
+                            if token:
+                                base["recaptchaToken"] = token
+                                base["recaptcha"] = token
+                                base["captchaToken"] = token
+                                base["g-recaptcha-response"] = token
+                        if same_jar_429 < 3:
+                            continue  # same jar
+                        # One alternate jar only
                         next_jar = acquire_jar(prefer_live=True)
-                        if next_jar:
+                        if next_jar and next_jar["id"] not in tried_jar_ids:
+                            log("WARN", f"[{jar_id}] Still 429 — one alternate jar '{next_jar.get('name')}'")
                             jar = next_jar
                             jar_id = jar["id"]
                             tried_jar_ids.add(jar_id)
+                            same_jar_429 = 0
                             jar = await _refresh_cookies_from_live(jar, jar_id)
                             continue
-                        yield ("error", "429: Arena rate limit and no accounts available")
+                        yield ("error", "429: Arena is rate-limiting this IP/session. Wait 30-60s then retry — accounts are fine.")
                         return
 
                     # Captcha rejection — try to grab a fresh token and retry once
@@ -3046,7 +3064,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             yield ("error", f"502: {type(e).__name__}: {e}")
             return
 
-    yield ("error", "Arena request failed after trying all available accounts.")
+    yield ("error", "Arena request failed after retries. If accounts work in the browser, wait 30s and try again (IP rate-limit), or open Live Browser and send one message.")
 
 
 # ============================================================
