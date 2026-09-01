@@ -1012,6 +1012,8 @@ def _proxy_tcp_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> bool:
             hint = " — PAYMENT REQUIRED (provider billing/quota)" if code == "402" else \
                    (" — auth failed (creds/allowlist)" if code == "407" else "")
             log("WARN", f"proxy probe {ph}:{pp} refused CONNECT: {code}{hint}")
+            if code in ("402", "407"):
+                quarantine_proxy(proxy_url, f"CONNECT refused {code} — billing/auth, not transient")
             return False
         finally:
             try:
@@ -1032,6 +1034,10 @@ def proxy_alive(proxy_url: str, *, force: bool = False) -> bool:
         return hit[0]
     ok = _proxy_tcp_probe(proxy_url)
     _proxy_probe_cache[proxy_url] = (ok, now + (PROBE_OK_TTL if ok else PROBE_DEAD_TTL))
+    if ok:
+        _proxy_strikes.pop(proxy_url, None)
+    else:
+        note_probe_failure(proxy_url)
     return ok
 
 
@@ -1040,17 +1046,110 @@ def mark_proxy_dead(proxy_url: str, ttl: float = PROBE_DEAD_TTL) -> None:
         _proxy_probe_cache[proxy_url] = (False, time.time() + ttl)
         _bump_cursor(_normalize_proxy(proxy_url))  # skip dead node in future assignments
 
+# ---- v5 QUARANTINE: a proxy that actually fails is REMOVED from proxies.txt ----
+# (line moved to proxies.dead.txt, never offered again this service lifetime),
+# instead of the 5-min TTL slap on the wrist. 402/407 or any runtime tunnel
+# failure = instant exile; repeated raw-probe misses exile after 2 strikes.
+# Kill switch: PROXY_QUARANTINE=0.  Revive:  grep -v '^#' proxies.dead.txt >> proxies.txt
+PROXY_QUARANTINE   = os.environ.get("PROXY_QUARANTINE", "1").strip().lower() not in ("0", "off", "false")
+PROBE_EXILE_AFTER  = 2
+CURL_TTFB_TIMEOUT  = float(os.environ.get("CURL_TTFB_TIMEOUT", "45"))  # headers must arrive in 45s
+_quarantine_lock   = __import__("threading").RLock()
+_proxy_strikes: Dict[str, int] = {}
+_QUARANTINED_KEYS: set = set()   # host:port — this process
+
+
+def _proxies_file() -> Optional[str]:
+    for candidate in ("proxies.txt",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt"),
+                      os.path.join(os.getcwd(), "proxies.txt")):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _proxy_hkey(proxy_url: str) -> str:
+    try:
+        from urllib.parse import urlparse as _up
+        u = _up(_normalize_proxy(proxy_url) or proxy_url)
+        return f"{u.hostname}:{u.port or 80}"
+    except Exception:
+        return proxy_url
+
+
+def quarantine_proxy(proxy_url: str, reason: str = "") -> None:
+    """Exile a proxy: cut its line(s) from proxies.txt, append to proxies.dead.txt,
+    clear every sticky pin pointing at it. Idempotent per process; thread-safe."""
+    if not proxy_url:
+        return
+    if not PROXY_QUARANTINE:
+        mark_proxy_dead(proxy_url)
+        return
+    key = _proxy_hkey(proxy_url)
+    with _quarantine_lock:
+        if key in _QUARANTINED_KEYS:
+            mark_proxy_dead(proxy_url, ttl=3600.0)
+            return
+        _QUARANTINED_KEYS.add(key)
+        moved = 0
+        path = _proxies_file()
+        try:
+            if path:
+                keep_lines, moved_lines = [], []
+                with open(path, encoding="utf-8-sig", errors="ignore") as f:
+                    for ln in f:
+                        raw = ln.strip()
+                        if raw and not raw.startswith("#") and _proxy_hkey(raw) == key:
+                            moved_lines.append(raw)
+                        else:
+                            keep_lines.append(ln.rstrip("\n"))
+                if moved_lines:
+                    tmp = path + ".quarantine.tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        f.write("\n".join(keep_lines) + ("\n" if keep_lines else ""))
+                    os.replace(tmp, path)
+                    dead = os.path.join(os.path.dirname(path) or ".", "proxies.dead.txt")
+                    with open(dead, "a", encoding="utf-8") as f:
+                        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                        for ml in moved_lines:
+                            f.write(f"# {stamp} {reason[:120]}\n{ml}\n")
+                    moved = len(moved_lines)
+        except Exception as e:
+            log("WARN", f"proxies.txt quarantine write failed ({e}) — TTL-marking only")
+        mark_proxy_dead(proxy_url, ttl=86400.0)
+        try:
+            def _unpin(jars):
+                for j in jars:
+                    for fld in ("proxy", "proxy_url", "_last_proxy", "_proxy_once"):
+                        if j.get(fld) and _proxy_hkey(j[fld]) == key:
+                            j[fld] = ""
+            mutate_jars(_unpin)
+        except Exception:
+            pass
+    log("WARN", f"proxy {key} QUARANTINED ({moved} line(s) → proxies.dead.txt): "
+                f"{reason[:140]} — pool now {len(get_proxy_pool())}")
+
+
+def note_probe_failure(proxy_url: str) -> None:
+    if not PROXY_QUARANTINE or not proxy_url:
+        return
+    n = _proxy_strikes[proxy_url] = _proxy_strikes.get(proxy_url, 0) + 1
+    if n >= PROBE_EXILE_AFTER:
+        quarantine_proxy(proxy_url, f"CONNECT probe failed {n}× in a row")
+
 
 def proxy_candidates(jar: Optional[dict], *, prefer_sticky: bool = True) -> List[str]:
     """Sweep order: the jar's live pin first (keeps cf_clearance valid), then the
     pool starting at the shared RR cursor. The old per-jar md5 offset collided
     (2 accounts on the same slot, pool entries left idle) — the cursor can't:
     every hand-out advances it exactly one step."""
-    pool = get_proxy_pool()
+    _q = _QUARANTINED_KEYS
+    pool = [p for p in get_proxy_pool() if _proxy_hkey(p) not in _q]
     out: List[str] = []
     if prefer_sticky:
         sticky = _normalize_proxy((jar or {}).get("proxy") or (jar or {}).get("_last_proxy") or "")
-        if sticky:
+        # an exiled node must never come back via a stale jar pin
+        if sticky and _proxy_hkey(sticky) not in _q:
             out.append(sticky)
     if pool:
         st = _proxy_assign_cursor % len(pool)
@@ -2772,7 +2871,7 @@ class KeeperSession:
             used = getattr(self, "_used_proxy", "") or ""
             if used:
                 self._tried_proxies.add(used)
-                mark_proxy_dead(used)
+                quarantine_proxy(used, f"keeper {self.name}: {txt[:90]}")
             pool = get_proxy_pool() or []
             left = [c for c in pool if c not in self._tried_proxies]
             if _retryable and left:
@@ -3487,14 +3586,30 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     post_kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
                     if proxy:
                         post_kw["proxy"] = proxy
-                    resp = await client.post(url, **post_kw)
+                    # TTFB watchdog: a stalled exit used to eat the full 120s and the
+                    # curl error it eventually raised wasn't even recognized as proxy
+                    # death. Healthy streams return headers in seconds.
+                    resp = await asyncio.wait_for(client.post(url, **post_kw), timeout=CURL_TTFB_TIMEOUT)
+                except asyncio.TimeoutError:
+                    if proxy:
+                        quarantine_proxy(proxy, "curl: no response headers before TTFB watchdog")
+                        if attempt + 1 < max_attempts:
+                            log("WARN", f"[{jar_id}] curl TTFB timeout via "
+                                        f"{proxy.split('@')[-1] if '@' in proxy else proxy} — quarantined, trying next")
+                            continue
+                    yield ("error", f"502: every proxy stalled before first byte (watchdog {CURL_TTFB_TIMEOUT:.0f}s)")
+                    return
                 except Exception as e:
                     _msg = str(e)
-                    if proxy and ("Failed to perform" in _msg or "CONNECT" in _msg.upper() or "TUNNEL" in _msg.upper()):
-                        mark_proxy_dead(proxy)
+                    _low = _msg.lower()
+                    _dead = ("failed to perform" in _low or "connect" in _low or "tunnel" in _low
+                             or "timed out" in _low or "timeout" in _low or "reset" in _low
+                             or "refused" in _low or "resolve" in _low or re.search(r"code \d+", _low) is not None)
+                    if proxy and _dead:
+                        quarantine_proxy(proxy, f"curl: {_msg[:90]}")
                         if attempt + 1 < max_attempts:
                             log("WARN", f"[{jar_id}] proxy {proxy.split('@')[-1] if '@' in proxy else proxy} "
-                                        f"dead mid-flight — next attempt sweeps the pool")
+                                        f"dead mid-flight — quarantined, next attempt sweeps the pool")
                             continue
                         yield ("error", f"502: Network error (all proxies down): {_msg}")
                         return
@@ -6798,7 +6913,7 @@ if __name__ == "__main__":
     effective_workers = max(1, requested)
 
     print("=" * 62)
-    print("  Bridgena v1.0 — Arena.ai Bridge")
+    print("  Bridgena boiii — Arena.ai Bridge")
     print("=" * 62)
     print(f"  * Chat WebUI  : http://localhost:{args.port}/chat")
     print(f"  * Dashboard   : http://localhost:{args.port}/dashboard")
