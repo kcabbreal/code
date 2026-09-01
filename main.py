@@ -702,10 +702,17 @@ def _normalize_proxy(raw: str) -> Optional[str]:
     """
     if not raw or not isinstance(raw, str):
         return None
-    p = raw.strip()
-    if not p or p.startswith("#"):
+    p = raw.strip().lstrip("\ufeff").strip().strip('"\'')
+    if p.count(",") == 1 and ":" not in p:          # 'ip,port' free-list format
+        p = p.replace(",", ":")
+    if not p or p.startswith("#") or p.startswith("//"):
         return None
     low = p.lower()
+    # bare IPv6 'ip:port' would colon-split wrong; bracket it
+    _parts0 = p.rsplit(":", 1)
+    if ("://" not in p and "@" not in p and len(_parts0) == 2
+            and _parts0[1].isdigit() and _parts0[0].count(":") == 1):
+        p = f"[{_parts0[0]}]:{_parts0[1]}"
 
     if low.startswith("socks5h://"):
         return "socks5://" + p.split("://", 1)[1]
@@ -724,12 +731,12 @@ def _normalize_proxy(raw: str) -> Optional[str]:
         scheme = "http"
         if len(parts) >= 5 and parts[4].lower() in ("http", "https", "socks5", "socks4", "socks5h"):
             scheme = parts[4].lower().replace("socks5h", "socks5")
-        if not port.isdigit():
+        if not port.isdigit() or not (0 < int(port) <= 65535):
             return None
         return f"{scheme}://{user}:{password}@{host}:{port}"
 
-    # host:port
-    if len(parts) == 2 and parts[1].isdigit():
+    # host:port   (incl. bracketed IPv6 [::1]:8080)
+    if len(parts) == 2 and parts[1].isdigit() and 0 < int(parts[1]) <= 65535:
         return f"http://{parts[0]}:{parts[1]}"
 
     return None
@@ -751,9 +758,19 @@ def get_proxy_pool() -> list:
 
     def _add(item):
         n = _normalize_proxy(item if isinstance(item, str) else str(item))
-        if n and n not in seen:
-            seen.add(n)
-            out.append(n)
+        if not n:
+            return
+        try:
+            from urllib.parse import urlparse as _up
+            _u = _up(n)
+            key = f"{_u.hostname}:{_u.port or 80}"
+        except Exception:
+            key = n
+        if key in seen:
+            return
+        seen.add(key)
+        seen.add(n)
+        out.append(n)
 
     # 1) proxies.txt next to the app / cwd
     for candidate in (
@@ -763,7 +780,7 @@ def get_proxy_pool() -> list:
     ):
         try:
             if os.path.isfile(candidate):
-                with open(candidate, encoding="utf-8") as f:
+                with open(candidate, encoding="utf-8-sig", errors="ignore") as f:  # Notepad BOM safe
                     for ln in f:
                         ln = ln.strip()
                         if not ln or ln.startswith("#"):
@@ -874,6 +891,165 @@ def playwright_proxy_from_url(proxy_url: str) -> Optional[dict]:
         return out
     except Exception:
         return None
+
+
+
+# ============================================================
+# >>> PROXY FAILOVER BEGIN  (probe-before-use for free ip:port pools) <<<
+# ============================================================
+PROBE_TIMEOUT = 5.0
+PROBE_OK_TTL = 900.0        # reuse a confirmed-healthy verdict for 15 min
+PROBE_DEAD_TTL = 300.0      # re-probe a failed proxy at most once per 5 min
+PROBE_BUDGET = 12           # live probes per sweep (cached verdicts are free)
+PROBE_MAX_PARALLEL = 8
+_proxy_probe_cache: Dict[str, Tuple[bool, float]] = {}
+
+
+def _probe_hostport() -> Tuple[str, int]:
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(ARENA_BASE)
+        return (u.hostname or "arena.ai"), (u.port or 443)
+    except Exception:
+        return "arena.ai", 443
+
+
+def _proxy_tcp_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> bool:
+    """Raw CONNECT probe: does this proxy tunnel to arena.ai:443 right now?
+    Only http/https-scheme proxies are probed; socks entries are trusted (skip probe)."""
+    import base64
+    import socket
+    from urllib.parse import unquote, urlparse
+    if not proxy_url:
+        return False
+    host, port = _probe_hostport()
+    try:
+        u = urlparse(proxy_url)
+        if u.scheme.lower().startswith("socks"):
+            return True  # don't misjudge socks5 nodes with an HTTP CONNECT; curl handles them
+        ph, pp = u.hostname, (u.port or 80)
+        s = socket.create_connection((ph, pp), timeout=timeout)
+        try:
+            req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            if u.username:
+                pw = unquote(u.password or "")
+                tok = base64.b64encode(f"{unquote(u.username)}:{pw}".encode()).decode()
+                req += f"Proxy-Authorization: Basic {tok}\r\n"
+            s.sendall((req + "\r\n").encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                c = s.recv(2048)
+                if not c:
+                    return False
+                buf += c
+                if len(buf) > 16384:
+                    return False
+            line = buf.split(b"\r\n", 1)[0].decode("latin1", "ignore")
+            m = re.match(r"HTTP/[\d.]+\s+(\d+)", line)
+            if m and m.group(1) == "200":
+                return True
+            code = m.group(1) if m else "?"
+            hint = " — PAYMENT REQUIRED (provider billing/quota)" if code == "402" else \
+                   (" — auth failed (creds/allowlist)" if code == "407" else "")
+            log("WARN", f"proxy probe {ph}:{pp} refused CONNECT: {code}{hint}")
+            return False
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+
+def proxy_alive(proxy_url: str, *, force: bool = False) -> bool:
+    """Cached health verdict for a proxy (probe on miss)."""
+    if not proxy_url:
+        return False
+    now = time.time()
+    hit = _proxy_probe_cache.get(proxy_url)
+    if hit and hit[1] > now and not force:
+        return hit[0]
+    ok = _proxy_tcp_probe(proxy_url)
+    _proxy_probe_cache[proxy_url] = (ok, now + (PROBE_OK_TTL if ok else PROBE_DEAD_TTL))
+    return ok
+
+
+def mark_proxy_dead(proxy_url: str, ttl: float = PROBE_DEAD_TTL) -> None:
+    if proxy_url:
+        _proxy_probe_cache[proxy_url] = (False, time.time() + ttl)
+
+
+def proxy_candidates(jar: Optional[dict]) -> List[str]:
+    """Sticky proxy first, then the whole pool rotated by a per-jar offset so
+    accounts spread across the list instead of stampeding the first entry."""
+    pool = get_proxy_pool()
+    out: List[str] = []
+    sticky = _normalize_proxy((jar or {}).get("proxy") or (jar or {}).get("_last_proxy") or "")
+    if sticky:
+        out.append(sticky)
+    if pool:
+        jid = str((jar or {}).get("id") or (jar or {}).get("name") or "x")
+        st = int(hashlib.md5(jid.encode()).hexdigest()[:8], 16) % len(pool)
+        for i in range(len(pool)):
+            c = pool[(st + i) % len(pool)]
+            if c not in out:
+                out.append(c)
+    return out
+
+
+def pick_live_proxy(jar: Optional[dict], *, purpose: str = "") -> Optional[str]:
+    """Return the first proxy that actually tunnels to Arena and PIN it to the
+    jar (so curl + keeper keep one exit IP). None = nothing tunnels -> go direct.
+    Dead nodes cost one probe per PROBE_DEAD_TTL, not per request."""
+    cands = proxy_candidates(jar)
+    if not cands:
+        return None
+    chosen = None
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        batch = cands[:PROBE_BUDGET]
+        # cheap pass: anything with a live 'ok' cache entry wins immediately, in priority order
+        now = time.time()
+        for c in cands:
+            hit = _proxy_probe_cache.get(c)
+            if hit and hit[1] > now and hit[0]:
+                chosen = c
+                break
+        if chosen is None:
+            with ThreadPoolExecutor(max_workers=min(PROBE_MAX_PARALLEL, max(1, len(batch)))) as ex:
+                results = list(ex.map(lambda c: proxy_alive(c), batch))
+            for c, ok in zip(batch, results):
+                if ok:
+                    chosen = c
+                    break
+            # candidates beyond the budget with a cached-ok verdict still win over nothing
+            if chosen is None:
+                for c in cands[PROBE_BUDGET:]:
+                    hit = _proxy_probe_cache.get(c)
+                    if hit and hit[1] > now and hit[0]:
+                        chosen = c
+                        break
+    except Exception as e:
+        log("WARN", f"proxy sweep failed ({e}) — trusting sticky/pool head")
+        chosen = cands[0]
+    jid = (jar or {}).get("id")
+    if chosen:
+        if jar is not None:
+            jar["proxy"] = chosen
+            jar["_last_proxy"] = chosen
+            if jid:
+                assign_jar_proxy(jid, chosen)
+        return chosen
+    if get_proxy_pool():
+        log("WARN", f"[{jid or 'global'}] {len(cands)} proxy candidates probed, none tunnel to Arena "
+                    f"({purpose or 'use'}) — direct egress; pinned sticky kept in case provider revives")
+    return None
+
+
+async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "") -> Optional[str]:
+    return await asyncio.to_thread(pick_live_proxy, jar, purpose=purpose)
+# <<< PROXY FAILOVER END >>>
 
 
 # ============================================================
@@ -2367,9 +2543,13 @@ class KeeperSession:
 
                 # Per-account / pool proxy for the live browser (bypasses IP rate-limits)
                 _jar_for_proxy = next((j for j in load_jars() if j.get("id") == self.jar_id), {"id": self.jar_id})
-                # Prefer last proxy used for this jar so browser IP matches curl cookies
-                _proxy_url = _normalize_proxy(_jar_for_proxy.get("_last_proxy") or "") or jar_proxy(_jar_for_proxy)
+                # Sweep: sticky first if it still tunnels, else the whole pool (pinned on winner)
+                self._set_step("Probing proxy pool for a live tunnel...")
+                _proxy_url = await apick_live_proxy(_jar_for_proxy, purpose="keeper")
+                if not _proxy_url and get_proxy_pool():
+                    self._set_step("No proxy tunnels — browser starting on DIRECT egress (IP exposed)")
                 _pw_proxy = playwright_proxy_from_url(_proxy_url) if _proxy_url else None
+                self._used_proxy = _proxy_url or ""
                 if _pw_proxy:
                     self._set_step(f"Browser proxy: {_proxy_url.split('@')[-1] if '@' in _proxy_url else _proxy_url}")
                     log("INFO", f"[{self.name}] Keeper using proxy {_proxy_url.split('@')[-1] if '@' in (_proxy_url or '') else _proxy_url}")
@@ -2520,8 +2700,24 @@ class KeeperSession:
             return True
 
         except Exception as e:
+            txt = f"{type(e).__name__}: {e}"
+            _tunnelish = ("TUNNEL" in txt.upper() or "PROXY" in txt.upper()) and getattr(self, "_used_proxy", "")
+            if _tunnelish and getattr(self, "_start_retries", 0) < 2:
+                mark_proxy_dead(self._used_proxy)
+                self._start_retries = getattr(self, "_start_retries", 0) + 1
+                log("WARN", f"[{self.name}] tunnel failed via {self._used_proxy.split('@')[-1]} "
+                            f"— sweeping next live proxy (retry {self._start_retries}/2)")
+                self._set_step("Proxy tunnel dead — retrying start with next live proxy...")
+                self.status = "starting"
+                try:
+                    await self.stop()
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+                return await self.start()
             self.status = "error"
-            self.error = f"{type(e).__name__}: {e}"
+            self._start_retries = 0
+            self.error = txt
             self._set_step(f"ERROR: Failed to start: {self.error}")
             log("ERROR", f"[{self.name}] Failed to start: {self.error}")
             return False
@@ -3194,11 +3390,11 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
 
         try:
             headers = _curl_headers(jar)
-            proxy = jar_proxy(jar)
+            proxy = await apick_live_proxy(jar, purpose="api")
             if proxy:
                 log("INFO", f"[{jar_id}] curl via proxy {proxy.split('@')[-1] if '@' in proxy else proxy}")
             else:
-                log("WARN", f"[{jar_id}] No proxy — using server IP (easy to rate-limit)")
+                log("WARN", f"[{jar_id}] No live proxy — using server IP (easy to rate-limit)")
             async with AsyncSession(impersonate="chrome131") as client:
                 try:
                     post_kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
@@ -3206,7 +3402,16 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                         post_kw["proxy"] = proxy
                     resp = await client.post(url, **post_kw)
                 except Exception as e:
-                    yield ("error", f"Network error: {str(e)}")
+                    _msg = str(e)
+                    if proxy and ("Failed to perform" in _msg or "CONNECT" in _msg.upper() or "TUNNEL" in _msg.upper()):
+                        mark_proxy_dead(proxy)
+                        if attempt + 1 < max_attempts:
+                            log("WARN", f"[{jar_id}] proxy {proxy.split('@')[-1] if '@' in proxy else proxy} "
+                                        f"dead mid-flight — next attempt sweeps the pool")
+                            continue
+                        yield ("error", f"502: Network error (all proxies down): {_msg}")
+                        return
+                    yield ("error", f"Network error: {_msg}")
                     return
 
                 if resp.status_code != 200:
