@@ -787,21 +787,42 @@ def get_proxy_pool() -> list:
     return out
 
 
-def jar_proxy(jar: dict) -> Optional[str]:
-    """Proxy for this account: jar.proxy → else rotate from global pool by jar id."""
-    if not jar:
-        return None
-    explicit = jar.get("proxy") or jar.get("proxy_url")
-    n = _normalize_proxy(explicit) if explicit else None
-    if n:
-        return n
+# Round-robin cursor for the global proxy pool (process-local, multi-worker each has own)
+_proxy_rr_index = 0
+_proxy_rr_lock = None  # lazy asyncio/threading-free; mutate under FileLock if needed
+
+def next_pool_proxy() -> Optional[str]:
+    """Round-robin next proxy from proxies.txt / config pool."""
+    global _proxy_rr_index
     pool = get_proxy_pool()
     if not pool:
         return None
-    # Stable assignment per jar so the same account keeps the same exit IP
-    jid = str(jar.get("id") or jar.get("name") or "x")
-    idx = int(hashlib.md5(jid.encode()).hexdigest()[:8], 16) % len(pool)
+    idx = _proxy_rr_index % len(pool)
+    _proxy_rr_index = idx + 1
     return pool[idx]
+
+
+def jar_proxy(jar: dict, *, rotate: bool = False) -> Optional[str]:
+    """Proxy for this request.
+
+    Priority:
+      1. jar["proxy"] / jar["proxy_url"] if set (sticky per-account)
+      2. jar["_proxy_once"] temporary override (set on 429 rotate)
+      3. Round-robin from global pool (proxies.txt)
+    """
+    if not jar:
+        return next_pool_proxy() if rotate else next_pool_proxy()
+    once = jar.get("_proxy_once")
+    if once:
+        n = _normalize_proxy(once)
+        if n:
+            return n
+    explicit = jar.get("proxy") or jar.get("proxy_url")
+    if explicit:
+        n = _normalize_proxy(explicit)
+        if n:
+            return n
+    return next_pool_proxy()
 
 
 def playwright_proxy_from_url(proxy_url: str) -> Optional[dict]:
@@ -2953,6 +2974,13 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
 
     # Fresh cookies from live keeper if possible
     jar = await _refresh_cookies_from_live(jar, jar_id)
+    # Round-robin a proxy onto this request (unless jar has sticky proxy set)
+    if not (jar.get("proxy") or jar.get("proxy_url")):
+        rr = next_pool_proxy()
+        if rr:
+            jar = dict(jar)
+            jar["_proxy_once"] = rr
+            log("INFO", f"[{jar_id}] RR proxy → {rr.split('@')[-1] if '@' in rr else rr}")
 
     # Drop stale soft-limits so a previous 429 doesn't poison the pool
     def _clear_stale_limits(jars):
@@ -3112,19 +3140,15 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                                 base["captchaToken"] = token
                                 base["g-recaptcha-response"] = token
                         if same_jar_429 < 3:
-                            # Rotate to next proxy in pool while keeping same jar (IP change)
-                            pool = get_proxy_pool()
-                            if pool and len(pool) > 1:
-                                cur = jar_proxy(jar) or ""
-                                try:
-                                    idx = pool.index(cur)
-                                except ValueError:
-                                    idx = 0
-                                nxt = pool[(idx + same_jar_429) % len(pool)]
+                            # Always advance round-robin proxy on 429 (new exit IP)
+                            nxt = next_pool_proxy()
+                            if nxt:
                                 jar = dict(jar)
-                                jar["proxy"] = nxt
-                                log("INFO", f"[{jar_id}] 429 → next proxy {nxt.split('@')[-1]}")
-                            continue  # same jar, possibly new proxy
+                                jar["_proxy_once"] = nxt
+                                # clear sticky so RR wins for this request chain
+                                jar.pop("proxy", None)
+                                log("INFO", f"[{jar_id}] 429 → RR proxy {nxt.split('@')[-1] if '@' in nxt else nxt}")
+                            continue  # same jar, new IP
                         # One alternate jar only
                         next_jar = acquire_jar(prefer_live=True)
                         if next_jar and next_jar["id"] not in tried_jar_ids:
