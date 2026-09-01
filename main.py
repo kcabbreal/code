@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import hmac
 import html
 import json
 import math
@@ -48,6 +49,11 @@ try:
     from camoufox.async_api import AsyncCamoufox
 except ImportError:
     AsyncCamoufox = None
+
+try:
+    from recaptcha_solver import get_solver
+except ImportError:
+    get_solver = None
 
 # ============================================================
 # CONFIGURATION & CONSTANTS
@@ -96,7 +102,46 @@ GATING_FALSE_KEYS = {"userSelectable", "selectable", "available", "enabled"}
 MAX_LOG_LINES = 3000
 MAX_CONVERSATIONS = 500
 
-dashboard_sessions: Dict[str, str] = {}
+dashboard_sessions: Dict[str, str] = {}  # legacy fallback only
+
+# ============================================================
+# STATELESS SIGNED SESSIONS (multi-worker safe, no Redis required)
+# ============================================================
+
+def _session_secret() -> str:
+    """Stable secret derived from dashboard password."""
+    try:
+        pw = get_config().get("password") or "admin"
+    except Exception:
+        pw = "admin"
+    return hashlib.sha256(f"{pw}|bridgena-session-v1".encode()).hexdigest()
+
+
+def create_session_token(user: str = "admin", ttl: int = 86400 * 30) -> str:
+    exp = int(time.time()) + ttl
+    payload = f"{user}:{exp}"
+    sig = hmac.new(_session_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    raw = f"{payload}:{sig}"
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def verify_session_token(token: str) -> Optional[str]:
+    if not token:
+        return None
+    try:
+        pad = "=" * (-len(token) % 4)
+        raw = base64.urlsafe_b64decode((token + pad).encode()).decode()
+        user, exp_s, sig = raw.rsplit(":", 2)
+        if time.time() > int(exp_s):
+            return None
+        payload = f"{user}:{exp_s}"
+        expect = hmac.new(_session_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(expect, sig):
+            return None
+        return user
+    except Exception:
+        return None
+
 
 DEFAULT_KNOWN_MODELS = [
     {"id": "claude-3-7-sonnet-20250219", "publicName": "claude-3-7-sonnet", "organization": "Anthropic", "capabilities": {"inputCapabilities": {"image": True, "text": True}, "outputCapabilities": {"text": True}}},
@@ -1276,6 +1321,149 @@ class KeeperSession:
         except Exception:
             pass
         return False
+
+    async def solve_recaptcha_image_challenge(self) -> bool:
+        """Fallback: solve a visible reCAPTCHA image challenge with ONNX models.
+
+        Primary path is reCAPTCHA v3 token (no challenge UI). This only runs when
+        an image grid challenge is already on screen. Requires models/type.onnx
+        and models/grid.onnx (or BRIDGENA_CAPTCHA_MODELS dir).
+        """
+        if get_solver is None:
+            return False
+        solver = get_solver()
+        if not solver.available():
+            log("WARN", f"[{self.name}] ONNX captcha models not available — skip image solve")
+            return False
+        page = self.page
+        if not page or page.is_closed():
+            return False
+
+        try:
+            self._set_step("Solving reCAPTCHA image challenge (ONNX fallback)...")
+            # Find the challenge iframe (bframe)
+            challenge_frame = None
+            for frame in page.frames:
+                u = (frame.url or "").lower()
+                if "recaptcha" in u and ("bframe" in u or "anchor" not in u):
+                    challenge_frame = frame
+                    break
+            if challenge_frame is None:
+                # Try clicking the anchor checkbox first to open challenge
+                for frame in page.frames:
+                    u = (frame.url or "").lower()
+                    if "recaptcha" in u and "anchor" in u:
+                        try:
+                            cb = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border")
+                            if await cb.count() > 0:
+                                await cb.first.click(timeout=3000)
+                                await asyncio.sleep(2)
+                        except Exception:
+                            pass
+                for frame in page.frames:
+                    u = (frame.url or "").lower()
+                    if "recaptcha" in u and "bframe" in u:
+                        challenge_frame = frame
+                        break
+            if challenge_frame is None:
+                return False
+
+            # Extract task text
+            task = ""
+            for sel in [".rc-imageselect-desc-text", ".rc-imageselect-desc", "strong"]:
+                try:
+                    loc = challenge_frame.locator(sel).first
+                    if await loc.count() > 0:
+                        task = (await loc.inner_text()).strip()
+                        if task:
+                            break
+                except Exception:
+                    continue
+            if not task:
+                return False
+
+            # Detect grid size and grab image(s)
+            tile_table = challenge_frame.locator("table.rc-imageselect-table-33, table.rc-imageselect-table-44, table.rc-imageselect-table")
+            grid = "3x3"
+            try:
+                if await challenge_frame.locator("table.rc-imageselect-table-44").count() > 0:
+                    grid = "4x4"
+                elif await challenge_frame.locator("table.rc-imageselect-table-33").count() > 0:
+                    grid = "3x3"
+            except Exception:
+                pass
+
+            # Prefer full challenge image if present
+            image_sources = []
+            try:
+                img = challenge_frame.locator(".rc-image-tile-wrapper img, img.rc-image-tile-33, img.rc-image-tile-44").first
+                if await img.count() > 0:
+                    src = await img.get_attribute("src")
+                    if src:
+                        image_sources = [src]
+            except Exception:
+                pass
+
+            if not image_sources:
+                # Per-tile images
+                tiles = challenge_frame.locator("img.rc-image-tile-33, img.rc-image-tile-44, td img")
+                n = await tiles.count()
+                for i in range(min(n, 16)):
+                    try:
+                        src = await tiles.nth(i).get_attribute("src")
+                        if src:
+                            image_sources.append(src)
+                    except Exception:
+                        pass
+
+            if not image_sources:
+                log("WARN", f"[{self.name}] Captcha challenge found but no images")
+                return False
+
+            result = solver.recognize(task, image_sources, grid)
+            if result.get("error"):
+                log("WARN", f"[{self.name}] Solver error: {result['error']}")
+                return False
+
+            clicks = result.get("data") or []
+            # Click matching tiles
+            cells = challenge_frame.locator("td, .rc-imageselect-tile")
+            cell_count = await cells.count()
+            clicked = 0
+            for i, should in enumerate(clicks):
+                if not should or i >= cell_count:
+                    continue
+                try:
+                    await cells.nth(i).click(timeout=2000)
+                    clicked += 1
+                    await asyncio.sleep(random.uniform(0.15, 0.35))
+                except Exception:
+                    continue
+
+            await asyncio.sleep(0.5)
+            # Verify / Next
+            for sel in ["#recaptcha-verify-button", ".rc-button-default", "button"]:
+                try:
+                    btn = challenge_frame.locator(sel).first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        txt = ""
+                        try:
+                            txt = (await btn.inner_text()).lower()
+                        except Exception:
+                            pass
+                        if sel.startswith("#") or "verify" in txt or "next" in txt or not txt:
+                            await btn.click(timeout=3000)
+                            break
+                except Exception:
+                    continue
+
+            await asyncio.sleep(2)
+            log("OK", f"[{self.name}] Image captcha solved (task={task[:40]!r}, clicks={clicked}, grid={grid})")
+            self._set_step(f"Captcha solved ({clicked} tiles)")
+            return clicked > 0
+        except Exception as e:
+            log("WARN", f"[{self.name}] solve_recaptcha_image_challenge: {type(e).__name__}: {e}")
+            return False
 
     async def _ensure_sidebar_cookie(self):
         """Set sidebar_state cookie so the arena.ai sidebar stays open."""
@@ -2550,29 +2738,71 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
         return j
 
     async def _get_recaptcha_token():
-        """Best-effort read of a grecaptcha token from any live page."""
-        _, s = _find_live_session()
+        """Primary: reCAPTCHA v3 / existing response from any live page.
+        Fallback: ask the keeper to solve an image challenge if one is open.
+        """
+        sid, s = _find_live_session()
         if not s:
             return None
         try:
-            token = await s.page.evaluate("""() => {
-                try {
-                    if (window.grecaptcha && window.grecaptcha.getResponse) {
-                        const t = window.grecaptcha.getResponse();
-                        if (t) return t;
-                    }
-                } catch (e) {}
+            # 1) Prefer an already-solved / v3 token
+            token = await s.page.evaluate("""async () => {
                 try {
                     const el = document.querySelector(
                         'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
                     );
-                    if (el && el.value) return el.value;
+                    if (el && el.value && el.value.length > 20) return el.value;
+                } catch (e) {}
+                try {
+                    if (window.grecaptcha) {
+                        if (typeof grecaptcha.getResponse === 'function') {
+                            const t = grecaptcha.getResponse();
+                            if (t && t.length > 20) return t;
+                        }
+                        // reCAPTCHA v3 execute
+                        let sitekey = null;
+                        const node = document.querySelector('[data-sitekey]');
+                        if (node) sitekey = node.getAttribute('data-sitekey');
+                        if (!sitekey && window.___grecaptcha_cfg && ___grecaptcha_cfg.clients) {
+                            try {
+                                const clients = Object.values(___grecaptcha_cfg.clients);
+                                for (const c of clients) {
+                                    const k = c?.sitekey || c?.settings?.sitekey;
+                                    if (k) { sitekey = k; break; }
+                                }
+                            } catch (e) {}
+                        }
+                        if (typeof grecaptcha.execute === 'function' && sitekey) {
+                            try {
+                                const t = await grecaptcha.execute(sitekey, {action: 'submit'});
+                                if (t && t.length > 20) return t;
+                            } catch (e) {}
+                        }
+                    }
                 } catch (e) {}
                 return null;
             }""")
-            return token or None
-        except Exception:
-            return None
+            if token:
+                return token
+        except Exception as e:
+            log("WARN", f"v3 token read failed: {e}")
+
+        # 2) Fallback: image challenge solver on the live page
+        try:
+            if hasattr(s, "solve_recaptcha_image_challenge"):
+                ok = await s.solve_recaptcha_image_challenge()
+                if ok:
+                    token = await s.page.evaluate("""() => {
+                        const el = document.querySelector(
+                            'textarea[name="g-recaptcha-response"], #g-recaptcha-response'
+                        );
+                        return (el && el.value) ? el.value : null;
+                    }""")
+                    if token:
+                        return token
+        except Exception as e:
+            log("WARN", f"Image captcha solve failed: {e}")
+        return None
 
     # Fresh cookies from live keeper if possible
     jar = await _refresh_cookies_from_live(jar, jar_id)
@@ -2962,8 +3192,15 @@ api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
 async def get_current_session(request: Request) -> Optional[str]:
+    # Stateless signed cookie — works across all uvicorn workers
     sid = request.cookies.get("session_id")
-    if sid and sid in dashboard_sessions:
+    if not sid:
+        return None
+    user = verify_session_token(sid)
+    if user:
+        return user
+    # Legacy in-memory fallback (single-worker only)
+    if sid in dashboard_sessions:
         return dashboard_sessions[sid]
     return None
 
@@ -2971,9 +3208,9 @@ async def get_current_session(request: Request) -> Optional[str]:
 async def verify_api_key(request: Request,
                          authorization: Optional[str] = Depends(api_key_header),
                          x_api_key: Optional[str] = Header(None)) -> dict:
-    # Allow authenticated web sessions to use the API without a key
+    # Allow authenticated web sessions to use the API without a key (multi-worker safe)
     sid = request.cookies.get("session_id")
-    if sid and sid in dashboard_sessions:
+    if sid and (verify_session_token(sid) or sid in dashboard_sessions):
         return {"name": "web-session", "rpm": 120, "key": "web-session"}
 
     cfg = get_config()
@@ -3441,8 +3678,8 @@ async def login_submit(response: Response, password: str = Form(...)):
     config = get_config()
     cfg_pw = config.get("password", "admin")
     if password == cfg_pw or not cfg_pw:
-        session_id = str(uuid.uuid4())
-        dashboard_sessions[session_id] = "admin"
+        session_id = create_session_token("admin")
+        dashboard_sessions[session_id] = "admin"  # optional local cache
         log("INFO", "Dashboard authentication successful")
         r = RedirectResponse(url="/chat", status_code=status.HTTP_303_SEE_OTHER)
         r.set_cookie(key="session_id", value=session_id, httponly=True, samesite="lax", path="/", max_age=86400 * 30)
@@ -3454,7 +3691,7 @@ async def login_submit(response: Response, password: str = Form(...)):
 @app.get("/logout")
 async def logout(request: Request):
     sid = request.cookies.get("session_id")
-    if sid in dashboard_sessions:
+    if sid and sid in dashboard_sessions:
         del dashboard_sessions[sid]
     r = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
     r.delete_cookie("session_id", path="/")
