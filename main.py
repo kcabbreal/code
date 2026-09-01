@@ -904,7 +904,7 @@ def playwright_proxy_from_url(proxy_url: str) -> Optional[dict]:
 PROBE_TIMEOUT = 5.0
 PROBE_OK_TTL = 900.0        # reuse a confirmed-healthy verdict for 15 min
 PROBE_DEAD_TTL = 300.0      # re-probe a failed proxy at most once per 5 min
-PROBE_BUDGET = 12           # live probes per sweep (cached verdicts are free)
+PROBE_BUDGET = 40           # live probes per sweep (cached verdicts are free)
 PROBE_MAX_PARALLEL = 8
 _proxy_probe_cache: Dict[str, Tuple[bool, float]] = {}
 _proxy_assign_cursor = 0   # shared round-robin position for ALL pinning paths
@@ -1061,7 +1061,8 @@ def proxy_candidates(jar: Optional[dict], *, prefer_sticky: bool = True) -> List
     return out
 
 
-def pick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = False) -> Optional[str]:
+def pick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = False,
+                    exclude=None) -> Optional[str]:
     """Return the first proxy that actually tunnels to Arena and PIN it to the
     jar (so curl + keeper keep one exit IP). None = nothing tunnels -> go direct.
     Dead nodes cost one probe per PROBE_DEAD_TTL, not per request.
@@ -1072,6 +1073,8 @@ def pick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = Fa
     if mode == "request" and get_proxy_pool():
         _proxy_assign_cursor += 1
     cands = proxy_candidates(jar, prefer_sticky=(mode != "request" and not rotate))
+    if exclude:
+        cands = [c for c in cands if c not in exclude]
     if not cands:
         return None
     chosen = None
@@ -1117,8 +1120,9 @@ def pick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = Fa
     return None
 
 
-async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = False) -> Optional[str]:
-    return await asyncio.to_thread(pick_live_proxy, jar, purpose=purpose, rotate=rotate)
+async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = False,
+                           exclude=None) -> Optional[str]:
+    return await asyncio.to_thread(pick_live_proxy, jar, purpose=purpose, rotate=rotate, exclude=exclude)
 
 
 async def anchor_proxy_to_keeper(jar_id, proxy):
@@ -1568,48 +1572,6 @@ class ConversationLost(Exception):
 # KEEPER SESSION — UNIVERSAL STEALTH BROWSER ENGINE
 # ============================================================
 
-_vnc_started = False
-
-def start_vnc_server_linux():
-    global _vnc_started
-    if _vnc_started or not sys.platform.startswith("linux"):
-        return
-    _vnc_started = True
-    os.environ["DISPLAY"] = ":99"
-    
-    # 1. Xvfb
-    try:
-        subprocess.run(["pgrep", "Xvfb"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError:
-        try:
-            subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-ac"])
-            time.sleep(1)
-        except FileNotFoundError:
-            log("WARN", "Xvfb not found. Install with: apt-get install -y xvfb x11vnc novnc websockify")
-            return
-
-    # 2. x11vnc
-    try:
-        subprocess.run(["pgrep", "x11vnc"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError:
-        try:
-            subprocess.Popen([
-                "x11vnc", "-display", ":99", "-forever", "-shared", "-nopw",
-                "-listen", "127.0.0.1", "-rfbport", "5900", "-geometry", "1920x1080"
-            ])
-            time.sleep(0.5)
-        except FileNotFoundError:
-            log("WARN", "x11vnc not found. Install with: apt-get install -y xvfb x11vnc novnc websockify")
-
-    # 3. websockify
-    try:
-        subprocess.run(["pgrep", "websockify"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError:
-        try:
-            subprocess.Popen(["websockify", "--web", "/usr/share/novnc", "6080", "127.0.0.1:5900"])
-        except FileNotFoundError:
-            log("WARN", "websockify not found. Install with: apt-get install -y xvfb x11vnc novnc websockify")
-
 class KeeperSession:
     """Persistent browser session for one Arena account.
     Cross-platform stealth engine compatible with Windows, macOS, Linux, and Pterodactyl/Docker containers.
@@ -1617,6 +1579,8 @@ class KeeperSession:
 
     def __init__(self, jar: dict, headless: Optional[bool] = None, keep_forever: bool = False):
         self.jar_id = jar["id"]
+        self._tried_proxies = set()   # persist across auto-retries: keeper grinds the pool
+        self._direct_tried = False
         self.name = jar.get("name", self.jar_id)
         self.login_method = jar.get("login_method") or "email"
         self.email = jar.get("email") or ""
@@ -2614,7 +2578,6 @@ class KeeperSession:
         if self.running:
             return True
             
-        start_vnc_server_linux()
         self.status = "starting"
         self.error = None
         self._set_step("Initializing stealth browser engine...")
@@ -2645,7 +2608,8 @@ class KeeperSession:
                 _jar_for_proxy = next((j for j in load_jars() if j.get("id") == self.jar_id), {"id": self.jar_id})
                 # Sweep: sticky first if it still tunnels, else the whole pool (pinned on winner)
                 self._set_step("Probing proxy pool for a live tunnel...")
-                _proxy_url = await apick_live_proxy(_jar_for_proxy, purpose="keeper")
+                _proxy_url = await apick_live_proxy(_jar_for_proxy, purpose="keeper",
+                                                     exclude=self._tried_proxies)
                 if not _proxy_url and get_proxy_pool():
                     self._set_step("No proxy tunnels — browser starting on DIRECT egress (IP exposed)")
                 _pw_proxy = playwright_proxy_from_url(_proxy_url) if _proxy_url else None
@@ -2777,7 +2741,7 @@ class KeeperSession:
 
             self._set_step("Navigating to arena.ai...")
             await self._ensure_sidebar_cookie()
-            await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+            await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded", timeout=25000)
             await self._wait_cloudflare(self.page)
             await self._handle_turnstile(self.page)
             await self._ensure_sidebar_cookie()
@@ -2787,6 +2751,8 @@ class KeeperSession:
             await self._dismiss_promos(self.page)
 
             self.running = True
+            self._tried_proxies = set()
+            self._direct_tried = False
             self.last_health_ok = 0
             self.status = "running"
             self._set_step("Keeper session active")
@@ -2801,13 +2767,30 @@ class KeeperSession:
 
         except Exception as e:
             txt = f"{type(e).__name__}: {e}"
-            _tunnelish = ("TUNNEL" in txt.upper() or "PROXY" in txt.upper()) and getattr(self, "_used_proxy", "")
-            if _tunnelish and getattr(self, "_start_retries", 0) < 2:
-                mark_proxy_dead(self._used_proxy)
-                self._start_retries = getattr(self, "_start_retries", 0) + 1
-                log("WARN", f"[{self.name}] tunnel failed via {self._used_proxy.split('@')[-1]} "
-                            f"— sweeping next live proxy (retry {self._start_retries}/2)")
-                self._set_step("Proxy tunnel dead — retrying start with next live proxy...")
+            _up = txt.upper()
+            _retryable = any(k in _up for k in ("TUNNEL", "PROXY", "TIMEOUT", "ERR_", "NET::", "CONNECTION"))
+            used = getattr(self, "_used_proxy", "") or ""
+            if used:
+                self._tried_proxies.add(used)
+                mark_proxy_dead(used)
+            pool = get_proxy_pool() or []
+            left = [c for c in pool if c not in self._tried_proxies]
+            if _retryable and left:
+                log("WARN", f"[{self.name}] start failed via {used.split('@')[-1]} ({txt[:110]}) — "
+                            f"auto-retrying on next live proxy ({len(left)} left)")
+                self._set_step(f"Proxy {used.split('@')[-1]} failed — trying next of {len(left)}…")
+                self.status = "starting"
+                try:
+                    await self.stop()
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+                return await self.start()
+            if _retryable and pool and not getattr(self, "_direct_tried", False):
+                self._direct_tried = True
+                log("WARN", f"[{self.name}] all {len(self._tried_proxies)} proxies failed to tunnel — "
+                            f"one final attempt on DIRECT egress")
+                self._set_step("Every proxy failed — one direct attempt (IP exposed)…")
                 self.status = "starting"
                 try:
                     await self.stop()
@@ -2816,7 +2799,6 @@ class KeeperSession:
                 await asyncio.sleep(1.0)
                 return await self.start()
             self.status = "error"
-            self._start_retries = 0
             self.error = txt
             self._set_step(f"ERROR: Failed to start: {self.error}")
             log("ERROR", f"[{self.name}] Failed to start: {self.error}")
@@ -3528,7 +3510,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
 
                     if resp.status_code in (401, 403):
                         if "cloudflare" in body.lower() or "just a moment" in body.lower():
-                            # cf_clearance is bound to IP+UA: a healthy VNC browser
+                            # cf_clearance is bound to IP+UA: a healthy Live Browser
                             # does NOT mean curl is cleared. One self-repair per
                             # request: cycle the keeper (it re-solves the challenge
                             # on the current exit) then re-harvest and retry.
@@ -3545,7 +3527,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                                 jar = await _refresh_cookies_from_live(jar, jar_id)
                                 continue
                             yield ("error", "502: Cloudflare block persists after keeper re-clear — this exit IP "
-                                            "is flagged; rotate to another proxy or solve in Live Browser (VNC)")
+                                            "is flagged; rotate to another proxy or solve in Live Browser")
                             return
                         # Harvest + retry same jar once, then rotate
                         jar = await _refresh_cookies_from_live(jar, jar_id)
@@ -3915,58 +3897,6 @@ async def get_screenshot(filename: str):
         return Response(status_code=404)
     return FileResponse(filename)
 
-# [Antigravity IDE Verified: Fix 3 (noVNC routing) Applied]
-@app.get("/vnc")
-async def vnc_viewer():
-    html = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Live Browser (noVNC)</title>
-    <style>
-        * { margin:0; padding:0; box-sizing:border-box; }
-        body { background: #0e0e10; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
-        header { background: #18181b; color: #efefed; padding: 10px 18px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #27272a; flex-shrink: 0; }
-        header .title { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
-        header .back { color: #a1a1aa; text-decoration: none; font-size: 13px; padding: 4px 10px; border-radius: 6px; background: #27272a; transition: background 0.2s; }
-        header .back:hover { background: #3f3f46; color: #fff; }
-        .iframe-container { flex: 1; position: relative; width: 100%; height: 100%; background: #000; }
-        iframe { width: 100%; height: 100%; border: none; }
-        .fallback-msg { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #71717a; text-align: center; font-size: 14px; display: none; }
-    </style>
-</head>
-<body>
-    <header>
-        <div class="title">
-            <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;"></span>
-            Live Browser &bull; Resolution: 1920x1080 (noVNC)
-        </div>
-        <a href="/dashboard" class="back">&larr; Back to Dashboard</a>
-    </header>
-    <div class="iframe-container">
-        <iframe id="vncFrame" src=""></iframe>
-        <div class="fallback-msg" id="fallbackMsg">
-            Connecting to noVNC on port 6080...<br>
-            If screen does not load, ensure <code>apt-get install -y xvfb x11vnc novnc websockify</code> is installed on Linux.
-        </div>
-    </div>
-    <script>
-        const host = window.location.hostname || 'localhost';
-        const vncUrl = `http://${host}:6080/vnc.html?autoconnect=1&resize=scale&reconnect=1&host=${host}&port=6080`;
-        const iframe = document.getElementById('vncFrame');
-        iframe.src = vncUrl;
-        setTimeout(() => {
-            const fallback = document.getElementById('fallbackMsg');
-            if (fallback) fallback.style.display = 'block';
-        }, 3000);
-        iframe.onload = () => {
-            const fallback = document.getElementById('fallbackMsg');
-            if (fallback) fallback.style.display = 'none';
-        };
-    </script>
-</body>
-</html>"""
-    return HTMLResponse(html)
 # ============================================================
 # ROOT ROUTE
 # ============================================================
@@ -4160,17 +4090,18 @@ LOGIN_TEMPLATE = r"""<!DOCTYPE html>
     <title>Bridgena - Sign In</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
                 :root {
-            --bg-base: #f4efe6;
-            --bg-card: rgba(255,255,255,.9);
-            --border: #e0d7c4;
+            --bg-base: #211f1c;
+            --bg-card: rgba(41,38,34,.86);
+            --border: #3c3831;
             --border-focus: #d97757;
-            --text-main: #26221a;
-            --text-muted: #6d6455;
-            --accent: #c15f3c;
-            --accent-text: #fbf6ee;
+            --text-main: #ece7de;
+            --text-muted: #a89f91;
+            --accent: #d97757;
+            --accent-text: #f7f2ea;
             --font-display: 'Fraunces','Iowan Old Style','Palatino Linotype','Book Antiqua',Georgia,serif;
             --font-ui: 'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
             --hero: url('https://motionarray.imgix.net/2069896-ilxnk7j2UB-high_0014.jpg?w=1600&q=65&fit=max&auto=format');
@@ -4299,31 +4230,32 @@ LOGIN_TEMPLATE = r"""<!DOCTYPE html>
             color: var(--text-muted);
         }
     
-        /* BRIDGENA-CLAUDE-THEME v1 */
-        /* ===== Claude-ish layer ===== */
+        /* BRIDGENA-CLAUDE-THEME v2 (dark) */
+        /* ===== Claude-dark layer ===== */
         body { font-family: var(--font-ui); }
         body::before { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
             background-image:var(--hero); background-size:cover; background-position:center;
-            opacity:.17; filter:saturate(.8) contrast(1.03); }
+            opacity:.26; filter:saturate(.7) brightness(.9); }
         body::after { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
-            background: radial-gradient(1100px 620px at 15% -12%, rgba(193,95,60,.14), transparent 60%),
-                        radial-gradient(900px 520px at 90% 112%, rgba(110,139,116,.13), transparent 62%),
-                        linear-gradient(180deg, rgba(244,239,230,0) 0%, #f4efe6 84%); }
-        .login-card { position:relative; z-index:1; backdrop-filter:blur(12px) saturate(1.04);
-            border-radius:20px; box-shadow:0 24px 60px -28px rgba(38,34,26,.35); padding:40px 34px 30px; }
-        .logo-circle { border-radius:16px !important; background:linear-gradient(145deg,#e6a48c,#b85c3e) !important;
-            color:#fff !important; font-family:var(--font-display); box-shadow:0 6px 18px -6px rgba(184,92,62,.55); }
+            background: radial-gradient(1100px 620px at 15% -12%, rgba(217,119,87,.16), transparent 60%),
+                        radial-gradient(900px 520px at 90% 112%, rgba(127,153,119,.10), transparent 62%),
+                        linear-gradient(180deg, rgba(33,31,28,.35) 0%, #211f1c 84%); }
+        .login-card { position:relative; z-index:1; backdrop-filter:blur(14px) saturate(1.08);
+            border-radius:20px; box-shadow:0 24px 60px -28px rgba(0,0,0,.65); padding:40px 34px 30px; }
+        .logo-circle { border-radius:16px !important; background:linear-gradient(145deg,#e08b62,#c15f3c) !important;
+            color:#fdf8f1 !important; font-family:var(--font-display); box-shadow:0 6px 18px -6px rgba(193,95,60,.5); }
         .brand-title { font-family:var(--font-display); font-weight:500; letter-spacing:-.4px; color:var(--text-main); }
         .brand-sub { color:var(--text-muted); }
-        .input-box { background:#fff; border:1px solid var(--border); border-radius:12px;
+        .input-box { background:rgba(26,24,21,.72); border:1px solid var(--border); border-radius:12px;
             color:var(--text-main); transition:border-color .16s, box-shadow .16s; }
-        .input-box:focus { border-color:#d97757; box-shadow:0 0 0 4px rgba(193,95,60,.12); }
-        .btn-submit { background:linear-gradient(180deg,#d97757,#b85c3e) !important; color:#fff !important;
-            border-radius:12px !important; font-weight:600; box-shadow:0 6px 16px -8px rgba(184,92,62,.6);
+        .input-box::placeholder { color:var(--text-faint); }
+        .input-box:focus { border-color:#d97757; box-shadow:0 0 0 4px rgba(217,119,87,.14); }
+        .btn-submit { background:linear-gradient(180deg,#dd8258,#b85c3e) !important; color:#fdf6ee !important;
+            border-radius:12px !important; font-weight:600; box-shadow:0 6px 16px -8px rgba(184,92,62,.55);
             transition:filter .14s, transform .12s; }
-        .btn-submit:hover { filter:brightness(1.05); }
+        .btn-submit:hover { filter:brightness(1.07); }
         .btn-submit:active { transform:translateY(1px); }
-        .error-banner { color:#a8492f; background:rgba(168,73,47,.08); border:1px solid rgba(168,73,47,.22);
+        .error-banner { color:#eda287; background:rgba(224,139,111,.09); border:1px solid rgba(224,139,111,.26);
             border-radius:10px; }
         .footer-note { color:var(--text-faint); }
 
@@ -4413,23 +4345,24 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
     <title>Bridgena</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
                 :root {
-            --bg-base: #faf8f4;
-            --bg-sidebar: #f2ede2;
-            --bg-card: #ffffff;
-            --bg-hover: #f0ead d;
-            --bg-active: #e8e0cf;
-            --border: #e4dcc9;
-            --border-faint: #efe9db;
-            --text-main: #26221a;
-            --text-muted: #6d6455;
-            --text-faint: #9a9080;
-            --accent: #c15f3c;
+            --bg-base: #262420;
+            --bg-sidebar: #1f1d19;
+            --bg-card: #2c2a25;
+            --bg-hover: #35322c;
+            --bg-active: #3e3a33;
+            --border: #3a372f;
+            --border-faint: #33302a;
+            --text-main: #eae5db;
+            --text-muted: #a89f91;
+            --text-faint: #7d766a;
+            --accent: #d97757;
             --sidebar-width: 260px;
             --font-display: 'Fraunces','Iowan Old Style','Palatino Linotype','Book Antiqua',Georgia,serif;
             --font-ui: 'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -5041,57 +4974,74 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
             .sidebar.collapsed { margin-left: -260px; }
         }
     
-        /* BRIDGENA-CLAUDE-THEME v1 */
-        /* ===== Claude-ish layer ===== */
+        /* BRIDGENA-CLAUDE-THEME v2 (dark) */
+        /* ===== Claude-dark layer ===== */
         body { font-family: var(--font-ui); }
         body::before { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
             background-image:var(--hero); background-size:cover; background-position:center 28%;
-            opacity:.05; filter:saturate(.65); }
+            opacity:.05; filter:saturate(.55) brightness(.85); }
         .sidebar, .main-chat-container, .top-navbar { position:relative; z-index:1; }
-        .sidebar { background:linear-gradient(180deg, #f2ede2, #ece5d5); border-right:1px solid var(--border); }
-        .brand-icon-circle { border-radius:9px !important; background:linear-gradient(145deg,#e6a48c,#b85c3e) !important;
-            color:#fff !important; font-family:var(--font-display); box-shadow:0 4px 12px -5px rgba(184,92,62,.5); }
+        .sidebar { background:linear-gradient(180deg, #1f1d19, #1a1815); border-right:1px solid var(--border); }
+        .brand-icon-circle { border-radius:9px !important; background:linear-gradient(145deg,#e08b62,#c15f3c) !important;
+            color:#fdf8f1 !important; font-family:var(--font-display); box-shadow:0 4px 12px -5px rgba(193,95,60,.45); }
         .sidebar-brand b, .chat-title-text, .hero-title, .suggest-title { font-family:var(--font-display); font-weight:500; letter-spacing:-.3px; }
         .hero-title { font-weight:400; font-size:clamp(26px,3.2vw,36px); letter-spacing:-.7px; }
         .hero-title::after { content:""; display:block; width:44px; height:2px; margin:14px auto 0;
-            background:linear-gradient(90deg,transparent,#c15f3c,transparent); }
-        .new-chat-btn { background:linear-gradient(180deg,#d97757,#b85c3e) !important; color:#fff !important;
+            background:linear-gradient(90deg,transparent,#d97757,transparent); }
+        .new-chat-btn { background:linear-gradient(180deg,#dd8258,#b85c3e) !important; color:#fdf6ee !important;
             border:0 !important; border-radius:12px !important; font-weight:600;
-            box-shadow:0 5px 14px -7px rgba(184,92,62,.6); transition:filter .14s; }
-        .new-chat-btn:hover { filter:brightness(1.06); }
-        .sidebar-search-input, .modal-search-input { background:#fff; border:1px solid var(--border); border-radius:10px; color:var(--text-main); }
+            box-shadow:0 5px 14px -7px rgba(184,92,62,.5); transition:filter .14s; }
+        .new-chat-btn:hover { filter:brightness(1.07); }
+        .sidebar-search-input, .modal-search-input { background:#262420; border:1px solid var(--border); border-radius:10px; color:var(--text-main); }
         .chat-history-item { border-radius:10px; }
         .chat-history-item:hover { background:var(--bg-hover); }
-        .chat-history-item.active { background:#fff; box-shadow:0 1px 2px rgba(38,34,26,.08); border:1px solid var(--border); }
-        .top-navbar { background:rgba(250,248,244,.78); backdrop-filter:blur(10px); border-bottom:1px solid var(--border); }
-        .main-chat-container { background:linear-gradient(180deg, rgba(255,255,255,.5), rgba(255,255,255,0) 240px); }
-        .hero-input-box { background:#fff; }
-        .hero-input-box { border:1px solid var(--border) !important; border-radius:20px;
-            box-shadow:0 12px 32px -18px rgba(38,34,26,.28); transition:border-color .16s, box-shadow .16s; }
-        .hero-input-box:focus-within { border-color:#d97757; box-shadow:0 0 0 4px rgba(193,95,60,.1), 0 12px 32px -18px rgba(38,34,26,.28); }
-        .suggest-card { background:#fff; border:1px solid var(--border); border-radius:14px; }
-        .user-bubble { background:#efe9db; color:var(--text-main); border:1px solid var(--border-faint);
+        .chat-history-item.active { background:#2c2a25; box-shadow:0 1px 3px rgba(0,0,0,.35); border:1px solid var(--border); }
+        .top-navbar { background:rgba(38,36,32,.82); backdrop-filter:blur(10px); border-bottom:1px solid var(--border); }
+        .main-chat-container { background:linear-gradient(180deg, rgba(255,255,255,.025), rgba(255,255,255,0) 240px); }
+        .hero-input-box { background:#2c2a25; border:1px solid var(--border) !important; border-radius:20px;
+            box-shadow:0 12px 32px -18px rgba(0,0,0,.6); transition:border-color .16s, box-shadow .16s; }
+        .hero-input-box:focus-within { border-color:#d97757; box-shadow:0 0 0 4px rgba(217,119,87,.12), 0 12px 32px -18px rgba(0,0,0,.6); }
+        .suggest-card { background:#2c2a25; border:1px solid var(--border); border-radius:14px; }
+        .suggest-card:hover { border-color:#4d4940; background:#302d27; }
+        .user-bubble { background:#35322c; color:var(--text-main); border:1px solid #3e3a33;
             border-radius:18px 18px 4px 18px; }
-        .assistant-avatar { border-radius:8px !important; background:linear-gradient(145deg,#e6a48c,#b85c3e) !important;
-            color:#fff !important; font-family:var(--font-display); }
+        .assistant-avatar { border-radius:8px !important; background:linear-gradient(145deg,#e08b62,#c15f3c) !important;
+            color:#fdf8f1 !important; font-family:var(--font-display); }
         .assistant-body { font-size:15px; line-height:1.72; }
         .assistant-body h1, .assistant-body h2, .assistant-body h3 { font-family:var(--font-display); font-weight:500; }
-        .assistant-body code { background:#f1ebdd; border:1px solid var(--border); border-radius:5px; }
-        .assistant-body pre { background:#241f18 !important; border-radius:12px; }
-        .thought-body { background:#f4efe3; border-left:2px solid #d97757; border-radius:0 12px 12px 0; }
-        .send-pill-btn { background:linear-gradient(180deg,#d97757,#b85c3e) !important; color:#fff !important;
-            border-radius:10px; box-shadow:0 4px 12px -6px rgba(184,92,62,.6); }
-        .stop-pill { background:#fff !important; color:var(--text-main) !important; border:1px solid var(--border); border-radius:10px; }
-        .model-header-wrap, .icon-btn, .chat-action-btn { background:#fff; border:1px solid var(--border); border-radius:999px;
+        .assistant-body code { background:#33302a; border:1px solid var(--border); border-radius:5px; }
+        .assistant-body pre { background:#171512 !important; border-radius:12px; }
+        .thought-body { background:#2a2823; border-left:2px solid #d97757; border-radius:0 12px 12px 0; }
+        .send-pill-btn { background:linear-gradient(180deg,#dd8258,#b85c3e) !important; color:#fdf6ee !important;
+            border-radius:10px; box-shadow:0 4px 12px -6px rgba(184,92,62,.5); }
+        .stop-pill { background:#2c2a25 !important; color:var(--text-main) !important; border:1px solid var(--border); border-radius:10px; }
+        .model-header-wrap, .icon-btn, .chat-action-btn { background:#2c2a25; border:1px solid var(--border); border-radius:999px;
             color:var(--text-main); transition:background .14s, border-color .14s; }
         .model-header-wrap:hover, .icon-btn:hover, .chat-action-btn:hover { border-color:#d97757; }
-        .modal-card { background:#fbf9f4; border:1px solid var(--border); border-radius:18px;
-            box-shadow:0 24px 60px -24px rgba(38,34,26,.4); }
+        .modal-card { background:#2b2823; border:1px solid var(--border); border-radius:18px;
+            box-shadow:0 24px 60px -24px rgba(0,0,0,.7); }
         .model-row-item { border-radius:10px; }
-        .model-row-item.active { background:rgba(193,95,60,.08); box-shadow:inset 0 0 0 1px rgba(193,95,60,.35); }
-        .user-menu-popover { background:#fff; border:1px solid var(--border); border-radius:12px;
-            box-shadow:0 12px 32px -12px rgba(38,34,26,.3); }
-        ::selection { background:rgba(193,95,60,.2); }
+        .model-row-item.active { background:rgba(217,119,87,.12); box-shadow:inset 0 0 0 1px rgba(217,119,87,.4); }
+        .user-menu-popover { background:#2c2a25; border:1px solid var(--border); border-radius:12px;
+            box-shadow:0 12px 32px -12px rgba(0,0,0,.6); }
+        ::selection { background:rgba(217,119,87,.28); }
+
+        #btToastWrap { position:fixed; right:22px; bottom:22px; z-index:999; display:flex;
+            flex-direction:column; gap:10px; align-items:flex-end; pointer-events:none; }
+        .bt-toast { pointer-events:auto; display:flex; align-items:flex-start; gap:10px; max-width:380px;
+            padding:12px 15px; background:#2e2b26; border:1px solid #3a372f; border-left:3px solid #8b8577;
+            border-radius:12px; box-shadow:0 16px 40px -18px rgba(0,0,0,.75); color:#ece7de;
+            font-size:13px; line-height:1.45; opacity:0; transform:translateX(16px);
+            transition:opacity .22s ease, transform .22s ease; cursor:pointer; font-family:var(--font-ui); }
+        .bt-toast.show { opacity:1; transform:none; }
+        .bt-toast.err  { border-left-color:#d97757; }
+        .bt-toast.err .bt-ico { color:#e08b6f; }
+        .bt-toast.ok   { border-left-color:#7fb986; }
+        .bt-toast.ok .bt-ico { color:#8fce96; }
+        .bt-toast.warn { border-left-color:#d9b45e; }
+        .bt-toast.warn .bt-ico { color:#d9b45e; }
+        .bt-toast .bt-ico { font-size:13px; line-height:1.3; }
+        .bt-toast .bt-msg { word-break:break-word; }
 
         </style>
 </head>
@@ -5548,6 +5498,26 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
         sendMessage(txt);
     }
 
+    function btToast(msg, kind) {
+        let w = document.getElementById('btToastWrap');
+        if (!w) { w = document.createElement('div'); w.id = 'btToastWrap'; document.body.appendChild(w); }
+        const el = document.createElement('div');
+        el.className = 'bt-toast ' + (kind || 'info');
+        el.innerHTML = '<span class="bt-ico"></span><span class="bt-msg"></span>';
+        el.querySelector('.bt-ico').textContent = kind === 'err' ? '⚠' : (kind === 'ok' ? '✓' : 'ℹ');
+        el.querySelector('.bt-msg').textContent = msg;
+        el.onclick = () => el.remove();
+        w.appendChild(el);
+        while (w.children.length > 4) w.removeChild(w.firstChild);
+        requestAnimationFrame(() => el.classList.add('show'));
+        setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 320); },
+                   kind === 'err' ? 8000 : 3800);
+    }
+    window.addEventListener('unhandledrejection', e => {
+        const m = (e && e.reason && (e.reason.message || e.reason)) || 'unknown';
+        btToast('UI error: ' + String(m).slice(0, 180), 'err');
+    });
+
     async function sendMessage(text) {
         let conv = getActiveConv();
         if (!conv) {
@@ -5593,6 +5563,7 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
             if (!r.ok) {
                 const errText = await r.text();
                 assistantMsg.content = '⚠️ Error (' + r.status + '): ' + errText;
+                btToast('HTTP ' + r.status + ': ' + errText.slice(0, 200), 'err');
                 saveConversations();
                 renderMessages();
                 return;
@@ -5617,6 +5588,7 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
                         const parsed = JSON.parse(dataStr);
                         if (parsed.error) {
                             assistantMsg.content += '\n\n<span style="color:#ef4444">**Error**: ' + (parsed.error.message || JSON.stringify(parsed.error)) + '</span>';
+                            btToast(String(parsed.error.message || 'Upstream returned an error').slice(0, 220), 'err');
                             renderMessages();
                             continue;
                         }
@@ -5634,6 +5606,7 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
         } catch (e) {
             if (e.name !== 'AbortError') {
                 assistantMsg.content += '\n\n*(Generation interrupted: ' + e.message + ')*';
+                btToast('Generation interrupted: ' + e.message, 'err');
             }
         } finally {
             if (stopBtn) stopBtn.classList.remove('visible');
@@ -5718,23 +5691,24 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     <title>Bridgena - Control Center</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
                 :root {
-            --bg-base: #f6f2e9;
-            --bg-card: rgba(255,255,255,.86);
-            --bg-hover: #f0eadd;
-            --border: #e2d9c6;
-            --border-hover: #cfc3a8;
-            --text-main: #26221a;
-            --text-muted: #6d6455;
-            --text-faint: #9a9080;
-            --accent: #c15f3c;
-            --accent-text: #fbf6ee;
-            --green: #5c8a5e;
-            --yellow: #b5842e;
-            --red: #a8492f;
-            --blue: #6e8b74;
+            --bg-base: #221f1b;
+            --bg-card: rgba(43,40,35,.88);
+            --bg-hover: #34312a;
+            --border: #3a372f;
+            --border-hover: #4d4940;
+            --text-main: #ece7de;
+            --text-muted: #a29a8c;
+            --text-faint: #7b7468;
+            --accent: #d97757;
+            --accent-text: #1e1c18;
+            --green: #8fce96;
+            --yellow: #d9b45e;
+            --red: #e08b6f;
+            --blue: #9db8a4;
             --font-display: 'Fraunces','Iowan Old Style','Palatino Linotype','Book Antiqua',Georgia,serif;
             --font-ui: 'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
             --hero: url('https://motionarray.imgix.net/2069896-ilxnk7j2UB-high_0014.jpg?w=1600&q=65&fit=max&auto=format');
@@ -6031,63 +6005,81 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
             color: #f87171;
         }
     
-        /* BRIDGENA-CLAUDE-THEME v1 */
-        /* ===== Claude-ish layer ===== */
+        /* BRIDGENA-CLAUDE-THEME v2 (dark) */
+        /* ===== Claude-dark layer ===== */
         body { font-family: var(--font-ui); }
         body::before { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
             background-image:var(--hero); background-size:cover; background-position:center;
-            opacity:.06; filter:saturate(.65); }
+            opacity:.06; filter:saturate(.55) brightness(.85); }
         body > * { position:relative; }
-        .dash-header, .stats-grid, .tabs-container, .card { }
         .header-title-wrap h1, .header-title-wrap .brand-sub { font-family:var(--font-display); letter-spacing:-.4px; }
-        .header-logo-circle { border-radius:14px !important; background:linear-gradient(145deg,#e6a48c,#b85c3e) !important;
-            color:#fff !important; box-shadow:0 6px 16px -7px rgba(184,92,62,.55); }
-        .header-btn { background:#fff; border:1px solid var(--border); border-radius:10px; color:var(--text-main); }
+        .header-logo-circle { border-radius:14px !important; background:linear-gradient(145deg,#e08b62,#c15f3c) !important;
+            color:#fdf8f1 !important; box-shadow:0 6px 16px -7px rgba(193,95,60,.5); }
+        .header-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+        .header-btn { display:inline-flex; align-items:center; gap:7px; background:#2b2823; border:1px solid var(--border);
+            border-radius:10px; color:var(--text-main); }
         .header-btn:hover { border-color:#d97757; }
-        .header-btn.primary { background:linear-gradient(180deg,#d97757,#b85c3e) !important; color:#fff !important;
-            border:0; font-weight:600; box-shadow:0 5px 14px -8px rgba(184,92,62,.6); }
-        .tabs-container { background:#efe9db; border:1px solid var(--border); border-radius:12px; padding:4px; }
+        .header-btn.primary { background:linear-gradient(180deg,#dd8258,#b85c3e) !important; color:#fdf6ee !important;
+            border:0; font-weight:600; box-shadow:0 5px 14px -8px rgba(184,92,62,.5); }
+        .tabs-container { background:#1c1a16; border:1px solid var(--border); border-radius:12px; padding:4px; }
         .tab-btn { border-radius:8px; color:var(--text-muted); }
-        .tab-btn.active { background:#fff; color:var(--text-main); box-shadow:0 1px 2px rgba(38,34,26,.1); }
-        .stat-card { background:rgba(255,255,255,.85); border:1px solid var(--border); border-radius:16px;
-            box-shadow:0 1px 2px rgba(38,34,26,.05); transition:transform .15s, box-shadow .15s; }
-        .stat-card:hover { transform:translateY(-1px); box-shadow:0 10px 26px -14px rgba(38,34,26,.22); }
+        .tab-btn.active { background:#2b2823; color:var(--text-main); box-shadow:0 1px 3px rgba(0,0,0,.35); }
+        .stat-card { background:rgba(43,40,35,.85); border:1px solid var(--border); border-radius:16px;
+            box-shadow:0 1px 2px rgba(0,0,0,.25); transition:transform .15s, box-shadow .15s; }
+        .stat-card:hover { transform:translateY(-1px); box-shadow:0 10px 26px -14px rgba(0,0,0,.55); }
         .stat-card .val { font-family:var(--font-display); font-weight:500; letter-spacing:-.5px; color:var(--text-main); }
         .stat-card .desc, .stat-card-header { color:var(--text-muted); }
-        .card { background:rgba(255,255,255,.88); border:1px solid var(--border); border-radius:16px;
-            box-shadow:0 1px 2px rgba(38,34,26,.05); }
+        .card { background:rgba(43,40,35,.88); border:1px solid var(--border); border-radius:16px;
+            box-shadow:0 1px 2px rgba(0,0,0,.25); }
         .card-header-bar { border-bottom:1px solid var(--border); }
         .card-header-bar h3, .card-header-bar h2 { font-family:var(--font-display); font-weight:500; letter-spacing:-.25px; }
-        .btn { background:linear-gradient(180deg,#d97757,#b85c3e) !important; color:#fff !important;
-            border-radius:10px; font-weight:600; box-shadow:0 4px 12px -7px rgba(184,92,62,.6);
+        .btn { background:linear-gradient(180deg,#dd8258,#b85c3e) !important; color:#fdf6ee !important;
+            border-radius:10px; font-weight:600; box-shadow:0 4px 12px -7px rgba(184,92,62,.5);
             transition:filter .14s, transform .12s; }
-        .btn:hover { filter:brightness(1.05); }
+        .btn:hover { filter:brightness(1.07); }
         .btn:active { transform:translateY(1px); }
-        .btn-sec { background:#fff; color:var(--text-main); border:1px solid var(--border); box-shadow:none; }
-        .btn-sec:hover { border-color:#d97757; background:#fff; }
-        .btn-red { color:#a8492f; }
-        .btn-red:hover { background:rgba(168,73,47,.07); color:#a8492f; }
-        .badge.ok { color:#33602f; background:rgba(92,138,94,.13); box-shadow:inset 0 0 0 1px rgba(92,138,94,.26); }
-        .badge.limited { color:#7a5510; background:rgba(181,132,46,.13); box-shadow:inset 0 0 0 1px rgba(181,132,46,.28); }
-        .badge.expired { color:#8c3a24; background:rgba(168,73,47,.09); box-shadow:inset 0 0 0 1px rgba(168,73,47,.22); }
-        .step-pill { background:#f4efe3; border:1px solid var(--border); border-radius:8px; color:var(--text-muted); }
+        .btn-sec { background:#2b2823; color:var(--text-main); border:1px solid var(--border); box-shadow:none; }
+        .btn-sec:hover { border-color:#d97757; background:#302d27; }
+        .btn-red { color:#e08b6f; }
+        .btn-red:hover { background:rgba(224,139,111,.09); color:#eda287; }
+        .badge.ok { color:#9ce2a2; background:rgba(143,205,150,.1); box-shadow:inset 0 0 0 1px rgba(143,205,150,.3); }
+        .badge.limited { color:#e5c377; background:rgba(217,180,94,.12); box-shadow:inset 0 0 0 1px rgba(217,180,94,.32); }
+        .badge.expired { color:#eda287; background:rgba(224,139,111,.1); box-shadow:inset 0 0 0 1px rgba(224,139,111,.28); }
+        .step-pill { background:#26241f; border:1px solid var(--border); border-radius:8px; color:var(--text-muted); }
         select, input[type=text], input[type=password], input[type=number], textarea {
-            background:#fff; border:1px solid var(--border); border-radius:10px; color:var(--text-main); }
-        select:focus, input:focus, textarea:focus { border-color:#d97757; box-shadow:0 0 0 3px rgba(193,95,60,.1); outline:none; }
+            background:#26241f; border:1px solid var(--border); border-radius:10px; color:var(--text-main); }
+        select:focus, input:focus, textarea:focus { border-color:#d97757; box-shadow:0 0 0 3px rgba(217,119,87,.13); outline:none; }
         table { width:100%; border-collapse:collapse; }
         th { text-align:left; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--text-muted);
             padding:10px 12px; border-bottom:1px solid var(--border); }
-        td { padding:12px; border-bottom:1px solid var(--border-faint, #efe9db); color:var(--text-main); }
-        tbody tr:hover { background:rgba(193,95,60,.04); }
-        .log-box-container { background:#241f18; border:1px solid #38301f; border-radius:14px; }
+        td { padding:12px; border-bottom:1px solid #33302a; color:var(--text-main); }
+        tbody tr:hover { background:rgba(217,119,87,.05); }
+        .log-box-container { background:#171511; border:1px solid #2c281f; border-radius:14px; }
         .log-line { color:#d8d0c0; }
         .log-OK .level, .log-INFO .level { color:#9ccf9a; }
         .log-WARN .level { color:#e3b968; }
         .log-ERROR .level { color:#e39a80; }
-        .refresh-banner.ok { color:#33602f; background:rgba(92,138,94,.12); border:1px solid rgba(92,138,94,.26); border-radius:12px; }
-        .refresh-banner.fail { color:#8c3a24; background:rgba(168,73,47,.08); border:1px solid rgba(168,73,47,.22); border-radius:12px; }
-        .toast-popup { background:#2b271f; color:#f7f2ea; border-radius:12px; }
-        ::selection { background:rgba(193,95,60,.2); }
+        .refresh-banner.ok { color:#9ce2a2; background:rgba(143,205,150,.08); border:1px solid rgba(143,205,150,.24); border-radius:12px; }
+        .refresh-banner.fail { color:#eda287; background:rgba(224,139,111,.08); border:1px solid rgba(224,139,111,.24); border-radius:12px; }
+
+        #btToastWrap { position:fixed; right:22px; bottom:22px; z-index:999; display:flex;
+            flex-direction:column; gap:10px; align-items:flex-end; pointer-events:none; }
+        .bt-toast { pointer-events:auto; display:flex; align-items:flex-start; gap:10px; max-width:380px;
+            padding:12px 15px; background:#2e2b26; border:1px solid #3a372f; border-left:3px solid #8b8577;
+            border-radius:12px; box-shadow:0 16px 40px -18px rgba(0,0,0,.75); color:#ece7de;
+            font-size:13px; line-height:1.45; opacity:0; transform:translateX(16px);
+            transition:opacity .22s ease, transform .22s ease; cursor:pointer; font-family:var(--font-ui); }
+        .bt-toast.show { opacity:1; transform:none; }
+        .bt-toast.err  { border-left-color:#d97757; }
+        .bt-toast.err .bt-ico { color:#e08b6f; }
+        .bt-toast.ok   { border-left-color:#7fb986; }
+        .bt-toast.ok .bt-ico { color:#8fce96; }
+        .bt-toast.warn { border-left-color:#d9b45e; }
+        .bt-toast.warn .bt-ico { color:#d9b45e; }
+        .bt-toast .bt-ico { font-size:13px; line-height:1.3; }
+        .bt-toast .bt-msg { word-break:break-word; }
+
+        ::selection { background:rgba(217,119,87,.28); }
 
         </style>
 </head>
@@ -6326,18 +6318,29 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- TOAST POPUP -->
-    <div class="toast-popup" id="toastPopup">
-        <span id="toastMsg">Action completed</span>
-    </div>
+    <!-- TOASTS -->
+    <div id="btToastWrap"></div>
 
     <script>
-        function showToast(msg) {
-            const t = document.getElementById('toastPopup');
-            document.getElementById('toastMsg').textContent = msg;
-            t.classList.add('show');
-            setTimeout(() => t.classList.remove('show'), 3500);
+        function showToast(msg, kind) {
+            let w = document.getElementById('btToastWrap');
+            if (!w) { w = document.createElement('div'); w.id = 'btToastWrap'; document.body.appendChild(w); }
+            const el = document.createElement('div');
+            el.className = 'bt-toast ' + (kind || 'info');
+            el.innerHTML = '<span class="bt-ico"></span><span class="bt-msg"></span>';
+            el.querySelector('.bt-ico').textContent = kind === 'err' ? '⚠' : (kind === 'ok' ? '✓' : 'ℹ');
+            el.querySelector('.bt-msg').textContent = msg;
+            el.onclick = () => el.remove();
+            w.appendChild(el);
+            while (w.children.length > 4) w.removeChild(w.firstChild);
+            requestAnimationFrame(() => el.classList.add('show'));
+            setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 320); },
+                       kind === 'err' ? 8000 : 3800);
         }
+        window.addEventListener('unhandledrejection', e => {
+            const m = (e && e.reason && (e.reason.message || e.reason)) || 'unknown';
+            showToast('UI error: ' + String(m).slice(0, 180), 'err');
+        });
         function copyKey(keyStr) {
             navigator.clipboard.writeText(keyStr);
             showToast('API Key copied to clipboard');
@@ -6386,7 +6389,22 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
             try {
                 const r = await fetch('/keeper/status');
                 const d = await r.json();
+                window._statusErr = 0;
                 if (d.sessions) {
+                    if (!window._lastSt) window._lastSt = {};
+                    for (const t of d.sessions) {
+                        const prev = window._lastSt[t.jar_id];
+                        window._lastSt[t.jar_id] = t.status;
+                        if (prev && prev !== t.status) {
+                            const nm = t.name || t.jar_id;
+                            if (t.status === 'error')
+                                showToast(nm + ': keeper failed — ' + String(t.error || t.current_step || 'see logs').slice(0, 220), 'err');
+                            else if (t.status === 'running')
+                                showToast(nm + ': keeper online', 'ok');
+                            else if (t.status === 'stopped' && prev === 'running')
+                                showToast(nm + ': keeper stopped', 'warn');
+                        }
+                    }
                     const running = d.sessions.filter(s => s.status === 'running').length;
                     document.getElementById('statKeepers').textContent = running;
                     for (const s of d.sessions) {
@@ -6401,7 +6419,12 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
                         }
                     }
                 }
-            } catch(e) {}
+            } catch(e) {
+                if (!window._statusErr) {
+                    window._statusErr = 1;
+                    showToast('Dashboard lost contact with Bridgena (status poll failed)', 'err');
+                }
+            }
         }
 
         setInterval(fetchLogs, 4000);
@@ -6476,7 +6499,7 @@ async def dashboard_page(request: Request, refresh: Optional[str] = None, refres
         keys_rows.append(f"""
         <tr>
             <td><strong>{k.get('name')}</strong></td>
-            <td><code style="background:rgba(38,34,26,0.06);padding:3px 8px;border-radius:6px;font-family:'JetBrains Mono',monospace;cursor:pointer" onclick="copyKey('{k.get('key')}')" title="Click to copy">{k.get('key')}</code></td>
+            <td><code style="background:rgba(255,255,255,0.07);padding:3px 8px;border-radius:6px;font-family:'JetBrains Mono',monospace;cursor:pointer" onclick="copyKey('{k.get('key')}')" title="Click to copy">{k.get('key')}</code></td>
             <td><span class="badge ok">{k.get('rpm')} RPM</span></td>
             <td><form action="/delete-key" method="post"><input type="hidden" name="key_id" value="{k['key']}"><button type="submit" class="btn btn-sec btn-sm btn-red">Revoke</button></form></td>
         </tr>""")
@@ -6720,7 +6743,10 @@ async def keeper_live(request: Request, jar_id: str = Form(...)):
         return RedirectResponse(url="/login")
     ok, msg = await keeper.start_live(jar_id)
     log("INFO", f"Live browser: {msg}")
-    return RedirectResponse(url="/vnc", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(
+        url=f"/dashboard?refresh={'ok' if ok else 'fail'}&refresh_msg={quote(msg)}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 @app.post("/keeper/relogin")
