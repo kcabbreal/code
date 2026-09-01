@@ -909,6 +909,35 @@ PROBE_MAX_PARALLEL = 8
 _proxy_probe_cache: Dict[str, Tuple[bool, float]] = {}
 _proxy_assign_cursor = 0   # shared round-robin position for ALL pinning paths
 
+# Upstream-degradation cooldown: when Arena's own origin is down (Cloudflare 520-527),
+# every in-flight request must not spin its 6-retry budget against a dead backend.
+# A single blip must NOT trip this (one slow 504 amid healthy traffic is normal):
+# the gate opens only after UPSTREAM_DEGRADE_THRESHOLD hits within the window.
+_upstream_degraded_until = 0.0
+_upstream_hits: List[float] = []
+UPSTREAM_DEGRADE_COOLDOWN = 45.0
+UPSTREAM_DEGRADE_WINDOW = 60.0
+UPSTREAM_DEGRADE_THRESHOLD = 3
+
+
+def note_upstream_degraded(reason: str = "") -> None:
+    global _upstream_degraded_until
+    now = time.time()
+    _upstream_hits[:] = [t for t in _upstream_hits if now - t < UPSTREAM_DEGRADE_WINDOW]
+    _upstream_hits.append(now)
+    if len(_upstream_hits) >= UPSTREAM_DEGRADE_THRESHOLD:
+        new_until = now + UPSTREAM_DEGRADE_COOLDOWN
+        if new_until > _upstream_degraded_until:
+            _upstream_degraded_until = new_until
+            log("WARN", f"Arena origin degraded ({len(_upstream_hits)}× 5xx/52x in "
+                        f"{UPSTREAM_DEGRADE_WINDOW:.0f}s) — pausing new requests ~"
+                        f"{UPSTREAM_DEGRADE_COOLDOWN:.0f}s; accounts & proxies stay healthy")
+
+
+def upstream_degraded() -> Tuple[bool, float]:
+    remaining = _upstream_degraded_until - time.time()
+    return (remaining > 0, max(0.0, remaining))
+
 
 def _rotation_mode() -> str:
     """config.json "proxy_rotation": "assignment" (default, CF-safe) | "request".
@@ -3577,6 +3606,17 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                         yield ("error", "429: Arena is rate-limiting this IP/session. Wait 30-60s then retry — accounts are fine.")
                         return
 
+                    if resp.status_code in (500, 502, 503, 504) or 520 <= resp.status_code <= 527:
+                        # Cloudflare↔origin trouble (524 = origin >100s silent; 521/522/523 = down/SSL/unreachable).
+                        # This is Arena's backend stalling — cookies, proxies and keepers are innocent.
+                        # Same jar, polite backoff, bounded retries; never cycle keeper / expire jar for this.
+                        note_upstream_degraded(str(resp.status_code))
+                        wait_s = 2.5 * (attempt + 1)
+                        log("WARN", f"[{jar_id}] Arena upstream {resp.status_code} (origin timeout/overload) — "
+                                    f"backoff {wait_s:.0f}s, retry {attempt + 1}/{max_attempts}")
+                        await asyncio.sleep(wait_s)
+                        continue
+
                     # Captcha rejection — try to grab a fresh token and retry once
                     if "captcha" in body.lower() or "recaptcha" in body.lower():
                         token = await _get_recaptcha_token()
@@ -3593,6 +3633,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     yield ("error", f"{resp.status_code}: {body[:400] or '(empty body)'}")
                     return
 
+                _upstream_hits.clear()   # origin is answering again — strikes forgiven
                 buffer = b""
                 async for chunk in resp.aiter_content():
                     if not chunk:
@@ -4039,6 +4080,16 @@ async def chat_completions(request: Request, _auth=Depends(verify_api_key)):
     model_id = model_obj["id"]
     model_public_name = model_obj.get("publicName", model_name)
     model_caps = model_obj.get("capabilities", {})
+    _deg, _left = upstream_degraded()
+    if _deg:
+        # Arena's own origin is timing out (5xx/52x seen moments ago). Fail fast with a
+        # clear retry-after instead of burning every account + proxy in the pool.
+        raise HTTPException(
+            status_code=503,
+            detail=f"Arena upstream degraded (origin timeout). Retry in ~{int(_left)}s. "
+                   f"Accounts/proxies are healthy — do not re-login.",
+            headers={"Retry-After": str(max(5, int(_left)))},
+        )
     jar = acquire_jar()
     if not jar:
         raise HTTPException(status_code=503, detail="No healthy accounts available.")
@@ -4109,17 +4160,20 @@ LOGIN_TEMPLATE = r"""<!DOCTYPE html>
     <title>Bridgena - Sign In</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
-        :root {
-            --bg-base: #171717;
-            --bg-card: #212121;
-            --border: #333333;
-            --border-focus: #555555;
-            --text-main: #ececec;
-            --text-muted: #a1a1aa;
-            --accent: #ffffff;
-            --accent-text: #000000;
+                :root {
+            --bg-base: #f4efe6;
+            --bg-card: rgba(255,255,255,.9);
+            --border: #e0d7c4;
+            --border-focus: #d97757;
+            --text-main: #26221a;
+            --text-muted: #6d6455;
+            --accent: #c15f3c;
+            --accent-text: #fbf6ee;
+            --font-display: 'Fraunces','Iowan Old Style','Palatino Linotype','Book Antiqua',Georgia,serif;
+            --font-ui: 'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+            --hero: url('https://motionarray.imgix.net/2069896-ilxnk7j2UB-high_0014.jpg?w=1600&q=65&fit=max&auto=format');
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -4244,7 +4298,36 @@ LOGIN_TEMPLATE = r"""<!DOCTYPE html>
             font-size: 12px;
             color: var(--text-muted);
         }
-    </style>
+    
+        /* BRIDGENA-CLAUDE-THEME v1 */
+        /* ===== Claude-ish layer ===== */
+        body { font-family: var(--font-ui); }
+        body::before { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+            background-image:var(--hero); background-size:cover; background-position:center;
+            opacity:.17; filter:saturate(.8) contrast(1.03); }
+        body::after { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+            background: radial-gradient(1100px 620px at 15% -12%, rgba(193,95,60,.14), transparent 60%),
+                        radial-gradient(900px 520px at 90% 112%, rgba(110,139,116,.13), transparent 62%),
+                        linear-gradient(180deg, rgba(244,239,230,0) 0%, #f4efe6 84%); }
+        .login-card { position:relative; z-index:1; backdrop-filter:blur(12px) saturate(1.04);
+            border-radius:20px; box-shadow:0 24px 60px -28px rgba(38,34,26,.35); padding:40px 34px 30px; }
+        .logo-circle { border-radius:16px !important; background:linear-gradient(145deg,#e6a48c,#b85c3e) !important;
+            color:#fff !important; font-family:var(--font-display); box-shadow:0 6px 18px -6px rgba(184,92,62,.55); }
+        .brand-title { font-family:var(--font-display); font-weight:500; letter-spacing:-.4px; color:var(--text-main); }
+        .brand-sub { color:var(--text-muted); }
+        .input-box { background:#fff; border:1px solid var(--border); border-radius:12px;
+            color:var(--text-main); transition:border-color .16s, box-shadow .16s; }
+        .input-box:focus { border-color:#d97757; box-shadow:0 0 0 4px rgba(193,95,60,.12); }
+        .btn-submit { background:linear-gradient(180deg,#d97757,#b85c3e) !important; color:#fff !important;
+            border-radius:12px !important; font-weight:600; box-shadow:0 6px 16px -8px rgba(184,92,62,.6);
+            transition:filter .14s, transform .12s; }
+        .btn-submit:hover { filter:brightness(1.05); }
+        .btn-submit:active { transform:translateY(1px); }
+        .error-banner { color:#a8492f; background:rgba(168,73,47,.08); border:1px solid rgba(168,73,47,.22);
+            border-radius:10px; }
+        .footer-note { color:var(--text-faint); }
+
+        </style>
 </head>
 <body>
     <div class="login-card">
@@ -4330,24 +4413,27 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
     <title>Bridgena</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
-        :root {
-            --bg-base: #212121;
-            --bg-sidebar: #171717;
-            --bg-card: #2f2f2f;
-            --bg-hover: #2f2f2f;
-            --bg-active: #424242;
-            --border: #333333;
-            --border-faint: #2a2a2a;
-            --text-main: #ececec;
-            --text-muted: #b4b4b4;
-            --text-faint: #737373;
-            --accent: #ffffff;
+                :root {
+            --bg-base: #faf8f4;
+            --bg-sidebar: #f2ede2;
+            --bg-card: #ffffff;
+            --bg-hover: #f0ead d;
+            --bg-active: #e8e0cf;
+            --border: #e4dcc9;
+            --border-faint: #efe9db;
+            --text-main: #26221a;
+            --text-muted: #6d6455;
+            --text-faint: #9a9080;
+            --accent: #c15f3c;
             --sidebar-width: 260px;
+            --font-display: 'Fraunces','Iowan Old Style','Palatino Linotype','Book Antiqua',Georgia,serif;
+            --font-ui: 'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+            --hero: url('https://motionarray.imgix.net/2069896-ilxnk7j2UB-high_0014.jpg?w=1600&q=65&fit=max&auto=format');
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -4954,7 +5040,60 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
             .sidebar { position: fixed; height: 100%; }
             .sidebar.collapsed { margin-left: -260px; }
         }
-    </style>
+    
+        /* BRIDGENA-CLAUDE-THEME v1 */
+        /* ===== Claude-ish layer ===== */
+        body { font-family: var(--font-ui); }
+        body::before { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+            background-image:var(--hero); background-size:cover; background-position:center 28%;
+            opacity:.05; filter:saturate(.65); }
+        .sidebar, .main-chat-container, .top-navbar { position:relative; z-index:1; }
+        .sidebar { background:linear-gradient(180deg, #f2ede2, #ece5d5); border-right:1px solid var(--border); }
+        .brand-icon-circle { border-radius:9px !important; background:linear-gradient(145deg,#e6a48c,#b85c3e) !important;
+            color:#fff !important; font-family:var(--font-display); box-shadow:0 4px 12px -5px rgba(184,92,62,.5); }
+        .sidebar-brand b, .chat-title-text, .hero-title, .suggest-title { font-family:var(--font-display); font-weight:500; letter-spacing:-.3px; }
+        .hero-title { font-weight:400; font-size:clamp(26px,3.2vw,36px); letter-spacing:-.7px; }
+        .hero-title::after { content:""; display:block; width:44px; height:2px; margin:14px auto 0;
+            background:linear-gradient(90deg,transparent,#c15f3c,transparent); }
+        .new-chat-btn { background:linear-gradient(180deg,#d97757,#b85c3e) !important; color:#fff !important;
+            border:0 !important; border-radius:12px !important; font-weight:600;
+            box-shadow:0 5px 14px -7px rgba(184,92,62,.6); transition:filter .14s; }
+        .new-chat-btn:hover { filter:brightness(1.06); }
+        .sidebar-search-input, .modal-search-input { background:#fff; border:1px solid var(--border); border-radius:10px; color:var(--text-main); }
+        .chat-history-item { border-radius:10px; }
+        .chat-history-item:hover { background:var(--bg-hover); }
+        .chat-history-item.active { background:#fff; box-shadow:0 1px 2px rgba(38,34,26,.08); border:1px solid var(--border); }
+        .top-navbar { background:rgba(250,248,244,.78); backdrop-filter:blur(10px); border-bottom:1px solid var(--border); }
+        .main-chat-container { background:linear-gradient(180deg, rgba(255,255,255,.5), rgba(255,255,255,0) 240px); }
+        .hero-input-box { background:#fff; }
+        .hero-input-box { border:1px solid var(--border) !important; border-radius:20px;
+            box-shadow:0 12px 32px -18px rgba(38,34,26,.28); transition:border-color .16s, box-shadow .16s; }
+        .hero-input-box:focus-within { border-color:#d97757; box-shadow:0 0 0 4px rgba(193,95,60,.1), 0 12px 32px -18px rgba(38,34,26,.28); }
+        .suggest-card { background:#fff; border:1px solid var(--border); border-radius:14px; }
+        .user-bubble { background:#efe9db; color:var(--text-main); border:1px solid var(--border-faint);
+            border-radius:18px 18px 4px 18px; }
+        .assistant-avatar { border-radius:8px !important; background:linear-gradient(145deg,#e6a48c,#b85c3e) !important;
+            color:#fff !important; font-family:var(--font-display); }
+        .assistant-body { font-size:15px; line-height:1.72; }
+        .assistant-body h1, .assistant-body h2, .assistant-body h3 { font-family:var(--font-display); font-weight:500; }
+        .assistant-body code { background:#f1ebdd; border:1px solid var(--border); border-radius:5px; }
+        .assistant-body pre { background:#241f18 !important; border-radius:12px; }
+        .thought-body { background:#f4efe3; border-left:2px solid #d97757; border-radius:0 12px 12px 0; }
+        .send-pill-btn { background:linear-gradient(180deg,#d97757,#b85c3e) !important; color:#fff !important;
+            border-radius:10px; box-shadow:0 4px 12px -6px rgba(184,92,62,.6); }
+        .stop-pill { background:#fff !important; color:var(--text-main) !important; border:1px solid var(--border); border-radius:10px; }
+        .model-header-wrap, .icon-btn, .chat-action-btn { background:#fff; border:1px solid var(--border); border-radius:999px;
+            color:var(--text-main); transition:background .14s, border-color .14s; }
+        .model-header-wrap:hover, .icon-btn:hover, .chat-action-btn:hover { border-color:#d97757; }
+        .modal-card { background:#fbf9f4; border:1px solid var(--border); border-radius:18px;
+            box-shadow:0 24px 60px -24px rgba(38,34,26,.4); }
+        .model-row-item { border-radius:10px; }
+        .model-row-item.active { background:rgba(193,95,60,.08); box-shadow:inset 0 0 0 1px rgba(193,95,60,.35); }
+        .user-menu-popover { background:#fff; border:1px solid var(--border); border-radius:12px;
+            box-shadow:0 12px 32px -12px rgba(38,34,26,.3); }
+        ::selection { background:rgba(193,95,60,.2); }
+
+        </style>
 </head>
 <body>
 
@@ -5579,23 +5718,26 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     <title>Bridgena - Control Center</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
-        :root {
-            --bg-base: #171717;
-            --bg-card: #212121;
-            --bg-hover: #2a2a2a;
-            --border: #333333;
-            --border-hover: #555555;
-            --text-main: #ececec;
-            --text-muted: #a1a1aa;
-            --text-faint: #71717a;
-            --accent: #ffffff;
-            --accent-text: #000000;
-            --green: #22c55e;
-            --yellow: #eab308;
-            --red: #ef4444;
-            --blue: #3b82f6;
+                :root {
+            --bg-base: #f6f2e9;
+            --bg-card: rgba(255,255,255,.86);
+            --bg-hover: #f0eadd;
+            --border: #e2d9c6;
+            --border-hover: #cfc3a8;
+            --text-main: #26221a;
+            --text-muted: #6d6455;
+            --text-faint: #9a9080;
+            --accent: #c15f3c;
+            --accent-text: #fbf6ee;
+            --green: #5c8a5e;
+            --yellow: #b5842e;
+            --red: #a8492f;
+            --blue: #6e8b74;
+            --font-display: 'Fraunces','Iowan Old Style','Palatino Linotype','Book Antiqua',Georgia,serif;
+            --font-ui: 'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+            --hero: url('https://motionarray.imgix.net/2069896-ilxnk7j2UB-high_0014.jpg?w=1600&q=65&fit=max&auto=format');
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -5888,7 +6030,66 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
             border: 1px solid rgba(239, 68, 68, 0.25);
             color: #f87171;
         }
-    </style>
+    
+        /* BRIDGENA-CLAUDE-THEME v1 */
+        /* ===== Claude-ish layer ===== */
+        body { font-family: var(--font-ui); }
+        body::before { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+            background-image:var(--hero); background-size:cover; background-position:center;
+            opacity:.06; filter:saturate(.65); }
+        body > * { position:relative; }
+        .dash-header, .stats-grid, .tabs-container, .card { }
+        .header-title-wrap h1, .header-title-wrap .brand-sub { font-family:var(--font-display); letter-spacing:-.4px; }
+        .header-logo-circle { border-radius:14px !important; background:linear-gradient(145deg,#e6a48c,#b85c3e) !important;
+            color:#fff !important; box-shadow:0 6px 16px -7px rgba(184,92,62,.55); }
+        .header-btn { background:#fff; border:1px solid var(--border); border-radius:10px; color:var(--text-main); }
+        .header-btn:hover { border-color:#d97757; }
+        .header-btn.primary { background:linear-gradient(180deg,#d97757,#b85c3e) !important; color:#fff !important;
+            border:0; font-weight:600; box-shadow:0 5px 14px -8px rgba(184,92,62,.6); }
+        .tabs-container { background:#efe9db; border:1px solid var(--border); border-radius:12px; padding:4px; }
+        .tab-btn { border-radius:8px; color:var(--text-muted); }
+        .tab-btn.active { background:#fff; color:var(--text-main); box-shadow:0 1px 2px rgba(38,34,26,.1); }
+        .stat-card { background:rgba(255,255,255,.85); border:1px solid var(--border); border-radius:16px;
+            box-shadow:0 1px 2px rgba(38,34,26,.05); transition:transform .15s, box-shadow .15s; }
+        .stat-card:hover { transform:translateY(-1px); box-shadow:0 10px 26px -14px rgba(38,34,26,.22); }
+        .stat-card .val { font-family:var(--font-display); font-weight:500; letter-spacing:-.5px; color:var(--text-main); }
+        .stat-card .desc, .stat-card-header { color:var(--text-muted); }
+        .card { background:rgba(255,255,255,.88); border:1px solid var(--border); border-radius:16px;
+            box-shadow:0 1px 2px rgba(38,34,26,.05); }
+        .card-header-bar { border-bottom:1px solid var(--border); }
+        .card-header-bar h3, .card-header-bar h2 { font-family:var(--font-display); font-weight:500; letter-spacing:-.25px; }
+        .btn { background:linear-gradient(180deg,#d97757,#b85c3e) !important; color:#fff !important;
+            border-radius:10px; font-weight:600; box-shadow:0 4px 12px -7px rgba(184,92,62,.6);
+            transition:filter .14s, transform .12s; }
+        .btn:hover { filter:brightness(1.05); }
+        .btn:active { transform:translateY(1px); }
+        .btn-sec { background:#fff; color:var(--text-main); border:1px solid var(--border); box-shadow:none; }
+        .btn-sec:hover { border-color:#d97757; background:#fff; }
+        .btn-red { color:#a8492f; }
+        .btn-red:hover { background:rgba(168,73,47,.07); color:#a8492f; }
+        .badge.ok { color:#33602f; background:rgba(92,138,94,.13); box-shadow:inset 0 0 0 1px rgba(92,138,94,.26); }
+        .badge.limited { color:#7a5510; background:rgba(181,132,46,.13); box-shadow:inset 0 0 0 1px rgba(181,132,46,.28); }
+        .badge.expired { color:#8c3a24; background:rgba(168,73,47,.09); box-shadow:inset 0 0 0 1px rgba(168,73,47,.22); }
+        .step-pill { background:#f4efe3; border:1px solid var(--border); border-radius:8px; color:var(--text-muted); }
+        select, input[type=text], input[type=password], input[type=number], textarea {
+            background:#fff; border:1px solid var(--border); border-radius:10px; color:var(--text-main); }
+        select:focus, input:focus, textarea:focus { border-color:#d97757; box-shadow:0 0 0 3px rgba(193,95,60,.1); outline:none; }
+        table { width:100%; border-collapse:collapse; }
+        th { text-align:left; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--text-muted);
+            padding:10px 12px; border-bottom:1px solid var(--border); }
+        td { padding:12px; border-bottom:1px solid var(--border-faint, #efe9db); color:var(--text-main); }
+        tbody tr:hover { background:rgba(193,95,60,.04); }
+        .log-box-container { background:#241f18; border:1px solid #38301f; border-radius:14px; }
+        .log-line { color:#d8d0c0; }
+        .log-OK .level, .log-INFO .level { color:#9ccf9a; }
+        .log-WARN .level { color:#e3b968; }
+        .log-ERROR .level { color:#e39a80; }
+        .refresh-banner.ok { color:#33602f; background:rgba(92,138,94,.12); border:1px solid rgba(92,138,94,.26); border-radius:12px; }
+        .refresh-banner.fail { color:#8c3a24; background:rgba(168,73,47,.08); border:1px solid rgba(168,73,47,.22); border-radius:12px; }
+        .toast-popup { background:#2b271f; color:#f7f2ea; border-radius:12px; }
+        ::selection { background:rgba(193,95,60,.2); }
+
+        </style>
 </head>
 <body>
 
@@ -6275,7 +6476,7 @@ async def dashboard_page(request: Request, refresh: Optional[str] = None, refres
         keys_rows.append(f"""
         <tr>
             <td><strong>{k.get('name')}</strong></td>
-            <td><code style="background:rgba(255,255,255,0.06);padding:3px 8px;border-radius:6px;font-family:'JetBrains Mono',monospace;cursor:pointer" onclick="copyKey('{k.get('key')}')" title="Click to copy">{k.get('key')}</code></td>
+            <td><code style="background:rgba(38,34,26,0.06);padding:3px 8px;border-radius:6px;font-family:'JetBrains Mono',monospace;cursor:pointer" onclick="copyKey('{k.get('key')}')" title="Click to copy">{k.get('key')}</code></td>
             <td><span class="badge ok">{k.get('rpm')} RPM</span></td>
             <td><form action="/delete-key" method="post"><input type="hidden" name="key_id" value="{k['key']}"><button type="submit" class="btn btn-sec btn-sm btn-red">Revoke</button></form></td>
         </tr>""")
