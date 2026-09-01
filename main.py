@@ -3195,15 +3195,16 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
         try:
             headers = _curl_headers(jar)
             proxy = jar_proxy(jar)
-            session_kw = {"impersonate": "chrome131", "timeout": 120.0}
             if proxy:
-                session_kw["proxy"] = proxy  # curl_cffi: use proxy=, not both
                 log("INFO", f"[{jar_id}] curl via proxy {proxy.split('@')[-1] if '@' in proxy else proxy}")
             else:
                 log("WARN", f"[{jar_id}] No proxy — using server IP (easy to rate-limit)")
-            async with AsyncSession(**session_kw) as client:
+            async with AsyncSession(impersonate="chrome131") as client:
                 try:
-                    resp = await client.post(url, json=base, headers=headers, stream=True, timeout=120.0)
+                    post_kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
+                    if proxy:
+                        post_kw["proxy"] = proxy
+                    resp = await client.post(url, **post_kw)
                 except Exception as e:
                     yield ("error", f"Network error: {str(e)}")
                     return
