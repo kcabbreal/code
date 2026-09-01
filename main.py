@@ -2136,11 +2136,18 @@ class KeeperSession:
                 await self._do_activity()
                 if (time.time() - self.last_nav > random.uniform(KEEPER_NAV_MIN, KEEPER_NAV_MAX)
                         and self.active_requests == 0 and not self._action_lock.locked()):
-                    async with self._action_lock:
-                        await self._ensure_sidebar_cookie()
-                        await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
-                        await self._wait_cloudflare(self.page)
-                        self.last_nav = time.time()
+                    try:
+                        async with self._action_lock:
+                            await self._ensure_sidebar_cookie()
+                            await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded", timeout=45000)
+                            await self._wait_cloudflare(self.page)
+                            self.last_nav = time.time()
+                    except Exception as e:
+                        # A slow/timed-out keep-alive nav is not fatal — arena.ai
+                        # can just be briefly slow. Log it and let the loop try
+                        # again on its next pass instead of tearing down and
+                        # relaunching the whole browser session over it.
+                        log("WARN", f"[{self.name}] Keep-alive navigation failed ({type(e).__name__}: {e}) — will retry next cycle")
                 if time.time() - self.last_health_ok > KEEPER_HEALTH_INTERVAL:
                     if not await self.check_health():
                         if time.time() >= self.next_retry:
