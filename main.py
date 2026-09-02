@@ -707,6 +707,25 @@ def _normalize_proxy(raw: str) -> Optional[str]:
     if not raw or not isinstance(raw, str):
         return None
     p = raw.strip().lstrip("\ufeff").strip().strip('"\'')
+    # free-proxy-list CSV rows: "IP,Port,Country,Protocol,Type,Latency,…" e.g.
+    #   98.188.47.150,4145,United States,SOCKS4,Anonymous,259,Unknown,"Wed, 02 Sep 2026 …"
+    if "," in p and "://" not in p and "@" not in p:
+        try:
+            import csv as _csv
+            _row = next(_csv.reader([p]))
+        except Exception:
+            _row = [x.strip() for x in p.split(",")]
+        if len(_row) >= 2:
+            _h = str(_row[0]).strip().strip('"')
+            _pt = str(_row[1]).strip().strip('"')
+            if _h and _pt.isdigit() and 0 < int(_pt) <= 65535 and ":" not in _h:
+                _sch = "http"
+                for _cell in _row[2:]:
+                    _c = str(_cell).strip().strip('"').upper()
+                    if _c in ("SOCKS4", "SOCKS4A", "SOCKS5", "SOCKS5H", "HTTP", "HTTPS"):
+                        _sch = _c.lower()
+                        break
+                return f"{_sch}://{_h}:{_pt}"
     if p.count(",") == 1 and ":" not in p:          # 'ip,port' free-list format
         p = p.replace(",", ":")
     if not p or p.startswith("#") or p.startswith("//"):
@@ -907,6 +926,7 @@ PROBE_DEAD_TTL = 300.0      # re-probe a failed proxy at most once per 5 min
 PROBE_BUDGET = 40           # live probes per sweep (cached verdicts are free)
 PROBE_MAX_PARALLEL = 8
 _proxy_probe_cache: Dict[str, Tuple[bool, float]] = {}
+_proxy_latency: Dict[str, int] = {}   # host → handshake RTT (ms)
 _proxy_assign_cursor = 0   # shared round-robin position for ALL pinning paths
 
 # Upstream-degradation cooldown: when Arena's own origin is down (Cloudflare 520-527),
@@ -974,54 +994,99 @@ def _probe_hostport() -> Tuple[str, int]:
         return "arena.ai", 443
 
 
-def _proxy_tcp_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> bool:
-    """Raw CONNECT probe: does this proxy tunnel to arena.ai:443 right now?
-    Only http/https-scheme proxies are probed; socks entries are trusted (skip probe)."""
+def _socks_client_handshake(s, scheme: str, host: str, port: int, u) -> bool:
+    """SOCKS4/4a/5 client handshake through an already-connected socket."""
+    import socket as _sk
+    import struct as _st
+    from urllib.parse import unquote as _unq
+    try:
+        if scheme in ("socks4", "socks4a"):
+            if scheme == "socks4":
+                try:
+                    addr = _sk.inet_aton(_sk.gethostbyname(host))     # client-side DNS
+                except Exception:
+                    return False
+            else:
+                addr = b"\x00\x00\x00\x01"                          # socks4a: resolve remotely
+            user = (_unq(u.username) if u.username else "bridgena").encode("utf-8", "ignore")[:255]
+            s.sendall(b"\x04\x01" + _st.pack(">H", port) + addr + user + b"\x00")
+            resp = s.recv(8)
+            return len(resp) == 8 and resp[0] == 0x00 and resp[1] == 0x5A
+        # socks5(h): no-auth method, then IPv4 CONNECT
+        s.sendall(b"\x05\x01\x00")
+        g = s.recv(2)
+        if len(g) < 2 or g[0] != 0x05 or g[1] != 0x00:
+            return False
+        try:
+            ip = _sk.inet_aton(_sk.gethostbyname(host))
+        except Exception:
+            return False
+        s.sendall(b"\x05\x01\x00\x01" + ip + _st.pack(">H", port))
+        r = s.recv(4)
+        return len(r) >= 4 and r[0] == 0x05 and r[1] == 0x00
+    except Exception:
+        return False
+
+
+def _proxy_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> Tuple[bool, int]:
+    """(alive, latency_ms) — a REAL handshake per scheme: http/https via CONNECT,
+    socks4/4a/5 via native SOCKS4/SOCKS5 connect to arena.ai:443. No more blanket
+    'trust socks' — free-list socks nodes are dead more often than not."""
     import base64
     import socket
     from urllib.parse import unquote, urlparse
     if not proxy_url:
-        return False
+        return False, -1
+    t0 = time.perf_counter()
     host, port = _probe_hostport()
     try:
-        u = urlparse(proxy_url)
-        if u.scheme.lower().startswith("socks"):
-            return True  # don't misjudge socks5 nodes with an HTTP CONNECT; curl handles them
+        u = urlparse(proxy_url if "://" in proxy_url else "http://" + proxy_url)
+        scheme = (u.scheme or "http").lower()
         ph, pp = u.hostname, (u.port or 80)
         s = socket.create_connection((ph, pp), timeout=timeout)
+        s.settimeout(timeout)
         try:
-            req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
-            if u.username:
-                pw = unquote(u.password or "")
-                tok = base64.b64encode(f"{unquote(u.username)}:{pw}".encode()).decode()
-                req += f"Proxy-Authorization: Basic {tok}\r\n"
-            s.sendall((req + "\r\n").encode())
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                c = s.recv(2048)
-                if not c:
-                    return False
-                buf += c
-                if len(buf) > 16384:
-                    return False
-            line = buf.split(b"\r\n", 1)[0].decode("latin1", "ignore")
-            m = re.match(r"HTTP/[\d.]+\s+(\d+)", line)
-            if m and m.group(1) == "200":
-                return True
-            code = m.group(1) if m else "?"
-            hint = " — PAYMENT REQUIRED (provider billing/quota)" if code == "402" else \
-                   (" — auth failed (creds/allowlist)" if code == "407" else "")
-            log("WARN", f"proxy probe {ph}:{pp} refused CONNECT: {code}{hint}")
-            if code in ("402", "407"):
-                quarantine_proxy(proxy_url, f"CONNECT refused {code} — billing/auth, not transient")
-            return False
+            if scheme in ("socks4", "socks4a", "socks5", "socks5h"):
+                if not _socks_client_handshake(s, scheme, host, port, u):
+                    return False, -1
+            else:
+                req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                if u.username:
+                    pw = unquote(u.password or "")
+                    tok = base64.b64encode(f"{unquote(u.username)}:{pw}".encode()).decode()
+                    req += f"Proxy-Authorization: Basic {tok}\r\n"
+                s.sendall((req + "\r\n").encode())
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    c = s.recv(2048)
+                    if not c:
+                        return False, -1
+                    buf += c
+                    if len(buf) > 16384:
+                        return False, -1
+                line = buf.split(b"\r\n", 1)[0].decode("latin1", "ignore")
+                m = re.match(r"HTTP/[\d.]+\s+(\d+)", line)
+                if not m or m.group(1) != "200":
+                    code = m.group(1) if m else "?"
+                    hint = " — PAYMENT REQUIRED (provider billing/quota)" if code == "402" else \
+                           (" — auth failed (creds/allowlist)" if code == "407" else "")
+                    log("WARN", f"proxy probe {ph}:{pp} refused CONNECT: {code}{hint}")
+                    if code in ("402", "407"):
+                        quarantine_proxy(proxy_url, f"CONNECT refused {code} — billing/auth, not transient")
+                    return False, -1
         finally:
             try:
                 s.close()
             except Exception:
                 pass
+        return True, int((time.perf_counter() - t0) * 1000)
     except Exception:
-        return False
+        return False, -1
+
+
+def _proxy_tcp_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> bool:
+    """Back-compat bool wrapper used by the picker."""
+    return _proxy_probe(proxy_url, timeout)[0]
 
 
 def proxy_alive(proxy_url: str, *, force: bool = False) -> bool:
@@ -1032,7 +1097,11 @@ def proxy_alive(proxy_url: str, *, force: bool = False) -> bool:
     hit = _proxy_probe_cache.get(proxy_url)
     if hit and hit[1] > now and not force:
         return hit[0]
-    ok = _proxy_tcp_probe(proxy_url)
+    ok, lat = _proxy_probe(proxy_url)
+    if ok and lat >= 0:
+        _proxy_latency[proxy_url] = lat
+    else:
+        _proxy_latency.pop(proxy_url, None)
     _proxy_probe_cache[proxy_url] = (ok, now + (PROBE_OK_TTL if ok else PROBE_DEAD_TTL))
     if ok:
         _proxy_strikes.pop(proxy_url, None)
@@ -1136,6 +1205,238 @@ def note_probe_failure(proxy_url: str) -> None:
     n = _proxy_strikes[proxy_url] = _proxy_strikes.get(proxy_url, 0) + 1
     if n >= PROBE_EXILE_AFTER:
         quarantine_proxy(proxy_url, f"CONNECT probe failed {n}× in a row")
+
+
+# ---- v6 PROXY MANAGER: upload/paste parsers, health store, bulk prune ----
+PROXY_HEALTH_FILE = "proxies.health.json"
+_proxy_health: Dict[str, dict] = {}       # host:port → {ok, latency, checked, source}
+_proxy_health_loaded = False
+_proxy_check_state = {"running": False, "done": 0, "total": 0, "started": 0.0}
+
+
+def _proxy_health_path() -> str:
+    base = _proxies_file()
+    d = os.path.dirname(os.path.abspath(base)) if base else os.getcwd()
+    return os.path.join(d, PROXY_HEALTH_FILE)
+
+
+def _proxy_health_load(force: bool = False) -> Dict[str, dict]:
+    global _proxy_health_loaded
+    if _proxy_health_loaded and not force:
+        return _proxy_health
+    _proxy_health_loaded = True
+    try:
+        with open(_proxy_health_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for k, v in (data.items()):
+                if isinstance(v, dict):
+                    _proxy_health[str(k)] = v
+    except Exception:
+        pass
+    return _proxy_health
+
+
+def _proxy_health_save() -> None:
+    try:
+        tmp = _proxy_health_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_proxy_health, f, indent=1, sort_keys=True)
+        os.replace(tmp, _proxy_health_path())
+    except Exception:
+        pass
+
+
+def _proxy_health_record(proxy_url: str, ok: bool, latency_ms: int, source: str = "probe") -> None:
+    _proxy_health_load()
+    key = _proxy_hkey(proxy_url)
+    prev = _proxy_health.get(key) or {}
+    _proxy_health[key] = {
+        "ok": bool(ok),
+        "latency": int(latency_ms) if (ok and latency_ms >= 0) else prev.get("latency"),
+        "checked": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "fails": (int(prev.get("fails") or 0) + (0 if ok else 1)),
+    }
+    _proxy_health_save()
+
+
+def parse_proxy_blob(text: str) -> Tuple[List[str], int, int]:
+    """Any paste/file: CSV free-lists, ip:port, user:pass@host:port, schemes.
+    Returns (normalized urls, lines parsed, lines skipped)."""
+    out, seen, parsed, skipped = [], set(), 0, 0
+    for raw in (text or "").splitlines():
+        ln = raw.strip().lstrip("\ufeff")
+        if not ln or ln.startswith("#"):
+            continue
+        low = ln.lower()
+        if low.startswith(("ip,port", "ip:port", "proxylist", "http://ip")) or "," in low[:8] and low[:2].isalpha() and "ip" in low.split(",")[0].lower():
+            if "port" in low or "ip" in low.split(",")[0]:
+                continue  # header row
+        parsed += 1
+        n = _normalize_proxy(ln)
+        if not n:
+            skipped += 1
+            continue
+        k = _proxy_hkey(n)
+        if k in seen or not k or k == ":0":
+            skipped += 1
+            continue
+        seen.add(k)
+        out.append(n)
+    return out, parsed, skipped
+
+
+def _proxies_pool_write(urls: List[str]) -> None:
+    """Atomic replace of the whole proxies.txt (dedup preserved order)."""
+    path = _proxies_file() or os.path.join(os.getcwd(), "proxies.txt")
+    tmp = path + ".manager.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for u in urls:
+            f.write(u + "\n")
+    os.replace(tmp, path)
+
+
+def proxies_snapshot() -> List[dict]:
+    _proxy_health_load()
+    now = time.time()
+    rows = []
+    for u in get_proxy_pool():
+        key = _proxy_hkey(u)
+        verdict, lat = None, None
+        hit = _proxy_probe_cache.get(u)
+        if hit and hit[1] > now:
+            verdict = bool(hit[0])
+        lat = _proxy_latency.get(u)
+        h = _proxy_health.get(key) or {}
+        if verdict is None and "ok" in h:
+            verdict = bool(h["ok"])
+            lat = lat if lat is not None else h.get("latency")
+        rows.append({
+            "url": u, "host": key,
+            "scheme": u.split("://", 1)[0] if "://" in u else "http",
+            "status": ("live" if verdict else "dead") if verdict is not None else "unchecked",
+            "latency": lat,
+            "checked": h.get("checked") or "",
+            "fails": int(h.get("fails") or 0),
+        })
+    rows.sort(key=lambda r: ({"live": 0, "unchecked": 1, "dead": 2}[r["status"]],
+                             r["latency"] if isinstance(r["latency"], int) else 10**9))
+    return rows
+
+
+def _proxy_run_check() -> int:
+    """Parallel handshake sweep of the whole pool; returns #live."""
+    pool = get_proxy_pool()
+    from concurrent.futures import ThreadPoolExecutor
+    live = 0
+    with ThreadPoolExecutor(max_workers=min(32, max(4, len(pool)))) as ex:
+        for u, (ok, lat) in zip(pool, ex.map(lambda p: _proxy_probe(p, 6.0), pool)):
+            verdict = ok
+            if ok and lat >= 0:
+                _proxy_latency[u] = lat
+            else:
+                _proxy_latency.pop(u, None)
+            _proxy_probe_cache[u] = (ok, time.time() + (PROBE_OK_TTL if ok else 30.0))
+            _proxy_health_record(u, ok, lat)
+            if not ok:
+                note_probe_failure(u)   # strike bookkeeping; 2 strikes → exile
+            _proxy_check_state["done"] += 1
+            live += 1 if ok else 0
+    return live
+
+
+async def proxy_check_start() -> bool:
+    """Kick a background sweep (one at a time)."""
+    if _proxy_check_state["running"]:
+        return False
+    _proxy_check_state.update(running=True, done=0, total=len(get_proxy_pool()), started=time.time())
+    def _job():
+        try:
+            live = _proxy_run_check()
+            log("OK", f"proxy sweep done: {live}/{_proxy_check_state['total']} live "
+                      f"(dead nodes got strike marks; 2 strikes exiles from proxies.txt)")
+        except Exception as e:
+            log("WARN", f"proxy sweep crashed: {e}")
+        finally:
+            _proxy_check_state["running"] = False
+    asyncio.ensure_future(asyncio.to_thread(_job))
+    return True
+
+
+def proxy_prune(mode: str, slow_ms: int = 1000) -> int:
+    """mode: 'dead' | 'slow' | 'unchecked' | 'all' — cut rows from proxies.txt
+    (append to proxies.dead.txt so nothing is unrecoverable)."""
+    _proxy_health_load()
+    now = time.time()
+    pool = get_proxy_pool()
+
+    def state_of(u):
+        hit = _proxy_probe_cache.get(u)
+        if hit and hit[1] > now:
+            return "live" if hit[0] else "dead"
+        h = _proxy_health.get(_proxy_hkey(u)) or {}
+        if "ok" not in h:
+            return "unchecked"
+        return "live" if h.get("ok") else "dead"
+
+    def lat_of(u):
+        return _proxy_latency.get(u) or (_proxy_health.get(_proxy_hkey(u)) or {}).get("latency")
+
+    keep: List[str] = []
+    removed: List[str] = []
+    for u in pool:
+        st = state_of(u)
+        if mode == "all" or st == mode or (mode == "slow" and isinstance(lat_of(u), int) and lat_of(u) > slow_ms):
+            removed.append(u)
+        else:
+            keep.append(u)
+    if not removed:
+        return 0
+    dead_path = os.path.join(os.path.dirname(_proxies_file() or os.path.join(os.getcwd(), "x")), "proxies.dead.txt")
+    try:
+        with open(dead_path, "a", encoding="utf-8") as f:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            for u in removed:
+                f.write(f"# {stamp} pruned:{mode}\n{u}\n")
+    except Exception:
+        pass
+    _proxies_pool_write(keep)
+    for u in removed:
+        _QUARANTINED_KEYS.add(_proxy_hkey(u))
+        _proxy_probe_cache[u] = (False, time.time() + 86400.0)
+        _proxy_latency.pop(u, None)
+    log("OK", f"proxy prune '{mode}': {len(removed)} cut from proxies.txt (kept {len(keep)})")
+    return len(removed)
+
+
+def proxies_revive_all() -> int:
+    """Append everything from proxies.dead.txt back into the pool (dedup)."""
+    base = _proxies_file() or os.path.join(os.getcwd(), "proxies.txt")
+    dead_path = os.path.join(os.path.dirname(os.path.abspath(base)), "proxies.dead.txt")
+    if not os.path.isfile(dead_path):
+        return 0
+    pool = get_proxy_pool()
+    have = {_proxy_hkey(u) for u in pool}
+    revived = []
+    with open(dead_path, encoding="utf-8", errors="ignore") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            n = _normalize_proxy(ln)
+            k = _proxy_hkey(n) if n else ""
+            if n and k not in have:
+                have.add(k)
+                revived.append(n)
+    if revived:
+        _proxies_pool_write(pool + revived)
+        for n in revived:
+            _QUARANTINED_KEYS.discard(_proxy_hkey(n))
+            _proxy_probe_cache.pop(n, None)
+        open(dead_path, "w").close()   # graveyard emptied — entries are back in play
+    log("OK", f"proxy revive: {len(revived)} moved back from proxies.dead.txt")
+    return len(revived)
 
 
 def proxy_candidates(jar: Optional[dict], *, prefer_sticky: bool = True) -> List[str]:
@@ -4013,6 +4314,118 @@ async def get_screenshot(filename: str):
     return FileResponse(filename)
 
 # ============================================================
+# PROXY MANAGER API (Dashboard → Proxy Pool tab)
+# ============================================================
+
+@app.get("/proxies/api/snapshot")
+async def proxies_api_snapshot(request: Request):
+    if not await get_current_session(request):
+        raise HTTPException(status_code=401)
+    rows = proxies_snapshot()
+    live = sum(1 for r in rows if r["status"] == "live")
+    dead = sum(1 for r in rows if r["status"] == "dead")
+    lats = sorted(r["latency"] for r in rows if isinstance(r["latency"], int) and r["latency"] >= 0)
+    return {
+        "rows": rows[:800], "total": len(rows), "live": live, "dead": dead,
+        "median_ms": lats[len(lats) // 2] if lats else None,
+        "quarantined": len(_QUARANTINED_KEYS),
+        "checking": _proxy_check_state["running"],
+        "progress": {"done": _proxy_check_state["done"], "total": _proxy_check_state["total"]},
+    }
+
+
+@app.post("/proxies/api/check")
+async def proxies_api_check(request: Request):
+    if not await get_current_session(request):
+        raise HTTPException(status_code=401)
+    started = await proxy_check_start()
+    return {"started": started, "already_running": not started}
+
+
+@app.post("/proxies/api/upload")
+async def proxies_api_upload(request: Request):
+    if not await get_current_session(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="send JSON {text: ...}")
+    urls, parsed, skipped = parse_proxy_blob(str(body.get("text") or ""))
+    pool = get_proxy_pool()
+    have = {_proxy_hkey(u) for u in pool}
+    fresh = []
+    for u in urls:
+        k = _proxy_hkey(u)
+        if k and k not in have:
+            have.add(k)
+            fresh.append(u)
+    if fresh:
+        _proxies_pool_write(pool + fresh)
+        log("OK", f"proxy manager: +{len(fresh)} from upload/paste ({parsed} parsed, {skipped} skipped)")
+    return {"added": len(fresh), "parsed": parsed, "skipped_dupes_or_bad": skipped,
+            "total": len(get_proxy_pool())}
+
+
+@app.post("/proxies/api/prune")
+async def proxies_api_prune(request: Request):
+    if not await get_current_session(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    mode = str(body.get("mode") or "dead")
+    if mode not in ("dead", "slow", "unchecked"):
+        raise HTTPException(status_code=400, detail="mode: dead|slow|unchecked")
+    try:
+        slow_ms = max(100, int(body.get("slow_ms") or 1000))
+    except Exception:
+        slow_ms = 1000
+    removed = proxy_prune(mode, slow_ms)
+    return {"removed": removed, "total": len(get_proxy_pool())}
+
+
+@app.post("/proxies/api/remove-one")
+async def proxies_api_remove_one(request: Request):
+    if not await get_current_session(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="send JSON {host: 'ip:port'}")
+    host = str(body.get("host") or "").strip()
+    if not host:
+        raise HTTPException(status_code=400)
+    pool = get_proxy_pool()
+    keep = [u for u in pool if _proxy_hkey(u) != host]
+    if len(keep) == len(pool):
+        raise HTTPException(status_code=404, detail="host not in pool")
+    dead_path = os.path.join(os.path.dirname(_proxies_file() or os.path.join(os.getcwd(), "x")), "proxies.dead.txt")
+    try:
+        with open(dead_path, "a", encoding="utf-8") as f:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            for u in pool:
+                if _proxy_hkey(u) == host:
+                    f.write(f"# {stamp} removed from UI\n{u}\n")
+    except Exception:
+        pass
+    _proxies_pool_write(keep)
+    for u in pool:
+        if _proxy_hkey(u) == host:
+            _QUARANTINED_KEYS.add(host)
+            _proxy_probe_cache[u] = (False, time.time() + 86400.0)
+            _proxy_latency.pop(u, None)
+    return {"removed": len(pool) - len(keep), "total": len(keep)}
+
+
+@app.post("/proxies/api/revive")
+async def proxies_api_revive(request: Request):
+    if not await get_current_session(request):
+        raise HTTPException(status_code=401)
+    return {"revived": proxies_revive_all(), "total": len(get_proxy_pool())}
+
+
+# ============================================================
 # ROOT ROUTE
 # ============================================================
 
@@ -4209,14 +4622,15 @@ LOGIN_TEMPLATE = r"""<!DOCTYPE html>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
                 :root {
-            --bg-base: #211f1c;
-            --bg-card: rgba(41,38,34,.86);
-            --border: #3c3831;
-            --border-focus: #d97757;
-            --text-main: #ece7de;
-            --text-muted: #a89f91;
-            --accent: #d97757;
-            --accent-text: #f7f2ea;
+            --bg-base: #17131f;
+            --bg-card: rgba(32,26,46,.84);
+            --border: #372c55;
+            --border-focus: #a78bfa;
+            --text-main: #ece8f6;
+            --text-muted: #a49bc4;
+            --text-faint: #776e94;
+            --accent: #a78bfa;
+            --accent-text: #171126;
             --font-display: 'Fraunces','Iowan Old Style','Palatino Linotype','Book Antiqua',Georgia,serif;
             --font-ui: 'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
             --hero: url('https://motionarray.imgix.net/2069896-ilxnk7j2UB-high_0014.jpg?w=1600&q=65&fit=max&auto=format');
@@ -4345,32 +4759,37 @@ LOGIN_TEMPLATE = r"""<!DOCTYPE html>
             color: var(--text-muted);
         }
     
-        /* BRIDGENA-CLAUDE-THEME v2 (dark) */
-        /* ===== Claude-dark layer ===== */
+        /* BRIDGENA-AMETHYST-THEME v3 */
+        /* ===== Amethyst layer ===== */
         body { font-family: var(--font-ui); }
         body::before { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
-            background-image:var(--hero); background-size:cover; background-position:center;
-            opacity:.26; filter:saturate(.7) brightness(.9); }
+            background-image:
+                radial-gradient(1250px 720px at 10% -12%, rgba(124,58,237,.24), transparent 58%),
+                radial-gradient(950px 640px at 92% 6%, rgba(167,139,250,.14), transparent 55%),
+                radial-gradient(1100px 900px at 50% 118%, rgba(88,28,135,.30), transparent 62%),
+                var(--hero);
+            background-size: auto, auto, auto, cover; background-position: center, center, center, center;
+            filter:saturate(.85) brightness(.85); }
         body::after { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
-            background: radial-gradient(1100px 620px at 15% -12%, rgba(217,119,87,.16), transparent 60%),
-                        radial-gradient(900px 520px at 90% 112%, rgba(127,153,119,.10), transparent 62%),
-                        linear-gradient(180deg, rgba(33,31,28,.35) 0%, #211f1c 84%); }
-        .login-card { position:relative; z-index:1; backdrop-filter:blur(14px) saturate(1.08);
-            border-radius:20px; box-shadow:0 24px 60px -28px rgba(0,0,0,.65); padding:40px 34px 30px; }
-        .logo-circle { border-radius:16px !important; background:linear-gradient(145deg,#e08b62,#c15f3c) !important;
-            color:#fdf8f1 !important; font-family:var(--font-display); box-shadow:0 6px 18px -6px rgba(193,95,60,.5); }
-        .brand-title { font-family:var(--font-display); font-weight:500; letter-spacing:-.4px; color:var(--text-main); }
-        .brand-sub { color:var(--text-muted); }
-        .input-box { background:rgba(26,24,21,.72); border:1px solid var(--border); border-radius:12px;
-            color:var(--text-main); transition:border-color .16s, box-shadow .16s; }
+            background: linear-gradient(180deg, rgba(23,19,31,.42) 0%, rgba(23,19,31,.72) 55%, #17131f 92%); }
+        .login-card { position:relative; z-index:1; backdrop-filter:blur(16px) saturate(1.1);
+            border-radius:22px; border:1px solid #3d3160 !important;
+            box-shadow:0 30px 80px -30px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.04);
+            padding:44px 38px 34px; }
+        .logo-circle { border-radius:17px !important; background:linear-gradient(150deg,#c4b5fd,#7c3aed) !important;
+            color:#171126 !important; font-family:var(--font-display); box-shadow:0 8px 26px -10px rgba(124,58,237,.65); }
+        .brand-title { font-family:var(--font-display); font-weight:500; letter-spacing:-.6px; color:var(--text-main); }
+        .brand-sub { color:var(--text-muted); letter-spacing:.01em; }
+        .input-box { background:rgba(19,15,28,.78); border:1px solid var(--border); border-radius:12px;
+            color:var(--text-main); padding:12px 14px; transition:border-color .16s, box-shadow .16s; }
         .input-box::placeholder { color:var(--text-faint); }
-        .input-box:focus { border-color:#d97757; box-shadow:0 0 0 4px rgba(217,119,87,.14); }
-        .btn-submit { background:linear-gradient(180deg,#dd8258,#b85c3e) !important; color:#fdf6ee !important;
-            border-radius:12px !important; font-weight:600; box-shadow:0 6px 16px -8px rgba(184,92,62,.55);
-            transition:filter .14s, transform .12s; }
-        .btn-submit:hover { filter:brightness(1.07); }
+        .input-box:focus { border-color:#a78bfa; box-shadow:0 0 0 4px rgba(167,139,250,.13); }
+        .btn-submit { background:linear-gradient(180deg,#b193f9,#7c3aed) !important; color:#f6f2ff !important;
+            border-radius:12px !important; font-weight:600; letter-spacing:.02em;
+            box-shadow:0 8px 22px -10px rgba(124,58,237,.7); transition:filter .14s, transform .12s; }
+        .btn-submit:hover { filter:brightness(1.08); }
         .btn-submit:active { transform:translateY(1px); }
-        .error-banner { color:#eda287; background:rgba(224,139,111,.09); border:1px solid rgba(224,139,111,.26);
+        .error-banner { color:#f0a48f; background:rgba(239,143,125,.08); border:1px solid rgba(239,143,125,.24);
             border-radius:10px; }
         .footer-note { color:var(--text-faint); }
 
@@ -4467,18 +4886,18 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
                 :root {
-            --bg-base: #262420;
-            --bg-sidebar: #1f1d19;
-            --bg-card: #2c2a25;
-            --bg-hover: #35322c;
-            --bg-active: #3e3a33;
-            --border: #3a372f;
-            --border-faint: #33302a;
-            --text-main: #eae5db;
-            --text-muted: #a89f91;
-            --text-faint: #7d766a;
-            --accent: #d97757;
-            --sidebar-width: 260px;
+            --bg-base: #16121d;
+            --bg-sidebar: #120f18;
+            --bg-card: #1f1929;
+            --bg-hover: #2a2239;
+            --bg-active: #342b47;
+            --border: #322848;
+            --border-faint: #282138;
+            --text-main: #ebe7f5;
+            --text-muted: #a49bc4;
+            --text-faint: #776e94;
+            --accent: #a78bfa;
+            --sidebar-width: 280px;
             --font-display: 'Fraunces','Iowan Old Style','Palatino Linotype','Book Antiqua',Georgia,serif;
             --font-ui: 'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
             --hero: url('https://motionarray.imgix.net/2069896-ilxnk7j2UB-high_0014.jpg?w=1600&q=65&fit=max&auto=format');
@@ -5089,72 +5508,117 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
             .sidebar.collapsed { margin-left: -260px; }
         }
     
-        /* BRIDGENA-CLAUDE-THEME v2 (dark) */
-        /* ===== Claude-dark layer ===== */
+        /* BRIDGENA-AMETHYST-THEME v3 */
+        /* ===== Amethyst layer — OpenWebUI-ish ===== */
         body { font-family: var(--font-ui); }
         body::before { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
-            background-image:var(--hero); background-size:cover; background-position:center 28%;
-            opacity:.05; filter:saturate(.55) brightness(.85); }
-        .sidebar, .main-chat-container, .top-navbar { position:relative; z-index:1; }
-        .sidebar { background:linear-gradient(180deg, #1f1d19, #1a1815); border-right:1px solid var(--border); }
-        .brand-icon-circle { border-radius:9px !important; background:linear-gradient(145deg,#e08b62,#c15f3c) !important;
-            color:#fdf8f1 !important; font-family:var(--font-display); box-shadow:0 4px 12px -5px rgba(193,95,60,.45); }
-        .sidebar-brand b, .chat-title-text, .hero-title, .suggest-title { font-family:var(--font-display); font-weight:500; letter-spacing:-.3px; }
-        .hero-title { font-weight:400; font-size:clamp(26px,3.2vw,36px); letter-spacing:-.7px; }
-        .hero-title::after { content:""; display:block; width:44px; height:2px; margin:14px auto 0;
-            background:linear-gradient(90deg,transparent,#d97757,transparent); }
-        .new-chat-btn { background:linear-gradient(180deg,#dd8258,#b85c3e) !important; color:#fdf6ee !important;
-            border:0 !important; border-radius:12px !important; font-weight:600;
-            box-shadow:0 5px 14px -7px rgba(184,92,62,.5); transition:filter .14s; }
-        .new-chat-btn:hover { filter:brightness(1.07); }
-        .sidebar-search-input, .modal-search-input { background:#262420; border:1px solid var(--border); border-radius:10px; color:var(--text-main); }
-        .chat-history-item { border-radius:10px; }
-        .chat-history-item:hover { background:var(--bg-hover); }
-        .chat-history-item.active { background:#2c2a25; box-shadow:0 1px 3px rgba(0,0,0,.35); border:1px solid var(--border); }
-        .top-navbar { background:rgba(38,36,32,.82); backdrop-filter:blur(10px); border-bottom:1px solid var(--border); }
-        .main-chat-container { background:linear-gradient(180deg, rgba(255,255,255,.025), rgba(255,255,255,0) 240px); }
-        .hero-input-box { background:#2c2a25; border:1px solid var(--border) !important; border-radius:20px;
-            box-shadow:0 12px 32px -18px rgba(0,0,0,.6); transition:border-color .16s, box-shadow .16s; }
-        .hero-input-box:focus-within { border-color:#d97757; box-shadow:0 0 0 4px rgba(217,119,87,.12), 0 12px 32px -18px rgba(0,0,0,.6); }
-        .suggest-card { background:#2c2a25; border:1px solid var(--border); border-radius:14px; }
-        .suggest-card:hover { border-color:#4d4940; background:#302d27; }
-        .user-bubble { background:#35322c; color:var(--text-main); border:1px solid #3e3a33;
-            border-radius:18px 18px 4px 18px; }
-        .assistant-avatar { border-radius:8px !important; background:linear-gradient(145deg,#e08b62,#c15f3c) !important;
-            color:#fdf8f1 !important; font-family:var(--font-display); }
-        .assistant-body { font-size:15px; line-height:1.72; }
-        .assistant-body h1, .assistant-body h2, .assistant-body h3 { font-family:var(--font-display); font-weight:500; }
-        .assistant-body code { background:#33302a; border:1px solid var(--border); border-radius:5px; }
-        .assistant-body pre { background:#171512 !important; border-radius:12px; }
-        .thought-body { background:#2a2823; border-left:2px solid #d97757; border-radius:0 12px 12px 0; }
-        .send-pill-btn { background:linear-gradient(180deg,#dd8258,#b85c3e) !important; color:#fdf6ee !important;
-            border-radius:10px; box-shadow:0 4px 12px -6px rgba(184,92,62,.5); }
-        .stop-pill { background:#2c2a25 !important; color:var(--text-main) !important; border:1px solid var(--border); border-radius:10px; }
-        .model-header-wrap, .icon-btn, .chat-action-btn { background:#2c2a25; border:1px solid var(--border); border-radius:999px;
-            color:var(--text-main); transition:background .14s, border-color .14s; }
-        .model-header-wrap:hover, .icon-btn:hover, .chat-action-btn:hover { border-color:#d97757; }
-        .modal-card { background:#2b2823; border:1px solid var(--border); border-radius:18px;
-            box-shadow:0 24px 60px -24px rgba(0,0,0,.7); }
+            background-image:
+                radial-gradient(1250px 720px at 10% -12%, rgba(124,58,237,.20), transparent 58%),
+                radial-gradient(950px 640px at 92% 6%, rgba(167,139,250,.12), transparent 55%),
+                radial-gradient(1100px 900px at 50% 118%, rgba(88,28,135,.28), transparent 62%);
+            opacity:.9; }
+        body > * { position:relative; z-index:1; }
+        .sidebar { background:linear-gradient(180deg, rgba(18,15,24,.92), rgba(16,13,22,.96));
+            border-right:1px solid #241d33; backdrop-filter:blur(8px); }
+        .brand-icon-circle { border-radius:10px !important; background:linear-gradient(150deg,#c4b5fd,#7c3aed) !important;
+            color:#171126 !important; font-family:var(--font-display); box-shadow:0 5px 14px -6px rgba(124,58,237,.55); }
+        .sidebar-brand b, .chat-title-text, .hero-title, .suggest-title { font-family:var(--font-display); font-weight:500; letter-spacing:-.4px; }
+        .sidebar-section-title { font-family:var(--font-ui); font-weight:600; letter-spacing:.09em; text-transform:uppercase;
+            font-size:10.5px; color:var(--text-faint); padding:0 10px; }
+        .nav-list { gap:2px; }
+        .chat-history-item { border-radius:9px; padding:8px 10px; line-height:1.35; }
+        .chat-history-item:hover { background:#1d1729; }
+        .chat-history-item.active { background:#241d36; box-shadow:inset 0 0 0 1px #322848; }
+        .new-chat-btn { background:linear-gradient(180deg,#b193f9,#7c3aed) !important; color:#f6f2ff !important;
+            border:0 !important; border-radius:12px !important; font-weight:600; letter-spacing:.02em;
+            box-shadow:0 6px 16px -8px rgba(124,58,237,.6); transition:filter .14s; }
+        .new-chat-btn:hover { filter:brightness(1.08); }
+        .sidebar-search-input { background:#171221; border:1px solid #2a2240; border-radius:10px; color:var(--text-main); }
+        .top-navbar { background:rgba(22,18,29,.72); backdrop-filter:blur(12px) saturate(1.1);
+            border-bottom:1px solid #241d33; }
+        .model-header-wrap { background:transparent; border:1px solid #322848; border-radius:999px; color:var(--text-main);
+            transition:background .15s, border-color .15s; }
+        .model-header-wrap:hover { background:#221b31; border-color:#a78bfa; }
+        .icon-btn, .chat-action-btn { background:transparent; border:0; border-radius:9px; color:var(--text-muted); }
+        .icon-btn:hover, .chat-action-btn:hover { background:#241d36; color:var(--text-main); }
+        .main-chat-container { background:linear-gradient(180deg, rgba(22,18,29,.35), rgba(22,18,29,.55)); }
+        .chat-scroll-area { background:transparent; }
+        .messages-container, .chat-content-width { max-width:820px; margin-left:auto; margin-right:auto; }
+        #messagesList { padding-bottom:26px; }
+        .message-wrapper { margin:10px 0; }
+        .user-bubble { background:#241d36; color:var(--text-main); border:1px solid #332a4d;
+            border-radius:18px 18px 5px 18px; padding:12px 16px; line-height:1.6; max-width:78%;
+            box-shadow:0 2px 10px -4px rgba(0,0,0,.4); }
+        .user-avatar-badge { background:#2e2547; color:#c4b5fd; border-radius:8px; }
+        .assistant-row { background:transparent !important; border:0 !important; box-shadow:none !important; padding:6px 0; }
+        .assistant-avatar { border-radius:9px !important; background:linear-gradient(150deg,#c4b5fd,#7c3aed) !important;
+            color:#171126 !important; font-family:var(--font-display); box-shadow:0 4px 10px -4px rgba(124,58,237,.5); }
+        .assistant-body { font-size:15.5px; line-height:1.78; color:var(--text-main); letter-spacing:.002em; }
+        .assistant-body h1, .assistant-body h2, .assistant-body h3 { font-family:var(--font-display); font-weight:500;
+            letter-spacing:-.3px; margin:1.4em 0 .5em; }
+        .assistant-body code { background:#2a2240; border:1px solid #372c55; border-radius:5px; padding:1px 6px; }
+        .assistant-body pre { background:#120e1b !important; border:1px solid #2a2240; border-radius:12px; padding:14px 16px; }
+        .code-copy-btn { background:#241d36; border:1px solid #372c55; border-radius:7px; color:var(--text-muted); }
+        .thought-accordion { background:#1c1628; border:1px solid #2e2548; border-radius:13px; overflow:hidden; }
+        .thought-body { background:#181325; border-left:2px solid #7c5cff; border-radius:0; }
+        .hero-empty-state { padding-top:7vh; }
+        .hero-title { font-weight:400; font-size:clamp(27px,3.4vw,38px); letter-spacing:-.9px; }
+        .hero-title::after { content:""; display:block; width:46px; height:2px; margin:16px auto 0;
+            background:linear-gradient(90deg,transparent,#a78bfa,transparent); }
+        .suggestions-wrap { margin-top:34px; gap:12px; }
+        .suggest-card { background:rgba(29,23,43,.72); border:1px solid #302650; border-radius:15px; padding:15px 17px;
+            transition:transform .15s ease, border-color .15s, background .15s; }
+        .suggest-card:hover { transform:translateY(-2px); border-color:#5b4797; background:#251d3a; }
+        .suggest-title { font-family:var(--font-display); }
+        .suggest-desc { color:var(--text-muted); line-height:1.5; }
+        .hero-input-box { background:rgba(29,23,43,.85); border:1px solid #372c55 !important; border-radius:22px;
+            box-shadow:0 18px 44px -22px rgba(0,0,0,.7); transition:border-color .16s, box-shadow .16s; }
+        .hero-input-box:focus-within { border-color:#a78bfa !important;
+            box-shadow:0 0 0 4px rgba(167,139,250,.12), 0 18px 44px -22px rgba(0,0,0,.7); }
+        .hero-textarea, #dockedPromptInput { font-size:15px; line-height:1.6; }
+        .hero-textarea::placeholder { color:var(--text-faint); }
+        .docked-composer-wrap { padding:0 12px 14px; }
+        #dockedComposer { max-width:820px; margin:0 auto; background:rgba(29,23,43,.9); backdrop-filter:blur(12px);
+            border:1px solid #372c55; border-radius:20px; box-shadow:0 -6px 30px -14px rgba(0,0,0,.65); }
+        #dockedComposer:focus-within { border-color:#a78bfa; box-shadow:0 0 0 4px rgba(167,139,250,.1), 0 -6px 30px -14px rgba(0,0,0,.65); }
+        .send-pill-btn { background:linear-gradient(180deg,#b193f9,#7c3aed) !important; color:#f6f2ff !important;
+            border-radius:11px; box-shadow:0 5px 14px -6px rgba(124,58,237,.6); }
+        .stop-pill { background:#241d36 !important; color:var(--text-main) !important; border:1px solid #372c55; border-radius:11px; }
+        .stop-dot { background:#ef8f7d; }
+        .modal-backdrop { background:rgba(10,8,16,.62); backdrop-filter:blur(4px); }
+        .modal-card { background:#1d1729; border:1px solid #372c55; border-radius:18px;
+            box-shadow:0 30px 70px -28px rgba(0,0,0,.8); }
+        .modal-search-input { background:#171221; border:1px solid #2a2240; border-radius:10px; color:var(--text-main); }
         .model-row-item { border-radius:10px; }
-        .model-row-item.active { background:rgba(217,119,87,.12); box-shadow:inset 0 0 0 1px rgba(217,119,87,.4); }
-        .user-menu-popover { background:#2c2a25; border:1px solid var(--border); border-radius:12px;
-            box-shadow:0 12px 32px -12px rgba(0,0,0,.6); }
-        ::selection { background:rgba(217,119,87,.28); }
+        .model-row-item:hover { background:#241d36; }
+        .model-row-item.active { background:rgba(124,58,237,.14); box-shadow:inset 0 0 0 1px rgba(167,139,250,.38); }
+        .model-row-name { font-family:var(--font-display); }
+        .user-pill { background:#241d36; border:1px solid #332a4d; border-radius:999px; }
+        .user-menu-popover { background:#221b31; border:1px solid #372c55; border-radius:13px;
+            box-shadow:0 16px 40px -14px rgba(0,0,0,.7); }
+        .user-menu-item:hover { background:#2c2346; }
+        ::selection { background:rgba(167,139,250,.28); }
+        ::-webkit-scrollbar { width:10px; height:10px; }
+        ::-webkit-scrollbar-thumb { background:#332a4d; border-radius:99px; border:3px solid transparent;
+            background-clip:content-box; }
+        ::-webkit-scrollbar-thumb:hover { background:#453a63; border:3px solid transparent; background-clip:content-box; }
 
         #btToastWrap { position:fixed; right:22px; bottom:22px; z-index:999; display:flex;
             flex-direction:column; gap:10px; align-items:flex-end; pointer-events:none; }
         .bt-toast { pointer-events:auto; display:flex; align-items:flex-start; gap:10px; max-width:380px;
-            padding:12px 15px; background:#2e2b26; border:1px solid #3a372f; border-left:3px solid #8b8577;
-            border-radius:12px; box-shadow:0 16px 40px -18px rgba(0,0,0,.75); color:#ece7de;
+            padding:12px 15px; background:#241d36; border:1px solid #372c55; border-left:3px solid #8f86b4;
+            border-radius:13px; box-shadow:0 16px 44px -18px rgba(0,0,0,.8); color:#ece8f6;
             font-size:13px; line-height:1.45; opacity:0; transform:translateX(16px);
             transition:opacity .22s ease, transform .22s ease; cursor:pointer; font-family:var(--font-ui); }
         .bt-toast.show { opacity:1; transform:none; }
-        .bt-toast.err  { border-left-color:#d97757; }
-        .bt-toast.err .bt-ico { color:#e08b6f; }
-        .bt-toast.ok   { border-left-color:#7fb986; }
-        .bt-toast.ok .bt-ico { color:#8fce96; }
-        .bt-toast.warn { border-left-color:#d9b45e; }
-        .bt-toast.warn .bt-ico { color:#d9b45e; }
+        .bt-toast.err  { border-left-color:#ef8f7d; }
+        .bt-toast.err .bt-ico { color:#ef8f7d; }
+        .bt-toast.ok   { border-left-color:#8fd39a; }
+        .bt-toast.ok .bt-ico { color:#8fd39a; }
+        .bt-toast.warn { border-left-color:#e3c46f; }
+        .bt-toast.warn .bt-ico { color:#e3c46f; }
+        .bt-toast.info  { border-left-color:#a78bfa; }
+        .bt-toast.info .bt-ico { color:#a78bfa; }
         .bt-toast .bt-ico { font-size:13px; line-height:1.3; }
         .bt-toast .bt-msg { word-break:break-word; }
 
@@ -5810,20 +6274,20 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
                 :root {
-            --bg-base: #221f1b;
-            --bg-card: rgba(43,40,35,.88);
-            --bg-hover: #34312a;
-            --border: #3a372f;
-            --border-hover: #4d4940;
-            --text-main: #ece7de;
-            --text-muted: #a29a8c;
-            --text-faint: #7b7468;
-            --accent: #d97757;
-            --accent-text: #1e1c18;
-            --green: #8fce96;
-            --yellow: #d9b45e;
-            --red: #e08b6f;
-            --blue: #9db8a4;
+            --bg-base: #151120;
+            --bg-card: rgba(31,25,41,.88);
+            --bg-hover: #261e3c;
+            --border: #322848;
+            --border-hover: #453a63;
+            --text-main: #ece8f6;
+            --text-muted: #a49bc4;
+            --text-faint: #776e94;
+            --accent: #a78bfa;
+            --accent-text: #171126;
+            --green: #8fd39a;
+            --yellow: #e3c46f;
+            --red: #ef8f7d;
+            --blue: #9fb6e8;
             --font-display: 'Fraunces','Iowan Old Style','Palatino Linotype','Book Antiqua',Georgia,serif;
             --font-ui: 'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
             --hero: url('https://motionarray.imgix.net/2069896-ilxnk7j2UB-high_0014.jpg?w=1600&q=65&fit=max&auto=format');
@@ -6120,81 +6584,93 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
             color: #f87171;
         }
     
-        /* BRIDGENA-CLAUDE-THEME v2 (dark) */
-        /* ===== Claude-dark layer ===== */
+        /* BRIDGENA-AMETHYST-THEME v3 */
+        /* ===== Amethyst layer ===== */
         body { font-family: var(--font-ui); }
         body::before { content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
-            background-image:var(--hero); background-size:cover; background-position:center;
-            opacity:.06; filter:saturate(.55) brightness(.85); }
+            background-image:
+                radial-gradient(1250px 720px at 10% -12%, rgba(124,58,237,.20), transparent 58%),
+                radial-gradient(950px 640px at 92% 6%, rgba(167,139,250,.12), transparent 55%),
+                radial-gradient(1100px 900px at 50% 118%, rgba(88,28,135,.28), transparent 62%);
+            opacity:.85; }
         body > * { position:relative; }
-        .header-title-wrap h1, .header-title-wrap .brand-sub { font-family:var(--font-display); letter-spacing:-.4px; }
-        .header-logo-circle { border-radius:14px !important; background:linear-gradient(145deg,#e08b62,#c15f3c) !important;
-            color:#fdf8f1 !important; box-shadow:0 6px 16px -7px rgba(193,95,60,.5); }
+        .header-title-wrap h1, .header-title-wrap .brand-sub { font-family:var(--font-display); letter-spacing:-.5px; }
+        .header-logo-circle { border-radius:15px !important; background:linear-gradient(150deg,#c4b5fd,#7c3aed) !important;
+            color:#171126 !important; box-shadow:0 7px 20px -8px rgba(124,58,237,.6); }
         .header-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-        .header-btn { display:inline-flex; align-items:center; gap:7px; background:#2b2823; border:1px solid var(--border);
+        .header-btn { display:inline-flex; align-items:center; gap:7px; background:#1f1929; border:1px solid #322848;
             border-radius:10px; color:var(--text-main); }
-        .header-btn:hover { border-color:#d97757; }
-        .header-btn.primary { background:linear-gradient(180deg,#dd8258,#b85c3e) !important; color:#fdf6ee !important;
-            border:0; font-weight:600; box-shadow:0 5px 14px -8px rgba(184,92,62,.5); }
-        .tabs-container { background:#1c1a16; border:1px solid var(--border); border-radius:12px; padding:4px; }
-        .tab-btn { border-radius:8px; color:var(--text-muted); }
-        .tab-btn.active { background:#2b2823; color:var(--text-main); box-shadow:0 1px 3px rgba(0,0,0,.35); }
-        .stat-card { background:rgba(43,40,35,.85); border:1px solid var(--border); border-radius:16px;
-            box-shadow:0 1px 2px rgba(0,0,0,.25); transition:transform .15s, box-shadow .15s; }
-        .stat-card:hover { transform:translateY(-1px); box-shadow:0 10px 26px -14px rgba(0,0,0,.55); }
-        .stat-card .val { font-family:var(--font-display); font-weight:500; letter-spacing:-.5px; color:var(--text-main); }
+        .header-btn:hover { border-color:#a78bfa; }
+        .header-btn.primary { background:linear-gradient(180deg,#b193f9,#7c3aed) !important; color:#f6f2ff !important;
+            border:0; font-weight:600; box-shadow:0 6px 16px -8px rgba(124,58,237,.55); }
+        .tabs-container { background:#171226; border:1px solid #2c2347; border-radius:13px; padding:4px; }
+        .tab-btn { border-radius:9px; color:var(--text-muted); font-weight:500; }
+        .tab-btn.active { background:#261e3e; color:var(--text-main); box-shadow:0 1px 4px rgba(0,0,0,.4); }
+        .stat-card { background:rgba(31,25,41,.85); border:1px solid #322848; border-radius:17px;
+            box-shadow:0 1px 2px rgba(0,0,0,.3); transition:transform .15s, box-shadow .15s, border-color .15s; }
+        .stat-card:hover { transform:translateY(-1px); border-color:#453a63; box-shadow:0 12px 30px -16px rgba(0,0,0,.6); }
+        .stat-card .val { font-family:var(--font-display); font-weight:500; letter-spacing:-.6px; color:var(--text-main); }
         .stat-card .desc, .stat-card-header { color:var(--text-muted); }
-        .card { background:rgba(43,40,35,.88); border:1px solid var(--border); border-radius:16px;
-            box-shadow:0 1px 2px rgba(0,0,0,.25); }
-        .card-header-bar { border-bottom:1px solid var(--border); }
-        .card-header-bar h3, .card-header-bar h2 { font-family:var(--font-display); font-weight:500; letter-spacing:-.25px; }
-        .btn { background:linear-gradient(180deg,#dd8258,#b85c3e) !important; color:#fdf6ee !important;
-            border-radius:10px; font-weight:600; box-shadow:0 4px 12px -7px rgba(184,92,62,.5);
+        .card { background:rgba(31,25,41,.88); border:1px solid #322848; border-radius:17px;
+            box-shadow:0 1px 2px rgba(0,0,0,.3); }
+        .card-header-bar { border-bottom:1px solid #2c2347; }
+        .card-header-bar h3, .card-header-bar h2 { font-family:var(--font-display); font-weight:500; letter-spacing:-.3px; }
+        .btn { background:linear-gradient(180deg,#b193f9,#7c3aed) !important; color:#f6f2ff !important;
+            border-radius:10px; font-weight:600; box-shadow:0 5px 14px -8px rgba(124,58,237,.55);
             transition:filter .14s, transform .12s; }
-        .btn:hover { filter:brightness(1.07); }
+        .btn:hover { filter:brightness(1.08); }
         .btn:active { transform:translateY(1px); }
-        .btn-sec { background:#2b2823; color:var(--text-main); border:1px solid var(--border); box-shadow:none; }
-        .btn-sec:hover { border-color:#d97757; background:#302d27; }
-        .btn-red { color:#e08b6f; }
-        .btn-red:hover { background:rgba(224,139,111,.09); color:#eda287; }
-        .badge.ok { color:#9ce2a2; background:rgba(143,205,150,.1); box-shadow:inset 0 0 0 1px rgba(143,205,150,.3); }
-        .badge.limited { color:#e5c377; background:rgba(217,180,94,.12); box-shadow:inset 0 0 0 1px rgba(217,180,94,.32); }
-        .badge.expired { color:#eda287; background:rgba(224,139,111,.1); box-shadow:inset 0 0 0 1px rgba(224,139,111,.28); }
-        .step-pill { background:#26241f; border:1px solid var(--border); border-radius:8px; color:var(--text-muted); }
+        .btn-sec { background:#1f1929; color:var(--text-main); border:1px solid #322848; box-shadow:none; }
+        .btn-sec:hover { border-color:#a78bfa; background:#261e3e; }
+        .btn-red { color:#ef8f7d; }
+        .btn-red:hover { background:rgba(239,143,125,.08); color:#f0a48f; }
+        .badge.ok { color:#9ce2a2; background:rgba(143,211,154,.1); box-shadow:inset 0 0 0 1px rgba(143,211,154,.3); }
+        .badge.limited { color:#e5c377; background:rgba(227,196,111,.12); box-shadow:inset 0 0 0 1px rgba(227,196,111,.32); }
+        .badge.expired { color:#f0a48f; background:rgba(239,143,125,.1); box-shadow:inset 0 0 0 1px rgba(239,143,125,.28); }
+        .step-pill { background:#1b1529; border:1px solid #2c2347; border-radius:8px; color:var(--text-muted); }
         select, input[type=text], input[type=password], input[type=number], textarea {
-            background:#26241f; border:1px solid var(--border); border-radius:10px; color:var(--text-main); }
-        select:focus, input:focus, textarea:focus { border-color:#d97757; box-shadow:0 0 0 3px rgba(217,119,87,.13); outline:none; }
+            background:#191427; border:1px solid #322848; border-radius:10px; color:var(--text-main); }
+        select:focus, input:focus, textarea:focus { border-color:#a78bfa; box-shadow:0 0 0 3px rgba(167,139,250,.13); outline:none; }
         table { width:100%; border-collapse:collapse; }
         th { text-align:left; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--text-muted);
-            padding:10px 12px; border-bottom:1px solid var(--border); }
-        td { padding:12px; border-bottom:1px solid #33302a; color:var(--text-main); }
-        tbody tr:hover { background:rgba(217,119,87,.05); }
-        .log-box-container { background:#171511; border:1px solid #2c281f; border-radius:14px; }
-        .log-line { color:#d8d0c0; }
+            padding:10px 12px; border-bottom:1px solid #322848; position:sticky; top:0; background:#1d1729; z-index:1; }
+        td { padding:12px; border-bottom:1px solid #282043; color:var(--text-main); }
+        tbody tr:hover { background:rgba(167,139,250,.05); }
+        #pxSlowMs { background:#191427; border:1px solid #322848; border-radius:8px; color:var(--text-main); }
+        #pxPaste { background:#191427; border:1px solid #322848; border-radius:12px; padding:12px 14px;
+            color:var(--text-main); line-height:1.55; }
+        #pxPaste:focus { border-color:#a78bfa; box-shadow:0 0 0 3px rgba(167,139,250,.13); outline:none; }
+        #pxProgBar { background:linear-gradient(90deg,#7c3aed,#c4b5fd) !important; }
+        .log-box-container { background:#120e1b; border:1px solid #2a2240; border-radius:14px; }
+        .log-line { color:#d5cee6; }
         .log-OK .level, .log-INFO .level { color:#9ccf9a; }
         .log-WARN .level { color:#e3b968; }
-        .log-ERROR .level { color:#e39a80; }
-        .refresh-banner.ok { color:#9ce2a2; background:rgba(143,205,150,.08); border:1px solid rgba(143,205,150,.24); border-radius:12px; }
-        .refresh-banner.fail { color:#eda287; background:rgba(224,139,111,.08); border:1px solid rgba(224,139,111,.24); border-radius:12px; }
+        .log-ERROR .level { color:#ef8f7d; }
+        .refresh-banner.ok { color:#9ce2a2; background:rgba(143,211,154,.08); border:1px solid rgba(143,211,154,.24); border-radius:12px; }
+        .refresh-banner.fail { color:#f0a48f; background:rgba(239,143,125,.08); border:1px solid rgba(239,143,125,.24); border-radius:12px; }
 
         #btToastWrap { position:fixed; right:22px; bottom:22px; z-index:999; display:flex;
             flex-direction:column; gap:10px; align-items:flex-end; pointer-events:none; }
         .bt-toast { pointer-events:auto; display:flex; align-items:flex-start; gap:10px; max-width:380px;
-            padding:12px 15px; background:#2e2b26; border:1px solid #3a372f; border-left:3px solid #8b8577;
-            border-radius:12px; box-shadow:0 16px 40px -18px rgba(0,0,0,.75); color:#ece7de;
+            padding:12px 15px; background:#241d36; border:1px solid #372c55; border-left:3px solid #8f86b4;
+            border-radius:13px; box-shadow:0 16px 44px -18px rgba(0,0,0,.8); color:#ece8f6;
             font-size:13px; line-height:1.45; opacity:0; transform:translateX(16px);
             transition:opacity .22s ease, transform .22s ease; cursor:pointer; font-family:var(--font-ui); }
         .bt-toast.show { opacity:1; transform:none; }
-        .bt-toast.err  { border-left-color:#d97757; }
-        .bt-toast.err .bt-ico { color:#e08b6f; }
-        .bt-toast.ok   { border-left-color:#7fb986; }
-        .bt-toast.ok .bt-ico { color:#8fce96; }
-        .bt-toast.warn { border-left-color:#d9b45e; }
-        .bt-toast.warn .bt-ico { color:#d9b45e; }
+        .bt-toast.err  { border-left-color:#ef8f7d; }
+        .bt-toast.err .bt-ico { color:#ef8f7d; }
+        .bt-toast.ok   { border-left-color:#8fd39a; }
+        .bt-toast.ok .bt-ico { color:#8fd39a; }
+        .bt-toast.warn { border-left-color:#e3c46f; }
+        .bt-toast.warn .bt-ico { color:#e3c46f; }
+        .bt-toast.info  { border-left-color:#a78bfa; }
+        .bt-toast.info .bt-ico { color:#a78bfa; }
         .bt-toast .bt-ico { font-size:13px; line-height:1.3; }
         .bt-toast .bt-msg { word-break:break-word; }
 
-        ::selection { background:rgba(217,119,87,.28); }
+        ::selection { background:rgba(167,139,250,.28); }
+        ::-webkit-scrollbar { width:10px; height:10px; }
+        ::-webkit-scrollbar-thumb { background:#332a4d; border-radius:99px; border:3px solid transparent; background-clip:content-box; }
 
         </style>
 </head>
@@ -6280,6 +6756,10 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
         <button class="tab-btn" onclick="switchTab('oxalpha', this)">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
             <span>OX Alpha Bridge</span>
+        </button>
+        <button class="tab-btn" onclick="switchTab('proxies', this)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect><rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect><line x1="6" y1="6" x2="6.01" y2="6"></line><line x1="6" y1="18" x2="6.01" y2="18"></line></svg>
+            <span>Proxy Pool</span>
         </button>
         <button class="tab-btn" onclick="switchTab('logs', this)">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
@@ -6418,6 +6898,45 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <!-- TAB 6: LIVE LOGS -->
+    <div id="tab-proxies" class="tab-content">
+        <div class="card">
+            <div class="card-header-bar">
+                <h3>Proxy Pool</h3>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                    <button class="btn btn-sm" id="pxCheckBtn" onclick="pxCheck()">Check all</button>
+                    <button class="btn-sec btn btn-sm" onclick="pxPrune('dead')">Delete not working</button>
+                    <button class="btn-sec btn btn-sm" onclick="pxPrune('slow')">Delete slow (&gt;<input type="number" id="pxSlowMs" value="1000" min="100" step="100" style="width:64px;padding:2px 6px;margin:0 4px">ms)</button>
+                    <button class="btn-sec btn btn-sm" onclick="pxPrune('unchecked')">Delete unchecked</button>
+                    <button class="btn-sec btn btn-sm" onclick="pxRevive()">Revive graveyard</button>
+                </div>
+            </div>
+            <div id="pxProgWrap" style="display:none;padding:10px 18px 0">
+                <div style="height:6px;border-radius:99px;background:var(--bg-hover);overflow:hidden">
+                    <div id="pxProgBar" style="height:6px;width:0%;background:var(--accent);transition:width .35s"></div>
+                </div>
+                <div id="pxProgTxt" style="font-size:11.5px;color:var(--text-muted);margin-top:6px">checking…</div>
+            </div>
+            <div id="pxSummary" style="padding:12px 18px 4px;font-size:13px;color:var(--text-muted)">Loading…</div>
+            <div style="max-height:420px;overflow:auto">
+                <table>
+                    <thead><tr><th>Proxy</th><th>Scheme</th><th>Status</th><th>Latency</th><th>Fails</th><th>Checked</th><th></th></tr></thead>
+                    <tbody id="pxRows"></tbody>
+                </table>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header-bar"><h3>Add proxies</h3><span style="font-size:12px;color:var(--text-muted)">free-list CSV, ip:port, user:pass@ip:port, socks5://… — mixed is fine</span></div>
+            <div style="padding:14px 18px 18px;display:flex;flex-direction:column;gap:12px">
+                <textarea id="pxPaste" rows="6" placeholder="98.188.47.150,4145,United States,SOCKS4,Anonymous,259,Unknown&#10;12.34.56.78:8080&#10;user:pass@gw.provider.io:999" style="width:100%;resize:vertical;font-family:'JetBrains Mono',monospace;font-size:12.5px"></textarea>
+                <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+                    <label class="btn-sec btn" style="cursor:pointer">Upload .csv / .txt<input type="file" id="pxFile" accept=".txt,.csv,text/plain,text/csv" style="display:none"></label>
+                    <span id="pxFileName" style="font-size:12px;color:var(--text-muted)">no file chosen</span>
+                    <button class="btn" onclick="pxAdd()">Add to pool</button>
+                    <span id="pxAddResult" style="font-size:12px;color:var(--text-muted)"></span>
+                </div>
+            </div>
+        </div>
+    </div>
     <div id="tab-logs" class="tab-content">
         <div class="card">
             <div class="card-header-bar">
@@ -6470,7 +6989,102 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             if (btn) btn.classList.add('active');
             document.getElementById('tab-' + name).classList.add('active');
+            if (name === 'proxies') pxRefresh();
         }
+
+        // ===== Proxy Pool tab =====
+        let _pxPoll = null;
+        function pxEsc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+        async function pxRefresh() {
+            try {
+                const r = await fetch('/proxies/api/snapshot');
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                pxRender(await r.json());
+            } catch (e) {
+                const el = document.getElementById('pxSummary');
+                if (el) el.textContent = 'Proxy data unavailable: ' + e.message;
+            }
+        }
+        function pxRender(d) {
+            const sum = document.getElementById('pxSummary');
+            if (sum) sum.innerHTML = '<b style="color:var(--text-main)">' + d.total + '</b> in pool &nbsp;·&nbsp; <span style="color:var(--green)">' + d.live + ' live</span> &nbsp;·&nbsp; <span style="color:var(--red)">' + d.dead + ' dead</span> &nbsp;·&nbsp; median ' + (d.median_ms != null ? d.median_ms + ' ms' : '—') + (d.quarantined ? ' &nbsp;·&nbsp; ' + d.quarantined + ' quarantined (graveyard)' : '');
+            const wrap = document.getElementById('pxProgWrap');
+            if (d.checking) {
+                wrap.style.display = 'block';
+                const p = d.progress && d.progress.total ? Math.round(100 * d.progress.done / d.progress.total) : 0;
+                document.getElementById('pxProgBar').style.width = p + '%';
+                document.getElementById('pxProgTxt').textContent = 'checking ' + (d.progress ? d.progress.done : 0) + '/' + (d.progress ? d.progress.total : '?') + ' — real SOCKS/CONNECT handshakes to arena.ai:443';
+                if (!_pxPoll) _pxPoll = setInterval(pxRefresh, 1200);
+            } else {
+                wrap.style.display = 'none';
+                if (_pxPoll) { clearInterval(_pxPoll); _pxPoll = null; }
+            }
+            const tb = document.getElementById('pxRows');
+            tb.innerHTML = (d.rows || []).map(function (row) {
+                const badge = row.status === 'live' ? 'ok' : (row.status === 'dead' ? 'expired' : 'limited');
+                const lat = (typeof row.latency === 'number' && row.latency >= 0) ? row.latency + ' ms' : '—';
+                return '<tr><td><code style="background:rgba(255,255,255,.07);padding:3px 8px;border-radius:6px;font-family:monospace;font-size:12px">' + pxEsc(row.url) + '</code></td><td>' + pxEsc(row.scheme) + '</td><td><span class="badge ' + badge + '">' + row.status + '</span></td><td>' + lat + '</td><td>' + (row.fails || 0) + '</td><td style="color:var(--text-muted)">' + pxEsc(row.checked || '—') + '</td><td><button class="btn-sec btn btn-sm btn-red" onclick="pxRemove(&quot;' + pxEsc(row.host) + '&quot;)">Remove</button></td></tr>';
+            }).join('') || '<tr><td colspan="7" style="padding:20px;color:var(--text-muted)">Pool is empty — paste or upload a list below.</td></tr>';
+        }
+        async function pxPost(path, body) {
+            const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+            const j = await r.json().catch(function () { return {}; });
+            if (!r.ok) throw new Error(j.detail || ('HTTP ' + r.status));
+            return j;
+        }
+        async function pxCheck() {
+            try {
+                const j = await pxPost('/proxies/api/check');
+                showToast(j.started ? 'Proxy sweep started' : 'Sweep already running', j.started ? 'info' : 'warn');
+                if (!_pxPoll) _pxPoll = setInterval(pxRefresh, 1200);
+                pxRefresh();
+            } catch (e) { showToast('Check failed: ' + e.message, 'err'); }
+        }
+        async function pxPrune(mode) {
+            try {
+                const body = { mode: mode };
+                if (mode === 'slow') body.slow_ms = parseInt(document.getElementById('pxSlowMs').value || '1000', 10);
+                const j = await pxPost('/proxies/api/prune', body);
+                showToast(j.removed ? 'Pruned ' + j.removed + ' ' + mode + ' proxies (' + j.total + ' left)' : 'Nothing matched "' + mode + '"', j.removed ? 'ok' : 'warn');
+                pxRefresh();
+            } catch (e) { showToast('Prune failed: ' + e.message, 'err'); }
+        }
+        async function pxRemove(host) {
+            try {
+                await pxPost('/proxies/api/remove-one', { host: host });
+                showToast('Removed ' + host + ' (graveyard has it if you regret it)', 'ok');
+                pxRefresh();
+            } catch (e) { showToast('Remove failed: ' + e.message, 'err'); }
+        }
+        async function pxRevive() {
+            try {
+                const j = await pxPost('/proxies/api/revive');
+                showToast(j.revived ? 'Revived ' + j.revived + ' proxies from graveyard' : 'Graveyard is empty', j.revived ? 'ok' : 'warn');
+                pxRefresh();
+            } catch (e) { showToast('Revive failed: ' + e.message, 'err'); }
+        }
+        async function pxAdd() {
+            const ta = document.getElementById('pxPaste');
+            const res = document.getElementById('pxAddResult');
+            let text = ta.value || '';
+            const f = document.getElementById('pxFile').files[0];
+            if (f) {
+                try { text += '\n' + (await f.text()); } catch (e) { showToast('File read failed: ' + e.message, 'err'); return; }
+            }
+            if (!text.trim()) { showToast('Nothing to add — paste lines or pick a file', 'warn'); return; }
+            try {
+                const j = await pxPost('/proxies/api/upload', { text: text });
+                showToast('+' + j.added + ' proxies added (' + (j.skipped_dupes_or_bad || 0) + ' dupes/skipped) — pool: ' + j.total, j.added ? 'ok' : 'warn');
+                if (res) res.textContent = 'pool now ' + j.total;
+                ta.value = ''; document.getElementById('pxFile').value = '';
+                document.getElementById('pxFileName').textContent = 'no file chosen';
+                pxRefresh();
+            } catch (e) { showToast('Add failed: ' + e.message, 'err'); }
+        }
+        document.getElementById('pxFile').addEventListener('change', function (ev) {
+            const f = ev.target.files[0];
+            document.getElementById('pxFileName').textContent = f ? (f.name + ' (' + Math.max(1, Math.round(f.size / 1024)) + ' KB)') : 'no file chosen';
+        });
 
         async function triggerRelogin(jarId) {
             showToast('Re-login triggered. Polling real-time steps...');
@@ -6913,7 +7527,7 @@ if __name__ == "__main__":
     effective_workers = max(1, requested)
 
     print("=" * 62)
-    print("  Bridgena boiii — Arena.ai Bridge")
+    print("  Bridgena v1.0 — Arena.ai Bridge")
     print("=" * 62)
     print(f"  * Chat WebUI  : http://localhost:{args.port}/chat")
     print(f"  * Dashboard   : http://localhost:{args.port}/dashboard")
