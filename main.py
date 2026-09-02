@@ -1528,23 +1528,34 @@ def proxies_revive_all() -> int:
     return len(revived)
 
 
-def proxy_candidates(jar: Optional[dict], *, prefer_sticky: bool = True) -> List[str]:
+def proxy_candidates(jar: Optional[dict], *, prefer_sticky: bool = True,
+                     include_flagged: bool = False) -> List[str]:
     """Sweep order: the jar's live pin first (keeps cf_clearance valid), then the
     pool starting at the shared RR cursor. The old per-jar md5 offset collided
     (2 accounts on the same slot, pool entries left idle) — the cursor can't:
-    every hand-out advances it exactly one step."""
-    _q = _QUARANTINED_KEYS | _flagged_active()
+    every hand-out advances it exactly one step.
+    include_flagged=True is the LAST-RESORT view: CF flags are fluid (a challenge
+    now ≠ a challenge in 30s), so when nothing un-flagged remains we still rotate
+    over flagged exits instead of surrendering to the direct server IP. Quarantined
+    (tunnel-dead) nodes are NEVER re-admitted."""
+    _q = _QUARANTINED_KEYS | (set() if include_flagged else _flagged_active())
     pool = [p for p in get_proxy_pool() if _proxy_hkey(p) not in _q]
     out: List[str] = []
-    if prefer_sticky:
+    if prefer_sticky and not include_flagged:
         sticky = _normalize_proxy((jar or {}).get("proxy") or (jar or {}).get("_last_proxy") or "")
         # an exiled/flagged node must never come back via a stale jar pin
         if sticky and _proxy_hkey(sticky) not in _q:
             out.append(sticky)
     if pool:
         st = _proxy_assign_cursor % len(pool)
-        for i in range(len(pool)):
-            c = pool[(st + i) % len(pool)]
+        ordered = [pool[(st + i) % len(pool)] for i in range(len(pool))]
+        # speed-first: a freshly measured latency (from sweeps AND from real
+        # streamed answers) floats that exit to the front; stable sort keeps
+        # RR fairness among the ones we've never timed.
+        def _k(u):
+            lat = _proxy_latency.get(u)
+            return (1, 0) if not isinstance(lat, int) or lat <= 0 else (0, lat)
+        for c in sorted(ordered, key=_k):
             if c not in out:
                 out.append(c)
     return out
@@ -1564,6 +1575,17 @@ def pick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = Fa
     cands = proxy_candidates(jar, prefer_sticky=(mode != "request" and not rotate))
     if exclude:
         cands = [c for c in cands if c not in exclude]
+    if not cands:
+        # everything left is CF-flagged. Going DIRECT means our datacenter server
+        # IP — a far worse bet than a recently-blocked exit. One last-resort
+        # rotation over the flagged ones (cursor still advances, so each attempt
+        # is a different exit; any 200 we get lifts that exit's flag outright).
+        cands = proxy_candidates(jar, prefer_sticky=False, include_flagged=True)
+        if exclude:
+            cands = [c for c in cands if c not in exclude]
+        if cands:
+            log("WARN", "proxy pool fully CF-flagged — last-resort rotation over flagged exits "
+                        "(blocks are fluid; a delivered 200 clears the flag immediately)")
     if not cands:
         return None
     chosen = None
@@ -1607,6 +1629,21 @@ def pick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = Fa
         log("WARN", f"[{jid or 'global'}] {len(cands)} proxy candidates probed, none tunnel to Arena "
                     f"({purpose or 'use'}) — direct egress; pinned sticky kept in case provider revives")
     return None
+
+
+def _ttfb_budget(proxy: Optional[str]) -> float:
+    """Adaptive first-byte budget. A stalled exit used to eat the full 45s watchdog
+    on EVERY attempt (6 attempts = nearly 5 minutes of nothing). If we have a latency
+    sample for this exit, its timeout scales with what it actually does when healthy;
+    unknown exits still get the full budget."""
+    if not proxy:
+        return CURL_TTFB_TIMEOUT
+    lat = _proxy_latency.get(proxy)
+    if not isinstance(lat, int) or lat <= 0:
+        lat = (_proxy_health.get(_proxy_hkey(proxy)) or {}).get("latency")
+    if not isinstance(lat, int) or lat <= 0:
+        return CURL_TTFB_TIMEOUT
+    return max(12.0, min(CURL_TTFB_TIMEOUT, 3.0 + lat * 8 / 1000.0))
 
 
 async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = False,
@@ -3973,6 +4010,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 log("INFO", f"[{jar_id}] curl via proxy {proxy.split('@')[-1] if '@' in proxy else proxy}")
             else:
                 log("WARN", f"[{jar_id}] No live proxy — using server IP (easy to rate-limit)")
+            _t0 = time.monotonic()
             async with AsyncSession(impersonate="chrome131") as client:
                 try:
                     post_kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
@@ -3980,8 +4018,9 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                         post_kw["proxy"] = proxy
                     # TTFB watchdog: a stalled exit used to eat the full 120s and the
                     # curl error it eventually raised wasn't even recognized as proxy
-                    # death. Healthy streams return headers in seconds.
-                    resp = await asyncio.wait_for(client.post(url, **post_kw), timeout=CURL_TTFB_TIMEOUT)
+                    # death. Healthy streams return headers in seconds — and a proxy
+                    # with a known latency now gets a budget fit to ITS speed.
+                    resp = await asyncio.wait_for(client.post(url, **post_kw), timeout=_ttfb_budget(proxy))
                 except asyncio.TimeoutError:
                     if proxy:
                         quarantine_proxy(proxy, "curl: no response headers before TTFB watchdog")
@@ -4132,6 +4171,19 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                     return
 
                 _upstream_hits.clear()   # origin is answering again — strikes forgiven
+                if proxy:
+                    _ms = int((time.monotonic() - _t0) * 1000)
+                    if 0 < _ms < 60000:
+                        # real traffic is the best health probe there is: it keeps the
+                        # picker from re-probing on the next message (15-min fresh
+                        # window) and teaches _ttfb_budget how fast this exit is
+                        _proxy_latency[proxy] = _ms
+                        _proxy_probe_cache[proxy] = (True, time.time() + PROBE_OK_TTL)
+                        _proxy_health_record(proxy, True, _ms, source="stream")
+                    if _proxy_hkey(proxy) in _flagged_exits:
+                        _flagged_exits.pop(_proxy_hkey(proxy), None)   # 200 IS the proof: un-flag now
+                        log("INFO", f"[{jar_id}] exit {proxy.split('@')[-1] if '@' in proxy else proxy} "
+                                    f"delivered 200 in {_ms} ms — Arena-block flag lifted early")
                 buffer = b""
                 async for chunk in resp.aiter_content():
                     if not chunk:
@@ -4346,7 +4398,9 @@ async def auto_login_on_boot():
     # and the start() method already does health check + relogin if needed
     log("INFO", f"Auto-login: {len(accounts_with_creds)} account(s) queued for keeper sessions")
 
+BUILD_STAMP = "r6.2-tailwind-fastpath"
 app = FastAPI(title="Bridgena", version="1.0", lifespan=lifespan)
+log("INFO", f"BRIDGENA build {BUILD_STAMP} · deep-Arena proxy verification · CF-flag rotation ON")
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
@@ -4715,7 +4769,8 @@ LOGIN_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="bridgena-build" content="r6.2-tailwind-fastpath">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Bridgena - Sign In</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -4860,7 +4915,9 @@ LOGIN_TEMPLATE = r"""<!DOCTYPE html>
             color: var(--text-muted);
         }
     
-        /* BRIDGENA-AMETHYST-THEME v3.1 */
+        /* BRIDGENA-TAILWIND v3.2 */
+        .visible{visibility:visible}.collapse{visibility:collapse}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.sticky{position:sticky}.mx-px{margin-left:1px;margin-right:1px}.block{display:block}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.hidden{display:none}.h-1{height:.25rem}.h-1\.5{height:.375rem}.h-3\.5{height:.875rem}.w-0{width:0}.w-1\.5{width:.375rem}.w-16{width:4rem}.w-3\.5{width:.875rem}.w-px{width:1px}.flex-1{flex:1 1 0%}.flex-shrink{flex-shrink:1}.border-collapse{border-collapse:collapse}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}@keyframes spin{to{transform:rotate(1turn)}}.animate-spin{animation:spin 1s linear infinite}.cursor-text{cursor:text}.resize{resize:both}.flex-wrap{flex-wrap:wrap}.items-center{align-items:center}.gap-1\.5{gap:.375rem}.gap-2{gap:.5rem}.self-stretch{align-self:stretch}.overflow-hidden{overflow:hidden}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5rem}.rounded-md{border-radius:.375rem}.border{border-width:1px}.border-amber-400\/25{border-color:rgba(251,191,36,.25)}.border-emerald-400\/25{border-color:rgba(52,211,153,.25)}.border-rose-400\/25{border-color:rgba(251,113,133,.25)}.border-white\/10{border-color:hsla(0,0%,100%,.1)}.bg-amber-400{--tw-bg-opacity:1;background-color:rgb(251 191 36/var(--tw-bg-opacity,1))}.bg-amber-400\/\[\.06\]{background-color:rgba(251,191,36,.06)}.bg-black\/25{background-color:rgba(0,0,0,.25)}.bg-emerald-400{--tw-bg-opacity:1;background-color:rgb(52 211 153/var(--tw-bg-opacity,1))}.bg-emerald-400\/\[\.06\]{background-color:rgba(52,211,153,.06)}.bg-rose-400{--tw-bg-opacity:1;background-color:rgb(251 113 133/var(--tw-bg-opacity,1))}.bg-rose-400\/15{background-color:rgba(251,113,133,.15)}.bg-rose-400\/\[\.05\]{background-color:rgba(251,113,133,.05)}.bg-rose-400\/\[\.06\]{background-color:rgba(251,113,133,.06)}.bg-slate-500{--tw-bg-opacity:1;background-color:rgb(100 116 139/var(--tw-bg-opacity,1))}.bg-white\/\[\.03\]{background-color:hsla(0,0%,100%,.03)}.bg-white\/\[\.06\]{background-color:hsla(0,0%,100%,.06)}.bg-gradient-to-b{background-image:linear-gradient(to bottom,var(--tw-gradient-stops))}.bg-gradient-to-r{background-image:linear-gradient(to right,var(--tw-gradient-stops))}.from-violet-400{--tw-gradient-from:#a78bfa var(--tw-gradient-from-position);--tw-gradient-to:rgba(167,139,250,0) var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from),var(--tw-gradient-to)}.from-violet-500{--tw-gradient-from:#8b5cf6 var(--tw-gradient-from-position);--tw-gradient-to:rgba(139,92,246,0) var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from),var(--tw-gradient-to)}.to-violet-300{--tw-gradient-to:#c4b5fd var(--tw-gradient-to-position)}.to-violet-600{--tw-gradient-to:#7c3aed var(--tw-gradient-to-position)}.p-\[3px\]{padding:3px}.px-1\.5{padding-left:.375rem;padding-right:.375rem}.px-2{padding-left:.5rem;padding-right:.5rem}.px-2\.5{padding-left:.625rem;padding-right:.625rem}.px-3{padding-left:.75rem;padding-right:.75rem}.px-3\.5{padding-left:.875rem;padding-right:.875rem}.px-\[18px\]{padding-left:18px;padding-right:18px}.py-1{padding-top:.25rem;padding-bottom:.25rem}.py-1\.5{padding-top:.375rem;padding-bottom:.375rem}.py-\[2px\]{padding-top:2px;padding-bottom:2px}.py-\[3px\]{padding-top:3px;padding-bottom:3px}.pb-1{padding-bottom:.25rem}.pt-1\.5{padding-top:.375rem}.pt-3{padding-top:.75rem}.text-center{text-align:center}.text-\[10\.5px\]{font-size:10.5px}.text-\[11\.5px\]{font-size:11.5px}.text-\[12\.5px\]{font-size:12.5px}.text-\[12px\]{font-size:12px}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.capitalize{text-transform:capitalize}.italic{font-style:italic}.tabular-nums{--tw-numeric-spacing:tabular-nums;font-variant-numeric:var(--tw-ordinal) var(--tw-slashed-zero) var(--tw-numeric-figure) var(--tw-numeric-spacing) var(--tw-numeric-fraction)}.tracking-wide{letter-spacing:.025em}.text-amber-300{--tw-text-opacity:1;color:rgb(252 211 77/var(--tw-text-opacity,1))}.text-emerald-300{--tw-text-opacity:1;color:rgb(110 231 183/var(--tw-text-opacity,1))}.text-rose-300{--tw-text-opacity:1;color:rgb(253 164 175/var(--tw-text-opacity,1))}.text-rose-300\/90{color:rgba(253,164,175,.9)}.text-slate-100{--tw-text-opacity:1;color:rgb(241 245 249/var(--tw-text-opacity,1))}.text-slate-200{--tw-text-opacity:1;color:rgb(226 232 240/var(--tw-text-opacity,1))}.text-slate-300{--tw-text-opacity:1;color:rgb(203 213 225/var(--tw-text-opacity,1))}.text-slate-300\/80{color:rgba(203,213,225,.8)}.text-slate-400{--tw-text-opacity:1;color:rgb(148 163 184/var(--tw-text-opacity,1))}.text-violet-50{--tw-text-opacity:1;color:rgb(245 243 255/var(--tw-text-opacity,1))}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-90{opacity:.9}.shadow-\[0_8px_20px_-8px_rgba\(124\2c 58\2c 237\2c \.85\)\]{--tw-shadow:0 8px 20px -8px rgba(124,58,237,.85);--tw-shadow-colored:0 8px 20px -8px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.outline{outline-style:solid}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.backdrop-filter{-webkit-backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia);backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.transition-\[width\]{transition-property:width;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.duration-300{transition-duration:.3s}.hover\:border-rose-400\/45:hover{border-color:rgba(251,113,133,.45)}.hover\:border-white\/25:hover{border-color:hsla(0,0%,100%,.25)}.hover\:bg-rose-400\/10:hover{background-color:rgba(251,113,133,.1)}.hover\:bg-white\/\[\.06\]:hover{background-color:hsla(0,0%,100%,.06)}.hover\:bg-white\/\[\.07\]:hover{background-color:hsla(0,0%,100%,.07)}.hover\:text-rose-200:hover{--tw-text-opacity:1;color:rgb(254 205 211/var(--tw-text-opacity,1))}.hover\:text-slate-100:hover{--tw-text-opacity:1;color:rgb(241 245 249/var(--tw-text-opacity,1))}.hover\:text-slate-200:hover{--tw-text-opacity:1;color:rgb(226 232 240/var(--tw-text-opacity,1))}.hover\:text-white:hover{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.hover\:brightness-110:hover{--tw-brightness:brightness(1.1);filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.focus\:border-rose-300\/50:focus{border-color:rgba(253,164,175,.5)}.focus\:outline-none:focus{outline:2px solid transparent;outline-offset:2px}.active\:translate-y-px:active{--tw-translate-y:1px;transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.disabled\:cursor-wait:disabled{cursor:wait}.disabled\:opacity-70:disabled{opacity:.7}@media (min-width:768px){.md\:inline-flex{display:inline-flex}}
+        /* BRIDGENA-AMETHYST-THEME v3.2 */
         /* ===== Amethyst layer ===== */
         body { font-family: var(--font-ui); background-color:#17131f;
             background-image:
@@ -4973,7 +5030,8 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="bridgena-build" content="r6.2-tailwind-fastpath">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Bridgena</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -5606,7 +5664,9 @@ CHAT_TEMPLATE = r"""<!DOCTYPE html>
             .sidebar.collapsed { margin-left: -260px; }
         }
     
-        /* BRIDGENA-AMETHYST-THEME v3.1 */
+        /* BRIDGENA-TAILWIND v3.2 */
+        .visible{visibility:visible}.collapse{visibility:collapse}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.sticky{position:sticky}.mx-px{margin-left:1px;margin-right:1px}.block{display:block}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.hidden{display:none}.h-1{height:.25rem}.h-1\.5{height:.375rem}.h-3\.5{height:.875rem}.w-0{width:0}.w-1\.5{width:.375rem}.w-16{width:4rem}.w-3\.5{width:.875rem}.w-px{width:1px}.flex-1{flex:1 1 0%}.flex-shrink{flex-shrink:1}.border-collapse{border-collapse:collapse}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}@keyframes spin{to{transform:rotate(1turn)}}.animate-spin{animation:spin 1s linear infinite}.cursor-text{cursor:text}.resize{resize:both}.flex-wrap{flex-wrap:wrap}.items-center{align-items:center}.gap-1\.5{gap:.375rem}.gap-2{gap:.5rem}.self-stretch{align-self:stretch}.overflow-hidden{overflow:hidden}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5rem}.rounded-md{border-radius:.375rem}.border{border-width:1px}.border-amber-400\/25{border-color:rgba(251,191,36,.25)}.border-emerald-400\/25{border-color:rgba(52,211,153,.25)}.border-rose-400\/25{border-color:rgba(251,113,133,.25)}.border-white\/10{border-color:hsla(0,0%,100%,.1)}.bg-amber-400{--tw-bg-opacity:1;background-color:rgb(251 191 36/var(--tw-bg-opacity,1))}.bg-amber-400\/\[\.06\]{background-color:rgba(251,191,36,.06)}.bg-black\/25{background-color:rgba(0,0,0,.25)}.bg-emerald-400{--tw-bg-opacity:1;background-color:rgb(52 211 153/var(--tw-bg-opacity,1))}.bg-emerald-400\/\[\.06\]{background-color:rgba(52,211,153,.06)}.bg-rose-400{--tw-bg-opacity:1;background-color:rgb(251 113 133/var(--tw-bg-opacity,1))}.bg-rose-400\/15{background-color:rgba(251,113,133,.15)}.bg-rose-400\/\[\.05\]{background-color:rgba(251,113,133,.05)}.bg-rose-400\/\[\.06\]{background-color:rgba(251,113,133,.06)}.bg-slate-500{--tw-bg-opacity:1;background-color:rgb(100 116 139/var(--tw-bg-opacity,1))}.bg-white\/\[\.03\]{background-color:hsla(0,0%,100%,.03)}.bg-white\/\[\.06\]{background-color:hsla(0,0%,100%,.06)}.bg-gradient-to-b{background-image:linear-gradient(to bottom,var(--tw-gradient-stops))}.bg-gradient-to-r{background-image:linear-gradient(to right,var(--tw-gradient-stops))}.from-violet-400{--tw-gradient-from:#a78bfa var(--tw-gradient-from-position);--tw-gradient-to:rgba(167,139,250,0) var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from),var(--tw-gradient-to)}.from-violet-500{--tw-gradient-from:#8b5cf6 var(--tw-gradient-from-position);--tw-gradient-to:rgba(139,92,246,0) var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from),var(--tw-gradient-to)}.to-violet-300{--tw-gradient-to:#c4b5fd var(--tw-gradient-to-position)}.to-violet-600{--tw-gradient-to:#7c3aed var(--tw-gradient-to-position)}.p-\[3px\]{padding:3px}.px-1\.5{padding-left:.375rem;padding-right:.375rem}.px-2{padding-left:.5rem;padding-right:.5rem}.px-2\.5{padding-left:.625rem;padding-right:.625rem}.px-3{padding-left:.75rem;padding-right:.75rem}.px-3\.5{padding-left:.875rem;padding-right:.875rem}.px-\[18px\]{padding-left:18px;padding-right:18px}.py-1{padding-top:.25rem;padding-bottom:.25rem}.py-1\.5{padding-top:.375rem;padding-bottom:.375rem}.py-\[2px\]{padding-top:2px;padding-bottom:2px}.py-\[3px\]{padding-top:3px;padding-bottom:3px}.pb-1{padding-bottom:.25rem}.pt-1\.5{padding-top:.375rem}.pt-3{padding-top:.75rem}.text-center{text-align:center}.text-\[10\.5px\]{font-size:10.5px}.text-\[11\.5px\]{font-size:11.5px}.text-\[12\.5px\]{font-size:12.5px}.text-\[12px\]{font-size:12px}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.capitalize{text-transform:capitalize}.italic{font-style:italic}.tabular-nums{--tw-numeric-spacing:tabular-nums;font-variant-numeric:var(--tw-ordinal) var(--tw-slashed-zero) var(--tw-numeric-figure) var(--tw-numeric-spacing) var(--tw-numeric-fraction)}.tracking-wide{letter-spacing:.025em}.text-amber-300{--tw-text-opacity:1;color:rgb(252 211 77/var(--tw-text-opacity,1))}.text-emerald-300{--tw-text-opacity:1;color:rgb(110 231 183/var(--tw-text-opacity,1))}.text-rose-300{--tw-text-opacity:1;color:rgb(253 164 175/var(--tw-text-opacity,1))}.text-rose-300\/90{color:rgba(253,164,175,.9)}.text-slate-100{--tw-text-opacity:1;color:rgb(241 245 249/var(--tw-text-opacity,1))}.text-slate-200{--tw-text-opacity:1;color:rgb(226 232 240/var(--tw-text-opacity,1))}.text-slate-300{--tw-text-opacity:1;color:rgb(203 213 225/var(--tw-text-opacity,1))}.text-slate-300\/80{color:rgba(203,213,225,.8)}.text-slate-400{--tw-text-opacity:1;color:rgb(148 163 184/var(--tw-text-opacity,1))}.text-violet-50{--tw-text-opacity:1;color:rgb(245 243 255/var(--tw-text-opacity,1))}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-90{opacity:.9}.shadow-\[0_8px_20px_-8px_rgba\(124\2c 58\2c 237\2c \.85\)\]{--tw-shadow:0 8px 20px -8px rgba(124,58,237,.85);--tw-shadow-colored:0 8px 20px -8px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.outline{outline-style:solid}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.backdrop-filter{-webkit-backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia);backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.transition-\[width\]{transition-property:width;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.duration-300{transition-duration:.3s}.hover\:border-rose-400\/45:hover{border-color:rgba(251,113,133,.45)}.hover\:border-white\/25:hover{border-color:hsla(0,0%,100%,.25)}.hover\:bg-rose-400\/10:hover{background-color:rgba(251,113,133,.1)}.hover\:bg-white\/\[\.06\]:hover{background-color:hsla(0,0%,100%,.06)}.hover\:bg-white\/\[\.07\]:hover{background-color:hsla(0,0%,100%,.07)}.hover\:text-rose-200:hover{--tw-text-opacity:1;color:rgb(254 205 211/var(--tw-text-opacity,1))}.hover\:text-slate-100:hover{--tw-text-opacity:1;color:rgb(241 245 249/var(--tw-text-opacity,1))}.hover\:text-slate-200:hover{--tw-text-opacity:1;color:rgb(226 232 240/var(--tw-text-opacity,1))}.hover\:text-white:hover{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.hover\:brightness-110:hover{--tw-brightness:brightness(1.1);filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.focus\:border-rose-300\/50:focus{border-color:rgba(253,164,175,.5)}.focus\:outline-none:focus{outline:2px solid transparent;outline-offset:2px}.active\:translate-y-px:active{--tw-translate-y:1px;transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.disabled\:cursor-wait:disabled{cursor:wait}.disabled\:opacity-70:disabled{opacity:.7}@media (min-width:768px){.md\:inline-flex{display:inline-flex}}
+        /* BRIDGENA-AMETHYST-THEME v3.2 */
         /* ===== Amethyst layer — OpenWebUI-ish ===== */
         body { font-family: var(--font-ui); background-color:#16121d;
             background-image:
@@ -6389,7 +6449,8 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="bridgena-build" content="r6.2-tailwind-fastpath">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Bridgena - Control Center</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -6707,7 +6768,9 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
             color: #f87171;
         }
     
-        /* BRIDGENA-AMETHYST-THEME v3.1 */
+        /* BRIDGENA-TAILWIND v3.2 */
+        .visible{visibility:visible}.collapse{visibility:collapse}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.sticky{position:sticky}.mx-px{margin-left:1px;margin-right:1px}.block{display:block}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.hidden{display:none}.h-1{height:.25rem}.h-1\.5{height:.375rem}.h-3\.5{height:.875rem}.w-0{width:0}.w-1\.5{width:.375rem}.w-16{width:4rem}.w-3\.5{width:.875rem}.w-px{width:1px}.flex-1{flex:1 1 0%}.flex-shrink{flex-shrink:1}.border-collapse{border-collapse:collapse}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}@keyframes spin{to{transform:rotate(1turn)}}.animate-spin{animation:spin 1s linear infinite}.cursor-text{cursor:text}.resize{resize:both}.flex-wrap{flex-wrap:wrap}.items-center{align-items:center}.gap-1\.5{gap:.375rem}.gap-2{gap:.5rem}.self-stretch{align-self:stretch}.overflow-hidden{overflow:hidden}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5rem}.rounded-md{border-radius:.375rem}.border{border-width:1px}.border-amber-400\/25{border-color:rgba(251,191,36,.25)}.border-emerald-400\/25{border-color:rgba(52,211,153,.25)}.border-rose-400\/25{border-color:rgba(251,113,133,.25)}.border-white\/10{border-color:hsla(0,0%,100%,.1)}.bg-amber-400{--tw-bg-opacity:1;background-color:rgb(251 191 36/var(--tw-bg-opacity,1))}.bg-amber-400\/\[\.06\]{background-color:rgba(251,191,36,.06)}.bg-black\/25{background-color:rgba(0,0,0,.25)}.bg-emerald-400{--tw-bg-opacity:1;background-color:rgb(52 211 153/var(--tw-bg-opacity,1))}.bg-emerald-400\/\[\.06\]{background-color:rgba(52,211,153,.06)}.bg-rose-400{--tw-bg-opacity:1;background-color:rgb(251 113 133/var(--tw-bg-opacity,1))}.bg-rose-400\/15{background-color:rgba(251,113,133,.15)}.bg-rose-400\/\[\.05\]{background-color:rgba(251,113,133,.05)}.bg-rose-400\/\[\.06\]{background-color:rgba(251,113,133,.06)}.bg-slate-500{--tw-bg-opacity:1;background-color:rgb(100 116 139/var(--tw-bg-opacity,1))}.bg-white\/\[\.03\]{background-color:hsla(0,0%,100%,.03)}.bg-white\/\[\.06\]{background-color:hsla(0,0%,100%,.06)}.bg-gradient-to-b{background-image:linear-gradient(to bottom,var(--tw-gradient-stops))}.bg-gradient-to-r{background-image:linear-gradient(to right,var(--tw-gradient-stops))}.from-violet-400{--tw-gradient-from:#a78bfa var(--tw-gradient-from-position);--tw-gradient-to:rgba(167,139,250,0) var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from),var(--tw-gradient-to)}.from-violet-500{--tw-gradient-from:#8b5cf6 var(--tw-gradient-from-position);--tw-gradient-to:rgba(139,92,246,0) var(--tw-gradient-to-position);--tw-gradient-stops:var(--tw-gradient-from),var(--tw-gradient-to)}.to-violet-300{--tw-gradient-to:#c4b5fd var(--tw-gradient-to-position)}.to-violet-600{--tw-gradient-to:#7c3aed var(--tw-gradient-to-position)}.p-\[3px\]{padding:3px}.px-1\.5{padding-left:.375rem;padding-right:.375rem}.px-2{padding-left:.5rem;padding-right:.5rem}.px-2\.5{padding-left:.625rem;padding-right:.625rem}.px-3{padding-left:.75rem;padding-right:.75rem}.px-3\.5{padding-left:.875rem;padding-right:.875rem}.px-\[18px\]{padding-left:18px;padding-right:18px}.py-1{padding-top:.25rem;padding-bottom:.25rem}.py-1\.5{padding-top:.375rem;padding-bottom:.375rem}.py-\[2px\]{padding-top:2px;padding-bottom:2px}.py-\[3px\]{padding-top:3px;padding-bottom:3px}.pb-1{padding-bottom:.25rem}.pt-1\.5{padding-top:.375rem}.pt-3{padding-top:.75rem}.text-center{text-align:center}.text-\[10\.5px\]{font-size:10.5px}.text-\[11\.5px\]{font-size:11.5px}.text-\[12\.5px\]{font-size:12.5px}.text-\[12px\]{font-size:12px}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.capitalize{text-transform:capitalize}.italic{font-style:italic}.tabular-nums{--tw-numeric-spacing:tabular-nums;font-variant-numeric:var(--tw-ordinal) var(--tw-slashed-zero) var(--tw-numeric-figure) var(--tw-numeric-spacing) var(--tw-numeric-fraction)}.tracking-wide{letter-spacing:.025em}.text-amber-300{--tw-text-opacity:1;color:rgb(252 211 77/var(--tw-text-opacity,1))}.text-emerald-300{--tw-text-opacity:1;color:rgb(110 231 183/var(--tw-text-opacity,1))}.text-rose-300{--tw-text-opacity:1;color:rgb(253 164 175/var(--tw-text-opacity,1))}.text-rose-300\/90{color:rgba(253,164,175,.9)}.text-slate-100{--tw-text-opacity:1;color:rgb(241 245 249/var(--tw-text-opacity,1))}.text-slate-200{--tw-text-opacity:1;color:rgb(226 232 240/var(--tw-text-opacity,1))}.text-slate-300{--tw-text-opacity:1;color:rgb(203 213 225/var(--tw-text-opacity,1))}.text-slate-300\/80{color:rgba(203,213,225,.8)}.text-slate-400{--tw-text-opacity:1;color:rgb(148 163 184/var(--tw-text-opacity,1))}.text-violet-50{--tw-text-opacity:1;color:rgb(245 243 255/var(--tw-text-opacity,1))}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-90{opacity:.9}.shadow-\[0_8px_20px_-8px_rgba\(124\2c 58\2c 237\2c \.85\)\]{--tw-shadow:0 8px 20px -8px rgba(124,58,237,.85);--tw-shadow-colored:0 8px 20px -8px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.outline{outline-style:solid}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.backdrop-filter{-webkit-backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia);backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.transition-\[width\]{transition-property:width;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.duration-300{transition-duration:.3s}.hover\:border-rose-400\/45:hover{border-color:rgba(251,113,133,.45)}.hover\:border-white\/25:hover{border-color:hsla(0,0%,100%,.25)}.hover\:bg-rose-400\/10:hover{background-color:rgba(251,113,133,.1)}.hover\:bg-white\/\[\.06\]:hover{background-color:hsla(0,0%,100%,.06)}.hover\:bg-white\/\[\.07\]:hover{background-color:hsla(0,0%,100%,.07)}.hover\:text-rose-200:hover{--tw-text-opacity:1;color:rgb(254 205 211/var(--tw-text-opacity,1))}.hover\:text-slate-100:hover{--tw-text-opacity:1;color:rgb(241 245 249/var(--tw-text-opacity,1))}.hover\:text-slate-200:hover{--tw-text-opacity:1;color:rgb(226 232 240/var(--tw-text-opacity,1))}.hover\:text-white:hover{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.hover\:brightness-110:hover{--tw-brightness:brightness(1.1);filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.focus\:border-rose-300\/50:focus{border-color:rgba(253,164,175,.5)}.focus\:outline-none:focus{outline:2px solid transparent;outline-offset:2px}.active\:translate-y-px:active{--tw-translate-y:1px;transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.disabled\:cursor-wait:disabled{cursor:wait}.disabled\:opacity-70:disabled{opacity:.7}@media (min-width:768px){.md\:inline-flex{display:inline-flex}}
+        /* BRIDGENA-AMETHYST-THEME v3.2 */
         /* ===== Amethyst layer ===== */
         body { font-family: var(--font-ui); background-color:#151120;
             background-image:
@@ -7039,23 +7102,37 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
         <div class="card">
             <div class="card-header-bar">
                 <h3>Proxy Pool</h3>
-                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                    <button class="btn btn-sm" id="pxCheckBtn" onclick="pxCheck()">Scan pool</button>
-                    <span style="font-size:11.5px;color:var(--text-faint)">handshake + live arena.ai fetch</span>
-                    <span style="flex:1"></span>
-                    <button class="btn-sec btn btn-sm" onclick="pxPrune('bad')">Delete not working</button>
-                    <label class="btn-sec btn btn-sm" style="display:inline-flex;gap:6px;align-items:center;cursor:default">slow &gt;<input type="number" id="pxSlowMs" value="1000" min="100" step="100" style="width:58px;padding:2px 6px;border-radius:6px" onclick="event.stopPropagation()"> ms<button class="btn-ghost" style="background:none;border:0;color:var(--accent);cursor:pointer;font-size:12px;padding:0" onclick="pxPrune('slow')">delete</button></label>
-                    <button class="btn-sec btn btn-sm" onclick="pxPrune('unchecked')">Delete unchecked</button>
-                    <button class="btn-sec btn btn-sm" onclick="pxRevive()">Revive graveyard</button>
+                <div class="flex flex-wrap items-center gap-2">
+                    <button id="pxCheckBtn" onclick="pxCheck()" title="Handshake + live arena.ai fetch for every row"
+                        class="inline-flex items-center gap-2 rounded-lg bg-gradient-to-b from-violet-400 to-violet-600 px-3.5 py-1.5 text-[12.5px] font-semibold text-violet-50 shadow-[0_8px_20px_-8px_rgba(124,58,237,.85)] transition hover:brightness-110 active:translate-y-px disabled:cursor-wait disabled:opacity-70">
+                        <svg id="pxScanIco" class="h-3.5 w-3.5 opacity-90" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+                        <span id="pxScanTxt">Scan pool</span></button>
+                    <span class="hidden md:inline-flex items-center rounded-full border border-white/10 bg-white/[.03] px-2.5 py-[3px] text-[10.5px] tracking-wide text-slate-400">tunnel + arena.ai verdict, not just ping</span>
+                    <span class="flex-1"></span>
+                    <div class="inline-flex items-center rounded-lg border border-rose-400/25 bg-rose-400/[.05] p-[3px] transition hover:border-rose-400/45">
+                        <button onclick="pxPrune('bad')" title="Cut every row that cannot load arena.ai right now (dead + Arena-blocked)"
+                            class="rounded-md px-2.5 py-1 text-[12px] font-medium text-rose-300/90 transition hover:bg-rose-400/10 hover:text-rose-200">Delete not working</button>
+                        <span class="mx-px w-px self-stretch bg-rose-400/15"></span>
+                        <label class="flex cursor-text items-center gap-1.5 px-1.5 text-[11.5px] text-slate-400">slower than
+                            <input id="pxSlowMs" type="number" value="1000" min="100" step="100"
+                                class="w-16 rounded-md border border-white/10 bg-black/25 px-1.5 py-[2px] text-center text-[11.5px] tabular-nums text-slate-200 transition focus:border-rose-300/50 focus:outline-none"> ms</label>
+                        <button onclick="pxPrune('slow')" title="Delete rows over the threshold"
+                            class="rounded-md px-2 py-1 text-[11.5px] text-slate-400 transition hover:bg-white/[.06] hover:text-slate-200">delete</button>
+                        <span class="mx-px w-px self-stretch bg-rose-400/15"></span>
+                        <button onclick="pxPrune('unchecked')" title="Delete rows never scanned"
+                            class="rounded-md px-2.5 py-1 text-[12px] text-slate-300/80 transition hover:bg-white/[.06] hover:text-slate-100">Delete unchecked</button>
+                    </div>
+                    <button onclick="pxRevive()" title="Move everything from proxies.dead.txt back into the pool"
+                        class="rounded-lg border border-white/10 bg-white/[.03] px-3 py-1.5 text-[12px] text-slate-300 transition hover:border-white/25 hover:bg-white/[.07] hover:text-white">Revive graveyard</button>
                 </div>
             </div>
-            <div id="pxProgWrap" style="display:none;padding:10px 18px 0">
-                <div style="height:6px;border-radius:99px;background:var(--bg-hover);overflow:hidden">
-                    <div id="pxProgBar" style="height:6px;width:0%;background:var(--accent);transition:width .35s"></div>
+            <div id="pxProgWrap" style="display:none" class="px-[18px] pt-3">
+                <div class="h-1 overflow-hidden rounded-full bg-white/[.06]">
+                    <div id="pxProgBar" class="h-1 w-0 rounded-full bg-gradient-to-r from-violet-500 to-violet-300 transition-[width] duration-300"></div>
                 </div>
-                <div id="pxProgTxt" style="font-size:11.5px;color:var(--text-muted);margin-top:6px">checking…</div>
+                <div id="pxProgTxt" class="pt-1.5 text-[11.5px] text-slate-400">checking…</div>
             </div>
-            <div id="pxSummary" style="padding:12px 18px 4px;font-size:13px;color:var(--text-muted)">Loading…</div>
+            <div id="pxSummary" class="flex flex-wrap items-center gap-1.5 px-[18px] pb-1 pt-3 text-[12px] text-slate-400">Loading…</div>
             <div style="max-height:420px;overflow:auto">
                 <table>
                     <thead><tr><th>Proxy</th><th>Scheme</th><th>Verdict</th><th>Latency</th><th>Checked</th><th></th></tr></thead>
@@ -7147,16 +7224,32 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
         function pxRender(d) {
             const sum = document.getElementById('pxSummary');
             const unk = (d.rows || []).filter(r => r.status === 'unchecked').length + Math.max(0, (d.total || 0) - (d.rows || 0).length);
-            if (sum) sum.innerHTML = '<b style="color:var(--text-main)">' + d.total + '</b> in pool &nbsp;·&nbsp; <span style="color:var(--green)">' + d.live + ' usable</span> &nbsp;·&nbsp; ' + (d.blocked ? '<span style="color:var(--yellow)">' + d.blocked + ' Arena-blocked</span> &nbsp;·&nbsp; ' : '') + '<span style="color:var(--red)">' + d.dead + ' dead</span>' + (unk ? ' &nbsp;·&nbsp; <span style="color:var(--text-faint)">' + unk + ' unchecked</span>' : '') + ' &nbsp;·&nbsp; median ' + (d.median_ms != null ? d.median_ms + ' ms' : '—') + (d.quarantined ? ' &nbsp;·&nbsp; ' + d.quarantined + ' quarantined (graveyard)' : '');
+            if (sum) {
+                const chip = (dot, txt, cls) => '<span class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-[2px] text-[11.5px] ' + cls + '">' + (dot ? '<i class="h-1.5 w-1.5 rounded-full ' + dot + '"></i>' : '') + txt + '</span>';
+                sum.innerHTML = chip('', '<b class="font-semibold text-slate-100">' + d.total + '</b> in pool', 'border-white/10 bg-white/[.03]')
+                    + chip('bg-emerald-400', d.live + ' usable', 'border-emerald-400/25 bg-emerald-400/[.06] text-emerald-300')
+                    + (d.blocked ? chip('bg-amber-400', d.blocked + ' Arena-blocked', 'border-amber-400/25 bg-amber-400/[.06] text-amber-300') : '')
+                    + (d.dead ? chip('bg-rose-400', d.dead + ' dead', 'border-rose-400/25 bg-rose-400/[.06] text-rose-300') : '')
+                    + (unk ? chip('bg-slate-500', unk + ' unchecked', 'border-white/10 bg-white/[.03] text-slate-400') : '')
+                    + chip('', 'median ' + (d.median_ms != null ? '<b class="tabular-nums text-slate-200">' + d.median_ms + ' ms</b>' : '—'), 'border-white/10 bg-white/[.03]')
+                    + (d.quarantined ? chip('', d.quarantined + ' in graveyard', 'border-white/10 bg-white/[.03] text-slate-400') : '');
+            }
             const wrap = document.getElementById('pxProgWrap');
+            const btn = document.getElementById('pxCheckBtn'), ico = document.getElementById('pxScanIco'), lbl = document.getElementById('pxScanTxt');
             if (d.checking) {
                 wrap.style.display = 'block';
                 const p = d.progress && d.progress.total ? Math.round(100 * d.progress.done / d.progress.total) : 0;
                 document.getElementById('pxProgBar').style.width = p + '%';
-                document.getElementById('pxProgTxt').textContent = 'checking ' + (d.progress ? d.progress.done : 0) + '/' + (d.progress ? d.progress.total : '?') + ' — real SOCKS/CONNECT handshakes to arena.ai:443';
+                document.getElementById('pxProgTxt').textContent = 'checking ' + (d.progress ? d.progress.done : 0) + '/' + (d.progress ? d.progress.total : '?') + ' — tunnel handshake, then a live arena.ai fetch through the same exit';
+                if (ico) ico.classList.add('animate-spin');
+                if (btn) btn.disabled = true;
+                if (lbl) lbl.textContent = 'Scanning…';
                 if (!_pxPoll) _pxPoll = setInterval(pxRefresh, 1200);
             } else {
                 wrap.style.display = 'none';
+                if (ico) ico.classList.remove('animate-spin');
+                if (btn) btn.disabled = false;
+                if (lbl) lbl.textContent = 'Scan pool';
                 if (_pxPoll) { clearInterval(_pxPoll); _pxPoll = null; }
             }
             const tb = document.getElementById('pxRows');
