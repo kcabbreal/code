@@ -65,7 +65,7 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
 ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.8-dynamic-recaptcha-discovery")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.9-followup-contract")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -4233,7 +4233,19 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         base = {"mode": "direct-battle", "modelAId": model_id, "modality": "chat"}
         follow_url = None
         if mc and mc.get("arena_id"):
-            base = {"id": mc["arena_id"], "mode": "direct"}
+            # post-to-evaluation is not a minimal "conversation id + text"
+            # endpoint. Arena expects a complete new message envelope for every
+            # continuation, with fresh message UUIDs and the selected model.
+            # `mode` belongs to create-evaluation and is intentionally omitted
+            # from this follow-up body, matching the live client contract.
+            base = {
+                "id": mc["arena_id"],
+                "modelAId": model_id,
+                "userMessageId": str(uuid7()),
+                "modelAMessageId": str(uuid7()),
+                "modelBMessageId": str(uuid7()),
+                "modality": "chat",
+            }
             follow_url = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/{mc['arena_id']}"
         else:
             base.update({"id": str(uuid7()), "userMessageId": str(uuid7()),
