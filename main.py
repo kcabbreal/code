@@ -5237,7 +5237,7 @@ def _cli():
     if args.workers > 1:
         print("  ! workers>1: keepers run in the leader elected via state.json only")
     print("=" * 62)
-    try:
+    try: 
         import uvicorn
     except ImportError:
         print("pip install uvicorn (or run behind any ASGI server: app object = `app`)")
