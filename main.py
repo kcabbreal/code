@@ -64,7 +64,7 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
                                             "6Le3_cYsAAAAAGwWOK2RLDgNI15Bh8C0yLBOL1yL")
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "submit")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.2-ui-keeper-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.3-readiness-shadcn")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -1572,13 +1572,10 @@ async def auto_login_on_boot():
             if j.get("email") and j.get("password") and j.get("enabled", True):
                 j["keeper_enabled"] = True
     mutate_jars(enable_keepers)
-
-    # Give the election loop time to pick them up
-    await asyncio.sleep(3)
-
-    # The keeper_election_loop / sync() will now start sessions for all keeper_enabled jars
-    # and the start() method already does health check + relogin if needed
-    log("INFO", f"Auto-login: {len(accounts_with_creds)} account(s) queued for keeper sessions")
+    # Do not wait for the supervisor's next 15-second tick. Register every
+    # session immediately; sync() starts browsers as background tasks.
+    await keeper.sync()
+    log("INFO", f"Auto-login: {len(accounts_with_creds)} keeper session(s) launched")
 
 def uuid7() -> str:
     ts = int(time.time() * 1000)
@@ -3849,6 +3846,9 @@ def _find_session(jar_id=None):
         s = sessions.get(jar_id)
         if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
             return jar_id, s
+        # A token from some other account/browser/exit is not a fallback: it is
+        # cryptographically and behaviorally the wrong identity for this jar.
+        return None, None
     for sid, s in list(sessions.items()):
         if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
             return sid, s
@@ -4086,6 +4086,23 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         yield ("error", "502: No jar with valid cookies/session — upload cookies or enable a keeper")
         return
     tried.add(jar["id"])
+
+    # Startup used to race chat: requests reached Arena with `token no` while
+    # all keepers were still launching, producing opaque 500s. Trigger sync and
+    # wait briefly for this exact jar's page instead of sending invalid traffic.
+    if not _find_session(jar.get("id"))[1]:
+        await keeper.sync()
+        deadline = time.monotonic() + 35.0
+        while time.monotonic() < deadline and not _find_session(jar.get("id"))[1]:
+            s_wait = keeper.sessions.get(jar.get("id"))
+            if s_wait and s_wait.status == "error":
+                break
+            await asyncio.sleep(0.5)
+    if not _find_session(jar.get("id"))[1]:
+        s_wait = keeper.sessions.get(jar.get("id"))
+        detail = redact(getattr(s_wait, "error", "") or getattr(s_wait, "current_step", "") or "keeper is still starting")
+        yield ("error", f"503: The selected account has no ready same-exit keeper ({detail}). Check Accounts, then retry.")
+        return
     response_text = ""
     for attempt in range(max_attempts):
         p = bind_persona(jar)
@@ -4116,8 +4133,10 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         base["userMessage"] = user_message
 
         tok = await mint_v3(jar.get("id"))
-        if tok:
-            _attach_v3(base, tok)
+        if not tok:
+            yield ("error", "503: The same-exit keeper is live but could not mint a reCAPTCHA token. No request was sent to Arena; inspect the keeper status/screenshot and retry.")
+            return
+        _attach_v3(base, tok)
         url = follow_url or f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
         # Existing Arena conversations are session-bound. Restore the exact exit
         # that created the thread before the normal sticky picker runs.
@@ -4468,6 +4487,49 @@ select.model{appearance:none}
 .muted{color:var(--ink3)} .small{font-size:12.5px}
 """
 
+# shadcn/ui zinc tokens and component geometry, compiled into the single-file
+# server build. shadcn components are source-owned rather than a runtime CDN;
+# these overrides keep the deployment self-contained while applying the same
+# primitives consistently across login, operations, tables, forms and logs.
+CSS += """
+:root{--bg:#09090b;--bg2:#09090b;--panel:#0c0c0e;--panel2:#18181b;--hair:#27272a;
+ --ink:#fafafa;--ink2:#a1a1aa;--ink3:#71717a;--amber:#fafafa;--amber-ink:#09090b;
+ --teal:#4ade80;--red:#f87171;--blue:#a1a1aa;--r-lg:10px;--r-md:8px;--r-sm:7px;
+ --disp:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+ --mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;--grid:none}
+[data-theme=light]{--bg:#fff;--bg2:#fff;--panel:#fff;--panel2:#f4f4f5;--hair:#e4e4e7;
+ --ink:#09090b;--ink2:#71717a;--ink3:#a1a1aa;--amber:#18181b;--amber-ink:#fafafa;
+ --teal:#16a34a;--red:#dc2626;--blue:#71717a}
+body{letter-spacing:-.005em}body::before{display:none}a{color:inherit}
+.topbar{height:57px;padding:0 20px;background:color-mix(in srgb,var(--bg) 92%,transparent);border-color:var(--hair);backdrop-filter:blur(16px)}
+.brand{font-size:14px;letter-spacing:-.02em}.brand .dot{width:22px;height:22px;border-radius:7px;background:var(--ink);box-shadow:none;position:relative}
+.brand .dot::after{content:"B";position:absolute;inset:0;display:grid;place-items:center;color:var(--bg);font-size:10px;font-weight:800}
+.brand small{font-family:var(--mono);font-size:10px;letter-spacing:0;color:var(--ink3);text-transform:none}
+.chip{font:500 11px var(--disp);letter-spacing:0;text-transform:none;padding:5px 9px;background:transparent}.dotlive{width:6px;height:6px;box-shadow:none;animation:none}
+.btn{min-height:36px;padding:7px 12px;background:var(--bg);border-color:var(--hair);font:500 13px var(--disp);border-radius:7px;box-shadow:0 1px 2px rgba(0,0,0,.14)}
+.btn:hover{background:var(--panel2);border-color:var(--hair);text-decoration:none}.btn.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.btn.ghost{box-shadow:none;background:transparent}.btn.sm{min-height:32px;padding:5px 9px}
+input,textarea,select{background:var(--bg);border-color:var(--hair);font:400 13px/1.5 var(--disp);border-radius:7px;min-height:38px}
+label{font:500 13px var(--disp);letter-spacing:0;text-transform:none;color:var(--ink);margin:15px 0 6px}
+.shell{grid-template-columns:232px minmax(0,1fr);min-height:calc(100vh - 57px)}
+.rail{background:var(--panel);padding:18px 10px;border-color:var(--hair);gap:2px}.rail::before{content:"Workspace";padding:0 10px 10px;color:var(--ink3);font-size:11px;font-weight:500}
+.rail a{padding:8px 10px;border-radius:7px;color:var(--ink2);font:500 13px var(--disp)}.rail a:hover{background:var(--panel2);color:var(--ink)}
+.rail a.on{background:var(--panel2);color:var(--ink)}.rail a.on::before{display:none}
+.main{max-width:1480px;padding:32px 36px 60px}.pagehead{align-items:center;margin-bottom:24px}.pagehead h1{font-size:24px;letter-spacing:-.035em;font-weight:650}.pagehead p{font-size:13px}
+.grid{gap:12px}.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.card{background:var(--panel);border-color:var(--hair);border-radius:10px;padding:18px;box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.card::before{display:none}.card h3{font:600 14px var(--disp);letter-spacing:-.01em}.metric{padding:17px}.metric .k{font:500 12px var(--disp);letter-spacing:0;text-transform:none;color:var(--ink2)}
+.metric .v{font:650 29px/1.15 var(--disp);letter-spacing:-.04em;margin-top:13px}.metric .s{font:400 11px var(--disp);margin-top:5px}
+th{font:500 11px var(--disp);letter-spacing:0;text-transform:none;color:var(--ink3);padding:9px 10px}td{font-size:13px;padding:10px;border-color:var(--hair)}tr:hover td{background:var(--panel2)}
+.pill{font:550 10px var(--disp);letter-spacing:0;text-transform:none;padding:3px 8px}.bar{background:var(--panel2)}.bar i{background:var(--ink)}
+.console{background:#050506;border-color:var(--hair);font:400 11px/1.7 var(--mono);color:#d4d4d8;border-radius:8px}
+[data-theme=light] .console{background:#fafafa;color:#27272a}.split{gap:12px}
+.authwrap{display:block;background:var(--bg)}.authplate{display:none}.authside{min-height:100vh;padding:24px}.authcard{width:min(390px,100%);background:transparent;border:0;box-shadow:none;padding:24px}
+.authcard::before{display:none}.authcard::after{content:"Access the Bridgena control plane";display:block;color:var(--ink3);font-size:12px;text-align:center;margin-top:18px}
+.authcard h3{font-size:23px;justify-content:center;letter-spacing:-.035em;margin-bottom:26px}.err{text-align:center;font-family:var(--disp);font-size:12px}
+@media(max-width:900px){.shell{grid-template-columns:1fr}.rail{display:none}.main{padding:24px 16px}.metrics{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){.metrics{grid-template-columns:1fr}.topbar .chip,.topbar .brand small{display:none}.pagehead{align-items:flex-start;flex-direction:column}}
+"""
+
 JS_THEME = """
 (function(){try{var t=localStorage.getItem('bgn.theme');if(t)document.documentElement.dataset.theme=t;}catch(e){}})();
 function bgnToggleTheme(){var h=document.documentElement;var n=(h.dataset.theme==='light')?'':'light';h.dataset.theme=n;try{localStorage.setItem('bgn.theme',n)}catch(e){}}
@@ -4713,7 +4775,7 @@ def chat_page(models: list, default_model: str) -> str:
     names = [m.get("name", "") for m in models if m.get("name")]
     payload = _json.dumps(names, ensure_ascii=False).replace("</", "<\\/")
     selected = _json.dumps(default_model or (names[0] if names else "auto"), ensure_ascii=False)
-    template = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    template = r'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bridgena</title>
 <style>
 :root{--bg:#fff;--panel:#fafafa;--soft:#f4f4f5;--line:#e4e4e7;--text:#09090b;--muted:#71717a;--hover:#f4f4f5;--accent:#18181b;--danger:#dc2626;--success:#16a34a;--shadow:0 12px 34px rgba(0,0,0,.12)}
