@@ -4538,16 +4538,23 @@ function f(){fetch('/debug-logs/data').then(r=>r.json()).then(d=>{var c=document
 
 
 def models_page(models: list, blocked: list) -> str:
-    rows = "".join(
-        f"<tr><td>{esc(m.get('name'))}</td><td class=mono muted>{esc(m.get('id','')[:22])}</td>"
-        f"<td>{'<span class=\"pill bad\">blocked</span>' if m.get('name') in blocked else '<span class=\"pill ok\">selectable</span>'}</td>"
-        f"<td><form method=post action=/models/block style=margin:0><input type=hidden name=name value=\"{esc(m.get('name'))}\">"
-        f"<button class='btn sm ghost'>{'unblock' if m.get('name') in blocked else 'block'}</button></form></td></tr>"
-        for m in models[:400])
-    return page("Models", f"""<div class="pagehead"><div><h1>Model Catalog</h1><p>{len(models)} known · {len(blocked)} blocked on this account set</p></div>
-<div class="row"><button class="btn" onclick="fetch('/keeper/config',{{method:'POST'}}).then(()=>toast('refresh queued'))">↻ Refresh</button></div></div>
+    def _row(m):
+        name = esc(m.get("name") or "")
+        mid = esc((m.get("id") or "")[:22])
+        is_b = m.get("name") in blocked
+        pill = '<span class="pill bad">blocked</span>' if is_b else '<span class="pill ok">selectable</span>'
+        act = "unblock" if is_b else "block"
+        return ("<tr><td>" + name + '</td><td class="mono muted">' + mid + "</td><td>" + pill +
+                '</td><td><form method="post" action="/models/block" style="margin:0">' +
+                '<input type="hidden" name="name" value="' + name + '">' +
+                "<button class='btn sm ghost'>" + act + "</button></form></td></tr>")
+    rows = "".join(_row(m) for m in models[:400])
+    return page("Models", '<div class="pagehead"><div><h1>Model Catalog</h1><p>' + str(len(models)) +
+                " known · " + str(len(blocked)) + ' blocked on this account set</p></div>' +
+                """<div class="row"><button class="btn" onclick="fetch('/keeper/config',{method:'POST'}).then(()=>toast('refresh queued'))">↻ Refresh</button></div></div>
 <div class="card"><input id="q" placeholder="filter…" oninput="flt()" style="margin-bottom:12px">
-<table><thead><tr><th>name</th><th>arena id</th><th>state</th><th></th></tr></thead><tbody id="tb">{rows}</tbody></table></div></div>""", active="models", raw_js="""
+<table><thead><tr><th>name</th><th>arena id</th><th>state</th><th></th></tr></thead><tbody id="tb">""" +
+                rows + """</tbody></table></div>""", active="models", raw_js="""
 function flt(){var q=document.getElementById('q').value.toLowerCase();
 document.querySelectorAll('#tb tr').forEach(r=>{r.style.display=r.textContent.toLowerCase().includes(q)?'':'none'})}""")
 
@@ -5237,7 +5244,7 @@ def _cli():
     if args.workers > 1:
         print("  ! workers>1: keepers run in the leader elected via state.json only")
     print("=" * 62)
-    try: 
+    try:
         import uvicorn
     except ImportError:
         print("pip install uvicorn (or run behind any ASGI server: app object = `app`)")
