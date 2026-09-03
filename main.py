@@ -64,7 +64,7 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
                                             "6Le3_cYsAAAAAGwWOK2RLDgNI15Bh8C0yLBOL1yL")
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "submit")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.0-arena-v3token")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.1-thread-affinity")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -3388,7 +3388,8 @@ async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bo
                            include_flagged: bool = False) -> Optional[str]:
     """Rotation-aware pick among exits PROVEN to tunnel to arena recently.
     Unknown lines are probed inside a per-cycle budget, never blocking traffic."""
-    cands = proxy_candidates(jar, prefer_sticky=False)
+    assignment_mode = _rotation_mode() == "assignment"
+    cands = proxy_candidates(jar, prefer_sticky=assignment_mode and not rotate)
     if not cands:
         return None
     bad = _flagged_and_quarantined(include_flagged)
@@ -3434,7 +3435,7 @@ async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bo
             # fluid last resort: cycle flagged exits (blocks move; a 200 un-flags)
             return await apick_live_proxy(jar, purpose=purpose or "last-resort", rotate=rotate, include_flagged=True)
         return None
-    if _rotation_mode() == "sticky" and jar is not None:
+    if assignment_mode and not rotate and jar is not None:
         pinned = _normalize_proxy(jar.get("proxy") or "") or None
         if pinned and pinned in live:
             if jar.get("id"):
@@ -3447,6 +3448,8 @@ async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bo
         chosen = live[_pick_ctr]
     _bump_cursor(chosen)
     if jar is not None and jar.get("id"):
+        if assignment_mode:
+            assign_jar_proxy(jar["id"], chosen)
         try:
             await anchor_proxy_to_keeper(jar["id"], chosen)
         except Exception:
@@ -4019,13 +4022,23 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         yield ("error", "500: curl_cffi missing in this environment — pip install curl_cffi")
         return
     conv = get_conversation(chat_id) or {}
+    mc = conv.get("arena", {}).get(model_name) if conv.get("model") == model_name else None
     max_attempts = 6
     route_fails: list = []
     cf_clear_attempts = 0
     same_jar_429 = 0
     rc_attempts = 0
     tried = set()
-    jar = acquire_jar(prefer_live=True) if not jar_hint else next((j for j in load_jars() if j.get("id") == jar_hint), None) or acquire_jar()
+    bound_jar_id = (mc or {}).get("jar_id")
+    wanted_jar_id = jar_hint or bound_jar_id
+    jar = (next((j for j in load_jars()
+                 if j.get("id") == wanted_jar_id and j.get("enabled", True)), None)
+           if wanted_jar_id else acquire_jar(prefer_live=True))
+    if bound_jar_id and not jar:
+        yield ("error", "409: This Arena thread's original jar is unavailable. Start a new Bridgena thread instead of replaying its ID through another account.")
+        return
+    if not jar and jar_hint:
+        jar = acquire_jar(prefer_live=True)
     if not jar:
         yield ("error", "502: No jar with valid cookies/session — upload cookies or enable a keeper")
         return
@@ -4035,6 +4048,9 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         p = bind_persona(jar)
         jar = await _live_cookies(jar)
         if not jar_has_auth(jar):
+            if mc:
+                yield ("error", "409: This Arena thread lost its original authenticated jar. Start a new Bridgena thread.")
+                return
             nxt = acquire_jar(prefer_live=True)
             if nxt and nxt["id"] not in tried:
                 jar, _ = nxt, tried.add(nxt["id"])
@@ -4044,7 +4060,6 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         model_id = jar.get("model_map", {}).get(model_name) or model_name
         base = {"mode": "direct-battle", "modelAId": model_id, "modality": "chat"}
         follow_url = None
-        mc = conv.get("arena", {}).get(model_name) if conv.get("model") == model_name else None
         if mc and mc.get("arena_id"):
             base = {"id": mc["arena_id"], "mode": "direct"}
             follow_url = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/{mc['arena_id']}"
@@ -4061,7 +4076,17 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         if tok:
             _attach_v3(base, tok)
         url = follow_url or f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
-        proxy = await apick_live_proxy(jar, purpose="api")
+        # Existing Arena conversations are session-bound. Restore the exact exit
+        # that created the thread before the normal sticky picker runs.
+        bound_proxy = (_normalize_proxy(mc.get("proxy"))
+                       if mc and mc.get("proxy") and _rotation_mode() == "assignment" else None)
+        if bound_proxy:
+            if not await asyncio.to_thread(proxy_alive, bound_proxy):
+                yield ("error", "409: This Arena thread's original exit is unavailable. Start a new Bridgena thread; its conversation ID cannot safely move to another IP.")
+                return
+            proxy = bound_proxy
+        else:
+            proxy = await apick_live_proxy(jar, purpose="api")
         proxy, cycled = await anchor_proxy_to_keeper(jar.get("id"), proxy)
         if cycled:
             jar = await _live_cookies(jar)
@@ -4135,6 +4160,9 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                             continue
                         if proxy and attempt + 1 < max_attempts:
                             note_cf_blocked_exit(proxy, "persistent 403 challenge after keeper re-clear")
+                            if mc:
+                                yield ("error", "403: This thread's bound exit is Arena-blocked. Start a new Bridgena thread to select another healthy exit.")
+                                return
                             continue
                         yield ("error", "502: Arena's Cloudflare flagged every exit we tried — retry shortly or add residential lines.")
                         return
@@ -4172,6 +4200,9 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         jar = await _live_cookies(jar)
                         if same_jar_429 < 3:
                             continue
+                        if mc:
+                            yield ("error", "429: This thread's bound Arena session is rate-limited — wait 30-60s or start a new thread")
+                            return
                         nxt = acquire_jar(prefer_live=True)
                         if nxt and nxt["id"] not in tried:
                             jar, _ = nxt, tried.add(nxt["id"])
@@ -4190,6 +4221,9 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         if jar_has_auth(jar) and attempt == 0:
                             continue
                         mark_jar_status(jar["id"], "expired")
+                        if mc:
+                            yield ("error", "409: This Arena thread's original session expired. Start a new Bridgena thread.")
+                            return
                         nxt = acquire_jar(prefer_live=True)
                         if nxt and nxt["id"] not in tried:
                             log("WARN", f"session expired — rotating to '{nxt.get('name')}'")
@@ -4234,7 +4268,10 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     conv2 = dict(conv)
                     conv2["model"] = model_name
                     conv2["arena"] = dict(conv2.get("arena") or {})
-                    conv2["arena"][model_name] = {"arena_id": base["id"], "mode": "direct"}
+                    conv2["arena"][model_name] = {
+                        "arena_id": base["id"], "mode": "direct",
+                        "jar_id": jar.get("id"), "proxy": proxy,
+                    }
                     save_conversation(chat_id, conv2)
                 yield ("done", response_text)
                 return
@@ -4604,11 +4641,13 @@ async function send(){{if(busy)return;const inp=document.getElementById('in');co
  add('user',text);const holder=add('ai','…');let acc='';
  try{{const r=await fetch('/v1/chat/completions',{{method:'POST',headers:{{'Content-Type':'application/json'}},
   body:JSON.stringify({{model:document.getElementById('model').value,messages:[{{role:'user',content:text}}],stream:true,chat_id:chat_id}})}});
+  if(!r.ok){{throw new Error('HTTP '+r.status+': '+await r.text())}}
   const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
-  while(true){{const {{done,value}}=await rd.read();if(done)break;buf+=dec.decode(value,{{{{stream:true}}}});
+  while(true){{const {{done,value}}=await rd.read();if(done)break;buf+=dec.decode(value,{{stream:true}});
    let nl;while((nl=buf.indexOf('\\n'))>=0){{const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);
-    if(line.startsWith('data: ')){{const p=line.slice(6);if(p==='[DONE]')continue;try{{const j=JSON.parse(p);
-     const d=j.choices&&j.choices[0]&&j.choices[0].delta&&j.choices[0].delta.content;if(d){{acc+=d;holder.innerHTML='<span class=who>ai</span>'+md(acc);document.getElementById('t').scrollTop=1e9}}}}catch(e){{}}}}}}}}
+    if(line.startsWith('data: ')){{const p=line.slice(6);if(p==='[DONE]')continue;let j;try{{j=JSON.parse(p)}}catch(e){{continue}}
+     if(j.error){{throw new Error(j.error.message||'Bridgena stream error')}}
+     const d=j.choices&&j.choices[0]&&j.choices[0].delta&&j.choices[0].delta.content;if(d){{acc+=d;holder.innerHTML='<span class=who>ai</span>'+md(acc);document.getElementById('t').scrollTop=1e9}}}}}}}}
   if(!acc){{holder.innerHTML='<span class=who>ai</span><i class=muted>empty response</i>'}}
   document.getElementById('st').textContent='done';
  }}catch(e){{holder.innerHTML='<span class=who>ai</span><span style=color:var(--red)>'+String(e)+'</span>';document.getElementById('st').textContent='error'}}
