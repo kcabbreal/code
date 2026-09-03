@@ -65,7 +65,7 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
 ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.10-captured-followup-contract")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.11-live-model-resolution")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -223,18 +223,48 @@ def model_name(m) -> str:
     return m.get("name") or m.get("publicName") or m.get("id") or ""
 
 
+def _model_key(value: str) -> str:
+    """Canonical comparison key for Arena display labels and API slugs."""
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
+# Captured from Arena's working direct-chat client on 2026-09-03. These are
+# compatibility pins, not substitutes for catalog refresh: a JSON environment
+# override lets an operator update a changed UUID without editing this file.
+_VERIFIED_MODEL_IDS = {
+    "gemini-3-8-flash-high": "01a0681c-b561-76b6-b338-a44ff0cff460",
+    "minimax-m3": "019e809d-f62d-7192-bb7f-1657e066b5f2",
+}
+try:
+    _VERIFIED_MODEL_IDS.update({
+        _model_key(k): str(v) for k, v in
+        json.loads(os.environ.get("BRIDGENA_MODEL_ID_OVERRIDES", "{}")).items()
+    })
+except Exception:
+    pass
+
+
 def resolve_model_id(public_name: str, jar: Optional[dict] = None) -> str:
     """Resolve Arena's public label to the internal UUID required by the
     create-evaluation contract. Sending a label here currently produces an
     opaque upstream 500, while Arena's own client always sends the UUID."""
-    mapped = (jar or {}).get("model_map", {}).get(public_name)
-    if mapped:
-        return mapped
+    wanted = _model_key(public_name)
+    if wanted in _VERIFIED_MODEL_IDS:
+        return _VERIFIED_MODEL_IDS[wanted]
+    # The shared catalog is replaced atomically by the latest successful live
+    # refresh. Prefer it over a jar's historical snapshot.
     for item in get_models():
         if not isinstance(item, dict):
             continue
-        if public_name in (item.get("name"), item.get("publicName"), item.get("id")):
+        labels = (item.get("name"), item.get("publicName"), item.get("id"))
+        if public_name in labels or wanted in {_model_key(x) for x in labels if x}:
             return item.get("id") or public_name
+    jar_map = (jar or {}).get("model_map", {})
+    mapped = jar_map.get(public_name)
+    if not mapped:
+        mapped = next((v for k, v in jar_map.items() if _model_key(k) == wanted), None)
+    if mapped:
+        return mapped
     return public_name
 
 
