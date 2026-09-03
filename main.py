@@ -59,13 +59,13 @@ STRIKES_MAX = 3
 MAX_CONVERSATIONS = 500
 
 ARENA_RECAPTCHA_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_SITEKEY",
-                                         "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I")
+                                         "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0")
 ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
                                             "6Ld7ePYrAAAAAB34ovoFoDau1fqCJ6IyOjFEQaMn")
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
 ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.7-current-arena-contract")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.8-dynamic-recaptcha-discovery")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -3762,7 +3762,11 @@ def snapshot_rows() -> List[dict]:
 # ============================================================
 import asyncio, time  # noqa
 
-RC_MINT_JS = r"""async (SITE) => {
+RC_MINT_JS = r"""async (OPTS) => {
+                const FALLBACK = String(OPTS?.fallbackSitekey || '');
+                const ACTION = String(OPTS?.action || 'chat_submit');
+                const validKey = (v) => typeof v === 'string' && /^6[0-9A-Za-z_-]{30,}$/.test(v);
+                const hint = (v) => validKey(v) ? `${v.slice(0, 8)}…${v.slice(-4)}` : 'none';
                 const grab = () => {
                     try {
                         const el = document.querySelector(
@@ -3772,26 +3776,61 @@ RC_MINT_JS = r"""async (SITE) => {
                     return null;
                 };
                 let t = grab();
-                if (t) return t;
+                if (t) return {token: t, source: 'response-field', keyHint: 'widget', action: ACTION};
                 const g = window.grecaptcha;
                 if (!g) return {err: 'no grecaptcha object on keeper page (arena widget script not on this URL?)'};
                 try {
                     const r0 = (g.getResponse && g.getResponse())
                             || (g.enterprise && g.enterprise.getResponse && g.enterprise.getResponse());
-                    if (r0 && r0.length > 20) return r0;
+                    if (r0 && r0.length > 20) return {token: r0, source: 'getResponse', keyHint: 'widget', action: ACTION};
                 } catch (e) {}
                 let sitekey = null;
+                let source = null;
                 const node = document.querySelector('[data-sitekey]');
-                if (node) sitekey = node.getAttribute('data-sitekey');
+                if (node && validKey(node.getAttribute('data-sitekey'))) {
+                    sitekey = node.getAttribute('data-sitekey'); source = 'data-sitekey';
+                }
+                if (!sitekey) {
+                    for (const script of [...document.scripts]) {
+                        try {
+                            const render = new URL(script.src, location.href).searchParams.get('render');
+                            if (validKey(render) && render !== 'explicit') {
+                                sitekey = render; source = 'api.js?render'; break;
+                            }
+                        } catch (e) {}
+                    }
+                }
+                if (!sitekey) {
+                    for (const frame of [...document.querySelectorAll('iframe[src]')]) {
+                        try {
+                            const key = new URL(frame.src, location.href).searchParams.get('k');
+                            if (validKey(key)) { sitekey = key; source = 'recaptcha-iframe'; break; }
+                        } catch (e) {}
+                    }
+                }
                 if (!sitekey && window.___grecaptcha_cfg && ___grecaptcha_cfg.clients) {
                     try {
+                        const seen = new WeakSet();
+                        const scan = (value, depth = 0) => {
+                            if (validKey(value)) return value;
+                            if (!value || typeof value !== 'object' || depth > 7 || seen.has(value)) return null;
+                            seen.add(value);
+                            for (const [name, child] of Object.entries(value)) {
+                                if (/token|response/i.test(name)) continue;
+                                const found = scan(child, depth + 1);
+                                if (found) return found;
+                            }
+                            return null;
+                        };
                         for (const c of Object.values(___grecaptcha_cfg.clients)) {
-                            const k = c?.sitekey || c?.settings?.sitekey;
-                            if (k) { sitekey = k; break; }
+                            const k = scan(c);
+                            if (k) { sitekey = k; source = 'grecaptcha-client'; break; }
                         }
                     } catch (e) {}
                 }
-                const KEY = sitekey || SITE;
+                const KEY = sitekey || FALLBACK;
+                source = source || 'configured-fallback';
+                if (!validKey(KEY)) return {err: 'no valid site key discovered', source, keyHint: hint(KEY), action: ACTION};
                 const ex = (a1, a2) => new Promise((res2, rej2) => {
                     const fail = setTimeout(() => rej2(new Error('execute-timeout (12s)')), 12000);
                     const go = () => {
@@ -3812,22 +3851,22 @@ RC_MINT_JS = r"""async (SITE) => {
                     // arena's own shape (proven against the live page 2026-09-03):
                     // POSITIONAL (sitekey, {action}) inside enterprise.ready. The object
                     // form throws 'No reCAPTCHA clients exist.' on this widget build.
-                    const tok = await ex(KEY, {action: 'submit'});
-                    if (tok && tok.length > 20) return tok;
-                    return {err: 'enterprise.execute resolved empty (Google scored this session low — image challenge may follow)'};
+                    const tok = await ex(KEY, {action: ACTION});
+                    if (tok && tok.length > 20) return {token: tok, source, keyHint: hint(KEY), action: ACTION};
+                    return {err: 'enterprise.execute resolved empty (Google scored this session low — image challenge may follow)', source, keyHint: hint(KEY), action: ACTION};
                 } catch (e1) {
                     try {
-                        const t2 = await ex({sitekey: KEY, action: 'submit'});
-                        if (t2 && t2.length > 20) return t2;
+                        const t2 = await ex({sitekey: KEY, action: ACTION});
+                        if (t2 && t2.length > 20) return {token: t2, source, keyHint: hint(KEY), action: ACTION};
                     } catch (e2) {}
                     try {
                         if (typeof g.execute === 'function') {
-                            const t3 = await Promise.race([g.execute(KEY, {action: 'submit'}),
+                            const t3 = await Promise.race([g.execute(KEY, {action: ACTION}),
                                                            new Promise((_, r) => setTimeout(() => r(new Error('v3-timeout')), 8000))]);
-                            if (t3 && t3.length > 20) return t3;
+                            if (t3 && t3.length > 20) return {token: t3, source, keyHint: hint(KEY), action: ACTION};
                         }
                     } catch (e3) {}
-                    return {err: 'execute failed: ' + String(e1).slice(0, 160)};
+                    return {err: 'execute failed: ' + String(e1).slice(0, 160), source, keyHint: hint(KEY), action: ACTION};
                 }
             }"""
 
@@ -3924,11 +3963,22 @@ async def mint_v3(jar_id=None):
                     diag = {"diagnostic": f"{type(diag_e).__name__}: {diag_e}"}
                 log("WARN", f"recaptcha runtime absent after 15s: {redact(json.dumps(diag, ensure_ascii=False))[:700]}")
                 return None
-            res = await s.page.evaluate(RC_MINT_JS.replace("ARENA_MARK", ""), ARENA_RECAPTCHA_SITEKEY)
+            res = await s.page.evaluate(RC_MINT_JS, {
+                "fallbackSitekey": ARENA_RECAPTCHA_SITEKEY,
+                "action": RECAPTCHA_ACTION,
+            })
             if isinstance(res, str) and len(res) > 20:
                 return res
+            if isinstance(res, dict) and isinstance(res.get("token"), str) and len(res["token"]) > 20:
+                log("OK", "recaptcha token minted via " + str(res.get("source", "unknown"))
+                    + " · key " + str(res.get("keyHint", "unknown"))
+                    + " · action " + str(res.get("action", RECAPTCHA_ACTION)))
+                return res["token"]
             why = res.get("err") if isinstance(res, dict) else "evaluate returned nothing"
-            log("WARN", f"recaptcha token: {why}")
+            detail = (" · source " + str(res.get("source", "unknown"))
+                      + " · key " + str(res.get("keyHint", "unknown"))
+                      + " · action " + str(res.get("action", RECAPTCHA_ACTION))) if isinstance(res, dict) else ""
+            log("WARN", f"recaptcha token: {why}{detail}")
 
             if isinstance(why, str) and "no grecaptcha" in why.lower():
                 return None
