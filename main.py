@@ -50,10 +50,12 @@ try:
 except ImportError:
     AsyncCamoufox = None
 
+_SOLVER_IMPORT_ERR = ""
 try:
     from recaptcha_solver import get_solver
-except ImportError:
+except ImportError as _solver_e:
     get_solver = None
+    _SOLVER_IMPORT_ERR = str(_solver_e)
 
 # ============================================================
 # CONFIGURATION & CONSTANTS
@@ -2708,6 +2710,8 @@ class KeeperSession:
         and models/grid.onnx (or BRIDGENA_CAPTCHA_MODELS dir).
         """
         if get_solver is None:
+            log("WARN", f"[{self.name}] image solver off: {_SOLVER_IMPORT_ERR or 'recaptcha_solver import failed'} "
+                         "— the file must sit next to main.py and export get_solver")
             return False
         solver = get_solver()
         if not solver.available():
@@ -4263,55 +4267,69 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             log("WARN", f"Cookie harvest from live session failed: {e}")
         return j
 
-    async def _get_recaptcha_token():
-        """Primary: reCAPTCHA v3 / existing response from any live page.
+    async def _get_recaptcha_token(prefer_jar_id: str | None = None):
+        """Primary: reCAPTCHA v3/Enterprise token minted by a live keeper page.
         Fallback: ask the keeper to solve an image challenge if one is open.
-        """
-        sid, s = _find_live_session()
+        Every dead-end logs a 'recaptcha token:' WARN so the log says WHICH
+        link of the chain is missing — never a silent None."""
+        sid, s = _find_live_session(prefer_jar_id)
         if not s:
+            log("WARN", "recaptcha token: no live keeper session — open Live Browser once on a working "
+                        "exit (the token must be minted from a page, ideally the SAME exit curl uses)")
             return None
         try:
-            # 1) Prefer an already-solved / v3 token
-            token = await s.page.evaluate("""async () => {
+            # 1) Prefer an already-solved token; else mint via Enterprise or v3.
+            res = await s.page.evaluate("""async () => {
+                const grab = () => {
+                    try {
+                        const el = document.querySelector(
+                            'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response');
+                        if (el && el.value && el.value.length > 20) return el.value;
+                    } catch (e) {}
+                    return null;
+                };
+                let t = grab();
+                if (t) return t;
+                const g = window.grecaptcha;
+                if (!g) return {err: 'no grecaptcha object on keeper page (arena widget script not on this URL?)'};
                 try {
-                    const el = document.querySelector(
-                        'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response'
-                    );
-                    if (el && el.value && el.value.length > 20) return el.value;
+                    const r0 = (g.getResponse && g.getResponse())
+                            || (g.enterprise && g.enterprise.getResponse && g.enterprise.getResponse());
+                    if (r0 && r0.length > 20) return r0;
                 } catch (e) {}
-                try {
-                    if (window.grecaptcha) {
-                        if (typeof grecaptcha.getResponse === 'function') {
-                            const t = grecaptcha.getResponse();
-                            if (t && t.length > 20) return t;
+                let sitekey = null;
+                const node = document.querySelector('[data-sitekey]');
+                if (node) sitekey = node.getAttribute('data-sitekey');
+                if (!sitekey && window.___grecaptcha_cfg && ___grecaptcha_cfg.clients) {
+                    try {
+                        for (const c of Object.values(___grecaptcha_cfg.clients)) {
+                            const k = c?.sitekey || c?.settings?.sitekey;
+                            if (k) { sitekey = k; break; }
                         }
-                        // reCAPTCHA v3 execute
-                        let sitekey = null;
-                        const node = document.querySelector('[data-sitekey]');
-                        if (node) sitekey = node.getAttribute('data-sitekey');
-                        if (!sitekey && window.___grecaptcha_cfg && ___grecaptcha_cfg.clients) {
-                            try {
-                                const clients = Object.values(___grecaptcha_cfg.clients);
-                                for (const c of clients) {
-                                    const k = c?.sitekey || c?.settings?.sitekey;
-                                    if (k) { sitekey = k; break; }
-                                }
-                            } catch (e) {}
-                        }
-                        if (typeof grecaptcha.execute === 'function' && sitekey) {
-                            try {
-                                const t = await grecaptcha.execute(sitekey, {action: 'submit'});
-                                if (t && t.length > 20) return t;
-                            } catch (e) {}
-                        }
-                    }
-                } catch (e) {}
-                return null;
+                    } catch (e) {}
+                }
+                if (!sitekey) return {err: 'no sitekey found on keeper page'};
+                if (g.enterprise && typeof g.enterprise.execute === 'function') {
+                    try {
+                        const tok = await g.enterprise.execute({sitekey, action: 'submit'});
+                        if (tok && tok.length > 20) return tok;
+                        return {err: 'enterprise.execute resolved empty (Google is challenging this session)'};
+                    } catch (e) { return {err: 'enterprise.execute threw: ' + String(e).slice(0, 120)}; }
+                }
+                if (typeof g.execute === 'function') {
+                    try {
+                        const tok = await g.execute(sitekey, {action: 'submit'});
+                        if (tok && tok.length > 20) return tok;
+                    } catch (e) { return {err: 'v3 execute threw: ' + String(e).slice(0, 120)}; }
+                }
+                return {err: 'grecaptcha present but no execute() (checkbox-only v2 widget on this page)'};
             }""")
-            if token:
-                return token
+            if isinstance(res, str) and len(res) > 20:
+                return res
+            why = res.get("err") if isinstance(res, dict) else "evaluate returned nothing"
+            log("WARN", f"recaptcha token: {why}")
         except Exception as e:
-            log("WARN", f"v3 token read failed: {e}")
+            log("WARN", f"recaptcha token: read failed: {type(e).__name__}: {e}")
 
         # 2) Fallback: image challenge solver on the live page
         try:
@@ -4354,6 +4372,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
     tried_jar_ids = {jar_id}
     cf_clear_attempts = 0
     same_jar_429 = 0  # consecutive 429s on current jar
+    rc_attempts = 0   # R29: recaptcha-token refresh tries (starvation != dead jar)
     max_attempts = 6  # fixed budget — do NOT burn entire pool on IP rate-limits
     route_fails: list = []   # (host:port, error tail) for exits that connected but couldn't route
 
@@ -4398,8 +4417,8 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
             }
             url = f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
 
-            # Attach recaptcha token when a live page has one (same as old code)
-            token = await _get_recaptcha_token()
+            # Attach recaptcha token from this jar's keeper (same exit as the request)
+            token = await _get_recaptcha_token(jar_id)
             if token:
                 base["recaptchaToken"] = token
                 base["recaptcha"] = token
@@ -4547,6 +4566,29 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                                             "(they get skipped for a few hours). Retry shortly, add more "
                                             "residential proxies, or solve once in Live Browser on a clean exit.")
                             return
+                        # 'recaptcha validation failed' on a 403 is OUR token starvation —
+                        # it says nothing about the account. Never burn jars on it (R29):
+                        # one keeper-minted retry, then stop clean with the jar kept healthy.
+                        if "captcha" in body.lower():
+                            if rc_attempts < 1:
+                                rc_attempts += 1
+                                token = await _get_recaptcha_token(jar_id)
+                                if token:
+                                    base["recaptchaToken"] = token
+                                    base["recaptcha"] = token
+                                    base["captchaToken"] = token
+                                    base["g-recaptcha-response"] = token
+                                    log("WARN", f"[{jar_id}] recaptcha rejected — fresh {len(token)}-char "
+                                                f"token attached, retrying SAME jar (not marking expired)")
+                                    continue
+                                log("WARN", f"[{jar_id}] recaptcha rejected + keeper minted nothing — "
+                                            f"keeping jar '{jar.get('name')}' healthy, stopping this request")
+                            yield ("error", "403: Arena's reCAPTCHA check failed and no token could be minted — "
+                                            "jars are NOT expired, this was never an account problem. The "
+                                            "'recaptcha token:' WARN lines say which link is missing (keeper "
+                                            "session / sitekey / solver module+models). Resend once a Live "
+                                            "Browser session on this exit shows recaptcha on the log.")
+                            return
                         # Harvest + retry same jar once, then rotate
                         jar = await _refresh_cookies_from_live(jar, jar_id)
                         if jar_has_auth(jar) and attempt == 0:
@@ -4581,7 +4623,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                         jar = await _refresh_cookies_from_live(jar, jar_id)
                         # refresh captcha token for next create attempt
                         if not follow:
-                            token = await _get_recaptcha_token()
+                            token = await _get_recaptcha_token(jar_id)
                             if token:
                                 base["recaptchaToken"] = token
                                 base["recaptcha"] = token
