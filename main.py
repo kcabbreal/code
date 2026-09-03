@@ -927,6 +927,7 @@ PROBE_BUDGET = 40           # live probes per sweep (cached verdicts are free)
 PROBE_MAX_PARALLEL = 8
 _proxy_probe_cache: Dict[str, Tuple[bool, float]] = {}
 _proxy_latency: Dict[str, int] = {}   # host → handshake RTT (ms)
+_probe_fail_reason: Dict[str, str] = {}   # url → human 'where it died', shown on dead rows
 _proxy_assign_cursor = 0   # shared round-robin position for ALL pinning paths
 
 # Upstream-degradation cooldown: when Arena's own origin is down (Cloudflare 520-527),
@@ -994,44 +995,105 @@ def _probe_hostport() -> Tuple[str, int]:
         return "arena.ai", 443
 
 
-def _socks_client_handshake(s, scheme: str, host: str, port: int, u) -> bool:
-    """SOCKS4/4a/5 client handshake through an already-connected socket."""
+def _socks_client_handshake(s, scheme: str, host: str, port: int, u, why=None) -> bool:
+    """SOCKS4/4a/5 client handshake through an already-connected socket.
+    Pass why=[] to collect a human 'where it died' line (tcp vs greeting vs
+    auth vs connect) — the pool page shows it on dead rows instead of bare
+    'dead', because 'provider rejected my creds' and 'your ISP ate the
+    handshake' need two different fixes and one label was lying about both."""
     import socket as _sk
     import struct as _st
     from urllib.parse import unquote as _unq
+    def fail(msg):
+        if why is not None:
+            why.append(msg)
+        return False
     try:
         if scheme in ("socks4", "socks4a"):
             if scheme == "socks4":
                 try:
                     addr = _sk.inet_aton(_sk.gethostbyname(host))     # client-side DNS
                 except Exception:
-                    return False
+                    return fail("local DNS failed for the target (socks4 is IP-mode; use socks4a/5h)")
             else:
                 addr = b"\x00\x00\x00\x01"                          # socks4a: resolve remotely
             user = (_unq(u.username) if u.username else "bridgena").encode("utf-8", "ignore")[:255]
             s.sendall(b"\x04\x01" + _st.pack(">H", port) + addr + user + b"\x00")
             resp = s.recv(8)
-            return len(resp) == 8 and resp[0] == 0x00 and resp[1] == 0x5A
-        # socks5(h): no-auth method, then IPv4 CONNECT
-        s.sendall(b"\x05\x01\x00")
-        g = s.recv(2)
-        if len(g) < 2 or g[0] != 0x05 or g[1] != 0x00:
-            return False
+            if len(resp) == 8 and resp[0] == 0x00 and resp[1] == 0x5A:
+                return True
+            return fail("socks4 refused (code %d)" % (resp[1] if len(resp) > 1 else 0xFF))
+        # socks5(h): offer RFC-1929 username/password when creds are present,
+        # no-auth otherwise; then CONNECT.
+        if u.username or u.password:
+            s.sendall(b"\x05\x02\x02\x00")
+        else:
+            s.sendall(b"\x05\x01\x00")
         try:
-            ip = _sk.inet_aton(_sk.gethostbyname(host))
-        except Exception:
-            return False
-        s.sendall(b"\x05\x01\x00\x01" + ip + _st.pack(">H", port))
+            g = s.recv(2)
+        except (_sk.timeout, TimeoutError):
+            return fail("gateway answered TCP but never spoke SOCKS — a middlebox/ISP is killing the handshake; the provider itself never rejected anything")
+        if not g or len(g) < 2:
+            return fail("gateway closed mid-greeting (its edge firewall dropped us — check plan/IP-allowlist at the provider)")
+        if g[0] != 0x05:
+            return fail("non-SOCKS reply 0x%02x — something else owns this port" % g[0])
+        if g[1] == 0xFF:
+            return fail("server rejected every auth method we offered")
+        if g[1] == 0x02:
+            if not (u.username or u.password):
+                return fail("server demands username/password auth — no creds in the pool line")
+            user = (_unq(u.username or "")).encode("utf-8", "ignore")[:255]
+            pw = (_unq(u.password or "")).encode("utf-8", "ignore")[:255]
+            s.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(pw)]) + pw)
+            a = s.recv(2)
+            if len(a) < 2 or a[0] != 0x01 or a[1] != 0x00:
+                return fail("auth REJECTED — wrong creds, or this server's IP is not in the provider's allowlist")
+        elif g[1] != 0x00:
+            return fail("unexpected method selection 0x%02x" % g[1])
+        # CONNECT: socks5h resolves remotely (domain ATYPE); plain socks5 tries
+        # local DNS like curl — but a DNS hiccup must not stamp a healthy exit
+        # dead, so fall back to domain CONNECT on failure.
+        ip4 = None
+        if scheme != "socks5h":
+            try:
+                ip4 = _sk.inet_aton(_sk.gethostbyname(host))
+            except Exception:
+                ip4 = None
+        if ip4 is not None:
+            s.sendall(b"\x05\x01\x00\x01" + ip4 + _st.pack(">H", port))
+        else:
+            hb = host.encode("ascii", "ignore")[:255]
+            if not hb:
+                return fail("no CONNECT target")
+            s.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + _st.pack(">H", port))
         r = s.recv(4)
-        return len(r) >= 4 and r[0] == 0x05 and r[1] == 0x00
-    except Exception:
-        return False
+        if not (len(r) >= 4 and r[0] == 0x05 and r[1] == 0x00):
+            return fail("gateway refused CONNECT to the target (SOCKS reply %s)" % (r[1] if len(r) >= 2 else "?"))
+        # Drain BND.ADDR+BND.PORT like a complete client (a server that only
+        # answers the 4-byte header still passes: short timeout, ignore error).
+        try:
+            s.settimeout(0.4)
+            if r[3] == 0x01:
+                s.recv(6)
+            elif r[3] == 0x03:
+                n = s.recv(1)
+                if n:
+                    s.recv(n[0] + 2)
+            elif r[3] == 0x04:
+                s.recv(18)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        return fail("handshake error (%s)" % type(e).__name__)
 
 
 def _proxy_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> Tuple[bool, int]:
     """(alive, latency_ms) — a REAL handshake per scheme: http/https via CONNECT,
-    socks4/4a/5 via native SOCKS4/SOCKS5 connect to arena.ai:443. No more blanket
-    'trust socks' — free-list socks nodes are dead more often than not."""
+    socks4/4a/5 via native SOCKS4/SOCKS5 connect to arena.ai:443. Every failure
+    records WHERE it died in _probe_fail_reason so the pool page can tell an ISP
+    black-hole from a bad-creds rejection from a billing refusal — each needs a
+    different fix, and bare 'dead' blamed the wrong party for months."""
     import base64
     import socket
     from urllib.parse import unquote, urlparse
@@ -1039,15 +1101,34 @@ def _proxy_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> Tuple[bool, 
         return False, -1
     t0 = time.perf_counter()
     host, port = _probe_hostport()
+    why: List[str] = []
     try:
         u = urlparse(proxy_url if "://" in proxy_url else "http://" + proxy_url)
         scheme = (u.scheme or "http").lower()
         ph, pp = u.hostname, (u.port or 80)
+    except Exception:
+        _probe_fail_reason[proxy_url] = "unparseable pool line"
+        return False, -1
+    try:
         s = socket.create_connection((ph, pp), timeout=timeout)
+    except socket.gaierror:
+        _probe_fail_reason[proxy_url] = "proxy hostname did not resolve ON THIS SERVER (local DNS; the provider never saw a packet)"
+        return False, -1
+    except (socket.timeout, TimeoutError):
+        _probe_fail_reason[proxy_url] = "TCP to %s:%s black-holed (no SYN-ACK) — a firewall/ISP between this server and the gateway; the proxy itself is healthy" % (ph, pp)
+        return False, -1
+    except ConnectionRefusedError:
+        _probe_fail_reason[proxy_url] = "TCP %s:%s refused — host is up, port closed for this source (plan/IP-allowlist on the provider side)" % (ph, pp)
+        return False, -1
+    except Exception as e:
+        _probe_fail_reason[proxy_url] = "TCP unreachable from this server (%s)" % type(e).__name__
+        return False, -1
+    try:
         s.settimeout(timeout)
         try:
             if scheme in ("socks4", "socks4a", "socks5", "socks5h"):
-                if not _socks_client_handshake(s, scheme, host, port, u):
+                if not _socks_client_handshake(s, scheme, host, port, u, why):
+                    _probe_fail_reason[proxy_url] = why[0] if why else "SOCKS handshake failed"
                     return False, -1
             else:
                 req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
@@ -1060,14 +1141,22 @@ def _proxy_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> Tuple[bool, 
                 while b"\r\n\r\n" not in buf:
                     c = s.recv(2048)
                     if not c:
+                        _probe_fail_reason[proxy_url] = "http proxy closed during CONNECT (its edge dropped us mid-handshake)"
                         return False, -1
                     buf += c
                     if len(buf) > 16384:
+                        _probe_fail_reason[proxy_url] = "http proxy babbled >16KB before answering CONNECT"
                         return False, -1
                 line = buf.split(b"\r\n", 1)[0].decode("latin1", "ignore")
                 m = re.match(r"HTTP/[\d.]+\s+(\d+)", line)
                 if not m or m.group(1) != "200":
                     code = m.group(1) if m else "?"
+                    if code == "407":
+                        _probe_fail_reason[proxy_url] = "proxy auth rejected (HTTP 407) — wrong creds, or this server's IP is not allowed"
+                    elif code == "402":
+                        _probe_fail_reason[proxy_url] = "provider says payment required (HTTP 402) — billing/quota, not a tunnel fault"
+                    else:
+                        _probe_fail_reason[proxy_url] = "CONNECT refused by proxy (HTTP %s)" % code
                     hint = " — PAYMENT REQUIRED (provider billing/quota)" if code == "402" else \
                            (" — auth failed (creds/allowlist)" if code == "407" else "")
                     log("WARN", f"proxy probe {ph}:{pp} refused CONNECT: {code}{hint}")
@@ -1079,8 +1168,10 @@ def _proxy_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> Tuple[bool, 
                 s.close()
             except Exception:
                 pass
+        _probe_fail_reason.pop(proxy_url, None)
         return True, int((time.perf_counter() - t0) * 1000)
-    except Exception:
+    except Exception as e:
+        _probe_fail_reason[proxy_url] = "probe error (%s)" % type(e).__name__
         return False, -1
 
 
@@ -1105,8 +1196,23 @@ def proxy_alive(proxy_url: str, *, force: bool = False) -> bool:
     _proxy_probe_cache[proxy_url] = (ok, now + (PROBE_OK_TTL if ok else PROBE_DEAD_TTL))
     if ok:
         _proxy_strikes.pop(proxy_url, None)
+        try:
+            _proxy_health_load()
+            _hh = _proxy_health.get(_proxy_hkey(proxy_url))
+            if _hh and _hh.pop("probe_note", None) is not None:
+                _proxy_health_save()
+        except Exception:
+            pass
     else:
         note_probe_failure(proxy_url)
+        try:
+            _r = _probe_fail_reason.get(proxy_url, "")
+            if _r:
+                _proxy_health_load()
+                _proxy_health.setdefault(_proxy_hkey(proxy_url), {})["probe_note"] = _r[:160]
+                _proxy_health_save()
+        except Exception:
+            pass
     return ok
 
 
@@ -1459,7 +1565,8 @@ def proxies_snapshot() -> List[dict]:
             "url": u, "host": key,
             "scheme": u.split("://", 1)[0] if "://" in u else "http",
             "status": st,
-            "note": (h.get("blocked_reason") or "")[:60] if st == "blocked" else "",
+            "note": ((h.get("blocked_reason") or "")[:60] if st == "blocked"
+                     else (h.get("probe_note") or "")[:70] if st == "dead" else ""),
             "latency": lat,
             "checked": h.get("checked") or "",
             "fails": int(h.get("fails") or 0),
@@ -1658,13 +1765,18 @@ def proxy_candidates(jar: Optional[dict], *, prefer_sticky: bool = True,
     if pool:
         st = _proxy_assign_cursor % len(pool)
         ordered = [pool[(st + i) % len(pool)] for i in range(len(pool))]
-        # speed-first: a freshly measured latency (from sweeps AND from real
-        # streamed answers) floats that exit to the front; stable sort keeps
-        # RR fairness among the ones we've never timed.
+        # Speed matters — but not more than IP spread. Reorder ONLY the head
+        # window the picker will actually take from (fastest-of-the-next-8),
+        # then let the cursor park after it. A GLOBAL latency sort used to
+        # float the single fastest exit to the front of EVERY candidate list,
+        # which collapsed the pool: 20 live proxies, all traffic (and every
+        # 429 retry) on one exit IP.
+        _w = PROBE_MAX_PARALLEL
+        _head, _rest = ordered[:_w], ordered[_w:]
         def _k(u):
             lat = _proxy_latency.get(u)
             return (1, 0) if not isinstance(lat, int) or lat <= 0 else (0, lat)
-        for c in sorted(ordered, key=_k):
+        for c in sorted(_head, key=_k) + _rest:
             if c not in out:
                 out.append(c)
     return out
@@ -1684,6 +1796,14 @@ def pick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = Fa
     cands = proxy_candidates(jar, prefer_sticky=(mode != "request" and not rotate))
     if exclude:
         cands = [c for c in cands if c not in exclude]
+    cur = _normalize_proxy((jar or {}).get("proxy") or (jar or {}).get("_last_proxy") or "")
+    if rotate and cur:
+        # A 429 "rotation" that hands back the pinned exit isn't one: skip the
+        # current pin whenever an alternative exists (revive-fallback below
+        # still keeps it if every alternative is actually dead).
+        _alt = [c for c in cands if c != cur]
+        if _alt:
+            cands = _alt
     if not cands:
         # everything left is CF-flagged. Going DIRECT means our datacenter server
         # IP — a far worse bet than a recently-blocked exit. One last-resort
@@ -1725,6 +1845,10 @@ def pick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = Fa
     except Exception as e:
         log("WARN", f"proxy sweep failed ({e}) — trusting sticky/pool head")
         chosen = cands[0]
+    if chosen is None and rotate and cur and proxy_alive(cur):
+        # the pool offered no live alternative: a known-working pinned exit
+        # beats surrendering to direct (datacenter) egress
+        chosen = cur
     jid = (jar or {}).get("id")
     if chosen:
         if jar is not None:
@@ -4142,6 +4266,28 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                 except Exception as e:
                     _msg = str(e)
                     _low = _msg.lower()
+                    _socks_reject = ("cannot complete socks5 connection" in _low
+                                     or "could not complete socks" in _low
+                                     or "curl: (97)" in _low or "curl: (96)" in _low)
+                    if proxy and _socks_reject:
+                        # The SOCKS handshake SUCCEEDED — the exit replied "host
+                        # unreachable" (reply 4/5): it tunnels fine, it just can't
+                        # route to arena's origin from this egress IP right now.
+                        # Destination weather, not proxy death: FLAG the exit
+                        # (picks skip it for _FLAGGED_TTL, self-heals) and keep
+                        # rotating. Never exile proxies.txt lines over this —
+                        # the old fall-through to quarantine_proxy punished
+                        # healthy exits and gutted the pool file attempt by attempt.
+                        note_cf_blocked_exit(proxy, f"socks reply while routing to arena: {_msg[-40:]}")
+                        if attempt + 1 < max_attempts:
+                            log("WARN", f"[{jar_id}] exit can't route to arena.ai (socks reply) — "
+                                        f"rotating; proxy NOT exiled")
+                            continue
+                        yield ("error", "503: WARP exits tunnel fine but none could route to arena.ai "
+                                        "on this pass (Cloudflare-egress → arena reachability). "
+                                        "Nothing was exiled — flags expire on their own; "
+                                        "'Scan pool' re-probes now.")
+                        return
                     _dead = ("failed to perform" in _low or "connect" in _low or "tunnel" in _low
                              or "timed out" in _low or "timeout" in _low or "reset" in _low
                              or "refused" in _low or "resolve" in _low or re.search(r"code \d+", _low) is not None)
