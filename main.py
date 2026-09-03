@@ -64,7 +64,7 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
                                             "6Le3_cYsAAAAAGwWOK2RLDgNI15Bh8C0yLBOL1yL")
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "submit")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.4-model-id-contract")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.5-browser-transaction-lock")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -1309,12 +1309,14 @@ async def refresh_models_via_worker(worker):
     """Fetch models from Arena's Next.js page/Flight state using a live keeper."""
     log("INFO", f"[{worker.name}] Refreshing models via worker navigation...")
     try:
-        await worker.page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded", timeout=30000)
-        body = await worker.page.content()
-        try:
-            flight = await worker.page.evaluate("() => JSON.stringify(self.__next_f || [])")
-        except Exception:
-            flight = ""
+        async with worker._action_lock:
+            await worker.page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded", timeout=30000)
+            await worker.page.wait_for_load_state("domcontentloaded")
+            body = await worker.page.content()
+            try:
+                flight = await worker.page.evaluate("() => JSON.stringify(self.__next_f || [])")
+            except Exception:
+                flight = ""
 
         def _array_after_key(src: str):
             """Extract nested JSON safely; a non-greedy regex truncates on the
@@ -3882,24 +3884,30 @@ async def mint_v3(jar_id=None):
                         "on the SAME exit; enable keepers (Pool page) or open Live Browser")
         return None
     try:
-        res = await s.page.evaluate(RC_MINT_JS.replace("ARENA_MARK", ""), ARENA_RECAPTCHA_SITEKEY)
-        if isinstance(res, str) and len(res) > 20:
-            return res
-        why = res.get("err") if isinstance(res, dict) else "evaluate returned nothing"
-        log("WARN", f"recaptcha token: {why}")
+        async with s._action_lock:
+            # The live client loads enterprise reCAPTCHA on the direct-chat
+            # route. Stabilize there, then evaluate in the same locked browser
+            # transaction so catalog/health navigation cannot destroy context.
+            if "/text/direct" not in (s.page.url or ""):
+                await s.page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded", timeout=30000)
+                await s.page.wait_for_load_state("domcontentloaded")
+                s.last_nav = time.time()
+            res = await s.page.evaluate(RC_MINT_JS.replace("ARENA_MARK", ""), ARENA_RECAPTCHA_SITEKEY)
+            if isinstance(res, str) and len(res) > 20:
+                return res
+            why = res.get("err") if isinstance(res, dict) else "evaluate returned nothing"
+            log("WARN", f"recaptcha token: {why}")
+
+            # image challenge fallback on that same locked page
+            if hasattr(s, "solve_recaptcha_image_challenge") and await s.solve_recaptcha_image_challenge():
+                tok = await s.page.evaluate("""() => {
+                    const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response');
+                    return (el && el.value) ? el.value : null;
+                }""")
+                if tok:
+                    return tok
     except Exception as e:
-        log("WARN", f"recaptcha token: read failed: {type(e).__name__}: {e}")
-    # image challenge fallback on that page (visible grids only)
-    try:
-        if hasattr(s, "solve_recaptcha_image_challenge") and await s.solve_recaptcha_image_challenge():
-            tok = await s.page.evaluate("""() => {
-                const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response');
-                return (el && el.value) ? el.value : null;
-            }""")
-            if tok:
-                return tok
-    except Exception as e:
-        log("WARN", f"recaptcha token: image-solve failed: {type(e).__name__}: {e}")
+        log("WARN", f"recaptcha token: browser transaction failed: {type(e).__name__}: {e}")
     return None
 
 
