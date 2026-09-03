@@ -64,7 +64,7 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
                                             "6Le3_cYsAAAAAGwWOK2RLDgNI15Bh8C0yLBOL1yL")
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "submit")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.3-readiness-shadcn")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.4-model-id-contract")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -220,6 +220,21 @@ def model_name(m) -> str:
     if isinstance(m, str):
         return m
     return m.get("name") or m.get("publicName") or m.get("id") or ""
+
+
+def resolve_model_id(public_name: str, jar: Optional[dict] = None) -> str:
+    """Resolve Arena's public label to the internal UUID required by the
+    create-evaluation contract. Sending a label here currently produces an
+    opaque upstream 500, while Arena's own client always sends the UUID."""
+    mapped = (jar or {}).get("model_map", {}).get(public_name)
+    if mapped:
+        return mapped
+    for item in get_models():
+        if not isinstance(item, dict):
+            continue
+        if public_name in (item.get("name"), item.get("publicName"), item.get("id")):
+            return item.get("id") or public_name
+    return public_name
 
 
 HEALTH_TRUST_SEC = 6 * 3600  # how long a persisted sweep verdict stays believable across restarts
@@ -4024,7 +4039,8 @@ def _classify(status: int, body: str) -> str:
 
 def _attach_v3(base: dict, tok: str) -> None:
     base["recaptchaV3Token"] = tok
-    base["recaptchaToken"] = tok          # legacy aliases: their schemas .catchall(), harmless
+    # Match Arena's current client contract exactly. The retired
+    # `recaptchaToken` alias is no longer emitted by the browser.
 
 
 def _attach_v2(base: dict, tok: str) -> None:
@@ -4117,7 +4133,10 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 continue
             yield ("error", "502: Arena session expired — no other authenticated account")
             return
-        model_id = jar.get("model_map", {}).get(model_name) or model_name
+        model_id = resolve_model_id(model_name, jar)
+        if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", str(model_id)):
+            yield ("error", f"422: Model '{model_name}' has no Arena UUID in the catalog. Refresh Models after a keeper is live, then retry.")
+            return
         base = {"mode": "direct-battle", "modelAId": model_id, "modality": "chat"}
         follow_url = None
         if mc and mc.get("arena_id"):
@@ -4153,7 +4172,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         if cycled:
             jar = await _live_cookies(jar)
         if proxy:
-            log("INFO", f"[{jar.get('name')}] via {p.key} persona · exit {_proxy_hkey(proxy)} · token {'yes' if tok else 'no'}")
+            log("INFO", f"[{jar.get('name')}] via {p.key} persona · exit {_proxy_hkey(proxy)} · "
+                        f"model {str(model_id)[:8]}… · token {'yes' if tok else 'no'}")
         else:
             log("WARN", f"[{jar.get('name')}] No live proxy — using server IP (easy to rate-limit)")
         headers = _headers_for(jar, p, json_body=True)
