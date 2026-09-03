@@ -737,8 +737,13 @@ def _normalize_proxy(raw: str) -> Optional[str]:
             and _parts0[1].isdigit() and _parts0[0].count(":") == 1):
         p = f"[{_parts0[0]}]:{_parts0[1]}"
 
-    if low.startswith("socks5h://"):
-        return "socks5://" + p.split("://", 1)[1]
+    # socks5h:// is PRESERVED. The suffix is the ONE signal that means
+    # "resolve the target at the gateway" — libcurl and the raw probe honor it,
+    # and it is what protects authenticated-proxy users from a poisoned local
+    # resolver (an app host resolving arena.ai itself can hand the gateway a
+    # sinkhole IP, which comes back as a fatal-looking (97)/(4) that was never
+    # the proxy's fault). Only the Playwright dict re-maps it; Chromium's
+    # socks5:// already sends domains — see playwright_proxy_from_url.
 
     if "://" in p:
         return p  # already a URL
@@ -753,7 +758,7 @@ def _normalize_proxy(raw: str) -> Optional[str]:
         host, port, user, password = parts[0], parts[1], parts[2], parts[3]
         scheme = "http"
         if len(parts) >= 5 and parts[4].lower() in ("http", "https", "socks5", "socks4", "socks5h"):
-            scheme = parts[4].lower().replace("socks5h", "socks5")
+            scheme = parts[4].lower()
         if not port.isdigit() or not (0 < int(port) <= 65535):
             return None
         return f"{scheme}://{user}:{password}@{host}:{port}"
@@ -896,14 +901,201 @@ def jar_proxy(jar: dict, *, rotate: bool = False) -> Optional[str]:
     return chosen
 
 
+# ---- Chromium SOCKS5-auth shim ---------------------------------------------------
+# Chromium categorically cannot authenticate an upstream SOCKS5 proxy — Playwright
+# raises "Browser does not support socks5 proxy authentication" at LAUNCH, for every
+# credentialled socks line, before a single packet hits the network. Providers that
+# hand out socks5://user:pass@ URLs (IPVanish etc.) were therefore un-usable by the
+# keeper — and worse, the keeper's start-failure handler read that capability error
+# as "proxy is dead" and exiled every healthy line in seconds. The shim: one local
+# NO-AUTH socks5 listener per authenticated exit (all on one daemon asyncio loop —
+# not a thread per proxy); the browser talks to 127.0.0.1, the relay authenticates
+# upstream by reusing _socks_client_handshake verbatim (RFC1929 + socks4a + full
+# reply drain). Bind is loopback-only: nothing else on the network can use it.
+# HTTP proxies are untouched — Playwright DOES support Proxy-Authorization there.
+_SHIM_SCHEMES = ("socks5", "socks5h", "socks4", "socks4a")
+_shim_state: dict = {"loop": None, "ports": {}, "servers": {}}
+
+def _shim_ensure_loop():
+    if _shim_state["loop"] is not None:
+        return _shim_state["loop"]
+    import threading as _th
+    lock = _shim_state.setdefault("lock", _th.Lock())
+    with lock:
+        if _shim_state["loop"] is None:
+            def _run():
+                lp = asyncio.new_event_loop()
+                asyncio.set_event_loop(lp)
+                _shim_state["loop"] = lp
+                lp.run_forever()
+            _th.Thread(target=_run, daemon=True, name="px-shim").start()
+            for _ in range(200):
+                if _shim_state["loop"] is not None:
+                    break
+                time.sleep(0.02)
+    return _shim_state["loop"]
+
+def _shim_upstream_connect(up_url: str, host: str, port: int):
+    """blocking: connect + full SOCKS handshake toward host:port; return the
+    connected, ready-to-relay socket (or raise — the browser gets a clean
+    failure reply and the pool row gets a human reason)."""
+    import socket as _sk
+    from urllib.parse import urlparse
+    pu = _normalize_proxy(up_url) or up_url
+    u = urlparse(pu)
+    s = _sk.create_connection((u.hostname, u.port or 1080), timeout=15)
+    try:
+        s.settimeout(15)
+        eff = (u.scheme or "socks5").lower()
+        if eff in ("socks5", "socks5h"):
+            # browser gave us a hostname? keep it remote (domain CONNECT) —
+            # this host's resolver is exactly what we do NOT trust. literal
+            # IPs take the fast IPv4 path (no resolver round-trip).
+            import ipaddress
+            try:
+                ipaddress.ip_address(host)
+                eff = "socks5"
+            except ValueError:
+                eff = "socks5h"
+        if not _socks_client_handshake(s, eff, host, port, u):
+            raise RuntimeError("upstream socks handshake refused")
+        s.settimeout(None)
+        return s
+    except Exception:
+        try:
+            s.close()
+        except Exception:
+            pass
+        raise
+
+async def _shim_pump(a, b):
+    try:
+        while True:
+            d = await a.read(65536)
+            if not d:
+                break
+            b.write(d)
+            await b.drain()
+    except Exception:
+        pass
+    try:
+        b.close()
+    except Exception:
+        pass
+
+async def _shim_handle(rd, wr, up_url):
+    import struct
+    import ipaddress
+    u_wr = None
+    try:
+        hdr = await rd.readexactly(2)
+        if hdr[0] != 0x05:
+            wr.close()
+            return
+        await rd.readexactly(hdr[1])               # methods — we answer no-auth;
+        wr.write(b"\x05\x00")                     #   real auth happens upstream
+        await wr.drain()
+        req = await rd.readexactly(4)              # VER CMD RSV ATYP
+        if req[1] != 0x01:                         # CONNECT only; UDP associate -> 0x07,
+            wr.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")   # browser falls back to TCP
+            await wr.drain()
+            wr.close()
+            return
+        atyp = req[3]
+        if atyp == 0x01:
+            host = str(ipaddress.IPv4Address(await rd.readexactly(4)))
+        elif atyp == 0x03:
+            ln = (await rd.readexactly(1))[0]
+            host = (await rd.readexactly(ln)).decode("ascii", "ignore")
+        elif atyp == 0x04:
+            host = str(ipaddress.IPv6Address(await rd.readexactly(16)))
+        else:
+            wr.close()
+            return
+        port = struct.unpack(">H", await rd.readexactly(2))[0]
+        loop = asyncio.get_running_loop()
+        try:
+            s = await loop.run_in_executor(None, _shim_upstream_connect, up_url, host, port)
+        except Exception as e:
+            _probe_fail_reason[up_url] = "shim: upstream refused CONNECT (%s) — line intact, not a tunnel death" % type(e).__name__
+            wr.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
+            await wr.drain()
+            wr.close()
+            return
+        wr.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
+        await wr.drain()
+        up_rd, u_wr = await asyncio.open_connection(sock=s)
+        await asyncio.gather(_shim_pump(rd, u_wr), _shim_pump(up_rd, wr))
+    except Exception:
+        pass
+    finally:
+        for w in (wr, u_wr):
+            try:
+                w.close()
+            except Exception:
+                pass
+
+async def _shim_open_listener(pu):
+    import functools
+    srv = await asyncio.start_server(functools.partial(_shim_handle, up_url=pu), "127.0.0.1", 0)
+    _shim_state["servers"][pu] = srv
+    return srv.sockets[0].getsockname()[1]
+
+def shim_proxy_for(proxy_url: str) -> Optional[str]:
+    """Browser-safe localhost relay URL for an authenticated socks line;
+    None when no shim is needed (unauth / http) — caller then proceeds as
+    before."""
+    try:
+        from urllib.parse import urlparse
+        pu = _normalize_proxy(proxy_url) or proxy_url
+        u = urlparse(pu)
+        if (u.scheme or "") not in _SHIM_SCHEMES or not u.username:
+            return None
+    except Exception:
+        return None
+    lp = _shim_ensure_loop()
+    if lp is None:
+        return None
+    lock = _shim_state.setdefault("lock", __import__("threading").Lock())
+    with lock:
+        port = _shim_state["ports"].get(pu)
+        if port is None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(_shim_open_listener(pu), lp)
+                port = fut.result(timeout=10)
+            except Exception:
+                port = None
+            if not port:
+                return None
+            _shim_state["ports"][pu] = port
+    return f"socks5://127.0.0.1:{port}"
+
+
 def playwright_proxy_from_url(proxy_url: str) -> Optional[dict]:
-    """Convert proxy URL to Playwright proxy dict."""
+    """Convert proxy URL to Playwright proxy dict.
+
+    Authenticated SOCKS lines are routed through the local shim (Chromium cannot
+    send SOCKS credentials at all); HTTP proxies keep Playwright-native
+    username/password.
+    """
     if not proxy_url:
         return None
     try:
         from urllib.parse import urlparse
         u = urlparse(proxy_url)
-        server = f"{u.scheme}://{u.hostname}"
+        if (u.scheme or "") in _SHIM_SCHEMES and u.username:
+            sh = shim_proxy_for(proxy_url)
+            if sh:
+                return {"server": sh}
+            log("WARN", f"socks shim unavailable for {u.hostname}:{u.port} — browser goes direct (curl path still uses the proxy)")
+            return None
+        # Chromium speaks "socks5://" (which for Chromium = send the hostname,
+        # resolve at gateway) and knows no "socks5h". Map the scheme name here,
+        # semantics already match.
+        _sch = (u.scheme or "").lower()
+        if _sch == "socks5h":
+            _sch = "socks5"
+        server = f"{_sch}://{u.hostname}"
         if u.port:
             server += f":{u.port}"
         out = {"server": server}
@@ -3531,9 +3723,17 @@ class KeeperSession:
             _up = txt.upper()
             _retryable = any(k in _up for k in ("TUNNEL", "PROXY", "TIMEOUT", "ERR_", "NET::", "CONNECTION"))
             used = getattr(self, "_used_proxy", "") or ""
+            # A browser CAPABILITY error ("does not support socks5 proxy auth…")
+            # means our launch shape was wrong, not that the exit is dead —
+            # exiling on it once ate an entire authenticated pool in 9 seconds.
+            _cap_err = "does not support socks5 proxy authentication" in txt.lower()
             if used:
                 self._tried_proxies.add(used)
-                quarantine_proxy(used, f"keeper {self.name}: {txt[:90]}")
+                if _cap_err:
+                    _proxy_fail_reason[used] = "keeper shim bypassed: browser capability error (proxy NOT exiled)"
+                    log("WARN", f"[{self.name}] {used.split('@')[-1]} kept in pool — Chromium capability error, not a dead proxy")
+                else:
+                    quarantine_proxy(used, f"keeper {self.name}: {txt[:90]}")
             pool = get_proxy_pool() or []
             left = [c for c in pool if c not in self._tried_proxies]
             if _retryable and left:
