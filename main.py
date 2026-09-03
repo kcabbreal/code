@@ -64,7 +64,7 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
                                             "6Le3_cYsAAAAAGwWOK2RLDgNI15Bh8C0yLBOL1yL")
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "submit")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.1-thread-affinity")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.2-ui-keeper-fix")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -1291,20 +1291,59 @@ async def get_initial_data() -> list:
     return result["models"]
 
 async def refresh_models_via_worker(worker):
-    """Fetch models using an idle worker by navigating to Arena homepage."""
+    """Fetch models from Arena's Next.js page/Flight state using a live keeper."""
     log("INFO", f"[{worker.name}] Refreshing models via worker navigation...")
     try:
-        await worker.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded", timeout=30000)
+        await worker.page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded", timeout=30000)
         body = await worker.page.content()
-        match = re.search(r'{\"initialModels\":(\[.*?\].*?\"userSelectable\":.*?\}|\[.*?\],\"initialModel[A-Z]Id)', body, re.DOTALL)
-        if not match:
-            match = re.search(r'{\"initialModels\":(\[.*?\],\"initialModel[A-Z]Id|\[.*?\])', body, re.DOTALL)
-        if match:
-            raw_match = match.group(1)
-            if raw_match.endswith(',"initialModelAId') or raw_match.endswith(',"initialModelBId'):
-                raw_match = raw_match.rsplit(',', 1)[0]
-            raw_json = raw_match.encode().decode('unicode_escape')
-            models_data = json.loads(raw_json)
+        try:
+            flight = await worker.page.evaluate("() => JSON.stringify(self.__next_f || [])")
+        except Exception:
+            flight = ""
+
+        def _array_after_key(src: str):
+            """Extract nested JSON safely; a non-greedy regex truncates on the
+            first capability array/object inside initialModels."""
+            if not src:
+                return None
+            for needle in ('"initialModels"', "'initialModels'"):
+                pos = src.find(needle)
+                while pos >= 0:
+                    start = src.find("[", pos + len(needle))
+                    if start < 0:
+                        break
+                    depth, quoted, escaped = 0, False, False
+                    for i in range(start, len(src)):
+                        ch = src[i]
+                        if quoted:
+                            if escaped:
+                                escaped = False
+                            elif ch == "\\":
+                                escaped = True
+                            elif ch == '"':
+                                quoted = False
+                        elif ch == '"':
+                            quoted = True
+                        elif ch == "[":
+                            depth += 1
+                        elif ch == "]":
+                            depth -= 1
+                            if depth == 0:
+                                try:
+                                    value = json.loads(src[start:i + 1])
+                                    if isinstance(value, list):
+                                        return value
+                                except Exception:
+                                    break
+                    pos = src.find(needle, pos + len(needle))
+            return None
+
+        import html as _model_html
+        sources = [body, _model_html.unescape(body), flight]
+        sources += [s.replace('\\"', '"').replace('\\\\', '\\')
+                    for s in list(sources) if s]
+        models_data = next((v for v in (_array_after_key(s) for s in sources) if v), None)
+        if models_data:
 
             # Always dump the raw, unfiltered payload so we can inspect the
             # exact fields Arena sends for any given model (e.g. to figure
@@ -1335,10 +1374,10 @@ async def refresh_models_via_worker(worker):
                 save_models(filtered)
                 log("OK", f"Model catalog refreshed via worker ({len(filtered)} models)")
                 return filtered
-        log("WARN", "Regex failed to find models in page source.")
+        log("WARN", "Could not find a balanced initialModels array in page/Flight source.")
     except Exception as e:
         log("ERROR", f"Failed to refresh models: {e}")
-    return get_models()
+    return []
 
 def _session_secret() -> str:
     """Stable secret derived from dashboard password."""
@@ -3385,11 +3424,14 @@ def _flagged_and_quarantined(include_flagged: bool) -> set:
 
 
 async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bool = False,
-                           include_flagged: bool = False) -> Optional[str]:
+                           include_flagged: bool = False,
+                           exclude: Optional[set] = None) -> Optional[str]:
     """Rotation-aware pick among exits PROVEN to tunnel to arena recently.
     Unknown lines are probed inside a per-cycle budget, never blocking traffic."""
     assignment_mode = _rotation_mode() == "assignment"
-    cands = proxy_candidates(jar, prefer_sticky=assignment_mode and not rotate)
+    excluded = set(exclude or ())
+    cands = [c for c in proxy_candidates(jar, prefer_sticky=assignment_mode and not rotate)
+             if c not in excluded and _proxy_hkey(c) not in excluded]
     if not cands:
         return None
     bad = _flagged_and_quarantined(include_flagged)
@@ -3433,7 +3475,8 @@ async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bo
     if not live:
         if not include_flagged and cands:
             # fluid last resort: cycle flagged exits (blocks move; a 200 un-flags)
-            return await apick_live_proxy(jar, purpose=purpose or "last-resort", rotate=rotate, include_flagged=True)
+            return await apick_live_proxy(jar, purpose=purpose or "last-resort", rotate=rotate,
+                                          include_flagged=True, exclude=excluded)
         return None
     if assignment_mode and not rotate and jar is not None:
         pinned = _normalize_proxy(jar.get("proxy") or "") or None
@@ -4596,7 +4639,7 @@ function flt(){var q=document.getElementById('q').value.toLowerCase();
 document.querySelectorAll('#tb tr').forEach(r=>{r.style.display=r.textContent.toLowerCase().includes(q)?'':'none'})}""")
 
 
-def chat_page(models: list, default_model: str) -> str:
+def _legacy_chat_page(models: list, default_model: str) -> str:
     opts = "".join(f'<option value="{esc(m["name"])}"{" selected" if m["name"]==default_model else ""}>{esc(m["name"])}</option>' for m in models[:300]) or '<option>gpt-4.1</option>'
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bridgena · Live Chat</title>
@@ -4658,6 +4701,62 @@ setInterval(()=>{{fetch('/debug-logs/data').then(r=>r.json()).then(d=>{{const c=
   if(m){{document.getElementById('ps').textContent=m[1];document.getElementById('ex').textContent=m[2];document.getElementById('tk').textContent=m[3]}}}}}}).catch(()=>{{}})}},3000);
 refreshChats();openChat(chat_id);
 </script></body></html>"""
+
+
+def chat_page(models: list, default_model: str) -> str:
+    """Modern, dependency-free shadcn-inspired chat shell.
+
+    Bridgena ships as one Python file, so these are native components rather
+    than a React build; the visual tokens and interaction model match the
+    shadcn/Vercel family without adding a fragile CDN/runtime dependency.
+    """
+    names = [m.get("name", "") for m in models if m.get("name")]
+    payload = _json.dumps(names, ensure_ascii=False).replace("</", "<\\/")
+    selected = _json.dumps(default_model or (names[0] if names else "auto"), ensure_ascii=False)
+    template = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bridgena</title>
+<style>
+:root{--bg:#fff;--panel:#fafafa;--soft:#f4f4f5;--line:#e4e4e7;--text:#09090b;--muted:#71717a;--hover:#f4f4f5;--accent:#18181b;--danger:#dc2626;--success:#16a34a;--shadow:0 12px 34px rgba(0,0,0,.12)}
+[data-theme=dark]{--bg:#09090b;--panel:#0d0d0f;--soft:#18181b;--line:#27272a;--text:#fafafa;--muted:#a1a1aa;--hover:#18181b;--accent:#fafafa;--danger:#f87171;--success:#4ade80;--shadow:0 18px 50px rgba(0,0,0,.55)}
+*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}body{background:var(--bg);color:var(--text);font:14px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+button,input,textarea{font:inherit}button{color:inherit}.icon{width:17px;height:17px;display:block}.app{height:100%;display:grid;grid-template-columns:260px minmax(0,1fr)}
+.sidebar{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0}.sidehead{height:60px;padding:0 14px;display:flex;align-items:center;gap:10px}.mark{width:28px;height:28px;border-radius:8px;background:var(--text);color:var(--bg);display:grid;place-items:center;font-weight:750;font-size:12px}.wordmark{font-weight:650;letter-spacing:-.02em}.sidebody{padding:8px;overflow:auto;flex:1}.newbtn,.ghost,.modelbtn{border:1px solid var(--line);background:var(--bg);border-radius:8px;cursor:pointer;transition:.15s}.newbtn{height:38px;width:100%;display:flex;align-items:center;justify-content:center;gap:8px;font-weight:550}.newbtn:hover,.ghost:hover,.modelbtn:hover{background:var(--hover)}.sectionlabel{padding:22px 8px 7px;color:var(--muted);font-size:11px;font-weight:600}.thread{width:100%;border:0;background:transparent;color:var(--muted);padding:8px 10px;border-radius:7px;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}.thread:hover{background:var(--hover);color:var(--text)}.thread.on{background:var(--soft);color:var(--text);font-weight:520}.sidefoot{padding:10px;border-top:1px solid var(--line)}.ops{display:flex;align-items:center;gap:9px;padding:9px 10px;border-radius:7px;color:var(--muted);text-decoration:none}.ops:hover{background:var(--hover);color:var(--text)}
+.main{min-width:0;display:flex;flex-direction:column}.top{height:60px;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 18px;gap:10px}.mobile{display:none}.modelwrap{position:relative}.modelbtn{height:36px;max-width:min(440px,55vw);display:flex;align-items:center;gap:8px;padding:0 11px;font-weight:550}.modelbtn span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.chev{color:var(--muted)}.status{margin-left:auto;display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}.statusdot{width:7px;height:7px;border-radius:50%;background:#a1a1aa}.statusdot.busy{background:#f59e0b;box-shadow:0 0 0 4px color-mix(in srgb,#f59e0b 15%,transparent)}.statusdot.ok{background:var(--success)}.statusdot.err{background:var(--danger)}.ghost{width:36px;height:36px;display:grid;place-items:center}
+.picker{position:absolute;z-index:30;top:42px;left:0;width:min(480px,calc(100vw - 32px));background:var(--bg);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);overflow:hidden;display:none}.picker.open{display:block}.searchbox{padding:9px;border-bottom:1px solid var(--line)}.searchbox input{width:100%;height:36px;background:transparent;color:var(--text);border:0;outline:0;padding:0 8px}.modellist{max-height:340px;overflow:auto;padding:5px}.modelopt{width:100%;border:0;background:transparent;color:var(--text);border-radius:6px;padding:9px 10px;text-align:left;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.modelopt:hover,.modelopt.on{background:var(--hover)}.emptymodels{padding:22px;text-align:center;color:var(--muted)}
+.scroll{flex:1;overflow:auto;scroll-behavior:smooth}.conversation{width:min(800px,100%);margin:0 auto;padding:34px 24px 150px}.welcome{min-height:58vh;display:grid;place-items:center;text-align:center}.welcome h1{font-size:28px;line-height:1.15;letter-spacing:-.04em;margin:0 0 9px}.welcome p{color:var(--muted);margin:0;max-width:470px}.msg{display:grid;grid-template-columns:30px minmax(0,1fr);gap:13px;margin:0 0 30px}.avatar{width:28px;height:28px;border:1px solid var(--line);border-radius:8px;display:grid;place-items:center;font-size:11px;font-weight:700;background:var(--soft)}.msg.user .avatar{background:var(--text);color:var(--bg);border-color:var(--text)}.msghead{font-size:13px;font-weight:650;margin:3px 0 6px}.msgbody{font-size:15px;line-height:1.75;white-space:pre-wrap;overflow-wrap:anywhere}.msgbody pre{background:var(--soft);border:1px solid var(--line);border-radius:9px;padding:13px;overflow:auto;font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace}.msgbody code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--soft);border-radius:4px;padding:2px 4px}.msgbody pre code{padding:0}.thinking{color:var(--muted)}.errorbox{color:var(--danger);background:color-mix(in srgb,var(--danger) 7%,transparent);border:1px solid color-mix(in srgb,var(--danger) 25%,var(--line));padding:11px 13px;border-radius:8px;white-space:pre-wrap}
+.dock{position:absolute;left:260px;right:0;bottom:0;padding:26px 20px 18px;background:linear-gradient(transparent,var(--bg) 35%)}.compose{width:min(800px,100%);margin:auto;border:1px solid var(--line);background:var(--bg);border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.08);padding:11px 11px 9px}.compose:focus-within{border-color:color-mix(in srgb,var(--text) 35%,var(--line));box-shadow:0 8px 34px rgba(0,0,0,.1)}textarea{display:block;width:100%;height:44px;max-height:180px;resize:none;border:0;outline:0;background:transparent;color:var(--text);padding:4px 5px;line-height:1.5}.composefoot{display:flex;align-items:center;gap:8px}.hint{color:var(--muted);font-size:11px;margin-left:4px}.send{margin-left:auto;width:34px;height:34px;border:0;border-radius:9px;background:var(--text);color:var(--bg);display:grid;place-items:center;cursor:pointer}.send:disabled{opacity:.35;cursor:not-allowed}.runtime{width:min(800px,100%);margin:7px auto 0;color:var(--muted);font-size:11px;text-align:center}.runtime details{text-align:left}.runtime pre{max-height:160px;overflow:auto;background:var(--soft);border:1px solid var(--line);padding:10px;border-radius:8px;white-space:pre-wrap}
+@media(max-width:760px){.app{grid-template-columns:1fr}.sidebar{position:fixed;z-index:50;inset:0 auto 0 0;width:280px;transform:translateX(-100%);transition:.2s;box-shadow:var(--shadow)}.sidebar.open{transform:none}.mobile{display:grid}.top{padding:0 12px}.dock{left:0;padding-inline:12px}.conversation{padding-inline:18px}.status span{display:none}.modelbtn{max-width:54vw}}
+</style></head><body><div class="app">
+<aside class="sidebar" id="sidebar"><div class="sidehead"><div class="mark">B</div><div class="wordmark">Bridgena</div></div><div class="sidebody"><button class="newbtn" onclick="newChat()">＋ New chat</button><div class="sectionlabel">Recent</div><div id="threads"></div></div><div class="sidefoot"><a class="ops" href="/dashboard">⚙ Operations</a></div></aside>
+<main class="main"><header class="top"><button class="ghost mobile" onclick="toggleSidebar()">☰</button><div class="modelwrap"><button class="modelbtn" id="modelBtn" onclick="togglePicker()"><span id="modelLabel"></span><span class="chev">⌄</span></button><div class="picker" id="picker"><div class="searchbox"><input id="modelSearch" placeholder="Search models…" autocomplete="off"></div><div class="modellist" id="modelList"></div></div></div><div class="status"><i class="statusdot" id="statusDot"></i><span id="statusText">Ready</span></div><button class="ghost" onclick="toggleTheme()" title="Toggle theme">◐</button></header>
+<div class="scroll" id="scroll"><div class="conversation" id="conversation"><div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:38px;height:38px">B</div><h1>How can I help?</h1><p>Choose an Arena model and start a conversation. Bridgena keeps the account, browser identity, and exit aligned for the thread.</p></div></div></div></div>
+<div class="dock"><div class="compose"><textarea id="input" rows="1" placeholder="Message Bridgena"></textarea><div class="composefoot"><span class="hint">Enter to send · Shift+Enter for newline</span><button class="send" id="send" onclick="sendMessage()" aria-label="Send">↑</button></div></div><div class="runtime"><details><summary>Runtime signal</summary><pre id="signal">Waiting for activity…</pre></details></div></div></main></div>
+<script>
+const MODELS=__MODELS_JSON__, DEFAULT_MODEL=__DEFAULT_MODEL__;
+let model=localStorage.getItem('bgn.model')||DEFAULT_MODEL, chatId=localStorage.getItem('bgn.chat')||makeId(), busy=false;
+const $=id=>document.getElementById(id), escHtml=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function makeId(){return 'c-'+Math.random().toString(36).slice(2,10)}
+function toggleSidebar(){ $('sidebar').classList.toggle('open') }
+function toggleTheme(){const root=document.documentElement,d=root.dataset.theme==='dark'?'light':'dark';root.dataset.theme=d;localStorage.setItem('bgn.theme',d)}
+document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||((matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');
+function togglePicker(force){const p=$('picker'),open=force===undefined?!p.classList.contains('open'):force;p.classList.toggle('open',open);if(open){$('modelSearch').value='';renderModels('');setTimeout(()=>$('modelSearch').focus(),0)}}
+function renderModels(q){q=(q||'').toLowerCase();const rows=MODELS.filter(x=>x.toLowerCase().includes(q)).slice(0,150);$('modelList').innerHTML=rows.length?rows.map(x=>'<button class="modelopt '+(x===model?'on':'')+'" data-model="'+escHtml(x)+'">'+escHtml(x)+'</button>').join(''):'<div class="emptymodels">No models found</div>';document.querySelectorAll('.modelopt').forEach(b=>b.onclick=()=>selectModel(b.dataset.model))}
+function selectModel(x){model=x;$('modelLabel').textContent=x;localStorage.setItem('bgn.model',x);togglePicker(false)}
+$('modelSearch').addEventListener('input',e=>renderModels(e.target.value));document.addEventListener('click',e=>{if(!e.target.closest('.modelwrap'))togglePicker(false)});selectModel(MODELS.includes(model)?model:(MODELS[0]||DEFAULT_MODEL));
+function md(s){return escHtml(s).replace(/```([\s\S]*?)```/g,'<pre><code>$1</code></pre>').replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>')}
+function clearWelcome(){$('welcome')?.remove()}
+function addMessage(role,text,kind){clearWelcome();const row=document.createElement('article');row.className='msg '+role;row.innerHTML='<div class="avatar">'+(role==='user'?'Y':'B')+'</div><div><div class="msghead">'+(role==='user'?'You':'Bridgena')+'</div><div class="msgbody '+(kind||'')+'"></div></div>';const body=row.querySelector('.msgbody');body.innerHTML=kind==='error'?'<div class="errorbox">'+escHtml(text)+'</div>':md(text);$('conversation').appendChild(row);$('scroll').scrollTop=$('scroll').scrollHeight;return body}
+function setStatus(label,state){$('statusText').textContent=label;$('statusDot').className='statusdot '+(state||'')}
+async function loadThreads(){try{const r=await fetch('/chat/api/chats');const d=await r.json();$('threads').innerHTML=d.map(c=>'<button class="thread '+(c.id===chatId?'on':'')+'" data-id="'+escHtml(c.id)+'">'+escHtml(c.title||c.id)+'</button>').join('');document.querySelectorAll('.thread').forEach(b=>b.onclick=()=>openChat(b.dataset.id))}catch(e){}}
+async function openChat(id){chatId=id;localStorage.setItem('bgn.chat',id);$('conversation').innerHTML='';try{const r=await fetch('/chat/api/history?chat_id='+encodeURIComponent(id));const h=await r.json();if(!h.length){showWelcome()}else h.forEach(m=>addMessage(m.role==='user'?'user':'ai',m.content))}catch(e){addMessage('ai',String(e),'error')}loadThreads();$('sidebar').classList.remove('open')}
+function showWelcome(){$('conversation').innerHTML='<div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:38px;height:38px">B</div><h1>How can I help?</h1><p>Choose an Arena model and start a conversation.</p></div></div>'}
+function newChat(){chatId=makeId();localStorage.setItem('bgn.chat',chatId);showWelcome();loadThreads();$('sidebar').classList.remove('open');$('input').focus()}
+async function sendMessage(){if(busy)return;const input=$('input'),text=input.value.trim();if(!text)return;busy=true;input.value='';input.style.height='44px';$('send').disabled=true;setStatus('Generating','busy');addMessage('user',text);const out=addMessage('ai','Thinking…','thinking');let acc='';try{const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,messages:[{role:'user',content:text}],stream:true,chat_id:chatId})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let nl;while((nl=buf.indexOf('\n'))>=0){const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);if(!line.startsWith('data: '))continue;const p=line.slice(6);if(p==='[DONE]')continue;let j;try{j=JSON.parse(p)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta?.content;if(d){acc+=d;out.classList.remove('thinking');out.innerHTML=md(acc);$('scroll').scrollTop=$('scroll').scrollHeight}}}if(!acc)throw new Error('Arena returned an empty response');setStatus('Ready','ok')}catch(e){out.classList.remove('thinking');out.innerHTML='<div class="errorbox">'+escHtml(e.message||e)+'</div>';setStatus('Error','err')}finally{busy=false;$('send').disabled=false;loadThreads()}}
+const input=$('input');input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px'});input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}});
+setInterval(()=>fetch('/debug-logs/data').then(r=>r.json()).then(d=>{$('signal').textContent=d.slice(-18).map(x=>x.line||x.m||'').join('\n')}).catch(()=>{}),3000);
+loadThreads();openChat(chatId);
+</script></body></html>'''
+    return template.replace("__MODELS_JSON__", payload).replace("__DEFAULT_MODEL__", selected)
 
 
 # ────────────────────────── module: api.py ──────────────────────────────
