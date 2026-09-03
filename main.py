@@ -65,7 +65,7 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
 ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.9-followup-contract")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.10-captured-followup-contract")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -4243,7 +4243,6 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 "modelAId": model_id,
                 "userMessageId": str(uuid7()),
                 "modelAMessageId": str(uuid7()),
-                "modelBMessageId": str(uuid7()),
                 "modality": "chat",
             }
             follow_url = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/{mc['arena_id']}"
@@ -4251,9 +4250,14 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
             base.update({"id": str(uuid7()), "userMessageId": str(uuid7()),
                          "modelAMessageId": str(uuid7())})
         content = prompt if len(prompt) <= MAX_PROMPT else prompt[:MAX_PROMPT]
-        user_message = {"content": content}
-        if attachments:
-            user_message["experimental_attachments"] = attachments
+        # These apparently optional fields are always emitted by Arena's live
+        # client. Its follow-up validator returns a generic 500 when they are
+        # absent, so preserve the exact captured envelope even when both empty.
+        user_message = {
+            "content": content,
+            "experimental_attachments": attachments or [],
+            "metadata": {},
+        }
         base["userMessage"] = user_message
 
         tok = await mint_v3(jar.get("id"))
