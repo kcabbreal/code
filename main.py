@@ -59,12 +59,13 @@ STRIKES_MAX = 3
 MAX_CONVERSATIONS = 500
 
 ARENA_RECAPTCHA_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_SITEKEY",
-                                         "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0")
+                                         "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I")
 ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
-                                            "6Le3_cYsAAAAAGwWOK2RLDgNI15Bh8C0yLBOL1yL")
-RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "submit")
+                                            "6Ld7ePYrAAAAAB34ovoFoDau1fqCJ6IyOjFEQaMn")
+RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
+ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.5-browser-transaction-lock")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.7-current-arena-contract")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -1310,7 +1311,7 @@ async def refresh_models_via_worker(worker):
     log("INFO", f"[{worker.name}] Refreshing models via worker navigation...")
     try:
         async with worker._action_lock:
-            await worker.page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded", timeout=30000)
+            await worker.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
             await worker.page.wait_for_load_state("domcontentloaded")
             body = await worker.page.content()
             try:
@@ -2747,7 +2748,7 @@ class KeeperSession:
                     return False
                 if ARENA_BASE not in (page.url or "") and self.active_requests == 0:
                     await self._ensure_sidebar_cookie()
-                    await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                    await page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded")
                     await self._wait_cloudflare(page)
                 if await self._verify_auth_state(page):
                     self.last_health_ok = time.time()
@@ -2845,7 +2846,7 @@ class KeeperSession:
             if len(self._page_pool) < self._max_pool_pages and self.context:
                 try:
                     new_page = await self.context.new_page()
-                    await new_page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                    await new_page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded")
                     await asyncio.sleep(0.5)
                     idx = len(self._page_pool)
                     self._page_pool.append((new_page, True))
@@ -2908,38 +2909,48 @@ class KeeperSession:
         page.on("console", on_console)
         self.active_requests += 1
         try:
-            script = """async ([url, payload, rid]) => {
+            script = """async ([url, payload, rid, action]) => {
                 const P = s => console.log('__NX' + rid + s);
                 try {
+                    const token = String(payload?.recaptchaV3Token || '');
                     const r = await fetch(url, {
                         method: 'POST', credentials: 'include',
-                        headers: {'Content-Type': 'application/json'},
+                        headers: {
+                          'Content-Type': 'application/json',
+                          ...(token ? {'X-Recaptcha-Token': token, 'X-Recaptcha-Action': action} : {})
+                        },
                         body: JSON.stringify(payload)
                     });
                     P('S' + r.status);
-                    if (!r.ok) { P('E' + (await r.text()).slice(0, 400)); return; }
+                    if (!r.ok) { P('E' + (await r.text()).slice(0, 400)); P('Dnull'); return; }
                     const reader = r.body.getReader();
                     const dec = new TextDecoder();
+                    let buffer = '';
                     while (true) {
                         const {done, value} = await reader.read();
-                        if (done) break;
-                        const text = dec.decode(value, {stream: true});
-                        for (const line of text.split('\n')) {
+                        if (value) buffer += dec.decode(value, {stream: true});
+                        if (done) buffer += dec.decode();
+                        const parts = buffer.split(/\\r?\\n/);
+                        buffer = parts.pop() || '';
+                        for (const line of parts) {
                             if (line.trim()) P('D' + JSON.stringify(line));
                         }
+                        if (done) break;
                     }
+                    if (buffer.trim()) P('D' + JSON.stringify(buffer));
                     P('D' + JSON.stringify(null));
                 } catch(e) {
-                    P('S500'); P('E' + e.message);
+                    P('S500'); P('E' + e.message); P('Dnull');
                 }
             }"""
-            eval_task = asyncio.create_task(page.evaluate(script, [url, payload, req_id]))
+            eval_task = asyncio.create_task(page.evaluate(script, [url, payload, req_id, RECAPTCHA_ACTION]))
             while True:
                 line = await queue.get()
                 if line is None:
                     break
                 yield line
-            if eval_task.done() and eval_task.exception():
+            await eval_task
+            if eval_task.exception():
                 raise RuntimeError(f"Bridge evaluate exception: {eval_task.exception()}")
             status_code = meta.get("status", 0)
             if status_code != 200:
@@ -3121,7 +3132,7 @@ class KeeperSession:
 
             self._set_step("Navigating to arena.ai...")
             await self._ensure_sidebar_cookie()
-            await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded", timeout=25000)
+            await self.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=25000)
             await self._wait_cloudflare(self.page)
             await self._handle_turnstile(self.page)
             await self._ensure_sidebar_cookie()
@@ -3237,7 +3248,7 @@ class KeeperSession:
                     try:
                         async with self._action_lock:
                             await self._ensure_sidebar_cookie()
-                            await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded", timeout=45000)
+                            await self.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=45000)
                             await self._wait_cloudflare(self.page)
                             self.last_nav = time.time()
                             self._nav_fail_count = 0
@@ -3888,15 +3899,39 @@ async def mint_v3(jar_id=None):
             # The live client loads enterprise reCAPTCHA on the direct-chat
             # route. Stabilize there, then evaluate in the same locked browser
             # transaction so catalog/health navigation cannot destroy context.
-            if "/text/direct" not in (s.page.url or ""):
-                await s.page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded", timeout=30000)
+            if "mode=direct" not in (s.page.url or ""):
+                await s.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
                 await s.page.wait_for_load_state("domcontentloaded")
                 s.last_nav = time.time()
+            # Arena hydrates the enterprise widget asynchronously after the
+            # document is ready. Minting in the same second as keeper startup
+            # used to observe no window.grecaptcha and fail prematurely.
+            try:
+                await s.page.wait_for_function(
+                    "() => !!(window.grecaptcha && (window.grecaptcha.enterprise || window.grecaptcha.execute))",
+                    timeout=15000,
+                )
+            except Exception:
+                try:
+                    diag = await s.page.evaluate(r"""() => ({
+                        url: location.href,
+                        title: document.title,
+                        ready: document.readyState,
+                        scripts: [...document.scripts].map(x => x.src).filter(x =>
+                          /recaptcha|google\.com\/recaptcha|gstatic\.com\/recaptcha/i.test(x)).slice(0, 6)
+                    })""")
+                except Exception as diag_e:
+                    diag = {"diagnostic": f"{type(diag_e).__name__}: {diag_e}"}
+                log("WARN", f"recaptcha runtime absent after 15s: {redact(json.dumps(diag, ensure_ascii=False))[:700]}")
+                return None
             res = await s.page.evaluate(RC_MINT_JS.replace("ARENA_MARK", ""), ARENA_RECAPTCHA_SITEKEY)
             if isinstance(res, str) and len(res) > 20:
                 return res
             why = res.get("err") if isinstance(res, dict) else "evaluate returned nothing"
             log("WARN", f"recaptcha token: {why}")
+
+            if isinstance(why, str) and "no grecaptcha" in why.lower():
+                return None
 
             # image challenge fallback on that same locked page
             if hasattr(s, "solve_recaptcha_image_challenge") and await s.solve_recaptcha_image_challenge():
@@ -4184,7 +4219,54 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         f"model {str(model_id)[:8]}… · token {'yes' if tok else 'no'}")
         else:
             log("WARN", f"[{jar.get('name')}] No live proxy — using server IP (easy to rate-limit)")
+
+        # Preferred transport: execute the POST inside the already-authenticated
+        # keeper origin. This preserves the exact browser cookie jar, TLS/browser
+        # identity and proxy exit that minted the token. curl remains a fallback
+        # only for browser-evaluation failures.
+        browser_session = keeper.sessions.get(jar.get("id"))
+        if browser_session and browser_session.running and browser_session.page:
+            try:
+                log("INFO", f"[{jar.get('name')}] transport browser-origin")
+                async with browser_session._action_lock:
+                    async for line in browser_session.bridge_fetch(url, base):
+                        ev = _parse_stream_line(str(line).strip())
+                        if not ev:
+                            continue
+                        kind, payload = ev
+                        if kind == "content" and isinstance(payload, str):
+                            response_text += payload
+                            yield ("content", payload)
+                        elif kind == "reasoning":
+                            yield ("reasoning", payload if isinstance(payload, str) else json.dumps(payload))
+                if proxy:
+                    _proxy_health_record(proxy, True, 0, source="browser-stream")
+                    _flagged_exits.pop(_proxy_hkey(proxy), None)
+                if not follow_url:
+                    conv2 = dict(conv)
+                    conv2["model"] = model_name
+                    conv2["arena"] = dict(conv2.get("arena") or {})
+                    conv2["arena"][model_name] = {
+                        "arena_id": base["id"], "mode": "direct",
+                        "jar_id": jar.get("id"), "proxy": proxy,
+                    }
+                    save_conversation(chat_id, conv2)
+                yield ("done", response_text)
+                return
+            except BridgeHTTPError as e:
+                verdict = _classify(e.status, e.body)
+                log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status}: {e.body[:300]}")
+                if verdict in ("RECAPTCHA", "RATELIMIT", "UPSTREAM") and attempt + 1 < max_attempts:
+                    await asyncio.sleep(min(5.0, 1.0 + attempt))
+                    continue
+                yield ("error", f"{e.status or 502}: Arena browser-origin request failed: {e.body[:350] or 'empty response'}")
+                return
+            except Exception as browser_e:
+                log("WARN", f"[{jar.get('name')}] browser-origin unavailable ({type(browser_e).__name__}: {browser_e}) — curl fallback")
+
         headers = _headers_for(jar, p, json_body=True)
+        headers["X-Recaptcha-Token"] = tok
+        headers["X-Recaptcha-Action"] = RECAPTCHA_ACTION
         kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
         if proxy:
             kw["proxy"] = proxy
