@@ -4355,6 +4355,7 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
     cf_clear_attempts = 0
     same_jar_429 = 0  # consecutive 429s on current jar
     max_attempts = 6  # fixed budget — do NOT burn entire pool on IP rate-limits
+    route_fails: list = []   # (host:port, error tail) for exits that connected but couldn't route
 
     for attempt in range(max_attempts):
         conv = get_conversation(conv_key)
@@ -4479,14 +4480,21 @@ async def stream_arena_chat(model_id, model_name, prompt, attachments, conv_key,
                         # the old fall-through to quarantine_proxy punished
                         # healthy exits and gutted the pool file attempt by attempt.
                         note_cf_blocked_exit(proxy, f"socks reply while routing to arena: {_msg[-40:]}")
+                        route_fails.append((_proxy_hkey(proxy) or "direct", _msg[-60:].split("@")[-1]))
                         if attempt + 1 < max_attempts:
                             log("WARN", f"[{jar_id}] exit can't route to arena.ai (socks reply) — "
                                         f"rotating; proxy NOT exiled")
                             continue
-                        yield ("error", "503: WARP exits tunnel fine but none could route to arena.ai "
-                                        "on this pass (Cloudflare-egress → arena reachability). "
-                                        "Nothing was exiled — flags expire on their own; "
-                                        "'Scan pool' re-probes now.")
+                        _hosts = " · ".join(dict.fromkeys(h for h, _m in route_fails)) or "the pool"
+                        _warp_only = bool(route_fails) and all(
+                            h.startswith(("127.0.0.1:", "[::1]:", "localhost:")) for h, _m in route_fails)
+                        _why = ("WARP-only pool: arena.ai's edge routinely rejects Cloudflare's own egress IPs — expected, not fixable from here"
+                                if _warp_only else
+                                "the gateways answered 'can't route' — arena.ai is rejecting these exits' egress IPs right now; tunnels + auth are fine")
+                        yield ("error", f"503: {_hosts} — {len(route_fails)} exit(s) this pass connected + authenticated fine "
+                                        f"but none could route to arena.ai ({_why}). "
+                                        "Nothing was exiled; flags self-expire (~3h) and rotation skips them meanwhile. "
+                                        "'Scan pool' re-probes now; the pool page's verdict column says where any row actually dies.")
                         return
                     _dead = ("failed to perform" in _low or "connect" in _low or "tunnel" in _low
                              or "timed out" in _low or "timeout" in _low or "reset" in _low
