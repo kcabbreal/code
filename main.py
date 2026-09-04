@@ -72,7 +72,7 @@ STREAM_TAIL_GRACE_MS = max(5000, min(60000, int(os.environ.get("BRIDGENA_STREAM_
 KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.31-stream-contract")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.32-newapi-usage")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -5746,6 +5746,11 @@ async def openai_stream(body: dict, keyinfo: dict):
 
     created = int(time.time())
     rid = "chatcmpl-" + uuid7()[:23]
+    include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+    input_text = "\n".join(
+        _openai_text_content(message.get("content", ""))
+        for message in body.get("messages") or [] if isinstance(message, dict)
+    )
 
     def chunk(delta, finish=None):
         return _sse({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -5789,6 +5794,15 @@ async def openai_stream(body: dict, keyinfo: dict):
                         yield chunk({"content": tail})
                     break
             yield chunk({}, finish="stop")
+            if include_usage:
+                prompt_tokens = _rough_tokens(input_text)
+                completion_tokens = _rough_tokens(acc)
+                yield _sse({
+                    "id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [],
+                    "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                              "total_tokens": prompt_tokens + completion_tokens},
+                })
             yield "data: [DONE]\n\n"
             terminal_sent = True
         except Exception as e:
@@ -5816,6 +5830,12 @@ async def chat_completions(request: Request):
     prompt = _last_openai_user_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
+    messages = body.get("messages") or []
+    log("INFO", f"OpenAI request · model {str(body.get('model') or 'auto')[:80]} · "
+                f"messages {len(messages) if isinstance(messages, list) else 0} · "
+                f"tools {len(body.get('tools') or []) if isinstance(body.get('tools') or [], list) else 0} · "
+                f"max_tokens {body.get('max_tokens') or body.get('max_completion_tokens') or 'default'} · "
+                f"usage {'yes' if (body.get('stream_options') or {}).get('include_usage') else 'no'}")
     reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
     if not reserved:
         if duplicate_count == 1:
