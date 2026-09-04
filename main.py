@@ -93,7 +93,7 @@ KEEPER_REQUEST_READY_SEC = max(30, min(180, int(os.environ.get("BRIDGENA_KEEPER_
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.34-adapter-proxy-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.35-local-proxy-bypass")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -1741,7 +1741,10 @@ def playwright_proxy_from_url(proxy_url: str) -> Optional[dict]:
         if (u.scheme or "") in _SHIM_SCHEMES and u.username:
             sh = shim_proxy_for(proxy_url)
             if sh:
-                return {"server": sh}
+                out = {"server": sh}
+                if LOCAL_UPSTREAM:
+                    out["bypass"] = "localhost,127.0.0.1,[::1]"
+                return out
             log("WARN", f"socks shim unavailable for {u.hostname}:{u.port} — browser goes direct (curl path still uses the proxy)")
             return None
         # Chromium speaks "socks5://" (which for Chromium = send the hostname,
@@ -1758,6 +1761,8 @@ def playwright_proxy_from_url(proxy_url: str) -> Optional[dict]:
             out["username"] = u.username
         if u.password:
             out["password"] = u.password
+        if LOCAL_UPSTREAM:
+            out["bypass"] = "localhost,127.0.0.1,[::1]"
         return out
     except Exception:
         return None
@@ -3882,12 +3887,18 @@ class KeeperSession:
             # means our launch shape was wrong, not that the exit is dead —
             # exiling on it once ate an entire authenticated pool in 9 seconds.
             _cap_err = "does not support socks5 proxy authentication" in txt.lower()
+            _local_route_err = bool(LOCAL_UPSTREAM and
+                                    (ARENA_BASE in txt or "localhost:6767" in txt))
             if used:
-                self._tried_proxies.add(used)
+                if _local_route_err:
+                    _probe_fail_reason[used] = "local mirror routing failed (upstream proxy NOT exiled)"
+                    log("WARN", f"[{self.name}] local mirror navigation failed; upstream proxy kept healthy")
+                else:
+                    self._tried_proxies.add(used)
                 if _cap_err:
                     _probe_fail_reason[used] = "keeper shim bypassed: browser capability error (proxy NOT exiled)"
                     log("WARN", f"[{self.name}] {used.split('@')[-1]} kept in pool — Chromium capability error, not a dead proxy")
-                else:
+                elif not _local_route_err:
                     quarantine_proxy(used, f"keeper {self.name}: {txt[:90]}")
             pool = get_proxy_pool() or []
             left = [c for c in pool if c not in self._tried_proxies]
