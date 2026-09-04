@@ -3417,12 +3417,10 @@ class KeeperSession:
                     P('D' + JSON.stringify({i, line}));
                 };
                 try {
-                    const token = String(payload?.recaptchaV3Token || '');
                     const r = await fetch(url, {
                         method: 'POST', credentials: 'include',
                         headers: {
-                          'Content-Type': 'application/json',
-                          ...(token ? {'X-Recaptcha-Token': token, 'X-Recaptcha-Action': action} : {})
+                          'Content-Type': 'application/json'
                         },
                         body: JSON.stringify(payload)
                     });
@@ -3519,7 +3517,7 @@ class KeeperSession:
                                 f"finish {'yes' if result.get('finishSeen') else 'no'} · "
                                 f"stop {result.get('stopReason') or 'unknown'}")
                 else:
-                    log("INFO", f"[{self.name}] stream audit · HTTP {status_code or 0} rejected before stream · frames {frame_count}")
+                    log("WARN", f"[{self.name}] stream audit · HTTP {status_code or 0} rejected before stream · frames {frame_count} · body: {error_body[:300]}")
             if status_code != 200:
                 raise BridgeHTTPError(status_code, error_body)
         finally:
@@ -4703,13 +4701,12 @@ def _classify(status: int, body: str) -> str:
 
 def _attach_v3(base: dict, tok: str) -> None:
     base["recaptchaV3Token"] = tok
-    # Match Arena's current client contract exactly. The retired
-    # `recaptchaToken` alias is no longer emitted by the browser.
+    base.pop("recaptchaV2Token", None)
 
 
 def _attach_v2(base: dict, tok: str) -> None:
     base["recaptchaV2Token"] = tok
-    base["recaptchaV3Token"] = None       # exactly what arena's client does on escalation
+    base.pop("recaptchaV3Token", None)
 
 
 def _events_from_stream_data(data) -> list:
@@ -5026,41 +5023,48 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 return
             except BridgeHTTPError as e:
                 verdict = _classify(e.status, e.body)
-                if verdict not in ("PROMPT", "RATELIMIT", "RECAPTCHA"):
-                    log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status}: {e.body[:300]}")
-                if e.status == 404 and "model not found" in (e.body or "").lower() and mc:
+                log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status} (verdict={verdict}): {e.body[:250]}")
+
+                # If a follow-up request failed on post-to-evaluation (403, 400, 404):
+                # Clear the stale Arena thread and rebuild as a fresh create-evaluation turn
+                if mc:
                     clear_conversation_model(chat_id, model_name)
                     mc = None
                     conv = {}
                     response_text = ""
                     reasoning_text = ""
-                    log("WARN", f"[{jar.get('name')}] stale Arena thread/model binding cleared — rebuilding as create-evaluation")
+                    log("WARN", f"[{jar.get('name')}] follow-up rejected by Arena (HTTP {e.status}) — rebuilding as fresh create-evaluation")
                     if attempt + 1 < max_attempts:
                         continue
+
                 if verdict == "PROMPT":
                     log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming (HTTP {e.status}) — no retry or rotation")
                     yield ("error", "422: Arena rejected this prompt before generation. Bridgena did not retry or rotate accounts; shorten the request or remove unsupported tool/system payloads.")
                     return
+
                 if verdict == "RATELIMIT":
                     log("WARN", f"[{jar.get('name')}] upstream prompt throttle (HTTP {e.status}) — request stopped; no account rotation")
                     yield ("error", "429: Arena throttled or rejected this prompt. No account rotation was attempted; wait 30-60 seconds, then retry or start a new chat.")
                     return
+
                 if verdict == "UPSTREAM" and attempt + 1 < max_attempts:
                     await asyncio.sleep(min(5.0, 1.0 + attempt))
                     continue
+
                 if verdict == "RECAPTCHA":
-                    log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) — request stopped")
+                    if rc_attempts < 2:
+                        rc_attempts += 1
+                        log("WARN", f"[{jar.get('name')}] Arena verification rejected token (HTTP {e.status}) — escalating to V2 challenge solver")
+                        esc = await mint_v2_escalation(jar.get("id"), settle_s=35.0)
+                        if esc:
+                            _attach_v2(base, esc)
+                            log("OK", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar")
+                            if attempt + 1 < max_attempts:
+                                continue
+                    log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation failed")
                     yield ("error", "403: Arena rejected this session's verification token. The request was stopped without repeated retries; wait briefly and try a new chat.")
                     return
-                if e.status == 400 and "user message is invalid" in (e.body or "").lower() and mc:
-                    clear_conversation_model(chat_id, model_name)
-                    mc = None
-                    conv = {}
-                    response_text = ""
-                    reasoning_text = ""
-                    log("WARN", f"[{jar.get('name')}] follow-up envelope rejected — rebuilding once as create-evaluation")
-                    if attempt + 1 < max_attempts:
-                        continue
+
                 if e.status == 400 and "user message is invalid" in (e.body or "").lower():
                     yield ("error", "400: Arena rejected the message content. Send plain text or supported text content parts; images and unsupported multimodal parts are not accepted by this bridge yet.")
                     return
@@ -5841,7 +5845,7 @@ function loadThreads(){const d=localChats(),rows=Object.keys(d).sort((a,b)=>(d[b
 function openChat(id){chatId=id;localStorage.setItem('bgn.chat',id);$('conversation').innerHTML='';const c=localChats()[id];if(!c||!(c.messages||[]).length){showWelcome()}else c.messages.forEach(m=>addMessage(m.role==='user'?'user':'ai',m.content));loadThreads();$('sidebar').classList.remove('open')}
 function showWelcome(){$('conversation').innerHTML='<div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:38px;height:38px">B</div><h1>How can I help?</h1><p>Choose an Arena model and start a conversation.</p></div></div>'}
 function newChat(){chatId=makeId();localStorage.setItem('bgn.chat',chatId);showWelcome();loadThreads();$('sidebar').classList.remove('open');$('input').focus()}
-async function sendMessage(){if(busy)return;const input=$('input'),text=input.value.trim();if(!text)return;busy=true;input.value='';input.style.height='44px';$('send').disabled=true;setStatus('Generating','busy');addMessage('user',text);saveLocalMessage('user',text);const out=addMessage('ai','Thinking…','thinking');let acc='';try{const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,messages:[{role:'user',content:text}],stream:true,chat_id:chatId})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let nl;while((nl=buf.indexOf('\n'))>=0){const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);if(!line.startsWith('data: '))continue;const p=line.slice(6);if(p==='[DONE]')continue;let j;try{j=JSON.parse(p)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta?.content;if(d){acc+=d;out.classList.remove('thinking');out.innerHTML=md(acc);$('scroll').scrollTop=$('scroll').scrollHeight}}}if(!acc)throw new Error('Arena returned an empty response');saveLocalMessage('assistant',acc);setStatus('Ready','ok')}catch(e){out.classList.remove('thinking');out.innerHTML='<div class="errorbox">'+escHtml(e.message||e)+'</div>';setStatus('Error','err')}finally{busy=false;$('send').disabled=false;loadThreads()}}
+async function sendMessage(){if(busy)return;const input=$('input'),text=input.value.trim();if(!text)return;busy=true;input.value='';input.style.height='44px';$('send').disabled=true;setStatus('Generating','busy');addMessage('user',text);saveLocalMessage('user',text);const out=addMessage('ai','Thinking…','thinking');let acc='';try{const history=((localChats()[chatId]||{}).messages||[]).slice(-16).map(m=>({role:m.role,content:m.content}));const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,messages:history.length?history:[{role:'user',content:text}],stream:true,chat_id:chatId})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let nl;while((nl=buf.indexOf('\n'))>=0){const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);if(!line.startsWith('data: '))continue;const p=line.slice(6);if(p==='[DONE]')continue;let j;try{j=JSON.parse(p)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta?.content;if(d){acc+=d;out.classList.remove('thinking');out.innerHTML=md(acc);$('scroll').scrollTop=$('scroll').scrollHeight}}}if(!acc)throw new Error('Arena returned an empty response');saveLocalMessage('assistant',acc);setStatus('Ready','ok')}catch(e){out.classList.remove('thinking');out.innerHTML='<div class="errorbox">'+escHtml(e.message||e)+'</div>';setStatus('Error','err')}finally{busy=false;$('send').disabled=false;loadThreads()}}
 const input=$('input');input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px'});input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}});
 setInterval(()=>fetch('/debug-logs/data').then(r=>r.json()).then(d=>{$('signal').textContent=d.slice(-18).map(x=>x.line||x.m||'').join('\n')}).catch(()=>{}),3000);
 loadThreads();openChat(chatId);
@@ -6103,6 +6107,33 @@ def _last_openai_user_prompt(body: dict) -> str:
     return prompts[-1] if prompts else ""
 
 
+def _format_conversation_prompt(body: dict) -> str:
+    """Format conversation messages into a coherent prompt with full dialogue history."""
+    messages = body.get("messages") or []
+    if not messages:
+        return _last_openai_user_prompt(body)
+    if len(messages) == 1 and isinstance(messages[0], dict) and messages[0].get("role") == "user":
+        return _openai_text_content(messages[0].get("content", ""))
+    lines = []
+    system = _openai_text_content(body.get("system", ""))
+    if system:
+        lines.append("System:\n" + system)
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = (m.get("role") or "").lower()
+        text = _openai_text_content(m.get("content", "")).strip()
+        if not text:
+            continue
+        if role == "system":
+            lines.append(f"System:\n{text}")
+        elif role == "assistant":
+            lines.append(f"Assistant:\n{text}")
+        else:
+            lines.append(f"User:\n{text}")
+    return "\n\n".join(lines) if lines else _last_openai_user_prompt(body)
+
+
 def _anthropic_prompt(body: dict) -> str:
     """Flatten Anthropic message blocks into one stateless Arena turn."""
     lines = []
@@ -6172,7 +6203,7 @@ def _reserve_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> tu
 
 
 async def openai_stream(body: dict, keyinfo: dict):
-    prompt = _last_openai_user_prompt(body)
+    prompt = _format_conversation_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
     model = body.get("model", "auto")
@@ -6263,7 +6294,7 @@ async def openai_stream(body: dict, keyinfo: dict):
 async def chat_completions(request: Request):
     keyinfo = await _require_key(request)
     body = await request.json()
-    prompt = _last_openai_user_prompt(body)
+    prompt = _format_conversation_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
     messages = body.get("messages") or []
