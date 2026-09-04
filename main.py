@@ -1967,14 +1967,17 @@ def mark_jar_status(jar_id: str, status_type: str) -> None:
                     log("OK", f"Jar '{j.get('name')}' reset to healthy")
     mutate_jars(upd)
 
+_captcha_failed_jars: dict = {}
+
 def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Optional[dict]:
     """Pick the best jar for a request.
 
     Priority when prefer_live=True (default, needed for new chats / captcha):
-      1. Enabled + auth + has a running live (headed) keeper session
-      2. Enabled + auth + has any running keeper session
-      3. Fully available jar (not rate-limited, has auth cookies)
-      4. Last resort: any enabled jar that still has a live session
+      1. Not recently rejected by reCAPTCHA on its exit IP
+      2. Enabled + auth + has a running live (headed) keeper session
+      3. Enabled + auth + has any running keeper session
+      4. Fully available jar (not rate-limited, has auth cookies)
+      5. Last resort: any enabled jar that still has a live session
 
     This makes the browser-bridge path the default whenever possible so we
     never need to scrape reCAPTCHA tokens from a page that isn't attached.
@@ -1990,9 +1993,11 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
         is_live = has_session and (not getattr(s, "headless", True))
         healthy = bool(s and s.last_health_ok and (now - s.last_health_ok) < 900)
         available = jar_available(j, now)
+        captcha_clean = 1 if (now - _captcha_failed_jars.get(sid, 0.0) > 300) else 0
         # last_used is inverted so older = higher priority
         recency = -float(j.get("last_used", 0) or 0)
         return (
+            captcha_clean,
             1 if (prefer_live and is_live and healthy) else 0,
             1 if (prefer_live and has_session and healthy) else 0,
             1 if available else 0,
@@ -5092,6 +5097,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 if proxy:
                     _proxy_health_record(proxy, True, 0, source="browser-stream")
                     _flagged_exits.pop(_proxy_hkey(proxy), None)
+                _captcha_failed_jars.pop(jar.get("id"), None)
                 if not response_text and reasoning_text:
                     response_text = reasoning_text
                     yield ("content", reasoning_text)
@@ -5132,8 +5138,14 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     return
 
                 if verdict == "RATELIMIT":
+                    if not mc and attempt + 1 < max_attempts:
+                        nxt = acquire_jar(prefer_live=True, exclude=tried)
+                        if nxt and nxt["id"] not in tried:
+                            jar, _ = nxt, tried.add(nxt["id"])
+                            log("WARN", f"[{jar.get('name')}] model rate-limited (HTTP 429) — rotating account to try remaining quota")
+                            continue
                     log("WARN", f"[{jar.get('name')}] upstream prompt throttle (HTTP {e.status}) — request stopped; no account rotation")
-                    yield ("error", "429: Arena throttled or rejected this prompt. No account rotation was attempted; wait 30-60 seconds, then retry or start a new chat.")
+                    yield ("error", f"429: Arena returned Too Many Requests for model '{model_name}'. This model is currently rate-limited upstream on Arena; wait 30-60s or select another model in your chat.")
                     return
 
                 if verdict == "UPSTREAM" and attempt + 1 < max_attempts:
@@ -5141,6 +5153,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     continue
 
                 if verdict == "RECAPTCHA":
+                    _captcha_failed_jars[jar.get("id")] = time.time()
                     if rc_attempts < 2:
                         rc_attempts += 1
                         log("WARN", f"[{jar.get('name')}] Arena verification rejected token (HTTP {e.status}) — escalating to V2 challenge solver")
