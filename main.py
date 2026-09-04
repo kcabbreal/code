@@ -68,8 +68,9 @@ ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
     "BRIDGENA_ALLOW_RECAPTCHA_FALLBACK", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 REQUEST_MAX_ATTEMPTS = max(1, min(3, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "2"))))
+STREAM_TAIL_GRACE_MS = max(1000, min(15000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "5000"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.22-stability-containment")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.23-claude-tail-drain")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -2954,7 +2955,7 @@ class KeeperSession:
         page.on("console", on_console)
         self.active_requests += 1
         try:
-            script = """async ([url, payload, rid, action]) => {
+            script = """async ([url, payload, rid, action, tailGraceMs]) => {
                 const P = s => console.log('__NX' + rid + s);
                 const captured = [];
                 const emit = line => {
@@ -2983,7 +2984,10 @@ class KeeperSession:
                     let buffer = '';
                     let protocolFinished = false;
                     const readWithGrace = () => new Promise((resolve, reject) => {
-                        const timer = setTimeout(() => resolve({graceExpired: true}), 450);
+                        // Some providers emit their final text delta after the
+                        // finish metadata. Drain for a real quiet window so a
+                        // trailing word or punctuation chunk is not clipped.
+                        const timer = setTimeout(() => resolve({graceExpired: true}), tailGraceMs);
                         reader.read().then(
                             value => { clearTimeout(timer); resolve(value); },
                             error => { clearTimeout(timer); reject(error); }
@@ -3016,7 +3020,9 @@ class KeeperSession:
                     return {status: 500, error: String(e.message || e), lines: captured};
                 }
             }"""
-            eval_task = asyncio.create_task(page.evaluate(script, [url, payload, req_id, RECAPTCHA_ACTION]))
+            eval_task = asyncio.create_task(page.evaluate(
+                script, [url, payload, req_id, RECAPTCHA_ACTION, STREAM_TAIL_GRACE_MS]
+            ))
             seen_indices = set()
             while True:
                 packet = await queue.get()
@@ -4056,7 +4062,9 @@ async def mint_v3(jar_id=None):
                       + " · action " + str(res.get("action", RECAPTCHA_ACTION))) if isinstance(res, dict) else ""
             log("WARN", f"recaptcha token: {why}{detail}")
 
-            if isinstance(why, str) and "no grecaptcha" in why.lower():
+            if isinstance(why, str) and (
+                "no grecaptcha" in why.lower() or "no valid site key" in why.lower()
+            ):
                 return None
 
             # image challenge fallback on that same locked page
