@@ -75,7 +75,7 @@ ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?m
 ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
     "BRIDGENA_ALLOW_RECAPTCHA_FALLBACK", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
-REQUEST_MAX_ATTEMPTS = max(1, min(3, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "2"))))
+REQUEST_MAX_ATTEMPTS = max(1, min(5, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "3"))))
 STREAM_TAIL_GRACE_MS = max(5000, min(60000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "30000"))))
 KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
@@ -1967,7 +1967,7 @@ def mark_jar_status(jar_id: str, status_type: str) -> None:
                     log("OK", f"Jar '{j.get('name')}' reset to healthy")
     mutate_jars(upd)
 
-def acquire_jar(prefer_live: bool = True) -> Optional[dict]:
+def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Optional[dict]:
     """Pick the best jar for a request.
 
     Priority when prefer_live=True (default, needed for new chats / captcha):
@@ -2001,7 +2001,7 @@ def acquire_jar(prefer_live: bool = True) -> Optional[dict]:
         )
 
     def pick(jars: list):
-        candidates = [j for j in jars if j.get("enabled", True)]
+        candidates = [j for j in jars if j.get("enabled", True) and (not exclude or j.get("id") not in exclude)]
         if not candidates:
             return
         # Sort by score descending
@@ -4446,14 +4446,14 @@ RC_V2_WIDGET_JS = """async (SITE) => {
   // mount a V2 checkbox under the escalation sitekey in the viewport corner
   try {
     let host = document.getElementById('bgn-v2-host');
-    if (!host) {
-      host = document.createElement('div');
-      host.id = 'bgn-v2-host';
-      host.style.cssText = 'position:fixed;bottom:12px;right:12px;width:304px;height:78px;z-index:2147483647;opacity:1;background:#fff;border-radius:4px;box-shadow:0 0 10px rgba(0,0,0,0.15);';
-      document.body.appendChild(host);
-    } else {
-      host.innerHTML = '';
+    if (host) {
+      host.remove();
     }
+    host = document.createElement('div');
+    host.id = 'bgn-v2-host';
+    host.style.cssText = 'position:fixed;bottom:12px;right:12px;width:304px;height:78px;z-index:2147483647;opacity:1;background:#fff;border-radius:4px;box-shadow:0 0 10px rgba(0,0,0,0.15);';
+    document.body.appendChild(host);
+
     window.__bgnV2Token = null;
     window.__bgnV2Done = false;
     window.__bgnV2Err = null;
@@ -4471,6 +4471,7 @@ RC_V2_WIDGET_JS = """async (SITE) => {
 
 RC_V2_READ_JS = """() => {
   try {
+    if (window.__bgnV2Err) return '__ERR__' + window.__bgnV2Err;
     if (window.__bgnV2Token && typeof window.__bgnV2Token === 'string' && window.__bgnV2Token.length > 20) {
       return window.__bgnV2Token;
     }
@@ -4536,6 +4537,15 @@ async def mint_v3(jar_id=None):
                 await s.page.wait_for_load_state("domcontentloaded")
                 s.last_nav = time.time()
 
+            try:
+                if hasattr(s, "_human_move") and s.page:
+                    size = s.page.viewport_size or {"width": 1920, "height": 1080}
+                    tx = random.randint(350, max(351, size.get("width", 1920) - 150))
+                    ty = random.randint(200, max(201, size.get("height", 1080) - 200))
+                    await s._human_move(s.page, tx, ty, steps=random.randint(4, 7))
+            except Exception:
+                pass
+
             v3_token = None
             try:
                 await s.page.wait_for_function(
@@ -4568,16 +4578,13 @@ async def mint_v3(jar_id=None):
 
             # 1. Try solving any challenge already open in the keeper session
             if hasattr(s, "solve_recaptcha_image_challenge") and await s.solve_recaptcha_image_challenge():
-                tok = await s.page.evaluate("""() => {
-                    const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response');
-                    return (el && el.value && el.value.length > 20) ? el.value : null;
-                }""")
-                if tok:
+                tok = await s.page.evaluate(RC_V2_READ_JS)
+                if tok and not str(tok).startswith("__ERR__"):
                     log("OK", f"recaptcha token harvested from live challenge fallback ({len(tok)} chars)")
                     return tok
 
             # 2. Trigger V2 escalation widget & solve
-            esc_token = await mint_v2_escalation(jar_id=sid, settle_s=35.0)
+            esc_token = await mint_v2_escalation(jar_id=sid, settle_s=20.0)
             if esc_token:
                 return esc_token
 
@@ -4586,48 +4593,97 @@ async def mint_v3(jar_id=None):
     return None
 
 
-async def mint_v2_escalation(jar_id=None, settle_s: float = 45.0):
+async def mint_v2_escalation(jar_id=None, settle_s: float = 20.0):
     """The path arena's OWN client uses after recaptcha_validation_failed:
-    mount the V2 checkbox, let the keeper's ONNX grid solver work it, harvest
-    the response. Returns token or None."""
+    mount the V2 checkbox, let the keeper's ONNX grid solver or extension work it,
+    harvest the response. Returns token or None.
+    CRITICAL: Must fail fast if checkbox cannot be clicked or if no solver is available,
+    to prevent client connection timeouts."""
     sid, s = _find_session(jar_id)
     if not s:
         log("WARN", "recaptcha token: V2 escalation skipped — no live keeper session")
         return None
     try:
-        mount = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_V2_SITEKEY)
+        # Check if ONNX solver or extension is present
+        solver = get_solver() if "get_solver" in globals() else None
+        has_onnx = bool(solver and solver.available())
+        ext_path = os.environ.get("BRIDGENA_CAPTCHA_EXT", "")
+        has_ext = bool(ext_path and os.path.exists(os.path.join(ext_path, "manifest.json")))
+
+        # Check if already solved or present
+        tok = await s.page.evaluate(RC_V2_READ_JS)
+        if tok and not str(tok).startswith("__ERR__"):
+            log("OK", f"recaptcha V2 token already present ({len(tok)} chars)")
+            return tok
+
+        # If solver is available, attempt to solve any challenge frame already open
+        if has_onnx and hasattr(s, "solve_recaptcha_image_challenge"):
+            if await s.solve_recaptcha_image_challenge():
+                tok = await s.page.evaluate(RC_V2_READ_JS)
+                if tok and not str(tok).startswith("__ERR__"):
+                    log("OK", f"recaptcha V2 token harvested via ONNX solver ({len(tok)} chars)")
+                    return tok
+
+        # 1. Mount checkbox widget with primary Arena sitekey
+        mount = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_SITEKEY)
         if not (isinstance(mount, dict) and mount.get("ok")):
             log("WARN", f"recaptcha token: V2 mount failed: {(mount or {}).get('err') if isinstance(mount, dict) else mount}")
-            mount2 = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_SITEKEY)
-            if not (isinstance(mount2, dict) and mount2.get("ok")):
-                return None
+            if ARENA_RECAPTCHA_V2_SITEKEY != ARENA_RECAPTCHA_SITEKEY:
+                mount2 = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_V2_SITEKEY)
+                if not (isinstance(mount2, dict) and mount2.get("ok")):
+                    return None
 
-        await asyncio.sleep(1.0)
-        # click the checkbox across all frames
+        await asyncio.sleep(0.8)
+        # 2. Click the checkbox across all frames
         clicked = False
         for frame in s.page.frames:
             try:
                 cb = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border")
                 if await cb.count() > 0 and await cb.first.is_visible():
-                    await cb.first.click(timeout=3000)
+                    await cb.first.click(timeout=2000)
                     clicked = True
                     break
             except Exception:
                 continue
 
-        await asyncio.sleep(1.5)
-        # run the image challenge via the keeper solver
-        if hasattr(s, "solve_recaptcha_image_challenge"):
+        # FAST-FAIL 1: If no checkbox was clicked, there is NO challenge to solve
+        if not clicked:
+            log("WARN", f"[{sid}] recaptcha token: V2 escalation skipped — no visible checkbox anchor on keeper page")
+            return None
+
+        # 3. Check for instant auto-pass checkmark
+        await asyncio.sleep(1.2)
+        tok = await s.page.evaluate(RC_V2_READ_JS)
+        if tok and not str(tok).startswith("__ERR__"):
+            log("OK", f"recaptcha V2 token harvested from auto-pass checkmark ({len(tok)} chars)")
+            return tok
+
+        # FAST-FAIL 2: If neither ONNX solver nor browser extension is present, fail fast
+        if not has_onnx and not has_ext:
+            await asyncio.sleep(1.0)
+            tok = await s.page.evaluate(RC_V2_READ_JS)
+            if tok and not str(tok).startswith("__ERR__"):
+                log("OK", f"recaptcha V2 token harvested ({len(tok)} chars)")
+                return tok
+            log("WARN", f"[{sid}] reCAPTCHA challenge presented but ONNX solver/extension not available — failing fast to rotate account")
+            return None
+
+        # 4. Solver or extension is available: run solver
+        if has_onnx and hasattr(s, "solve_recaptcha_image_challenge"):
             await s.solve_recaptcha_image_challenge()
 
-        deadline = time.time() + settle_s
+        max_wait = min(settle_s, 20.0 if has_onnx else 15.0)
+        deadline = time.time() + max_wait
         while time.time() < deadline:
             tok = await s.page.evaluate(RC_V2_READ_JS)
             if tok:
+                if str(tok).startswith("__ERR__"):
+                    log("WARN", f"[{sid}] reCAPTCHA widget reported error: {tok}")
+                    return None
                 log("OK", f"recaptcha V2 token harvested ({len(tok)} chars)")
                 return tok
             await asyncio.sleep(1.0)
-        log("WARN", f"recaptcha token: V2 challenge did not complete in window (clicked checkbox={clicked})")
+        log("WARN", f"recaptcha token: V2 challenge did not complete in window (clicked={clicked}, solver={has_onnx or has_ext})")
         return None
     except Exception as e:
         log("WARN", f"recaptcha token: V2 escalation error: {type(e).__name__}: {e}")
@@ -4927,7 +4983,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
             if mc:
                 yield ("error", "409: This Arena thread lost its original authenticated jar. Start a new Bridgena thread.")
                 return
-            nxt = acquire_jar(prefer_live=True)
+            nxt = acquire_jar(prefer_live=True, exclude=tried)
             if nxt and nxt["id"] not in tried:
                 jar, _ = nxt, tried.add(nxt["id"])
                 continue
@@ -4978,7 +5034,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
             tok = await mint_v3(jar.get("id"))
             if not tok:
                 log("INFO", f"[{jar.get('name')}] Minting v3 token unavailable — attempting v2 escalation challenge fallback")
-                tok = await mint_v2_escalation(jar.get("id"), settle_s=35.0)
+                tok = await mint_v2_escalation(jar.get("id"), settle_s=20.0)
                 if tok:
                     _attach_v2(base, tok)
             else:
@@ -5088,7 +5144,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     if rc_attempts < 2:
                         rc_attempts += 1
                         log("WARN", f"[{jar.get('name')}] Arena verification rejected token (HTTP {e.status}) — escalating to V2 challenge solver")
-                        esc = await mint_v2_escalation(jar.get("id"), settle_s=35.0)
+                        esc = await mint_v2_escalation(jar.get("id"), settle_s=20.0)
                         if esc:
                             pending_v2_token = esc
                             log("OK", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar")
@@ -5104,7 +5160,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         if attempt + 1 < max_attempts:
                             continue
                     if not mc and attempt + 1 < max_attempts:
-                        nxt = acquire_jar(prefer_live=True)
+                        nxt = acquire_jar(prefer_live=True, exclude=tried)
                         if nxt and nxt["id"] not in tried:
                             jar, _ = nxt, tried.add(nxt["id"])
                             log("INFO", f"[{jar.get('name')}] Rotating to live account after captcha rejection on previous exit")
@@ -5225,7 +5281,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                                 _attach_v3(base, fresh)
                                 log("WARN", f"[{jar.get('name')}] recaptcha rejected — fresh V3 token, retrying SAME jar")
                                 continue
-                            esc = await mint_v2_escalation(jar.get("id"), settle_s=30)
+                            esc = await mint_v2_escalation(jar.get("id"), settle_s=20.0)
                             if esc:
                                 _attach_v2(base, esc)
                                 log("WARN", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar")
@@ -5259,7 +5315,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         if mc:
                             yield ("error", "409: This Arena thread's original session expired. Start a new Bridgena thread.")
                             return
-                        nxt = acquire_jar(prefer_live=True)
+                        nxt = acquire_jar(prefer_live=True, exclude=tried)
                         if nxt and nxt["id"] not in tried:
                             log("WARN", f"session expired — rotating to '{nxt.get('name')}'")
                             jar, _ = nxt, tried.add(nxt["id"])
