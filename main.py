@@ -4445,27 +4445,46 @@ RC_MINT_JS = r"""async (OPTS) => {
 RC_V2_WIDGET_JS = """async (SITE) => {
   // mount a V2 checkbox under the escalation sitekey in the viewport corner
   try {
-    if (!document.getElementById('bgn-v2-host')) {
-      const host = document.createElement('div');
+    let host = document.getElementById('bgn-v2-host');
+    if (!host) {
+      host = document.createElement('div');
       host.id = 'bgn-v2-host';
       host.style.cssText = 'position:fixed;bottom:12px;right:12px;width:304px;height:78px;z-index:2147483647;opacity:1;background:#fff;border-radius:4px;box-shadow:0 0 10px rgba(0,0,0,0.15);';
       document.body.appendChild(host);
-      const api = (window.grecaptcha && window.grecaptcha.enterprise) ? grecaptcha.enterprise : grecaptcha;
-      window.__bgnV2 = api.render(host, {sitekey: SITE, size: 'normal',
-        callback: () => { window.__bgnV2Done = true; },
-        'error-callback': () => { window.__bgnV2Err = 'widget-error'; },
-        'expired-callback': () => { window.__bgnV2Done = false; }});
-      window.__bgnV2Done = false; window.__bgnV2Err = null;
+    } else {
+      host.innerHTML = '';
     }
+    window.__bgnV2Token = null;
+    window.__bgnV2Done = false;
+    window.__bgnV2Err = null;
+    const api = (window.grecaptcha && window.grecaptcha.enterprise) ? grecaptcha.enterprise : grecaptcha;
+    window.__bgnV2 = api.render(host, {
+      sitekey: SITE,
+      size: 'normal',
+      callback: (tok) => { window.__bgnV2Done = true; window.__bgnV2Token = tok; },
+      'error-callback': () => { window.__bgnV2Err = 'widget-error'; },
+      'expired-callback': () => { window.__bgnV2Done = false; window.__bgnV2Token = null; }
+    });
     return {ok: true};
   } catch (e) { return {ok: false, err: String(e).slice(0, 160)}; }
 }"""
 
 RC_V2_READ_JS = """() => {
   try {
+    if (window.__bgnV2Token && typeof window.__bgnV2Token === 'string' && window.__bgnV2Token.length > 20) {
+      return window.__bgnV2Token;
+    }
     const api = (window.grecaptcha && window.grecaptcha.enterprise) ? grecaptcha.enterprise : grecaptcha;
-    const t = (window.__bgnV2 !== undefined) ? api.getResponse(window.__bgnV2) : api.getResponse();
-    return (t && t.length > 20) ? t : null;
+    if (window.__bgnV2 !== undefined && typeof api.getResponse === 'function') {
+      const t = api.getResponse(window.__bgnV2);
+      if (t && t.length > 20) return t;
+    }
+    const host = document.getElementById('bgn-v2-host');
+    if (host) {
+      const el = host.querySelector('textarea[name="g-recaptcha-response"]');
+      if (el && el.value && el.value.length > 20) return el.value;
+    }
+    return null;
   } catch (e) { return null; }
 }"""
 
@@ -4604,11 +4623,6 @@ async def mint_v2_escalation(jar_id=None, settle_s: float = 45.0):
         deadline = time.time() + settle_s
         while time.time() < deadline:
             tok = await s.page.evaluate(RC_V2_READ_JS)
-            if not tok:
-                tok = await s.page.evaluate("""() => {
-                    const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response');
-                    return (el && el.value && el.value.length > 20) ? el.value : null;
-                }""")
             if tok:
                 log("OK", f"recaptcha V2 token harvested ({len(tok)} chars)")
                 return tok
@@ -5088,6 +5102,12 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         reasoning_text = ""
                         log("WARN", f"[{jar.get('name')}] follow-up verification failed — rebuilding as fresh create-evaluation")
                         if attempt + 1 < max_attempts:
+                            continue
+                    if not mc and attempt + 1 < max_attempts:
+                        nxt = acquire_jar(prefer_live=True)
+                        if nxt and nxt["id"] not in tried:
+                            jar, _ = nxt, tried.add(nxt["id"])
+                            log("INFO", f"[{jar.get('name')}] Rotating to live account after captcha rejection on previous exit")
                             continue
                     log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation failed")
                     yield ("error", "403: Arena rejected this session's verification token. The request was stopped without repeated retries; wait briefly and try a new chat.")
