@@ -69,8 +69,9 @@ ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
 ).strip().lower() in {"1", "true", "yes", "on"}
 REQUEST_MAX_ATTEMPTS = max(1, min(3, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "2"))))
 STREAM_TAIL_GRACE_MS = max(1000, min(15000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "5000"))))
+KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.26-api-key-console")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.27-keeper-readiness")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -2059,6 +2060,7 @@ class KeeperSession:
         self.last_health_ok = 0.0
         self.last_nav = 0.0
         self.last_restart = 0.0
+        self.ready_at = 0.0
         self.fail_count = 0
         self.next_retry = 0.0
         self.relogin_count = 0
@@ -3270,6 +3272,10 @@ class KeeperSession:
                 log("WARN", f"[{self.name}] Initial health check negative — triggering relogin")
                 await self.relogin()
 
+            self.ready_at = time.monotonic() + KEEPER_WARMUP_SEC
+            if KEEPER_WARMUP_SEC:
+                log("INFO", f"[{self.name}] Keeper warm-up gate {KEEPER_WARMUP_SEC}s before API traffic")
+
             self._loop_task = asyncio.create_task(self._session_loop())
             return True
 
@@ -4018,13 +4024,15 @@ def _find_session(jar_id=None):
         return None, None
     if jar_id:
         s = sessions.get(jar_id)
-        if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
+        if (s and s.running and getattr(s, "page", None) and not s.page.is_closed()
+                and time.monotonic() >= getattr(s, "ready_at", 0.0)):
             return jar_id, s
         # A token from some other account/browser/exit is not a fallback: it is
         # cryptographically and behaviorally the wrong identity for this jar.
         return None, None
     for sid, s in list(sessions.items()):
-        if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
+        if (s and s.running and getattr(s, "page", None) and not s.page.is_closed()
+                and time.monotonic() >= getattr(s, "ready_at", 0.0)):
             return sid, s
     return None, None
 
@@ -5645,11 +5653,14 @@ async def openai_stream(body: dict, keyinfo: dict):
                     yield chunk({"reasoning_content": payload})
                 elif kind == "error":
                     yield _sse({"error": {"message": payload}})
-                    break
+                    yield "data: [DONE]\n\n"
+                    return
                 elif kind == "done":
                     break
         except Exception as e:
             yield _sse({"error": {"message": f"{type(e).__name__}: {e}"}})
+            yield "data: [DONE]\n\n"
+            return
         yield chunk({}, finish="stop")
         yield "data: [DONE]\n\n"
     return StreamingResponse(gen(), media_type="text/event-stream")
