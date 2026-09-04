@@ -65,7 +65,7 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
 ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.16-vercel-ui")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.19-lossless-browser-stream")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -249,16 +249,16 @@ def resolve_model_id(public_name: str, jar: Optional[dict] = None) -> str:
     create-evaluation contract. Sending a label here currently produces an
     opaque upstream 500, while Arena's own client always sends the UUID."""
     wanted = _model_key(public_name)
-    if wanted in _VERIFIED_MODEL_IDS:
-        return _VERIFIED_MODEL_IDS[wanted]
     # The shared catalog is replaced atomically by the latest successful live
-    # refresh. Prefer it over a jar's historical snapshot.
+    # refresh. It must outrank compatibility pins because Arena rotates UUIDs.
     for item in get_models():
         if not isinstance(item, dict):
             continue
         labels = (item.get("name"), item.get("publicName"), item.get("id"))
         if public_name in labels or wanted in {_model_key(x) for x in labels if x}:
             return item.get("id") or public_name
+    if wanted in _VERIFIED_MODEL_IDS:
+        return _VERIFIED_MODEL_IDS[wanted]
     jar_map = (jar or {}).get("model_map", {})
     mapped = jar_map.get(public_name)
     if not mapped:
@@ -1510,6 +1510,23 @@ def save_conversation(key: str, conv: dict) -> None:
         mutate_state(fn)
     except Exception as e:
         log("WARN", f"Conversation save failed: {e}")
+
+def clear_conversation_model(key: str, model_name: str) -> None:
+    """Remove only a stale upstream binding; never touch browser-local text."""
+    def fn(state: dict):
+        conv = state.get("conversations", {}).get(key)
+        if not isinstance(conv, dict):
+            return
+        arena = conv.get("arena")
+        if isinstance(arena, dict):
+            arena.pop(model_name, None)
+        if conv.get("model") == model_name:
+            conv["model"] = None
+        conv["updated"] = time.time()
+    try:
+        mutate_state(fn)
+    except Exception as e:
+        log("WARN", f"Conversation binding clear failed: {e}")
 
 def mark_jar_status(jar_id: str, status_type: str) -> None:
     def upd(jars: list):
@@ -2921,7 +2938,10 @@ class KeeperSession:
                     elif tag == "D":
                         data = json.loads(body)
                         if data is None: queue.put_nowait(None)
-                        else: queue.put_nowait(data)
+                        elif isinstance(data, dict) and "line" in data:
+                            queue.put_nowait((data.get("i"), data.get("line")))
+                        else:
+                            queue.put_nowait((None, data))
             except Exception:
                 pass
 
@@ -2930,6 +2950,12 @@ class KeeperSession:
         try:
             script = """async ([url, payload, rid, action]) => {
                 const P = s => console.log('__NX' + rid + s);
+                const captured = [];
+                const emit = line => {
+                    const i = captured.length;
+                    captured.push(line);
+                    P('D' + JSON.stringify({i, line}));
+                };
                 try {
                     const token = String(payload?.recaptchaV3Token || '');
                     const r = await fetch(url, {
@@ -2941,7 +2967,11 @@ class KeeperSession:
                         body: JSON.stringify(payload)
                     });
                     P('S' + r.status);
-                    if (!r.ok) { P('E' + (await r.text()).slice(0, 400)); P('Dnull'); return; }
+                    if (!r.ok) {
+                        const error = (await r.text()).slice(0, 400);
+                        P('E' + error); P('Dnull');
+                        return {status: r.status, error, lines: captured};
+                    }
                     const reader = r.body.getReader();
                     const dec = new TextDecoder();
                     let buffer = '';
@@ -2952,28 +2982,42 @@ class KeeperSession:
                         const parts = buffer.split(/\\r?\\n/);
                         buffer = parts.pop() || '';
                         for (const line of parts) {
-                            if (line.trim()) P('D' + JSON.stringify(line));
+                            if (line.trim()) emit(line);
                         }
                         if (done) break;
                     }
-                    if (buffer.trim()) P('D' + JSON.stringify(buffer));
+                    if (buffer.trim()) emit(buffer);
                     P('D' + JSON.stringify(null));
+                    return {status: r.status, error: '', lines: captured};
                 } catch(e) {
                     P('S500'); P('E' + e.message); P('Dnull');
+                    return {status: 500, error: String(e.message || e), lines: captured};
                 }
             }"""
             eval_task = asyncio.create_task(page.evaluate(script, [url, payload, req_id, RECAPTCHA_ACTION]))
+            seen_indices = set()
             while True:
-                line = await queue.get()
-                if line is None:
+                packet = await queue.get()
+                if packet is None:
                     break
+                index, line = packet
+                if isinstance(index, int):
+                    seen_indices.add(index)
                 yield line
-            await eval_task
+            result = await eval_task
             if eval_task.exception():
                 raise RuntimeError(f"Bridge evaluate exception: {eval_task.exception()}")
-            status_code = meta.get("status", 0)
+            # Console delivery can drop messages under load. The page retains
+            # the exact same response lines, so recover only indices that were
+            # not already emitted—no second POST and no duplicated chunks.
+            if isinstance(result, dict):
+                for index, line in enumerate(result.get("lines") or []):
+                    if index not in seen_indices:
+                        yield line
+            status_code = (result.get("status") if isinstance(result, dict) else None) or meta.get("status", 0)
+            error_body = (result.get("error") if isinstance(result, dict) else None) or meta.get("error", "")
             if status_code != 200:
-                raise BridgeHTTPError(status_code, meta.get("error", ""))
+                raise BridgeHTTPError(status_code, error_body)
         finally:
             self.active_requests -= 1
             page.remove_listener("console", on_console)
@@ -4149,27 +4193,126 @@ def _attach_v2(base: dict, tok: str) -> None:
     base["recaptchaV3Token"] = None       # exactly what arena's client does on escalation
 
 
-def _parse_stream_line(line: str):
-    """One arena 'a0:'/'ag:' SSE frame → (kind, payload) or None."""
-    if line.startswith("data: "):
-        line = line[6:].strip()
-    if not line:
+def _events_from_stream_data(data) -> list:
+    """Normalize common provider/SSE envelopes to Bridgena events."""
+    out = []
+    if isinstance(data, list):
+        for item in data:
+            out.extend(_events_from_stream_data(item))
+        return out
+    if not isinstance(data, dict):
+        return out
+
+    kind = str(data.get("type") or data.get("event") or "").lower().replace("_", "-")
+    if kind in ("error", "error-message") or data.get("error"):
+        err = data.get("error") or data.get("message") or "Provider stream error"
+        if isinstance(err, dict):
+            err = err.get("message") or err.get("detail") or json.dumps(err, ensure_ascii=False)
+        return [("error", str(err))]
+
+    # OpenAI-compatible chunks.
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") or choice.get("message") or {}
+            if isinstance(delta, dict):
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    out.append(("content", content))
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    out.append(("reasoning", reasoning))
+        return out
+
+    # Gemini generateContent chunks.
+    candidates = data.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            content = candidate.get("content", {}) if isinstance(candidate, dict) else {}
+            for part in content.get("parts", []) if isinstance(content, dict) else []:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    out.append(("content", part["text"]))
+        return out
+
+    # Anthropic content_block_delta and AI SDK UI-message events.
+    delta = data.get("delta")
+    if isinstance(delta, dict):
+        delta_kind = str(delta.get("type") or kind).lower().replace("_", "-")
+        value = delta.get("text") or delta.get("content")
+        if isinstance(value, str) and value:
+            out.append(("reasoning" if "thinking" in delta_kind or "reasoning" in delta_kind else "content", value))
+            return out
+
+    value = delta if isinstance(delta, str) else data.get("text")
+    if not isinstance(value, str):
+        value = data.get("content")
+    if kind in ("text-delta", "content-block-delta", "content", "token", "message") and isinstance(value, str):
+        out.append(("content", value))
+    elif kind in ("reasoning", "reasoning-delta", "thinking", "thinking-delta") and isinstance(value, str):
+        out.append(("reasoning", value))
+    elif kind in ("finish", "finish-step", "finish-message", "message-stop", "done"):
+        out.append(("done", kind))
+    elif isinstance(data.get("data"), (dict, list)):
+        out.extend(_events_from_stream_data(data["data"]))
+    return out
+
+
+def _collapse_stream_events(events: list):
+    if not events:
         return None
+    for kind, value in events:
+        if kind == "error":
+            return kind, value
+    for target in ("content", "reasoning"):
+        values = [str(value) for kind, value in events if kind == target and value is not None]
+        if values:
+            return target, "".join(values)
+    return next(((kind, value) for kind, value in events if kind == "done"), None)
+
+
+def _parse_stream_line(line: str):
+    """Normalize Arena/Vercel, OpenAI, Anthropic and Gemini stream frames."""
+    line = str(line or "").strip()
+    if line.startswith("data:"):
+        line = line[5:].strip()
+    if not line or line.startswith("event:") or line.startswith(":"):
+        return None
+    if line == "[DONE]":
+        return ("done", "stop")
+
+    # Plain JSON SSE payloads used by OpenAI, Anthropic and Gemini adapters.
+    if line[:1] in ("{", "["):
+        try:
+            return _collapse_stream_events(_events_from_stream_data(json.loads(line)))
+        except json.JSONDecodeError:
+            return None
+
     colon = line.find(":")
     if colon < 0:
         return None
     prefix, payload = line[:colon], line[colon + 1:]
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        parsed = payload
+
     if prefix in ("a0", "0"):
-        try:
-            t = json.loads(payload)
-            return ("content", t) if isinstance(t, str) else None
-        except json.JSONDecodeError:
-            return None
+        if isinstance(parsed, str):
+            return ("content", parsed)
+        return _collapse_stream_events(_events_from_stream_data(parsed))
     if prefix in ("ag", "g"):
-        try:
-            return ("reasoning", json.loads(payload))
-        except json.JSONDecodeError:
-            return None
+        if isinstance(parsed, str):
+            return ("reasoning", parsed)
+        return _collapse_stream_events(_events_from_stream_data(parsed))
+    if prefix in ("a2", "2"):
+        return _collapse_stream_events(_events_from_stream_data(parsed))
+    if prefix in ("3", "error"):
+        message = parsed.get("message") if isinstance(parsed, dict) else parsed
+        return ("error", str(message or "Provider stream error"))
+    if prefix in ("ad", "d", "e"):
+        return ("done", payload)
     return None
 
 
@@ -4221,6 +4364,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         yield ("error", f"503: The selected account has no ready same-exit keeper ({detail}). Check Accounts, then retry.")
         return
     response_text = ""
+    reasoning_text = ""
     for attempt in range(max_attempts):
         p = bind_persona(jar)
         jar = await _live_cookies(jar)
@@ -4312,10 +4456,22 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                             response_text += payload
                             yield ("content", payload)
                         elif kind == "reasoning":
-                            yield ("reasoning", payload if isinstance(payload, str) else json.dumps(payload))
+                            reasoning_chunk = payload if isinstance(payload, str) else json.dumps(payload)
+                            reasoning_text += reasoning_chunk
+                            yield ("reasoning", reasoning_chunk)
+                        elif kind == "error":
+                            yield ("error", str(payload))
+                            return
                 if proxy:
                     _proxy_health_record(proxy, True, 0, source="browser-stream")
                     _flagged_exits.pop(_proxy_hkey(proxy), None)
+                if not response_text and reasoning_text:
+                    response_text = reasoning_text
+                    yield ("content", reasoning_text)
+                if not response_text:
+                    log("WARN", f"[{jar.get('name')}] Arena returned HTTP 200 but no decodable text frames for {model_name}")
+                    yield ("error", "502: Arena completed the stream without a text response. The model may be unavailable or using an unsupported event format.")
+                    return
                 if not follow_url:
                     conv2 = dict(conv)
                     conv2["model"] = model_name
@@ -4330,6 +4486,15 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
             except BridgeHTTPError as e:
                 verdict = _classify(e.status, e.body)
                 log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status}: {e.body[:300]}")
+                if e.status == 404 and "model not found" in (e.body or "").lower() and mc:
+                    clear_conversation_model(chat_id, model_name)
+                    mc = None
+                    conv = {}
+                    response_text = ""
+                    reasoning_text = ""
+                    log("WARN", f"[{jar.get('name')}] stale Arena thread/model binding cleared — rebuilding as create-evaluation")
+                    if attempt + 1 < max_attempts:
+                        continue
                 if verdict == "RATELIMIT":
                     same_jar_429 += 1
                     wait_s = min(8.0, 1.5 * same_jar_429)
@@ -4346,9 +4511,12 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     if attempt + 1 < max_attempts:
                         await asyncio.sleep(wait_s)
                         continue
-                if verdict in ("RECAPTCHA", "UPSTREAM") and attempt + 1 < max_attempts:
+                if verdict == "UPSTREAM" and attempt + 1 < max_attempts:
                     await asyncio.sleep(min(5.0, 1.0 + attempt))
                     continue
+                if verdict == "RECAPTCHA":
+                    yield ("error", "403: Arena rejected this session's verification token. The request was stopped without repeated retries; wait briefly and try a new chat.")
+                    return
                 if e.status == 400 and "user message is invalid" in (e.body or "").lower():
                     yield ("error", "400: Arena rejected the message content. Send plain text or supported text content parts; images and unsupported multimodal parts are not accepted by this bridge yet.")
                     return
@@ -4411,6 +4579,16 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     body = raw.decode("utf-8", "ignore")
                     log("ERROR", f"Status {resp.status_code}, URL {url}, Body: {body[:600]}")
                     verdict = _classify(resp.status_code, body)
+
+                    if resp.status_code == 404 and "model not found" in body.lower() and mc:
+                        clear_conversation_model(chat_id, model_name)
+                        mc = None
+                        conv = {}
+                        response_text = ""
+                        reasoning_text = ""
+                        log("WARN", f"[{jar.get('name')}] stale Arena thread/model binding cleared — rebuilding as create-evaluation")
+                        if attempt + 1 < max_attempts:
+                            continue
 
                     if verdict == "CHALLENGE":
                         if cf_clear_attempts < 1 and keeper.sessions.get(jar.get("id")):
@@ -4527,7 +4705,32 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                             yield ("content", payload)
                         elif kind == "reasoning":
                             t = payload if isinstance(payload, str) else json.dumps(payload)
+                            reasoning_text += t
                             yield ("reasoning", t)
+                        elif kind == "error":
+                            yield ("error", str(payload))
+                            return
+                if buffer.strip():
+                    ev = _parse_stream_line(buffer.decode("utf-8", "ignore").strip())
+                    if ev:
+                        kind, payload = ev
+                        if kind == "content" and isinstance(payload, str):
+                            response_text += payload
+                            yield ("content", payload)
+                        elif kind == "reasoning":
+                            t = payload if isinstance(payload, str) else json.dumps(payload)
+                            reasoning_text += t
+                            yield ("reasoning", t)
+                        elif kind == "error":
+                            yield ("error", str(payload))
+                            return
+                if not response_text and reasoning_text:
+                    response_text = reasoning_text
+                    yield ("content", reasoning_text)
+                if not response_text:
+                    log("WARN", f"[{jar.get('name')}] Arena returned HTTP 200 but no decodable text frames for {model_name}")
+                    yield ("error", "502: Arena completed the stream without a text response. The model may be unavailable or using an unsupported event format.")
+                    return
                 # remember the conversation for follow-ups
                 if not follow_url:
                     conv2 = dict(conv)
