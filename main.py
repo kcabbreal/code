@@ -68,10 +68,10 @@ ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
     "BRIDGENA_ALLOW_RECAPTCHA_FALLBACK", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 REQUEST_MAX_ATTEMPTS = max(1, min(3, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "2"))))
-STREAM_TAIL_GRACE_MS = max(1000, min(15000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "5000"))))
+STREAM_TAIL_GRACE_MS = max(5000, min(60000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "30000"))))
 KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.27-keeper-readiness")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.28-lossless-stream-eof")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -3011,6 +3011,7 @@ class KeeperSession:
                     const dec = new TextDecoder();
                     let buffer = '';
                     let protocolFinished = false;
+                    let stopReason = 'eof';
                     const readWithGrace = () => new Promise((resolve, reject) => {
                         // Some providers emit their final text delta after the
                         // finish metadata. Drain for a real quiet window so a
@@ -3024,6 +3025,7 @@ class KeeperSession:
                     while (true) {
                         const packet = protocolFinished ? await readWithGrace() : await reader.read();
                         if (packet.graceExpired) {
+                            stopReason = 'post-finish-timeout';
                             try { await reader.cancel(); } catch (_) {}
                             break;
                         }
@@ -3042,7 +3044,8 @@ class KeeperSession:
                     }
                     if (buffer.trim()) emit(buffer);
                     P('D' + JSON.stringify(null));
-                    return {status: r.status, error: '', lines: captured};
+                    return {status: r.status, error: '', lines: captured,
+                            finishSeen: protocolFinished, stopReason};
                 } catch(e) {
                     P('S500'); P('E' + e.message); P('Dnull');
                     return {status: 500, error: String(e.message || e), lines: captured};
@@ -3070,6 +3073,9 @@ class KeeperSession:
                 for index, line in enumerate(result.get("lines") or []):
                     if index not in seen_indices:
                         yield line
+                log("INFO", f"[{self.name}] stream audit · frames {len(result.get('lines') or [])} · "
+                            f"finish {'yes' if result.get('finishSeen') else 'no'} · "
+                            f"stop {result.get('stopReason') or 'unknown'}")
             status_code = (result.get("status") if isinstance(result, dict) else None) or meta.get("status", 0)
             error_body = (result.get("error") if isinstance(result, dict) else None) or meta.get("error", "")
             if status_code != 200:
