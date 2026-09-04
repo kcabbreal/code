@@ -61,10 +61,11 @@ MAX_CONVERSATIONS = 500
 ARENA_RECAPTCHA_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_SITEKEY",
                                          "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0")
 ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
-                                            "6Le3_cYsAAAAAGwWOK2RLDgNI15Bh8C0yLBOL1yL")
-RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "submit")
+                                            "6Ld7ePYrAAAAAB34ovoFoDau1fqCJ6IyOjFEQaMn")
+RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
+ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.5-browser-transaction-lock")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.16-vercel-ui")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -222,18 +223,48 @@ def model_name(m) -> str:
     return m.get("name") or m.get("publicName") or m.get("id") or ""
 
 
+def _model_key(value: str) -> str:
+    """Canonical comparison key for Arena display labels and API slugs."""
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
+# Captured from Arena's working direct-chat client on 2026-09-03. These are
+# compatibility pins, not substitutes for catalog refresh: a JSON environment
+# override lets an operator update a changed UUID without editing this file.
+_VERIFIED_MODEL_IDS = {
+    "gemini-3-8-flash-high": "01a0681c-b561-76b6-b338-a44ff0cff460",
+    "minimax-m3": "019e809d-f62d-7192-bb7f-1657e066b5f2",
+}
+try:
+    _VERIFIED_MODEL_IDS.update({
+        _model_key(k): str(v) for k, v in
+        json.loads(os.environ.get("BRIDGENA_MODEL_ID_OVERRIDES", "{}")).items()
+    })
+except Exception:
+    pass
+
+
 def resolve_model_id(public_name: str, jar: Optional[dict] = None) -> str:
     """Resolve Arena's public label to the internal UUID required by the
     create-evaluation contract. Sending a label here currently produces an
     opaque upstream 500, while Arena's own client always sends the UUID."""
-    mapped = (jar or {}).get("model_map", {}).get(public_name)
-    if mapped:
-        return mapped
+    wanted = _model_key(public_name)
+    if wanted in _VERIFIED_MODEL_IDS:
+        return _VERIFIED_MODEL_IDS[wanted]
+    # The shared catalog is replaced atomically by the latest successful live
+    # refresh. Prefer it over a jar's historical snapshot.
     for item in get_models():
         if not isinstance(item, dict):
             continue
-        if public_name in (item.get("name"), item.get("publicName"), item.get("id")):
+        labels = (item.get("name"), item.get("publicName"), item.get("id"))
+        if public_name in labels or wanted in {_model_key(x) for x in labels if x}:
             return item.get("id") or public_name
+    jar_map = (jar or {}).get("model_map", {})
+    mapped = jar_map.get(public_name)
+    if not mapped:
+        mapped = next((v for k, v in jar_map.items() if _model_key(k) == wanted), None)
+    if mapped:
+        return mapped
     return public_name
 
 
@@ -300,17 +331,6 @@ PERSONAS = {
         "ipad", "iPad Pro · Safari", "safari",
         "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
         "iOS", viewport=(1024, 1366), dpr=2.0, touch=True, tablet=True),
-    "tizen_tv": Persona(
-        "tizen_tv", "Samsung TV · Tizen", "chrome",
-        "Mozilla/5.0 (SmartTV; Tizen 8.0) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/2.0 Chrome/113.0.0.0 Mobile Safari/537.36",
-        "Tizen", viewport=(1920, 1080), dpr=1.0,
-        accept_lang="en-US,en;q=0.5", webgl="ANGLE (Vivante, GC3000, OpenGL ES 3.2)"),
-    "steamdeck": Persona(
-        "steamdeck", "Steam Deck · Firefox", "firefox",
-        "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-        "Linux", viewport=(1280, 800), dpr=1.0, accept_lang="en-US,en;q=0.5",
-        accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        webgl="Radeon Graphics (VG20)"),
 }
 PERSONA_KEYS = list(PERSONAS.keys())
 
@@ -320,12 +340,12 @@ def _hash_slot(jar_id: str, mod: int) -> int:
 
 
 def persona_for(jar: dict) -> Persona:
-    """Stable binding: stored choice wins; otherwise deterministic on jar id so
-    the same account ALWAYS presents the same device (relogin, keeper, curl)."""
+    """Stable binding: preserve a supported explicit choice; otherwise use the
+    real deployment family (Linux Chromium). Never invent a random device."""
     key = jar.get("persona")
     if key not in PERSONAS:
-        key = PERSONA_KEYS[_hash_slot(jar.get("id", jar.get("name", "x")), len(PERSONA_KEYS))]
-        jar["persona"] = key          # caller persists via mutate_jars; harmless if not
+        key = "ubuntu"
+        jar["persona"] = key
     return PERSONAS[key]
 
 
@@ -1310,7 +1330,7 @@ async def refresh_models_via_worker(worker):
     log("INFO", f"[{worker.name}] Refreshing models via worker navigation...")
     try:
         async with worker._action_lock:
-            await worker.page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded", timeout=30000)
+            await worker.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
             await worker.page.wait_for_load_state("domcontentloaded")
             body = await worker.page.content()
             try:
@@ -2747,7 +2767,7 @@ class KeeperSession:
                     return False
                 if ARENA_BASE not in (page.url or "") and self.active_requests == 0:
                     await self._ensure_sidebar_cookie()
-                    await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                    await page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded")
                     await self._wait_cloudflare(page)
                 if await self._verify_auth_state(page):
                     self.last_health_ok = time.time()
@@ -2845,7 +2865,7 @@ class KeeperSession:
             if len(self._page_pool) < self._max_pool_pages and self.context:
                 try:
                     new_page = await self.context.new_page()
-                    await new_page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+                    await new_page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded")
                     await asyncio.sleep(0.5)
                     idx = len(self._page_pool)
                     self._page_pool.append((new_page, True))
@@ -2908,38 +2928,48 @@ class KeeperSession:
         page.on("console", on_console)
         self.active_requests += 1
         try:
-            script = """async ([url, payload, rid]) => {
+            script = """async ([url, payload, rid, action]) => {
                 const P = s => console.log('__NX' + rid + s);
                 try {
+                    const token = String(payload?.recaptchaV3Token || '');
                     const r = await fetch(url, {
                         method: 'POST', credentials: 'include',
-                        headers: {'Content-Type': 'application/json'},
+                        headers: {
+                          'Content-Type': 'application/json',
+                          ...(token ? {'X-Recaptcha-Token': token, 'X-Recaptcha-Action': action} : {})
+                        },
                         body: JSON.stringify(payload)
                     });
                     P('S' + r.status);
-                    if (!r.ok) { P('E' + (await r.text()).slice(0, 400)); return; }
+                    if (!r.ok) { P('E' + (await r.text()).slice(0, 400)); P('Dnull'); return; }
                     const reader = r.body.getReader();
                     const dec = new TextDecoder();
+                    let buffer = '';
                     while (true) {
                         const {done, value} = await reader.read();
-                        if (done) break;
-                        const text = dec.decode(value, {stream: true});
-                        for (const line of text.split('\n')) {
+                        if (value) buffer += dec.decode(value, {stream: true});
+                        if (done) buffer += dec.decode();
+                        const parts = buffer.split(/\\r?\\n/);
+                        buffer = parts.pop() || '';
+                        for (const line of parts) {
                             if (line.trim()) P('D' + JSON.stringify(line));
                         }
+                        if (done) break;
                     }
+                    if (buffer.trim()) P('D' + JSON.stringify(buffer));
                     P('D' + JSON.stringify(null));
                 } catch(e) {
-                    P('S500'); P('E' + e.message);
+                    P('S500'); P('E' + e.message); P('Dnull');
                 }
             }"""
-            eval_task = asyncio.create_task(page.evaluate(script, [url, payload, req_id]))
+            eval_task = asyncio.create_task(page.evaluate(script, [url, payload, req_id, RECAPTCHA_ACTION]))
             while True:
                 line = await queue.get()
                 if line is None:
                     break
                 yield line
-            if eval_task.done() and eval_task.exception():
+            await eval_task
+            if eval_task.exception():
                 raise RuntimeError(f"Bridge evaluate exception: {eval_task.exception()}")
             status_code = meta.get("status", 0)
             if status_code != 200:
@@ -3121,7 +3151,7 @@ class KeeperSession:
 
             self._set_step("Navigating to arena.ai...")
             await self._ensure_sidebar_cookie()
-            await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded", timeout=25000)
+            await self.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=25000)
             await self._wait_cloudflare(self.page)
             await self._handle_turnstile(self.page)
             await self._ensure_sidebar_cookie()
@@ -3237,7 +3267,7 @@ class KeeperSession:
                     try:
                         async with self._action_lock:
                             await self._ensure_sidebar_cookie()
-                            await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded", timeout=45000)
+                            await self.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=45000)
                             await self._wait_cloudflare(self.page)
                             self.last_nav = time.time()
                             self._nav_fail_count = 0
@@ -3751,36 +3781,64 @@ def snapshot_rows() -> List[dict]:
 # ============================================================
 import asyncio, time  # noqa
 
-RC_MINT_JS = r"""async (SITE) => {
-                const grab = () => {
-                    try {
-                        const el = document.querySelector(
-                            'textarea[name="g-recaptcha-response"], #g-recaptcha-response, textarea.g-recaptcha-response');
-                        if (el && el.value && el.value.length > 20) return el.value;
-                    } catch (e) {}
-                    return null;
-                };
-                let t = grab();
-                if (t) return t;
+RC_MINT_JS = r"""async (OPTS) => {
+                const FALLBACK = String(OPTS?.fallbackSitekey || '');
+                const ACTION = String(OPTS?.action || 'chat_submit');
+                const validKey = (v) => typeof v === 'string' && /^6[0-9A-Za-z_-]{30,}$/.test(v);
+                const hint = (v) => validKey(v) ? `${v.slice(0, 8)}…${v.slice(-4)}` : 'none';
                 const g = window.grecaptcha;
                 if (!g) return {err: 'no grecaptcha object on keeper page (arena widget script not on this URL?)'};
-                try {
-                    const r0 = (g.getResponse && g.getResponse())
-                            || (g.enterprise && g.enterprise.getResponse && g.enterprise.getResponse());
-                    if (r0 && r0.length > 20) return r0;
-                } catch (e) {}
+                // Never read a token from response fields/getResponse here.
+                // Arena may already have consumed it while the DOM retains the
+                // value, and replaying that stale token deterministically fails
+                // validation. Primary V3 tokens must always come from execute().
                 let sitekey = null;
+                let source = null;
                 const node = document.querySelector('[data-sitekey]');
-                if (node) sitekey = node.getAttribute('data-sitekey');
+                if (node && validKey(node.getAttribute('data-sitekey'))) {
+                    sitekey = node.getAttribute('data-sitekey'); source = 'data-sitekey';
+                }
+                if (!sitekey) {
+                    for (const script of [...document.scripts]) {
+                        try {
+                            const render = new URL(script.src, location.href).searchParams.get('render');
+                            if (validKey(render) && render !== 'explicit') {
+                                sitekey = render; source = 'api.js?render'; break;
+                            }
+                        } catch (e) {}
+                    }
+                }
+                if (!sitekey) {
+                    for (const frame of [...document.querySelectorAll('iframe[src]')]) {
+                        try {
+                            const key = new URL(frame.src, location.href).searchParams.get('k');
+                            if (validKey(key)) { sitekey = key; source = 'recaptcha-iframe'; break; }
+                        } catch (e) {}
+                    }
+                }
                 if (!sitekey && window.___grecaptcha_cfg && ___grecaptcha_cfg.clients) {
                     try {
+                        const seen = new WeakSet();
+                        const scan = (value, depth = 0) => {
+                            if (validKey(value)) return value;
+                            if (!value || typeof value !== 'object' || depth > 7 || seen.has(value)) return null;
+                            seen.add(value);
+                            for (const [name, child] of Object.entries(value)) {
+                                if (/token|response/i.test(name)) continue;
+                                const found = scan(child, depth + 1);
+                                if (found) return found;
+                            }
+                            return null;
+                        };
                         for (const c of Object.values(___grecaptcha_cfg.clients)) {
-                            const k = c?.sitekey || c?.settings?.sitekey;
-                            if (k) { sitekey = k; break; }
+                            const k = scan(c);
+                            if (k) { sitekey = k; source = 'grecaptcha-client'; break; }
                         }
                     } catch (e) {}
                 }
-                const KEY = sitekey || SITE;
+                const KEY = sitekey || FALLBACK;
+                source = source || 'configured-fallback';
+                if (!validKey(KEY)) return {err: 'no valid site key discovered', source, keyHint: hint(KEY), action: ACTION};
                 const ex = (a1, a2) => new Promise((res2, rej2) => {
                     const fail = setTimeout(() => rej2(new Error('execute-timeout (12s)')), 12000);
                     const go = () => {
@@ -3801,22 +3859,22 @@ RC_MINT_JS = r"""async (SITE) => {
                     // arena's own shape (proven against the live page 2026-09-03):
                     // POSITIONAL (sitekey, {action}) inside enterprise.ready. The object
                     // form throws 'No reCAPTCHA clients exist.' on this widget build.
-                    const tok = await ex(KEY, {action: 'submit'});
-                    if (tok && tok.length > 20) return tok;
-                    return {err: 'enterprise.execute resolved empty (Google scored this session low — image challenge may follow)'};
+                    const tok = await ex(KEY, {action: ACTION});
+                    if (tok && tok.length > 20) return {token: tok, source, keyHint: hint(KEY), action: ACTION};
+                    return {err: 'enterprise.execute resolved empty (Google scored this session low — image challenge may follow)', source, keyHint: hint(KEY), action: ACTION};
                 } catch (e1) {
                     try {
-                        const t2 = await ex({sitekey: KEY, action: 'submit'});
-                        if (t2 && t2.length > 20) return t2;
+                        const t2 = await ex({sitekey: KEY, action: ACTION});
+                        if (t2 && t2.length > 20) return {token: t2, source, keyHint: hint(KEY), action: ACTION};
                     } catch (e2) {}
                     try {
                         if (typeof g.execute === 'function') {
-                            const t3 = await Promise.race([g.execute(KEY, {action: 'submit'}),
+                            const t3 = await Promise.race([g.execute(KEY, {action: ACTION}),
                                                            new Promise((_, r) => setTimeout(() => r(new Error('v3-timeout')), 8000))]);
-                            if (t3 && t3.length > 20) return t3;
+                            if (t3 && t3.length > 20) return {token: t3, source, keyHint: hint(KEY), action: ACTION};
                         }
                     } catch (e3) {}
-                    return {err: 'execute failed: ' + String(e1).slice(0, 160)};
+                    return {err: 'execute failed: ' + String(e1).slice(0, 160), source, keyHint: hint(KEY), action: ACTION};
                 }
             }"""
 
@@ -3888,15 +3946,50 @@ async def mint_v3(jar_id=None):
             # The live client loads enterprise reCAPTCHA on the direct-chat
             # route. Stabilize there, then evaluate in the same locked browser
             # transaction so catalog/health navigation cannot destroy context.
-            if "/text/direct" not in (s.page.url or ""):
-                await s.page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded", timeout=30000)
+            if "mode=direct" not in (s.page.url or ""):
+                await s.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
                 await s.page.wait_for_load_state("domcontentloaded")
                 s.last_nav = time.time()
-            res = await s.page.evaluate(RC_MINT_JS.replace("ARENA_MARK", ""), ARENA_RECAPTCHA_SITEKEY)
+            # Arena hydrates the enterprise widget asynchronously after the
+            # document is ready. Minting in the same second as keeper startup
+            # used to observe no window.grecaptcha and fail prematurely.
+            try:
+                await s.page.wait_for_function(
+                    "() => !!(window.grecaptcha && (window.grecaptcha.enterprise || window.grecaptcha.execute))",
+                    timeout=15000,
+                )
+            except Exception:
+                try:
+                    diag = await s.page.evaluate(r"""() => ({
+                        url: location.href,
+                        title: document.title,
+                        ready: document.readyState,
+                        scripts: [...document.scripts].map(x => x.src).filter(x =>
+                          /recaptcha|google\.com\/recaptcha|gstatic\.com\/recaptcha/i.test(x)).slice(0, 6)
+                    })""")
+                except Exception as diag_e:
+                    diag = {"diagnostic": f"{type(diag_e).__name__}: {diag_e}"}
+                log("WARN", f"recaptcha runtime absent after 15s: {redact(json.dumps(diag, ensure_ascii=False))[:700]}")
+                return None
+            res = await s.page.evaluate(RC_MINT_JS, {
+                "fallbackSitekey": ARENA_RECAPTCHA_SITEKEY,
+                "action": RECAPTCHA_ACTION,
+            })
             if isinstance(res, str) and len(res) > 20:
                 return res
+            if isinstance(res, dict) and isinstance(res.get("token"), str) and len(res["token"]) > 20:
+                log("OK", "recaptcha token minted via " + str(res.get("source", "unknown"))
+                    + " · key " + str(res.get("keyHint", "unknown"))
+                    + " · action " + str(res.get("action", RECAPTCHA_ACTION)))
+                return res["token"]
             why = res.get("err") if isinstance(res, dict) else "evaluate returned nothing"
-            log("WARN", f"recaptcha token: {why}")
+            detail = (" · source " + str(res.get("source", "unknown"))
+                      + " · key " + str(res.get("keyHint", "unknown"))
+                      + " · action " + str(res.get("action", RECAPTCHA_ACTION))) if isinstance(res, dict) else ""
+            log("WARN", f"recaptcha token: {why}{detail}")
+
+            if isinstance(why, str) and "no grecaptcha" in why.lower():
+                return None
 
             # image challenge fallback on that same locked page
             if hasattr(s, "solve_recaptcha_image_challenge") and await s.solve_recaptcha_image_challenge():
@@ -4148,15 +4241,31 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         base = {"mode": "direct-battle", "modelAId": model_id, "modality": "chat"}
         follow_url = None
         if mc and mc.get("arena_id"):
-            base = {"id": mc["arena_id"], "mode": "direct"}
+            # post-to-evaluation is not a minimal "conversation id + text"
+            # endpoint. Arena expects a complete new message envelope for every
+            # continuation, with fresh message UUIDs and the selected model.
+            # `mode` belongs to create-evaluation and is intentionally omitted
+            # from this follow-up body, matching the live client contract.
+            base = {
+                "id": mc["arena_id"],
+                "modelAId": model_id,
+                "userMessageId": str(uuid7()),
+                "modelAMessageId": str(uuid7()),
+                "modality": "chat",
+            }
             follow_url = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/{mc['arena_id']}"
         else:
             base.update({"id": str(uuid7()), "userMessageId": str(uuid7()),
                          "modelAMessageId": str(uuid7())})
         content = prompt if len(prompt) <= MAX_PROMPT else prompt[:MAX_PROMPT]
-        user_message = {"content": content}
-        if attachments:
-            user_message["experimental_attachments"] = attachments
+        # These apparently optional fields are always emitted by Arena's live
+        # client. Its follow-up validator returns a generic 500 when they are
+        # absent, so preserve the exact captured envelope even when both empty.
+        user_message = {
+            "content": content,
+            "experimental_attachments": attachments or [],
+            "metadata": {},
+        }
         base["userMessage"] = user_message
 
         tok = await mint_v3(jar.get("id"))
@@ -4184,7 +4293,73 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         f"model {str(model_id)[:8]}… · token {'yes' if tok else 'no'}")
         else:
             log("WARN", f"[{jar.get('name')}] No live proxy — using server IP (easy to rate-limit)")
+
+        # Preferred transport: execute the POST inside the already-authenticated
+        # keeper origin. This preserves the exact browser cookie jar, TLS/browser
+        # identity and proxy exit that minted the token. curl remains a fallback
+        # only for browser-evaluation failures.
+        browser_session = keeper.sessions.get(jar.get("id"))
+        if browser_session and browser_session.running and browser_session.page:
+            try:
+                log("INFO", f"[{jar.get('name')}] transport browser-origin")
+                async with browser_session._action_lock:
+                    async for line in browser_session.bridge_fetch(url, base):
+                        ev = _parse_stream_line(str(line).strip())
+                        if not ev:
+                            continue
+                        kind, payload = ev
+                        if kind == "content" and isinstance(payload, str):
+                            response_text += payload
+                            yield ("content", payload)
+                        elif kind == "reasoning":
+                            yield ("reasoning", payload if isinstance(payload, str) else json.dumps(payload))
+                if proxy:
+                    _proxy_health_record(proxy, True, 0, source="browser-stream")
+                    _flagged_exits.pop(_proxy_hkey(proxy), None)
+                if not follow_url:
+                    conv2 = dict(conv)
+                    conv2["model"] = model_name
+                    conv2["arena"] = dict(conv2.get("arena") or {})
+                    conv2["arena"][model_name] = {
+                        "arena_id": base["id"], "mode": "direct",
+                        "jar_id": jar.get("id"), "proxy": proxy,
+                    }
+                    save_conversation(chat_id, conv2)
+                yield ("done", response_text)
+                return
+            except BridgeHTTPError as e:
+                verdict = _classify(e.status, e.body)
+                log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status}: {e.body[:300]}")
+                if verdict == "RATELIMIT":
+                    same_jar_429 += 1
+                    wait_s = min(8.0, 1.5 * same_jar_429)
+                    if same_jar_429 >= 3:
+                        if mc:
+                            yield ("error", "429: This thread's bound Arena session is rate-limited — wait 30-60s or start a new thread")
+                            return
+                        nxt = acquire_jar(prefer_live=True)
+                        if nxt and nxt["id"] not in tried:
+                            jar = nxt
+                            tried.add(nxt["id"])
+                            same_jar_429 = 0
+                            log("WARN", f"browser-origin 429 persisted — rotating to '{jar.get('name')}'")
+                    if attempt + 1 < max_attempts:
+                        await asyncio.sleep(wait_s)
+                        continue
+                if verdict in ("RECAPTCHA", "UPSTREAM") and attempt + 1 < max_attempts:
+                    await asyncio.sleep(min(5.0, 1.0 + attempt))
+                    continue
+                if e.status == 400 and "user message is invalid" in (e.body or "").lower():
+                    yield ("error", "400: Arena rejected the message content. Send plain text or supported text content parts; images and unsupported multimodal parts are not accepted by this bridge yet.")
+                    return
+                yield ("error", f"{e.status or 502}: Arena browser-origin request failed: {e.body[:350] or 'empty response'}")
+                return
+            except Exception as browser_e:
+                log("WARN", f"[{jar.get('name')}] browser-origin unavailable ({type(browser_e).__name__}: {browser_e}) — curl fallback")
+
         headers = _headers_for(jar, p, json_body=True)
+        headers["X-Recaptcha-Token"] = tok
+        headers["X-Recaptcha-Action"] = RECAPTCHA_ACTION
         kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
         if proxy:
             kw["proxy"] = proxy
@@ -4558,6 +4733,27 @@ th{font:500 11px var(--disp);letter-spacing:0;text-transform:none;color:var(--in
 @media(max-width:560px){.metrics{grid-template-columns:1fr}.topbar .chip,.topbar .brand small{display:none}.pagehead{align-items:flex-start;flex-direction:column}}
 """
 
+# v2.16 visual pass — quieter Vercel-like surfaces, stronger hierarchy and
+# denser operational information without changing any dashboard behavior.
+CSS += """
+:root{--shadow-sm:0 1px 2px rgba(0,0,0,.18);--shadow-lg:0 20px 55px rgba(0,0,0,.24)}
+html{background:var(--bg)}body{min-height:100vh;background:
+ radial-gradient(900px 440px at 64% -180px,color-mix(in srgb,var(--ink) 5%,transparent),transparent 70%),var(--bg)}
+.topbar{height:64px;padding:0 24px;border-bottom:1px solid color-mix(in srgb,var(--hair) 82%,transparent)}
+.brand{gap:10px}.brand .dot{width:28px;height:28px;border-radius:9px}.brand .dot::after{font-size:11px}
+.brand small{padding-left:2px}.chip.live{border:0;background:color-mix(in srgb,var(--teal) 9%,transparent);color:var(--teal);padding:6px 10px}
+.shell{grid-template-columns:248px minmax(0,1fr);min-height:calc(100vh - 64px)}
+.rail{position:sticky;top:64px;height:calc(100vh - 64px);padding:20px 12px;background:color-mix(in srgb,var(--panel) 76%,transparent)}
+.rail::before{padding:0 12px 12px;text-transform:uppercase;letter-spacing:.08em;font-size:10px}
+.rail a{min-height:38px;padding:9px 12px;border-radius:8px}.rail a.on{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--hair) 76%,transparent)}
+.main{padding:40px 44px 72px;max-width:1560px}.pagehead{margin-bottom:28px}.pagehead h1{font-size:28px;font-weight:680;letter-spacing:-.045em}.pagehead p{margin-top:6px;color:var(--ink2)}
+.card{border-color:color-mix(in srgb,var(--hair) 78%,transparent);border-radius:12px;box-shadow:var(--shadow-sm);background:color-mix(in srgb,var(--panel) 94%,transparent)}
+.metric{min-height:126px;display:flex;flex-direction:column;justify-content:space-between}.metric .v{font-size:34px}.metric .s{color:var(--ink3)}
+.btn{border-radius:8px;transition:background .15s,border-color .15s,transform .12s,box-shadow .15s}.btn:hover{box-shadow:0 1px 4px rgba(0,0,0,.16)}
+table{border-spacing:0}th{height:40px}td{height:46px}.console{height:390px;box-shadow:inset 0 1px 0 rgba(255,255,255,.025)}
+@media(max-width:900px){.topbar{padding:0 14px}.main{padding:28px 18px 56px}.shell{grid-template-columns:1fr}}
+"""
+
 JS_THEME = """
 (function(){try{var t=localStorage.getItem('bgn.theme');if(t)document.documentElement.dataset.theme=t;}catch(e){}})();
 function bgnToggleTheme(){var h=document.documentElement;var n=(h.dataset.theme==='light')?'':'light';h.dataset.theme=n;try{localStorage.setItem('bgn.theme',n)}catch(e){}}
@@ -4763,15 +4959,15 @@ function md(s){{return s.replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;
  .replace(/\\*\\*([^*\\n]+)\\*\\*/g,'<b>$1</b>')}}
 function add(who,txt){{const t=document.getElementById('t');const d=document.createElement('div');d.className='bubble '+who;
  d.innerHTML='<span class=who>'+who+'</span>'+md(txt);t.appendChild(d);t.scrollTop=t.scrollHeight;return d}}
-async function refreshChats(){{try{{const r=await fetch('/chat/api/chats');const d=await r.json();
- document.getElementById('chats').innerHTML=d.map(c=>'<div class="chatitem'+(c.id===chat_id?' on':'')+'" onclick="openChat(\\''+c.id+'\\')">'+ (c.title||c.id) +'</div>').join('')}}catch(e){{}}}}
-function openChat(id){{chat_id=id;localStorage.setItem('bgn.chat',id);document.getElementById('t').innerHTML='';refreshChats();
- fetch('/chat/api/history?chat_id='+id).then(r=>r.json()).then(h=>h.forEach(m=>add(m.role==='user'?'user':'ai',m.content))).catch(()=>{{}})}}
+function localChats(){{try{{return JSON.parse(localStorage.getItem('bgn.localChats.v1')||'{{}}')}}catch(e){{return {{}}}}}}
+function saveLocal(role,content){{const all=localChats(),c=all[chat_id]||(all[chat_id]={{messages:[],updated:0}});c.messages=(c.messages||[]).concat([{{role,content}}]).slice(-200);c.updated=Date.now();c.title=c.title||(role==='user'?content.slice(0,44):chat_id);const ids=Object.keys(all).sort((a,b)=>(all[b].updated||0)-(all[a].updated||0)).slice(0,50),keep={{}};ids.forEach(id=>keep[id]=all[id]);localStorage.setItem('bgn.localChats.v1',JSON.stringify(keep))}}
+function refreshChats(){{const d=localChats();document.getElementById('chats').innerHTML=Object.keys(d).sort((a,b)=>(d[b].updated||0)-(d[a].updated||0)).map(id=>'<div class="chatitem'+(id===chat_id?' on':'')+'" onclick="openChat(\\''+id+'\\')">'+md(d[id].title||id)+'</div>').join('')}}
+function openChat(id){{chat_id=id;localStorage.setItem('bgn.chat',id);document.getElementById('t').innerHTML='';refreshChats();const c=localChats()[id];if(c)(c.messages||[]).forEach(m=>add(m.role==='user'?'user':'ai',m.content))}}
 function newChat(){{chat_id='c-'+Math.random().toString(36).slice(2,10);localStorage.setItem('bgn.chat',chat_id);
  document.getElementById('t').innerHTML='';refreshChats()}}
 async function send(){{if(busy)return;const inp=document.getElementById('in');const text=inp.value.trim();if(!text)return;
  busy=true;inp.value='';document.getElementById('go').disabled=true;document.getElementById('st').textContent='streaming';
- add('user',text);const holder=add('ai','…');let acc='';
+ add('user',text);saveLocal('user',text);const holder=add('ai','…');let acc='';
  try{{const r=await fetch('/v1/chat/completions',{{method:'POST',headers:{{'Content-Type':'application/json'}},
   body:JSON.stringify({{model:document.getElementById('model').value,messages:[{{role:'user',content:text}}],stream:true,chat_id:chat_id}})}});
   if(!r.ok){{throw new Error('HTTP '+r.status+': '+await r.text())}}
@@ -4782,7 +4978,7 @@ async function send(){{if(busy)return;const inp=document.getElementById('in');co
      if(j.error){{throw new Error(j.error.message||'Bridgena stream error')}}
      const d=j.choices&&j.choices[0]&&j.choices[0].delta&&j.choices[0].delta.content;if(d){{acc+=d;holder.innerHTML='<span class=who>ai</span>'+md(acc);document.getElementById('t').scrollTop=1e9}}}}}}}}
   if(!acc){{holder.innerHTML='<span class=who>ai</span><i class=muted>empty response</i>'}}
-  document.getElementById('st').textContent='done';
+  if(acc)saveLocal('assistant',acc);document.getElementById('st').textContent='done';
  }}catch(e){{holder.innerHTML='<span class=who>ai</span><span style=color:var(--red)>'+String(e)+'</span>';document.getElementById('st').textContent='error'}}
  busy=false;document.getElementById('go').disabled=false;refreshChats()}}
 setInterval(()=>{{fetch('/debug-logs/data').then(r=>r.json()).then(d=>{{const c=document.getElementById('lc');
@@ -4815,7 +5011,22 @@ button,input,textarea{font:inherit}button{color:inherit}.icon{width:17px;height:
 .picker{position:absolute;z-index:30;top:42px;left:0;width:min(480px,calc(100vw - 32px));background:var(--bg);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);overflow:hidden;display:none}.picker.open{display:block}.searchbox{padding:9px;border-bottom:1px solid var(--line)}.searchbox input{width:100%;height:36px;background:transparent;color:var(--text);border:0;outline:0;padding:0 8px}.modellist{max-height:340px;overflow:auto;padding:5px}.modelopt{width:100%;border:0;background:transparent;color:var(--text);border-radius:6px;padding:9px 10px;text-align:left;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.modelopt:hover,.modelopt.on{background:var(--hover)}.emptymodels{padding:22px;text-align:center;color:var(--muted)}
 .scroll{flex:1;overflow:auto;scroll-behavior:smooth}.conversation{width:min(800px,100%);margin:0 auto;padding:34px 24px 150px}.welcome{min-height:58vh;display:grid;place-items:center;text-align:center}.welcome h1{font-size:28px;line-height:1.15;letter-spacing:-.04em;margin:0 0 9px}.welcome p{color:var(--muted);margin:0;max-width:470px}.msg{display:grid;grid-template-columns:30px minmax(0,1fr);gap:13px;margin:0 0 30px}.avatar{width:28px;height:28px;border:1px solid var(--line);border-radius:8px;display:grid;place-items:center;font-size:11px;font-weight:700;background:var(--soft)}.msg.user .avatar{background:var(--text);color:var(--bg);border-color:var(--text)}.msghead{font-size:13px;font-weight:650;margin:3px 0 6px}.msgbody{font-size:15px;line-height:1.75;white-space:pre-wrap;overflow-wrap:anywhere}.msgbody pre{background:var(--soft);border:1px solid var(--line);border-radius:9px;padding:13px;overflow:auto;font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace}.msgbody code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--soft);border-radius:4px;padding:2px 4px}.msgbody pre code{padding:0}.thinking{color:var(--muted)}.errorbox{color:var(--danger);background:color-mix(in srgb,var(--danger) 7%,transparent);border:1px solid color-mix(in srgb,var(--danger) 25%,var(--line));padding:11px 13px;border-radius:8px;white-space:pre-wrap}
 .dock{position:absolute;left:260px;right:0;bottom:0;padding:26px 20px 18px;background:linear-gradient(transparent,var(--bg) 35%)}.compose{width:min(800px,100%);margin:auto;border:1px solid var(--line);background:var(--bg);border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.08);padding:11px 11px 9px}.compose:focus-within{border-color:color-mix(in srgb,var(--text) 35%,var(--line));box-shadow:0 8px 34px rgba(0,0,0,.1)}textarea{display:block;width:100%;height:44px;max-height:180px;resize:none;border:0;outline:0;background:transparent;color:var(--text);padding:4px 5px;line-height:1.5}.composefoot{display:flex;align-items:center;gap:8px}.hint{color:var(--muted);font-size:11px;margin-left:4px}.send{margin-left:auto;width:34px;height:34px;border:0;border-radius:9px;background:var(--text);color:var(--bg);display:grid;place-items:center;cursor:pointer}.send:disabled{opacity:.35;cursor:not-allowed}.runtime{width:min(800px,100%);margin:7px auto 0;color:var(--muted);font-size:11px;text-align:center}.runtime details{text-align:left}.runtime pre{max-height:160px;overflow:auto;background:var(--soft);border:1px solid var(--line);padding:10px;border-radius:8px;white-space:pre-wrap}
-@media(max-width:760px){.app{grid-template-columns:1fr}.sidebar{position:fixed;z-index:50;inset:0 auto 0 0;width:280px;transform:translateX(-100%);transition:.2s;box-shadow:var(--shadow)}.sidebar.open{transform:none}.mobile{display:grid}.top{padding:0 12px}.dock{left:0;padding-inline:12px}.conversation{padding-inline:18px}.status span{display:none}.modelbtn{max-width:54vw}}
+/* v2.16 chat polish + correct nested flex scrolling */
+.app{grid-template-columns:280px minmax(0,1fr)}
+.sidebar{background:color-mix(in srgb,var(--panel) 88%,transparent)}
+.sidehead{height:64px;padding:0 16px}.mark{border-radius:9px}.sidebody{padding:10px}.newbtn{height:40px;border-radius:9px;box-shadow:0 1px 2px rgba(0,0,0,.12)}
+.thread{padding:9px 11px}.sidefoot{padding:12px}.ops{padding:10px 11px}
+.main{position:relative;min-height:0;overflow:hidden;background:radial-gradient(800px 400px at 50% -220px,color-mix(in srgb,var(--text) 6%,transparent),transparent 75%),var(--bg)}
+.top{height:64px;padding:0 22px;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(18px)}
+.modelbtn{border:0;background:transparent;box-shadow:none;font-weight:600}.modelbtn:hover{background:var(--hover)}
+.scroll{min-height:0;overscroll-behavior:contain;scrollbar-gutter:stable}
+.conversation{width:min(860px,100%);padding:48px 28px 190px}.welcome{min-height:calc(100vh - 280px)}.welcome h1{font-size:34px;font-weight:680}
+.msg{grid-template-columns:32px minmax(0,1fr);gap:14px;margin-bottom:34px}.avatar{width:30px;height:30px;border-radius:9px}.msgbody{font-size:15px;line-height:1.8}
+.msg.user{margin-left:12%}.msg.user>div:last-child{background:var(--soft);border:1px solid var(--line);border-radius:14px;padding:12px 15px}.msg.user .msghead{display:none}
+.dock{left:280px;padding:46px 20px 18px;background:linear-gradient(transparent,var(--bg) 42%);pointer-events:none}.compose,.runtime{pointer-events:auto}
+.compose{width:min(860px,100%);border-radius:16px;padding:13px 13px 10px;box-shadow:0 14px 45px rgba(0,0,0,.16)}.compose:focus-within{box-shadow:0 16px 50px rgba(0,0,0,.2),0 0 0 1px color-mix(in srgb,var(--text) 12%,transparent)}
+.send{border-radius:10px}.runtime{width:min(860px,100%)}
+@media(max-width:760px){.app{grid-template-columns:1fr}.sidebar{position:fixed;z-index:50;inset:0 auto 0 0;width:280px;transform:translateX(-100%);transition:.2s;box-shadow:var(--shadow)}.sidebar.open{transform:none}.mobile{display:grid}.top{padding:0 12px}.dock{left:0;padding-inline:12px}.conversation{padding:30px 18px 180px}.status span{display:none}.modelbtn{max-width:54vw}.msg.user{margin-left:4%}}
 </style></head><body><div class="app">
 <aside class="sidebar" id="sidebar"><div class="sidehead"><div class="mark">B</div><div class="wordmark">Bridgena</div></div><div class="sidebody"><button class="newbtn" onclick="newChat()">＋ New chat</button><div class="sectionlabel">Recent</div><div id="threads"></div></div><div class="sidefoot"><a class="ops" href="/dashboard">⚙ Operations</a></div></aside>
 <main class="main"><header class="top"><button class="ghost mobile" onclick="toggleSidebar()">☰</button><div class="modelwrap"><button class="modelbtn" id="modelBtn" onclick="togglePicker()"><span id="modelLabel"></span><span class="chev">⌄</span></button><div class="picker" id="picker"><div class="searchbox"><input id="modelSearch" placeholder="Search models…" autocomplete="off"></div><div class="modellist" id="modelList"></div></div></div><div class="status"><i class="statusdot" id="statusDot"></i><span id="statusText">Ready</span></div><button class="ghost" onclick="toggleTheme()" title="Toggle theme">◐</button></header>
@@ -4837,11 +5048,14 @@ function md(s){return escHtml(s).replace(/```([\s\S]*?)```/g,'<pre><code>$1</cod
 function clearWelcome(){$('welcome')?.remove()}
 function addMessage(role,text,kind){clearWelcome();const row=document.createElement('article');row.className='msg '+role;row.innerHTML='<div class="avatar">'+(role==='user'?'Y':'B')+'</div><div><div class="msghead">'+(role==='user'?'You':'Bridgena')+'</div><div class="msgbody '+(kind||'')+'"></div></div>';const body=row.querySelector('.msgbody');body.innerHTML=kind==='error'?'<div class="errorbox">'+escHtml(text)+'</div>':md(text);$('conversation').appendChild(row);$('scroll').scrollTop=$('scroll').scrollHeight;return body}
 function setStatus(label,state){$('statusText').textContent=label;$('statusDot').className='statusdot '+(state||'')}
-async function loadThreads(){try{const r=await fetch('/chat/api/chats');const d=await r.json();$('threads').innerHTML=d.map(c=>'<button class="thread '+(c.id===chatId?'on':'')+'" data-id="'+escHtml(c.id)+'">'+escHtml(c.title||c.id)+'</button>').join('');document.querySelectorAll('.thread').forEach(b=>b.onclick=()=>openChat(b.dataset.id))}catch(e){}}
-async function openChat(id){chatId=id;localStorage.setItem('bgn.chat',id);$('conversation').innerHTML='';try{const r=await fetch('/chat/api/history?chat_id='+encodeURIComponent(id));const h=await r.json();if(!h.length){showWelcome()}else h.forEach(m=>addMessage(m.role==='user'?'user':'ai',m.content))}catch(e){addMessage('ai',String(e),'error')}loadThreads();$('sidebar').classList.remove('open')}
+function localChats(){try{return JSON.parse(localStorage.getItem('bgn.localChats.v1')||'{}')}catch(e){return {}}}
+function writeLocalChats(all){const ids=Object.keys(all).sort((a,b)=>(all[b].updated||0)-(all[a].updated||0)).slice(0,50),keep={};ids.forEach(id=>keep[id]=all[id]);try{localStorage.setItem('bgn.localChats.v1',JSON.stringify(keep))}catch(e){}}
+function saveLocalMessage(role,content){const all=localChats(),c=all[chatId]||(all[chatId]={messages:[],updated:0});c.messages=(c.messages||[]).concat([{role,content}]).slice(-200);c.updated=Date.now();c.title=c.title||(role==='user'?content.slice(0,44):chatId);writeLocalChats(all)}
+function loadThreads(){const d=localChats(),rows=Object.keys(d).sort((a,b)=>(d[b].updated||0)-(d[a].updated||0));$('threads').innerHTML=rows.map(id=>'<button class="thread '+(id===chatId?'on':'')+'" data-id="'+escHtml(id)+'">'+escHtml(d[id].title||id)+'</button>').join('');document.querySelectorAll('.thread').forEach(b=>b.onclick=()=>openChat(b.dataset.id))}
+function openChat(id){chatId=id;localStorage.setItem('bgn.chat',id);$('conversation').innerHTML='';const c=localChats()[id];if(!c||!(c.messages||[]).length){showWelcome()}else c.messages.forEach(m=>addMessage(m.role==='user'?'user':'ai',m.content));loadThreads();$('sidebar').classList.remove('open')}
 function showWelcome(){$('conversation').innerHTML='<div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:38px;height:38px">B</div><h1>How can I help?</h1><p>Choose an Arena model and start a conversation.</p></div></div>'}
 function newChat(){chatId=makeId();localStorage.setItem('bgn.chat',chatId);showWelcome();loadThreads();$('sidebar').classList.remove('open');$('input').focus()}
-async function sendMessage(){if(busy)return;const input=$('input'),text=input.value.trim();if(!text)return;busy=true;input.value='';input.style.height='44px';$('send').disabled=true;setStatus('Generating','busy');addMessage('user',text);const out=addMessage('ai','Thinking…','thinking');let acc='';try{const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,messages:[{role:'user',content:text}],stream:true,chat_id:chatId})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let nl;while((nl=buf.indexOf('\n'))>=0){const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);if(!line.startsWith('data: '))continue;const p=line.slice(6);if(p==='[DONE]')continue;let j;try{j=JSON.parse(p)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta?.content;if(d){acc+=d;out.classList.remove('thinking');out.innerHTML=md(acc);$('scroll').scrollTop=$('scroll').scrollHeight}}}if(!acc)throw new Error('Arena returned an empty response');setStatus('Ready','ok')}catch(e){out.classList.remove('thinking');out.innerHTML='<div class="errorbox">'+escHtml(e.message||e)+'</div>';setStatus('Error','err')}finally{busy=false;$('send').disabled=false;loadThreads()}}
+async function sendMessage(){if(busy)return;const input=$('input'),text=input.value.trim();if(!text)return;busy=true;input.value='';input.style.height='44px';$('send').disabled=true;setStatus('Generating','busy');addMessage('user',text);saveLocalMessage('user',text);const out=addMessage('ai','Thinking…','thinking');let acc='';try{const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,messages:[{role:'user',content:text}],stream:true,chat_id:chatId})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let nl;while((nl=buf.indexOf('\n'))>=0){const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);if(!line.startsWith('data: '))continue;const p=line.slice(6);if(p==='[DONE]')continue;let j;try{j=JSON.parse(p)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta?.content;if(d){acc+=d;out.classList.remove('thinking');out.innerHTML=md(acc);$('scroll').scrollTop=$('scroll').scrollHeight}}}if(!acc)throw new Error('Arena returned an empty response');saveLocalMessage('assistant',acc);setStatus('Ready','ok')}catch(e){out.classList.remove('thinking');out.innerHTML='<div class="errorbox">'+escHtml(e.message||e)+'</div>';setStatus('Error','err')}finally{busy=false;$('send').disabled=false;loadThreads()}}
 const input=$('input');input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px'});input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}});
 setInterval(()=>fetch('/debug-logs/data').then(r=>r.json()).then(d=>{$('signal').textContent=d.slice(-18).map(x=>x.line||x.m||'').join('\n')}).catch(()=>{}),3000);
 loadThreads();openChat(chatId);
@@ -5016,16 +5230,13 @@ async def chat_view(request: Request):
 # ---------- chat history (page) ----------
 @app.get("/chat/api/chats")
 async def chats_list():
-    state = load_state()
-    chats = state.get("chats", {})
-    return JSONResponse([{"id": k, "title": v.get("title", k)[:40]} for k, v in
-                         sorted(chats.items(), key=lambda kv: -kv[1].get("updated", 0))][:50])
+    # Chat content is intentionally kept in the user's browser, never state.json.
+    return JSONResponse([])
 
 
 @app.get("/chat/api/history")
 async def chat_history(chat_id: str = ""):
-    state = load_state()
-    return JSONResponse(state.get("chats", {}).get(chat_id, {}).get("messages", [])[-200:])
+    return JSONResponse([])
 
 
 @app.get("/chat/api/models")
@@ -5042,24 +5253,34 @@ def _sse(obj) -> str:
 
 async def openai_stream(body: dict, keyinfo: dict):
     msgs = body.get("messages") or []
-    user_msgs = [m.get("content", "") for m in msgs if m.get("role") == "user"]
+    def _text_content(value) -> str:
+        """Normalize OpenAI string and multimodal content into Arena text."""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("type") in ("text", "input_text"):
+                    text = item.get("text", "")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(p for p in parts if p)
+        if isinstance(value, dict):
+            text = value.get("text") or value.get("content") or ""
+            return text if isinstance(text, str) else ""
+        return ""
+
+    user_msgs = [_text_content(m.get("content", "")) for m in msgs
+                 if isinstance(m, dict) and m.get("role") == "user"]
     prompt = user_msgs[-1] if user_msgs else ""
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
     model = body.get("model", "auto")
-    chat_id = body.get("chat_id") or ("api-" + hashlib.md5(("-".join(str(m.get("content", ""))[:40] for m in msgs)).encode()).hexdigest()[:12])
-
-    def remember(role, content):
-        def fn(state):
-            chats = state.setdefault("chats", {})
-            c = chats.setdefault(chat_id, {"messages": [], "updated": 0})
-            c["title"] = c.get("title") or content[:44]
-            c["messages"] = (c.get("messages", []) + [{"role": role, "content": content}])[-200:]
-            c["updated"] = time.time()
-            if len(chats) > 300:
-                for k in sorted(chats, key=lambda kk: chats[kk].get("updated", 0))[:-300]:
-                    chats.pop(k, None)
-        mutate_state(fn)
+    # A caller-supplied opaque thread id preserves Arena context without storing
+    # prompt or response content. One-off API calls receive a random id.
+    chat_id = body.get("chat_id") or ("api-" + uuid7())
 
     created = int(time.time())
     rid = "chatcmpl-" + uuid7()[:23]
@@ -5086,9 +5307,6 @@ async def openai_stream(body: dict, keyinfo: dict):
                     break
         except Exception as e:
             yield _sse({"error": {"message": f"{type(e).__name__}: {e}"}})
-        if acc:
-            remember("user", prompt)
-            remember("assistant", acc)
         yield chunk({}, finish="stop")
         yield "data: [DONE]\n\n"
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -5436,6 +5654,15 @@ def jars_have_creds() -> bool:
     return any(j.get("email") and j.get("password") and j.get("enabled", True) for j in load_jars())
 @asynccontextmanager
 async def _lifespan(app):
+    def _remove_legacy_transcripts(state):
+        state.pop("chats", None)
+    mutate_state(_remove_legacy_transcripts)
+    def _normalize_personas(jars):
+        for jar in jars:
+            if jar.get("persona") not in PERSONAS:
+                jar["persona"] = "ubuntu"
+                jar["user_agent"] = PERSONAS["ubuntu"].ua
+    mutate_jars(_normalize_personas)
     tasks = [asyncio.create_task(keeper_election_loop()),
              asyncio.create_task(periodic_model_refresher()),
              asyncio.create_task(get_initial_data())]
