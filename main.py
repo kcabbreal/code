@@ -36,8 +36,10 @@ except ImportError:
 
 try:
     from recaptcha_solver import get_solver as get_verification_solver
-except ImportError:
+    _VERIFICATION_IMPORT_ERROR = None
+except Exception as _verification_import_exc:
     get_verification_solver = None
+    _VERIFICATION_IMPORT_ERROR = f"{type(_verification_import_exc).__name__}: {_verification_import_exc}"
 
 # legacy global keeper UA: chrome131 on Windows — matches curl_cffi impersonate
 # default so cf_clearance (UA+IP-bound) stays coherent for persona-less jars.
@@ -91,7 +93,7 @@ KEEPER_REQUEST_READY_SEC = max(30, min(180, int(os.environ.get("BRIDGENA_KEEPER_
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.33-local-mirror-control-plane")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.34-adapter-proxy-fix")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -1234,6 +1236,14 @@ def _proxy_hkey(proxy_url: str) -> str:
     except Exception:
         return proxy_url
 
+
+def _is_loopback_proxy(proxy_url: str) -> bool:
+    try:
+        host = (urlparse(_normalize_proxy(proxy_url) or proxy_url).hostname or "").lower()
+        return host in {"localhost", "127.0.0.1", "::1"}
+    except Exception:
+        return False
+
 def get_proxy_pool() -> list:
     """Load proxies from proxies.txt (preferred) and/or config.json.
 
@@ -1250,7 +1260,7 @@ def get_proxy_pool() -> list:
 
     def _add(item):
         n = _normalize_proxy(item if isinstance(item, str) else str(item))
-        if not n:
+        if not n or _is_loopback_proxy(n):
             return
         try:
             from urllib.parse import urlparse as _up
@@ -4337,6 +4347,9 @@ def parse_upload(text: str) -> Tuple[List[str], int, int]:
             skipped += 1
     seen, dedup = set(), []
     for u in out:
+        if _is_loopback_proxy(u):
+            skipped += 1
+            continue
         k = _proxy_hkey(u) or u
         if k not in seen:
             seen.add(k); dedup.append(u)
@@ -4675,6 +4688,24 @@ RC_V2_CLEAR_JS = """() => {
 }"""
 
 _mint_last_no_session = 0.0
+_verification_adapter_warned_at = 0.0
+
+
+def _externally_reachable_proxy(session) -> Optional[str]:
+    """Return the real upstream proxy, never a process-local browser shim."""
+    candidate = getattr(session, "_used_proxy", None) or None
+    if not candidate:
+        return None
+    try:
+        parsed = urlparse(candidate)
+        if (parsed.hostname or "").lower() not in {"localhost", "127.0.0.1", "::1"}:
+            return candidate
+        for upstream, local_port in (_shim_state.get("ports") or {}).items():
+            if parsed.port == local_port:
+                return upstream
+    except Exception:
+        pass
+    return None
 
 
 async def _solve_with_verification_adapter(challenge_type: str, session,
@@ -4684,7 +4715,14 @@ async def _solve_with_verification_adapter(challenge_type: str, session,
     Cookie values and tokens are deliberately excluded from logs. The bundled
     ONNX get_solver() remains independent from the adapter factory alias.
     """
+    global _verification_adapter_warned_at
     if get_verification_solver is None:
+        now = time.time()
+        if now - _verification_adapter_warned_at > 30:
+            _verification_adapter_warned_at = now
+            log("ERROR", "verification adapter import unavailable"
+                + (f": {_VERIFICATION_IMPORT_ERROR}" if _VERIFICATION_IMPORT_ERROR else
+                   ": recaptcha_solver.py was not found beside bridgena.py"))
         return None
     try:
         factory_result = get_verification_solver()
@@ -4694,7 +4732,12 @@ async def _solve_with_verification_adapter(challenge_type: str, session,
             return None
 
         cookie_map = {}
-        if getattr(session, "context", None):
+        if LOCAL_UPSTREAM and getattr(session, "_public_cookie_snapshot", None):
+            for cookie in session._public_cookie_snapshot:
+                name, value = cookie.get("name"), cookie.get("value")
+                if name and value:
+                    cookie_map[name] = value
+        elif getattr(session, "context", None):
             for cookie in await session.context.cookies([ARENA_BASE]):
                 name, value = cookie.get("name"), cookie.get("value")
                 if name and value:
@@ -4704,10 +4747,16 @@ async def _solve_with_verification_adapter(challenge_type: str, session,
         user_agent = (getattr(persona, "ua", None)
                       or getattr(session, "user_agent", None)
                       or KEEPER_UA)
-        proxy = getattr(session, "_used_proxy", None) or None
-        page_url = getattr(getattr(session, "page", None), "url", None) or ARENA_BASE
-        if not str(page_url).startswith(ARENA_BASE):
+        proxy = _externally_reachable_proxy(session)
+        page_url = PUBLIC_AUTH_BASE if LOCAL_UPSTREAM else (
+            getattr(getattr(session, "page", None), "url", None) or ARENA_BASE
+        )
+        if not LOCAL_UPSTREAM and not str(page_url).startswith(ARENA_BASE):
             page_url = ARENA_BASE
+
+        log("INFO", f"verification adapter request · type {challenge_type}"
+            f" · origin {urlparse(page_url).hostname or 'unknown'}"
+            f" · proxy {'upstream' if proxy else 'direct'} · cookies {len(cookie_map)}")
 
         result = await solver.solve(
             challenge_type=challenge_type,
