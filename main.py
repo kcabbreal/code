@@ -34,12 +34,56 @@ try:
 except ImportError:
     ort = None
 
-try:
-    from recaptcha_solver import get_solver as get_verification_solver
-    _VERIFICATION_IMPORT_ERROR = None
-except Exception as _verification_import_exc:
-    get_verification_solver = None
-    _VERIFICATION_IMPORT_ERROR = f"{type(_verification_import_exc).__name__}: {_verification_import_exc}"
+def _discover_verification_factory():
+    """Resolve both a flat recaptcha_solver.py and common package layouts."""
+    import importlib
+    errors = []
+    configured = os.environ.get("BRIDGENA_VERIFICATION_FACTORY", "").strip()
+    candidates = ([configured] if configured else []) + [
+        "recaptcha_solver:get_solver",
+        "recaptcha_solver.recaptcha_solver:get_solver",
+        "recaptcha_solver.solver:get_solver",
+        "recaptcha_solver.adapter:get_solver",
+        "recaptcha_solver.client:get_solver",
+    ]
+    seen = set()
+    for spec in candidates:
+        if not spec or spec in seen:
+            continue
+        seen.add(spec)
+        module_name, _, attr = spec.partition(":")
+        attr = attr or "get_solver"
+        try:
+            module = importlib.import_module(module_name)
+            factory = getattr(module, attr)
+            if callable(factory):
+                return factory, None, spec
+        except Exception as exc:
+            errors.append(f"{spec}={type(exc).__name__}: {exc}")
+    try:
+        import pkgutil
+        package = importlib.import_module("recaptcha_solver")
+        package_path = getattr(package, "__path__", None)
+        if package_path:
+            for info in pkgutil.iter_modules(package_path):
+                if not any(hint in info.name.lower() for hint in ("solver", "adapter", "client", "service")):
+                    continue
+                spec = f"recaptcha_solver.{info.name}:get_solver"
+                if spec in seen:
+                    continue
+                try:
+                    module = importlib.import_module(f"recaptcha_solver.{info.name}")
+                    factory = getattr(module, "get_solver", None)
+                    if callable(factory):
+                        return factory, None, spec
+                except Exception as exc:
+                    errors.append(f"{spec}={type(exc).__name__}: {exc}")
+    except Exception as exc:
+        errors.append(f"recaptcha_solver package scan={type(exc).__name__}: {exc}")
+    return None, "; ".join(errors[-4:]), None
+
+
+get_verification_solver, _VERIFICATION_IMPORT_ERROR, _VERIFICATION_FACTORY_SPEC = _discover_verification_factory()
 
 # legacy global keeper UA: chrome131 on Windows — matches curl_cffi impersonate
 # default so cf_clearance (UA+IP-bound) stays coherent for persona-less jars.
@@ -93,7 +137,7 @@ KEEPER_REQUEST_READY_SEC = max(30, min(180, int(os.environ.get("BRIDGENA_KEEPER_
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.35-local-proxy-bypass")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.36-wrapper-ui-fix")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -6279,20 +6323,24 @@ button,input,textarea{font:inherit}button{color:inherit}.icon{width:17px;height:
 .dock{left:270px;padding:64px 20px 20px;background:linear-gradient(transparent,var(--bg) 48%)}
 .compose{width:min(900px,100%);border-radius:22px;padding:14px 14px 11px;border-color:var(--line);box-shadow:0 8px 32px rgba(0,0,0,.16)}
 .compose:focus-within{border-color:color-mix(in srgb,var(--text) 25%,var(--line));box-shadow:0 10px 38px rgba(0,0,0,.2)}
-.send{border-radius:50%;width:34px;height:34px}.runtime{opacity:.72}.picker{border-radius:14px;background:var(--panel)}
+.send{border-radius:50%;width:34px;height:34px}.picker{border-radius:14px;background:var(--panel)}
 .promptgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:28px auto 0;max-width:600px}.promptchip{border:1px solid var(--line);background:var(--panel);color:var(--muted);padding:12px 14px;border-radius:12px;text-align:left;cursor:pointer}.promptchip:hover{background:var(--hover);color:var(--text)}
+.runtime-drawer{position:fixed;z-index:70;top:76px;right:16px;bottom:16px;width:min(540px,calc(100vw - 32px));padding:14px;background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);opacity:0;pointer-events:none;transform:translateX(calc(100% + 32px));transition:opacity .18s ease,transform .18s ease}
+.runtime-drawer.open{opacity:1;pointer-events:auto;transform:none}.drawerhead{height:34px;display:flex;align-items:center;justify-content:space-between;font-weight:650}.drawerhead .ghost{width:30px;height:30px}.runtime-drawer pre{height:calc(100% - 42px);margin:8px 0 0;padding:12px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:10px;color:var(--muted);white-space:pre-wrap;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
 @media(max-width:760px){.app{grid-template-columns:1fr}.dock{left:0}.promptgrid{grid-template-columns:1fr}.msg.user{margin-left:8%}.conversation{padding-inline:16px}}
 </style></head><body><div class="app">
 <aside class="sidebar" id="sidebar"><div class="sidehead"><div class="mark">B</div><div class="wordmark">Bridgena</div></div><div class="sidebody"><button class="newbtn" onclick="newChat()">＋ New chat</button><div class="sectionlabel">Recent</div><div id="threads"></div></div><div class="sidefoot"><a class="ops" href="/dashboard">⚙ Operations</a></div></aside>
-<main class="main"><header class="top"><button class="ghost mobile" onclick="toggleSidebar()">☰</button><div class="modelwrap"><button class="modelbtn" id="modelBtn" onclick="togglePicker()"><span id="modelLabel"></span><span class="chev">⌄</span></button><div class="picker" id="picker"><div class="searchbox"><input id="modelSearch" placeholder="Search models…" autocomplete="off"></div><div class="modellist" id="modelList"></div></div></div><div class="status"><i class="statusdot" id="statusDot"></i><span id="statusText">Ready</span></div><button class="ghost" onclick="toggleTheme()" title="Toggle theme">◐</button></header>
+<main class="main"><header class="top"><button class="ghost mobile" onclick="toggleSidebar()">☰</button><div class="modelwrap"><button class="modelbtn" id="modelBtn" onclick="togglePicker()"><span id="modelLabel"></span><span class="chev">⌄</span></button><div class="picker" id="picker"><div class="searchbox"><input id="modelSearch" placeholder="Search models…" autocomplete="off"></div><div class="modellist" id="modelList"></div></div></div><div class="status"><i class="statusdot" id="statusDot"></i><span id="statusText">Ready</span></div><button class="ghost" onclick="toggleRuntime()" title="Runtime signal">⌁</button><button class="ghost" onclick="toggleTheme()" title="Toggle theme">◐</button></header>
 <div class="scroll" id="scroll"><div class="conversation" id="conversation"><div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:42px;height:42px">B</div><h1>What are we building?</h1><p>Choose a model and start a conversation with your Bridgena workspace.</p><div class="promptgrid"><button class="promptchip" onclick="usePrompt('Explain this code and identify reliability risks')">Review code</button><button class="promptchip" onclick="usePrompt('Help me debug a failed API request')">Debug a request</button><button class="promptchip" onclick="usePrompt('Design a production rollout plan')">Plan a rollout</button><button class="promptchip" onclick="usePrompt('Summarize the latest runtime signals')">Inspect runtime</button></div></div></div></div></div>
-<div class="dock"><div class="compose"><textarea id="input" rows="1" placeholder="Message Bridgena"></textarea><div class="composefoot"><span class="hint">Enter to send · Shift+Enter for newline</span><button class="send" id="send" onclick="sendMessage()" aria-label="Send">↑</button></div></div><div class="runtime"><details><summary>Runtime signal</summary><pre id="signal">Waiting for activity…</pre></details></div></div></main></div>
+<div class="dock"><div class="compose"><textarea id="input" rows="1" placeholder="Message Bridgena"></textarea><div class="composefoot"><span class="hint">Enter to send · Shift+Enter for newline</span><button class="send" id="send" onclick="sendMessage()" aria-label="Send">↑</button></div></div></div></main></div>
+<aside class="runtime-drawer" id="runtimeDrawer"><div class="drawerhead"><span>Runtime signal</span><button class="ghost" onclick="toggleRuntime()" aria-label="Close runtime">×</button></div><pre id="signal">Waiting for activity…</pre></aside>
 <script>
 const MODELS=__MODELS_JSON__, DEFAULT_MODEL=__DEFAULT_MODEL__;
 let model=localStorage.getItem('bgn.model')||DEFAULT_MODEL, chatId=localStorage.getItem('bgn.chat')||makeId(), busy=false;
 const $=id=>document.getElementById(id), escHtml=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function makeId(){return 'c-'+Math.random().toString(36).slice(2,10)}
 function toggleSidebar(){ $('sidebar').classList.toggle('open') }
+function toggleRuntime(){ $('runtimeDrawer').classList.toggle('open') }
 function toggleTheme(){const root=document.documentElement,d=root.dataset.theme==='dark'?'light':'dark';root.dataset.theme=d;localStorage.setItem('bgn.theme',d)}
 document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||((matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');
 function togglePicker(force){const p=$('picker'),open=force===undefined?!p.classList.contains('open'):force;p.classList.toggle('open',open);if(open){$('modelSearch').value='';renderModels('');setTimeout(()=>$('modelSearch').focus(),0)}}
@@ -7237,6 +7285,10 @@ async def _lifespan(app):
     if jars_have_creds():
         tasks.append(asyncio.create_task(auto_login_on_boot()))
     log("INFO", f"BRIDGENA build {BUILD_STAMP} · v2 engine · recaptcha V3/V2 protocol ON")
+    if get_verification_solver:
+        log("OK", f"Verification adapter factory loaded: {_VERIFICATION_FACTORY_SPEC}")
+    else:
+        log("ERROR", f"Verification adapter factory unavailable: {_VERIFICATION_IMPORT_ERROR}")
     yield
     for t in tasks:
         t.cancel()
