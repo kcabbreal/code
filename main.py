@@ -69,7 +69,7 @@ MAX_CONVERSATIONS = 500
 ARENA_RECAPTCHA_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_SITEKEY",
                                          "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0")
 ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
-                                            "6Ld7ePYrAAAAAB34ovoFoDau1fqCJ6IyOjFEQaMn")
+                                            "6Le3_cYsAAAAAGwWOK2RLDgNI15Bh8C0yLBOL1yL")
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
 ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
 ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
@@ -4456,7 +4456,8 @@ RC_V2_WIDGET_JS = """async (SITE) => {
     }
     host = document.createElement('div');
     host.id = 'bgn-v2-host';
-    host.style.cssText = 'position:fixed;bottom:12px;right:12px;width:304px;height:78px;z-index:2147483647;opacity:1;background:#fff;border-radius:4px;box-shadow:0 0 10px rgba(0,0,0,0.15);';
+    host.className = 'recaptcha-v2-container g-recaptcha';
+    host.style.cssText = 'position:fixed;bottom:12px;right:12px;width:304px;height:78px;z-index:2147483647;opacity:1;background:#1a1a1a;border-radius:4px;box-shadow:0 0 10px rgba(0,0,0,0.3);';
     document.body.appendChild(host);
 
     window.__bgnV2Token = null;
@@ -4466,6 +4467,7 @@ RC_V2_WIDGET_JS = """async (SITE) => {
     window.__bgnV2 = api.render(host, {
       sitekey: SITE,
       size: 'normal',
+      theme: 'dark',
       callback: (tok) => { window.__bgnV2Done = true; window.__bgnV2Token = tok; },
       'error-callback': () => { window.__bgnV2Err = 'widget-error'; },
       'expired-callback': () => { window.__bgnV2Done = false; window.__bgnV2Token = null; }
@@ -4490,6 +4492,8 @@ RC_V2_READ_JS = """() => {
       const el = host.querySelector('textarea[name="g-recaptcha-response"]');
       if (el && el.value && el.value.length > 20) return el.value;
     }
+    const anyEl = document.querySelector('textarea[name="g-recaptcha-response"]');
+    if (anyEl && anyEl.value && anyEl.value.length > 20) return anyEl.value;
     return null;
   } catch (e) { return null; }
 }"""
@@ -4577,21 +4581,7 @@ async def mint_v3(jar_id=None):
 
             if v3_token:
                 return v3_token
-
-            # V3 bypass failed — FALLBACK to visible image challenge / V2 escalation
-            log("INFO", f"[{sid}] reCAPTCHA v3 bypass did not produce a token; falling back to challenge solver")
-
-            # 1. Try solving any challenge already open in the keeper session
-            if hasattr(s, "solve_recaptcha_image_challenge") and await s.solve_recaptcha_image_challenge():
-                tok = await s.page.evaluate(RC_V2_READ_JS)
-                if tok and not str(tok).startswith("__ERR__"):
-                    log("OK", f"recaptcha token harvested from live challenge fallback ({len(tok)} chars)")
-                    return tok
-
-            # 2. Trigger V2 escalation widget & solve
-            esc_token = await mint_v2_escalation(jar_id=sid, settle_s=20.0)
-            if esc_token:
-                return esc_token
+            return None
 
     except Exception as e:
         log("WARN", f"recaptcha token: browser transaction failed: {type(e).__name__}: {e}")
@@ -4629,27 +4619,30 @@ async def mint_v2_escalation(jar_id=None, settle_s: float = 20.0):
                     log("OK", f"recaptcha V2 token harvested via ONNX solver ({len(tok)} chars)")
                     return tok
 
-        # 1. Mount checkbox widget with primary Arena sitekey
-        mount = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_SITEKEY)
+        # 1. Mount V2 checkbox widget with verified Arena V2 escalation sitekey
+        mount = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_V2_SITEKEY)
         if not (isinstance(mount, dict) and mount.get("ok")):
             log("WARN", f"recaptcha token: V2 mount failed: {(mount or {}).get('err') if isinstance(mount, dict) else mount}")
-            if ARENA_RECAPTCHA_V2_SITEKEY != ARENA_RECAPTCHA_SITEKEY:
-                mount2 = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_V2_SITEKEY)
+            if ARENA_RECAPTCHA_SITEKEY != ARENA_RECAPTCHA_V2_SITEKEY:
+                mount2 = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_SITEKEY)
                 if not (isinstance(mount2, dict) and mount2.get("ok")):
                     return None
 
-        await asyncio.sleep(0.8)
-        # 2. Click the checkbox across all frames
+        # 2. Click the checkbox across all frames (give iframe up to 2.5s to mount)
         clicked = False
-        for frame in s.page.frames:
-            try:
-                cb = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border")
-                if await cb.count() > 0 and await cb.first.is_visible():
-                    await cb.first.click(timeout=2000)
-                    clicked = True
-                    break
-            except Exception:
-                continue
+        for _ in range(5):
+            await asyncio.sleep(0.5)
+            for frame in s.page.frames:
+                try:
+                    cb = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border")
+                    if await cb.count() > 0 and await cb.first.is_visible():
+                        await cb.first.click(timeout=2000)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if clicked:
+                break
 
         # FAST-FAIL 1: If no checkbox was clicked, there is NO challenge to solve
         if not clicked:
@@ -4778,9 +4771,9 @@ def _classify(status: int, body: str) -> str:
         if "captcha" in low or "recaptcha" in low:
             return "RECAPTCHA"
         return "SESSION" if status == 401 or "auth" in low else "RECAPTCHA"  # conservative: unknown 403s never burn jars
-    if status == 429 and "prompt failed" in low:
-        return "PROMPT"
     if status == 429:
+        if "prompt failed" in low or "captcha" in low or "recaptcha" in low:
+            return "RECAPTCHA"
         return "RATELIMIT"
     if status >= 500 or 520 <= status <= 527:
         return "UPSTREAM"
@@ -5191,8 +5184,6 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 log("WARN", f"[{jar.get('name')}] browser-origin unavailable ({type(browser_e).__name__}: {browser_e}) — curl fallback")
 
         headers = _headers_for(jar, p, json_body=True)
-        headers["X-Recaptcha-Token"] = tok or base.get("recaptchaV2Token") or base.get("recaptchaV3Token") or ""
-        headers["X-Recaptcha-Action"] = RECAPTCHA_ACTION
         kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
         if proxy:
             kw["proxy"] = proxy
@@ -5289,15 +5280,15 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     if verdict == "RECAPTCHA":
                         if rc_attempts < 2:
                             rc_attempts += 1
-                            fresh = await mint_v3(jar.get("id"))
-                            if fresh:
-                                _attach_v3(base, fresh)
-                                log("WARN", f"[{jar.get('name')}] recaptcha rejected — fresh V3 token, retrying SAME jar")
-                                continue
                             esc = await mint_v2_escalation(jar.get("id"), settle_s=20.0)
                             if esc:
                                 _attach_v2(base, esc)
                                 log("WARN", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar")
+                                continue
+                            fresh = await mint_v3(jar.get("id"))
+                            if fresh:
+                                _attach_v3(base, fresh)
+                                log("WARN", f"[{jar.get('name')}] recaptcha rejected — fresh V3 token, retrying SAME jar")
                                 continue
                         log("WARN", f"[{jar.get('name')}] recaptcha unresolved — jar KEPT HEALTHY (starvation is our bug, not their death)")
                         yield ("error", "403: arena's recaptcha check rejected us and the keeper could not mint a token on this exit. "
