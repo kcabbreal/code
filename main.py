@@ -72,7 +72,7 @@ STREAM_TAIL_GRACE_MS = max(5000, min(60000, int(os.environ.get("BRIDGENA_STREAM_
 KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.30-newapi-terminal")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.31-stream-contract")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -3055,25 +3055,37 @@ class KeeperSession:
             eval_task = asyncio.create_task(page.evaluate(
                 script, [url, payload, req_id, RECAPTCHA_ACTION, STREAM_TAIL_GRACE_MS]
             ))
-            seen_indices = set()
+            # Console delivery is fast but may skip an event under load. Keep
+            # indexed frames ordered: later chunks wait behind a gap until the
+            # page result supplies the missing frame at EOF. This prevents a
+            # recovered middle delta from being appended as a fake tail.
+            pending_lines = {}
+            next_index = 0
             while True:
                 packet = await queue.get()
                 if packet is None:
                     break
                 index, line = packet
                 if isinstance(index, int):
-                    seen_indices.add(index)
-                yield line
+                    pending_lines[index] = line
+                    while next_index in pending_lines:
+                        yield pending_lines.pop(next_index)
+                        next_index += 1
+                else:
+                    yield line
             result = await eval_task
             if eval_task.exception():
                 raise RuntimeError(f"Bridge evaluate exception: {eval_task.exception()}")
             # Console delivery can drop messages under load. The page retains
-            # the exact same response lines, so recover only indices that were
-            # not already emitted—no second POST and no duplicated chunks.
+            # the exact same response lines, so fill any index gaps and flush
+            # them in original order—no second POST and no duplicated chunks.
             if isinstance(result, dict):
                 for index, line in enumerate(result.get("lines") or []):
-                    if index not in seen_indices:
-                        yield line
+                    if index >= next_index:
+                        pending_lines.setdefault(index, line)
+                while next_index in pending_lines:
+                    yield pending_lines.pop(next_index)
+                    next_index += 1
             status_code = (result.get("status") if isinstance(result, dict) else None) or meta.get("status", 0)
             error_body = (result.get("error") if isinstance(result, dict) else None) or meta.get("error", "")
             if isinstance(result, dict):
@@ -4578,7 +4590,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 return
             except BridgeHTTPError as e:
                 verdict = _classify(e.status, e.body)
-                log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status}: {e.body[:300]}")
+                if verdict not in ("PROMPT", "RATELIMIT", "RECAPTCHA"):
+                    log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status}: {e.body[:300]}")
                 if e.status == 404 and "model not found" in (e.body or "").lower() and mc:
                     clear_conversation_model(chat_id, model_name)
                     mc = None
@@ -4589,17 +4602,18 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     if attempt + 1 < max_attempts:
                         continue
                 if verdict == "PROMPT":
-                    log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming — no retry or rotation")
+                    log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming (HTTP {e.status}) — no retry or rotation")
                     yield ("error", "422: Arena rejected this prompt before generation. Bridgena did not retry or rotate accounts; shorten the request or remove unsupported tool/system payloads.")
                     return
                 if verdict == "RATELIMIT":
-                    log("WARN", f"[{jar.get('name')}] upstream prompt throttle — request stopped; no account rotation")
+                    log("WARN", f"[{jar.get('name')}] upstream prompt throttle (HTTP {e.status}) — request stopped; no account rotation")
                     yield ("error", "429: Arena throttled or rejected this prompt. No account rotation was attempted; wait 30-60 seconds, then retry or start a new chat.")
                     return
                 if verdict == "UPSTREAM" and attempt + 1 < max_attempts:
                     await asyncio.sleep(min(5.0, 1.0 + attempt))
                     continue
                 if verdict == "RECAPTCHA":
+                    log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) — request stopped")
                     yield ("error", "403: Arena rejected this session's verification token. The request was stopped without repeated retries; wait briefly and try a new chat.")
                     return
                 if e.status == 400 and "user message is invalid" in (e.body or "").lower() and mc:
@@ -4671,8 +4685,9 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         if len(raw) > 40000:
                             break
                     body = raw.decode("utf-8", "ignore")
-                    log("ERROR", f"Status {resp.status_code}, URL {url}, Body: {body[:600]}")
                     verdict = _classify(resp.status_code, body)
+                    level = "WARN" if 400 <= resp.status_code < 500 else "ERROR"
+                    log(level, f"Status {resp.status_code}, URL {url}, Body: {body[:600]}")
 
                     if resp.status_code == 404 and "model not found" in body.lower() and mc:
                         clear_conversation_model(chat_id, model_name)
@@ -5420,6 +5435,7 @@ _api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 _dashboard_sessions: dict = {}
 _recent_api_requests: dict = {}
 _recent_api_requests_lock = threading.Lock()
+_duplicate_notices: dict = {}
 
 
 @app.middleware("http")
@@ -5462,7 +5478,9 @@ async def _require_key(request: Request) -> Optional[dict]:
     if await _current_session(request):
         return {"name": "web-session", "rpm": 120, "key": "web-session"}
     hdr = request.headers.get("authorization", "")
-    key = hdr[7:].strip() if hdr.lower().startswith("bearer ") else request.query_params.get("api_key", "")
+    key = (hdr[7:].strip() if hdr.lower().startswith("bearer ")
+           else request.headers.get("x-api-key", "").strip()
+           or request.query_params.get("api_key", ""))
     cfg = get_config()
     if _normalize_api_key_records(cfg):
         save_config(cfg)
@@ -5649,26 +5667,72 @@ def _last_openai_user_prompt(body: dict) -> str:
     return prompts[-1] if prompts else ""
 
 
-def _reserve_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> bool:
-    """Reject exact rapid duplicates before they create another upstream job."""
-    if not API_DUPLICATE_WINDOW_SEC:
-        return True
+def _anthropic_prompt(body: dict) -> str:
+    """Flatten Anthropic message blocks into one stateless Arena turn."""
+    lines = []
+    system = _openai_text_content(body.get("system", ""))
+    if system:
+        lines.append("System:\n" + system)
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        text = _openai_text_content(message.get("content", ""))
+        if text:
+            role = "Assistant" if message.get("role") == "assistant" else "User"
+            lines.append(f"{role}:\n{text}")
+    return "\n\n".join(lines)
+
+
+def _anthropic_sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _rough_tokens(text: str) -> int:
+    # Usage is informational; the upstream protocol does not expose tokenizer
+    # counts. A conservative character heuristic is preferable to claiming an
+    # exact provider count.
+    return max(0, math.ceil(len(text or "") / 4))
+
+
+def _api_request_fingerprint(body: dict, keyinfo: Optional[dict], prompt: str) -> str:
+    """Hash the complete message context; never retain or log its contents."""
     identity = str((keyinfo or {}).get("id") or (keyinfo or {}).get("name") or "anonymous")
     model = str(body.get("model") or "auto")
-    fingerprint = hashlib.sha256(
-        (identity + "\0" + model + "\0" + prompt).encode("utf-8", "ignore")
+    request_context = {
+        "system": body.get("system"),
+        "messages": body.get("messages"),
+        "tools": body.get("tools"),
+        "tool_choice": body.get("tool_choice"),
+    }
+    try:
+        context = json.dumps(request_context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        context = prompt
+    return hashlib.sha256(
+        (identity + "\0" + model + "\0" + context).encode("utf-8", "ignore")
     ).hexdigest()
+
+
+def _reserve_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> tuple[bool, int]:
+    """Reject exact rapid duplicates before they create another upstream job."""
+    if not API_DUPLICATE_WINDOW_SEC:
+        return True, 0
+    fingerprint = _api_request_fingerprint(body, keyinfo, prompt)
     now = time.monotonic()
     with _recent_api_requests_lock:
         cutoff = now - API_DUPLICATE_WINDOW_SEC
         for old_fp, seen_at in list(_recent_api_requests.items()):
             if seen_at < cutoff:
                 _recent_api_requests.pop(old_fp, None)
+                _duplicate_notices.pop(old_fp, None)
         previous = _recent_api_requests.get(fingerprint, 0.0)
         if previous >= cutoff:
-            return False
+            count = int(_duplicate_notices.get(fingerprint, 0)) + 1
+            _duplicate_notices[fingerprint] = count
+            return False, count
         _recent_api_requests[fingerprint] = now
-    return True
+        _duplicate_notices[fingerprint] = 0
+    return True, 0
 
 
 async def openai_stream(body: dict, keyinfo: dict):
@@ -5688,17 +5752,22 @@ async def openai_stream(body: dict, keyinfo: dict):
                      "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
 
     async def gen():
-        yield chunk({"role": "assistant"})
         acc = ""
+        content_chunks = 0
+        terminal_sent = False
+        outcome = "complete"
         try:
+            yield chunk({"role": "assistant"})
             async for kind, payload in run_turn(chat_id, prompt, model,
                                                 attachments=body.get("attachments")):
                 if kind == "content":
                     acc += payload
+                    content_chunks += 1
                     yield chunk({"content": payload})
                 elif kind == "reasoning":
                     yield chunk({"reasoning_content": payload})
                 elif kind == "error":
+                    outcome = "upstream-error"
                     yield _sse({"error": {"message": payload}})
                     # New API's OpenAI-stream translator does not consider a
                     # top-level error plus [DONE] terminal by itself. Emit the
@@ -5706,16 +5775,36 @@ async def openai_stream(body: dict, keyinfo: dict):
                     # clients always leave their generating state.
                     yield chunk({}, finish="stop")
                     yield "data: [DONE]\n\n"
+                    terminal_sent = True
                     return
                 elif kind == "done":
+                    # run_turn carries its complete accumulated text in the
+                    # terminal event. Repair a missing suffix if an adapter
+                    # delivered a final delta only in its terminal envelope.
+                    complete = payload if isinstance(payload, str) else ""
+                    if complete.startswith(acc) and len(complete) > len(acc):
+                        tail = complete[len(acc):]
+                        acc += tail
+                        content_chunks += 1
+                        yield chunk({"content": tail})
                     break
+            yield chunk({}, finish="stop")
+            yield "data: [DONE]\n\n"
+            terminal_sent = True
         except Exception as e:
+            outcome = "bridge-exception"
             yield _sse({"error": {"message": f"{type(e).__name__}: {e}"}})
             yield chunk({}, finish="stop")
             yield "data: [DONE]\n\n"
+            terminal_sent = True
             return
-        yield chunk({}, finish="stop")
-        yield "data: [DONE]\n\n"
+        finally:
+            if terminal_sent:
+                log("INFO", f"OpenAI stream {rid[-8:]} delivered · outcome {outcome} · "
+                            f"content {content_chunks} chunks/{len(acc)} chars · terminal yes")
+            else:
+                log("WARN", f"OpenAI stream {rid[-8:]} disconnected before terminal · outcome {outcome} · "
+                            f"content {content_chunks} chunks/{len(acc)} chars")
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
@@ -5727,9 +5816,11 @@ async def chat_completions(request: Request):
     prompt = _last_openai_user_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
-    if not _reserve_api_request(body, keyinfo, prompt):
-        log("WARN", f"duplicate API request suppressed · model {str(body.get('model') or 'auto')[:80]} · "
-                    f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
+    reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
+    if not reserved:
+        if duplicate_count == 1:
+            log("INFO", f"duplicate API retries suppressed · model {str(body.get('model') or 'auto')[:80]} · "
+                        f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
         raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
     if not body.get("stream", True):
         out = {"id": "chatcmpl-" + uuid7()[:23], "object": "chat.completion", "created": int(time.time()),
@@ -5743,7 +5834,98 @@ async def chat_completions(request: Request):
                 raise HTTPException(status_code=502, detail=payload)
         out["choices"][0]["message"]["content"] = acc
         return JSONResponse(out)
-    return await openai_stream(body, None)
+    return await openai_stream(body, keyinfo)
+
+
+@app.post("/v1/messages")
+@app.post("/messages")
+async def anthropic_messages(request: Request):
+    """Native Anthropic Messages surface for clients that should not traverse
+    an OpenAI-to-Anthropic stream converter."""
+    keyinfo = await _require_key(request)
+    body = await request.json()
+    prompt = _anthropic_prompt(body)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="no user message")
+    reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
+    if not reserved:
+        if duplicate_count == 1:
+            log("INFO", f"duplicate Anthropic API retries suppressed · model {str(body.get('model') or 'auto')[:80]} · "
+                        f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
+        raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
+
+    model = body.get("model", "auto")
+    chat_id = body.get("chat_id") or ("anthropic-" + uuid7())
+    message_id = "msg_" + uuid7().replace("-", "")
+    input_tokens = _rough_tokens(prompt)
+
+    if not body.get("stream", False):
+        acc = ""
+        async for kind, payload in run_turn(chat_id, prompt, model,
+                                            attachments=body.get("attachments")):
+            if kind in ("content", "reasoning") and isinstance(payload, str):
+                acc += payload
+            elif kind == "error":
+                raise HTTPException(status_code=502, detail=payload)
+        return JSONResponse({
+            "id": message_id, "type": "message", "role": "assistant", "model": model,
+            "content": [{"type": "text", "text": acc}], "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": input_tokens, "output_tokens": _rough_tokens(acc)},
+        })
+
+    async def gen():
+        acc = ""
+        chunks = 0
+        terminal_sent = False
+        outcome = "complete"
+        try:
+            yield _anthropic_sse("message_start", {"type": "message_start", "message": {
+                "id": message_id, "type": "message", "role": "assistant", "model": model,
+                "content": [], "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            }})
+            yield _anthropic_sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                                          "content_block": {"type": "text", "text": ""}})
+            async for kind, payload in run_turn(chat_id, prompt, model,
+                                                attachments=body.get("attachments")):
+                if kind in ("content", "reasoning") and isinstance(payload, str):
+                    acc += payload
+                    chunks += 1
+                    yield _anthropic_sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                                                  "delta": {"type": "text_delta", "text": payload}})
+                elif kind == "error":
+                    outcome = "upstream-error"
+                    yield _anthropic_sse("error", {"type": "error", "error": {
+                        "type": "api_error", "message": payload,
+                    }})
+                    return
+                elif kind == "done":
+                    complete = payload if isinstance(payload, str) else ""
+                    if complete.startswith(acc) and len(complete) > len(acc):
+                        tail = complete[len(acc):]
+                        acc += tail
+                        chunks += 1
+                        yield _anthropic_sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                                                      "delta": {"type": "text_delta", "text": tail}})
+                    break
+            yield _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+            yield _anthropic_sse("message_delta", {"type": "message_delta",
+                                                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                                    "usage": {"output_tokens": _rough_tokens(acc)}})
+            yield _anthropic_sse("message_stop", {"type": "message_stop"})
+            terminal_sent = True
+        except Exception as e:
+            outcome = "bridge-exception"
+            yield _anthropic_sse("error", {"type": "error", "error": {
+                "type": "api_error", "message": f"{type(e).__name__}: {e}",
+            }})
+        finally:
+            level = "INFO" if terminal_sent or outcome == "upstream-error" else "WARN"
+            log(level, f"Anthropic stream {message_id[-8:]} delivered · outcome {outcome} · "
+                       f"content {chunks} chunks/{len(acc)} chars · terminal {'yes' if terminal_sent else 'no'}")
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/v1/models")
