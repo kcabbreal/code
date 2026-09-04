@@ -70,7 +70,7 @@ ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
 REQUEST_MAX_ATTEMPTS = max(1, min(3, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "2"))))
 STREAM_TAIL_GRACE_MS = max(1000, min(15000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "5000"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.24-cache-tail-integrity")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.25-message-envelope")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -4454,6 +4454,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
             "metadata": {},
         }
         base["userMessage"] = user_message
+        log("INFO", f"[{jar.get('name')}] outbound {'follow-up' if follow_url else 'create'} envelope · "
+                    f"content string {len(content)} chars · attachments {len(attachments or [])}")
 
         tok = await mint_v3(jar.get("id"))
         if not tok:
@@ -5503,30 +5505,36 @@ def _sse(obj) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-async def openai_stream(body: dict, keyinfo: dict):
-    msgs = body.get("messages") or []
-    def _text_content(value) -> str:
-        """Normalize OpenAI string and multimodal content into Arena text."""
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            parts = []
-            for item in value:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict) and item.get("type") in ("text", "input_text"):
-                    text = item.get("text", "")
-                    if isinstance(text, str):
-                        parts.append(text)
-            return "\n".join(p for p in parts if p)
-        if isinstance(value, dict):
-            text = value.get("text") or value.get("content") or ""
-            return text if isinstance(text, str) else ""
-        return ""
+def _openai_text_content(value) -> str:
+    """Normalize OpenAI string and multipart content without logging content."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") in ("text", "input_text"):
+                text = item.get("text", "")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        text = value.get("text") or value.get("content") or ""
+        return text if isinstance(text, str) else ""
+    return ""
 
-    user_msgs = [_text_content(m.get("content", "")) for m in msgs
-                 if isinstance(m, dict) and m.get("role") == "user"]
-    prompt = user_msgs[-1] if user_msgs else ""
+
+def _last_openai_user_prompt(body: dict) -> str:
+    messages = body.get("messages") or []
+    prompts = [_openai_text_content(message.get("content", ""))
+               for message in messages
+               if isinstance(message, dict) and message.get("role") == "user"]
+    return prompts[-1] if prompts else ""
+
+
+async def openai_stream(body: dict, keyinfo: dict):
+    prompt = _last_openai_user_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
     model = body.get("model", "auto")
@@ -5570,10 +5578,14 @@ async def chat_completions(request: Request):
     await _require_key(request)
     body = await request.json()
     if not body.get("stream", True):
+        prompt = _last_openai_user_prompt(body)
+        if not prompt:
+            raise HTTPException(status_code=400, detail="no user message")
         out = {"id": "chatcmpl-" + uuid7()[:23], "object": "chat.completion", "created": int(time.time()),
                "model": body.get("model", "auto"), "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]}
         acc = ""
-        async for kind, payload in run_turn(body.get("chat_id", "api"), body.get("messages", [{}])[-1].get("content", ""), body.get("model", "auto")):
+        async for kind, payload in run_turn(body.get("chat_id") or ("api-" + uuid7()), prompt,
+                                            body.get("model", "auto"), attachments=body.get("attachments")):
             if kind == "content":
                 acc += payload
             elif kind == "error":
