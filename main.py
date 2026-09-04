@@ -9,6 +9,8 @@ import re, secrets, socket, struct, subprocess, threading, time, uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote, urlparse, quote, quote_plus
+from io import BytesIO
+import shutil
 
 try:
     from playwright.async_api import async_playwright
@@ -19,12 +21,18 @@ try:
 except ImportError:
     AsyncCamoufox = None
 
-_SOLVER_IMPORT_ERR = ""
 try:
-    from recaptcha_solver import get_solver
-except ImportError as _solver_e:
-    get_solver = None
-    _SOLVER_IMPORT_ERR = str(_solver_e)
+    import numpy as np
+except ImportError:
+    np = None
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
 
 # legacy global keeper UA: chrome131 on Windows — matches curl_cffi impersonate
 # default so cf_clearance (UA+IP-bound) stays coherent for persona-less jars.
@@ -223,7 +231,373 @@ class FileLock:
         return wrapped
 
 
+# ────────────────────── module: recaptcha_vision.py ─────────────────────────
+
+# ============================================================
+# v2 VISION SOLVER — local ONNX neural inference engine for visual
+# reCAPTCHA image challenges (type.onnx for 3x3/individual tiles,
+# grid.onnx for 4x4 challenges). Auto-creates models directory
+# and copies from root if needed.
+# ============================================================
+
+DEFAULT_GRID_META = {
+    "schema_version": 1,
+    "format": "selected16",
+    "task": "multi_type_grid16",
+    "model_name": "efficientnet_b1",
+    "image_size": 240,
+    "output": "logits_by_type",
+    "n_types": 11,
+    "label_types": [
+        "bicycles", "buses", "chimney", "crosswalks", "hydrants",
+        "motorcycles", "parkingmeter", "stairs", "taxi", "tractors", "trafficlights"
+    ],
+    "type_to_index": {
+        "bicycles": 0, "buses": 1, "chimney": 2, "crosswalks": 3, "hydrants": 4,
+        "motorcycles": 5, "parkingmeter": 6, "stairs": 7, "taxi": 8, "tractors": 9,
+        "trafficlights": 10
+    },
+    "thresholds_by_type": {
+        "bicycles": [0.968, 0.78, 0.858, 0.982, 0.679, 0.657, 0.552, 0.905, 0.619, 0.637, 0.598, 0.633, 0.819, 0.859, 0.645, 0.784],
+        "buses": [0.925, 0.872, 0.708, 0.894, 0.529, 0.701, 0.123, 0.802, 0.783, 0.614, 0.35, 0.807, 0.863, 0.839, 0.689, 0.642],
+        "chimney": [0.916, 0.729, 0.827, 0.808, 0.917, 0.69, 0.556, 0.922, 0.837, 0.702, 0.812, 0.747, 0.977, 0.944, 0.872, 0.966],
+        "crosswalks": [0.966, 0.53, 0.966, 0.856, 0.766, 0.583, 0.485, 0.748, 0.639, 0.858, 0.683, 0.799, 0.928, 0.732, 0.767, 0.793],
+        "hydrants": [0.656, 0.435, 0.686, 0.88, 0.691, 0.56, 0.433, 0.497, 0.48, 0.66, 0.401, 0.428, 0.745, 0.45, 0.608, 0.581],
+        "motorcycles": [0.923, 0.728, 0.869, 0.74, 0.712, 0.679, 0.571, 0.674, 0.899, 0.713, 0.515, 0.727, 0.751, 0.81, 0.361, 0.573],
+        "parkingmeter": [0.778, 0.97, 0.882, 0.926, 0.863, 0.85, 0.866, 0.855, 0.928, 0.555, 0.535, 0.951, 0.94, 0.466, 0.769, 0.941],
+        "stairs": [0.904, 0.767, 0.729, 0.971, 0.476, 0.474, 0.577, 0.755, 0.526, 0.591, 0.702, 0.873, 0.893, 0.772, 0.553, 0.842],
+        "taxi": [0.935, 0.633, 0.725, 0.897, 0.578, 0.403, 0.418, 0.58, 0.689, 0.547, 0.435, 0.501, 0.678, 0.588, 0.209, 0.65],
+        "tractors": [0.916, 0.759, 0.713, 0.863, 0.798, 0.304, 0.298, 0.574, 0.57, 0.194, 0.587, 0.617, 0.708, 0.587, 0.374, 0.34],
+        "trafficlights": [0.913, 0.846, 0.827, 0.913, 0.684, 0.533, 0.532, 0.873, 0.713, 0.506, 0.725, 0.79, 0.884, 0.827, 0.904, 0.805]
+    }
+}
+
+RECAPTCHA_THR = {
+    "type": {
+        "default": 0.50,
+        "hydrants": 0.139,
+        "bridges": 0.191,
+        "boats": 0.047,
+        "cars": 0.994,
+        "crosswalks": 0.136,
+        "taxi": 0.862,
+        "bicycles": 0.065,
+        "trafficlights": 0.137,
+        "motorcycles": 0.154,
+        "stairs": 0.075,
+        "mountains": 0.061,
+        "tractors": 0.015,
+        "buses": 0.618,
+        "palm": 0.01,
+        "parkingmeter": 0.001,
+        "chimney": 0.006,
+    }
+}
+
+RECAPTCHA_TYPE_INDEX = {
+    "boats": 0, "motorcycles": 1, "palm": 2, "parkingmeter": 3, "stairs": 4,
+    "taxi": 5, "tractors": 6, "bicycles": 7, "cars": 8, "hydrants": 9,
+    "crosswalks": 10, "buses": 11, "trafficlights": 12, "bridges": 13,
+    "chimney": 14, "mountains": 15,
+}
+
+RECAPTCHA_ALIAS = {
+    "fire": "hydrants", "firehydrant": "hydrants", "fire_hydrant": "hydrants", "hydrant": "hydrants",
+    "bicycle": "bicycles", "bike": "bicycles",
+    "boat": "boats",
+    "bridge": "bridges",
+    "bus": "buses",
+    "car": "cars",
+    "chimney": "chimney", "chimneys": "chimney",
+    "crosswalk": "crosswalks", "zebra": "crosswalks", "pedestrian": "crosswalks",
+    "motorcycle": "motorcycles",
+    "mountain": "mountains",
+    "palm": "palm",
+    "parkingmeter": "parkingmeter", "parking": "parkingmeter",
+    "stairs": "stairs", "stair": "stairs",
+    "taxi": "taxi", "taxis": "taxi",
+    "tractors": "tractors", "tractor": "tractors",
+    "traffic": "trafficlights", "trafficlight": "trafficlights", "traffic_light": "trafficlights",
+    "trafficlights": "trafficlights", "traffic_lights": "trafficlights",
+}
+
+RECAPTCHA_KNOWN = set([
+    "bicycles", "boats", "bridges", "buses", "cars", "chimney", "crosswalks", "hydrants",
+    "motorcycles", "mountains", "palm", "parkingmeter", "stairs", "taxi", "tractors",
+    "trafficlights"
+])
+
+
+def extract_captcha_label(txt: str) -> str:
+    txt = str(txt or "").lower().strip()
+    match = re.search(r'with\s+(?:an?\s+)?([a-z_]+)', txt)
+    if match:
+        return match.group(1)
+    return txt.split()[-1] if txt.split() else ""
+
+
+def normalize_captcha_label(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    raw = raw.lower().strip()
+    basic = RECAPTCHA_ALIAS.get(raw, raw if raw.endswith('s') else raw + 's')
+    return basic if basic in RECAPTCHA_KNOWN else None
+
+
+# Backward-compatible aliases for recaptcha_solver / server.py
+THR = RECAPTCHA_THR
+TYPE_INDEX = RECAPTCHA_TYPE_INDEX
+ALIAS = RECAPTCHA_ALIAS
+KNOWN = RECAPTCHA_KNOWN
+extract_label = extract_captcha_label
+normalize_label = normalize_captcha_label
+
+
+def sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def ensure_models_dir(base_dir: Optional[str] = None) -> str:
+    """Ensure the models directory exists. If model files (type.onnx, grid.onnx,
+    grid.meta.json) are found in the root directory rather than /models/, copy
+    them to /models/. If grid.meta.json is missing, generate it automatically."""
+    base = base_dir or BASE_DIR or "."
+    models_dir = os.environ.get("BRIDGENA_CAPTCHA_MODELS") or os.path.join(base, "models")
+    try:
+        os.makedirs(models_dir, exist_ok=True)
+    except Exception as e:
+        log("WARN", f"ensure_models_dir: could not create directory '{models_dir}': {e}")
+        return models_dir
+
+    for fn in ("type.onnx", "grid.onnx", "grid.meta.json"):
+        dst = os.path.join(models_dir, fn)
+        src_root = os.path.join(base, fn)
+        if not os.path.exists(dst):
+            if os.path.exists(src_root):
+                try:
+                    shutil.copy2(src_root, dst)
+                    log("OK", f"Copied model asset '{fn}' from root to '{models_dir}'")
+                except Exception as ce:
+                    log("WARN", f"Failed copying '{fn}' from root to '{models_dir}': {ce}")
+            elif fn == "grid.meta.json":
+                try:
+                    with open(dst, "w", encoding="utf-8") as f:
+                        json.dump(DEFAULT_GRID_META, f, indent=2)
+                    log("OK", f"Generated default '{dst}'")
+                except Exception as ge:
+                    log("WARN", f"Failed generating '{dst}': {ge}")
+    return models_dir
+
+
+class RecaptchaSolver:
+    """Local ONNX neural solver for visual reCAPTCHA challenges."""
+
+    def __init__(self, models_dir: Optional[str] = None):
+        self.models_dir = ensure_models_dir(models_dir or BASE_DIR)
+        self.type_session = None
+        self.grid_session = None
+        self.grid_meta = None
+
+    def _resolve_file(self, filename: str) -> str:
+        p1 = os.path.join(self.models_dir, filename)
+        if os.path.exists(p1):
+            return p1
+        p2 = os.path.join(BASE_DIR, filename)
+        if os.path.exists(p2):
+            return p2
+        return p1
+
+    def available(self) -> bool:
+        """Return True if ONNX Runtime, Pillow, and neural models are present."""
+        if ort is None or Image is None or np is None:
+            return False
+        has_type = os.path.exists(self._resolve_file("type.onnx"))
+        has_grid = os.path.exists(self._resolve_file("grid.onnx"))
+        return bool(has_type and has_grid)
+
+    def _load_type_session(self):
+        if self.type_session is None:
+            if ort is None:
+                raise RuntimeError("onnxruntime is not installed")
+            model_path = self._resolve_file("type.onnx")
+            self.type_session = ort.InferenceSession(model_path)
+        return self.type_session
+
+    def _load_grid_session(self):
+        if self.grid_session is None:
+            if ort is None:
+                raise RuntimeError("onnxruntime is not installed")
+            model_path = self._resolve_file("grid.onnx")
+            self.grid_session = ort.InferenceSession(model_path)
+        return self.grid_session
+
+    def _load_grid_meta(self) -> dict:
+        if self.grid_meta is None:
+            meta_path = self._resolve_file("grid.meta.json")
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        self.grid_meta = json.load(f)
+                except Exception:
+                    self.grid_meta = DEFAULT_GRID_META
+            else:
+                self.grid_meta = DEFAULT_GRID_META
+        return self.grid_meta
+
+    def _img_to_tensor(self, img: Any, size: int):
+        img = img.convert("RGB").resize((size, size))
+        data = np.array(img, dtype=np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        data = (data - mean) / std
+        data = np.transpose(data, (2, 0, 1))
+        return np.expand_dims(data, axis=0)
+
+    def _split_3x3(self, base_img: Any) -> list:
+        tiles = []
+        width, height = base_img.size
+        tile_w, tile_h = width // 3, height // 3
+        for r in range(3):
+            for c in range(3):
+                left = c * tile_w
+                upper = r * tile_h
+                tile = base_img.crop((left, upper, left + tile_w, upper + tile_h))
+                tiles.append(tile)
+        return tiles
+
+    def _load_image(self, source: Any) -> Any:
+        if Image is None:
+            raise RuntimeError("Pillow is not installed")
+        if isinstance(source, Image.Image):
+            return source
+        if isinstance(source, bytes):
+            return Image.open(BytesIO(source))
+        if isinstance(source, str):
+            if source.startswith("data:image/"):
+                base64_str = source.split(",", 1)[1] if "," in source else source
+                return Image.open(BytesIO(base64.b64decode(base64_str)))
+            if source.startswith("http://") or source.startswith("https://"):
+                import urllib.request
+                req = urllib.request.Request(source, headers={"User-Agent": KEEPER_UA})
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    return Image.open(BytesIO(resp.read()))
+            if os.path.exists(source):
+                return Image.open(source)
+            if len(source) > 100:
+                try:
+                    return Image.open(BytesIO(base64.b64decode(source)))
+                except Exception:
+                    pass
+        raise ValueError(f"Unsupported image source: {type(source)}")
+
+    def recognize(self, task: str, image_sources: list, grid: Optional[str] = "3x3", randomize_20pct: bool = False) -> dict:
+        """Classify visual challenge tiles or grid against the target task prompt."""
+        if not task or not image_sources:
+            return {"error": "bad_payload"}
+
+        raw = extract_captcha_label(task)
+        label = normalize_captcha_label(raw)
+        if not label:
+            return {"error": f"unsupported_label:{raw}"}
+
+        variant = "grid" if grid == "4x4" else "type"
+
+        try:
+            if variant == "grid":
+                base = self._load_image(image_sources[0])
+                meta = self._load_grid_meta()
+                grid_size = meta.get("image_size", 240)
+                tensors = [self._img_to_tensor(base, grid_size)]
+            elif grid == "3x3":
+                base = self._load_image(image_sources[0])
+                tiles = self._split_3x3(base)
+                tensors = [self._img_to_tensor(tile, 100) for tile in tiles]
+            else:
+                im_objs = [self._load_image(src) for src in image_sources]
+                tensors = [self._img_to_tensor(im, 100) for im in im_objs]
+
+            if variant == "type":
+                thr = RECAPTCHA_THR["type"].get(label, RECAPTCHA_THR["type"]["default"])
+                idx = RECAPTCHA_TYPE_INDEX.get(label)
+                if idx is None:
+                    return {"error": f"unknown_class_in_type_model:{label}"}
+
+                sess = self._load_type_session()
+                input_name = sess.get_inputs()[0].name
+                outs = [sess.run(None, {input_name: t})[0] for t in tensors]
+                probs = [sigmoid(float(o[0][idx])) for o in outs]
+                data = [p > thr for p in probs]
+                return {
+                    "data": data,
+                    "indices": [i for i, v in enumerate(data) if v],
+                    "label": label,
+                    "probs": probs
+                }
+
+            # 4x4 Grid inference
+            grid_meta = self._load_grid_meta()
+            class_idx = grid_meta.get("type_to_index", {}).get(label)
+            if class_idx is None:
+                return {"error": f"unknown_class_in_grid_model:{label}"}
+
+            thr16 = grid_meta.get("thresholds_by_type", {}).get(label)
+            if not isinstance(thr16, list) or len(thr16) != 16:
+                return {"error": f"bad_thresholds_for_grid_model:{label}"}
+
+            sess = self._load_grid_session()
+            input_name = sess.get_inputs()[0].name
+            out = sess.run(None, {input_name: tensors[0]})[0]
+            logits = out.flatten()
+            HW = 16
+            base_idx = class_idx * HW
+            probs16 = [sigmoid(float(logits[base_idx + i])) for i in range(HW)]
+            data = [probs16[i] > (thr16[i] if thr16[i] is not None else 0.5) for i in range(16)]
+
+            if randomize_20pct and random.random() < 0.20:
+                new_data = []
+                for i, v in enumerate(data):
+                    p = probs16[i]
+                    if not v:
+                        new_data.append(random.random() < p)
+                    else:
+                        flip_prob = (1 - p) / 2
+                        new_data.append(not (random.random() < flip_prob))
+                data = new_data
+
+            if grid == "4x4":
+                count = sum(1 for v in data if v)
+                first_idx = next((i for i, v in enumerate(data) if v), -1)
+                if count == 1:
+                    best_idx, best_p = -1, -float('inf')
+                    for i, p in enumerate(probs16):
+                        if i != first_idx and math.isfinite(p) and p > best_p:
+                            best_p, best_idx = p, i
+                    if best_idx != -1:
+                        data[best_idx] = True
+
+            return {
+                "data": data,
+                "indices": [i for i, v in enumerate(data) if v],
+                "label": label,
+                "probs": probs16
+            }
+        except Exception as exc:
+            return {"error": f"inference_exception:{type(exc).__name__}:{exc}"}
+
+
+_global_solver: Optional[RecaptchaSolver] = None
+
+
+def get_solver(models_dir: Optional[str] = None) -> RecaptchaSolver:
+    """Return the global singleton RecaptchaSolver instance."""
+    global _global_solver
+    if _global_solver is None:
+        _global_solver = RecaptchaSolver(models_dir=models_dir)
+    return _global_solver
+
+
 def model_name(m) -> str:
+
     """Arena catalog entries carry publicName/id; OpenAI surface needs one canonical name."""
     if isinstance(m, str):
         return m
@@ -2198,20 +2572,15 @@ class KeeperSession:
             pass
         return False
 
-    async def solve_recaptcha_image_challenge(self) -> bool:
+    async def solve_recaptcha_image_challenge(self, max_rounds: int = 4) -> bool:
         """Fallback: solve a visible reCAPTCHA image challenge with ONNX models.
 
         Primary path is reCAPTCHA v3 token (no challenge UI). This only runs when
-        an image grid challenge is already on screen. Requires models/type.onnx
-        and models/grid.onnx (or BRIDGENA_CAPTCHA_MODELS dir).
+        an image grid challenge is already on screen or after v2 escalation.
         """
-        if get_solver is None:
-            log("WARN", f"[{self.name}] image solver off: {_SOLVER_IMPORT_ERR or 'recaptcha_solver import failed'} "
-                         "— the file must sit next to main.py and export get_solver")
-            return False
         solver = get_solver()
-        if not solver.available():
-            log("WARN", f"[{self.name}] ONNX captcha models not available — skip image solve")
+        if not solver or not solver.available():
+            log("WARN", f"[{self.name}] ONNX captcha solver not available — skip image solve")
             return False
         page = self.page
         if not page or page.is_closed():
@@ -2219,126 +2588,181 @@ class KeeperSession:
 
         try:
             self._set_step("Solving reCAPTCHA image challenge (ONNX fallback)...")
-            # Find the challenge iframe (bframe)
-            challenge_frame = None
-            for frame in page.frames:
-                u = (frame.url or "").lower()
-                if "recaptcha" in u and ("bframe" in u or "anchor" not in u):
-                    challenge_frame = frame
-                    break
-            if challenge_frame is None:
-                # Try clicking the anchor checkbox first to open challenge
-                for frame in page.frames:
-                    u = (frame.url or "").lower()
-                    if "recaptcha" in u and "anchor" in u:
-                        try:
-                            cb = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border")
-                            if await cb.count() > 0:
-                                await cb.first.click(timeout=3000)
-                                await asyncio.sleep(2)
-                        except Exception:
-                            pass
+            solved_any = False
+
+            for round_idx in range(max_rounds):
+                # 1. Check if already solved (aria-checked or response textarea filled)
+                for f in page.frames:
+                    try:
+                        checked = await f.locator("#recaptcha-anchor[aria-checked='true'], .recaptcha-checkbox[aria-checked='true']").count()
+                        if checked > 0:
+                            log("OK", f"[{self.name}] reCAPTCHA anchor verified (aria-checked=true)")
+                            self._set_step("reCAPTCHA challenge solved")
+                            return True
+                    except Exception:
+                        pass
+
+                tok_check = await page.evaluate("""() => {
+                    const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response');
+                    return (el && el.value && el.value.length > 20) ? el.value : null;
+                }""")
+                if tok_check:
+                    log("OK", f"[{self.name}] reCAPTCHA response token present in DOM ({len(tok_check)} chars)")
+                    self._set_step("reCAPTCHA response verified")
+                    return True
+
+                # 2. Find the challenge iframe (bframe)
+                challenge_frame = None
                 for frame in page.frames:
                     u = (frame.url or "").lower()
                     if "recaptcha" in u and "bframe" in u:
                         challenge_frame = frame
                         break
-            if challenge_frame is None:
-                return False
 
-            # Extract task text
-            task = ""
-            for sel in [".rc-imageselect-desc-text", ".rc-imageselect-desc", "strong"]:
-                try:
-                    loc = challenge_frame.locator(sel).first
-                    if await loc.count() > 0:
-                        task = (await loc.inner_text()).strip()
-                        if task:
+                if challenge_frame is None:
+                    # Try clicking the anchor checkbox to reveal/mount challenge
+                    for frame in page.frames:
+                        u = (frame.url or "").lower()
+                        if "recaptcha" in u and ("anchor" in u or "bframe" not in u):
+                            try:
+                                cb = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border")
+                                if await cb.count() > 0 and await cb.first.is_visible():
+                                    await cb.first.click(timeout=3000)
+                                    await asyncio.sleep(2.0)
+                                    break
+                            except Exception:
+                                pass
+                    for frame in page.frames:
+                        u = (frame.url or "").lower()
+                        if "recaptcha" in u and "bframe" in u:
+                            challenge_frame = frame
                             break
-                except Exception:
-                    continue
-            if not task:
-                return False
 
-            # Detect grid size and grab image(s)
-            tile_table = challenge_frame.locator("table.rc-imageselect-table-33, table.rc-imageselect-table-44, table.rc-imageselect-table")
-            grid = "3x3"
-            try:
-                if await challenge_frame.locator("table.rc-imageselect-table-44").count() > 0:
-                    grid = "4x4"
-                elif await challenge_frame.locator("table.rc-imageselect-table-33").count() > 0:
-                    grid = "3x3"
-            except Exception:
-                pass
+                if challenge_frame is None:
+                    if round_idx == 0:
+                        log("WARN", f"[{self.name}] No reCAPTCHA challenge bframe found on page")
+                    break
 
-            # Prefer full challenge image if present
-            image_sources = []
-            try:
-                img = challenge_frame.locator(".rc-image-tile-wrapper img, img.rc-image-tile-33, img.rc-image-tile-44").first
-                if await img.count() > 0:
-                    src = await img.get_attribute("src")
-                    if src:
-                        image_sources = [src]
-            except Exception:
-                pass
+                await asyncio.sleep(1.0)
 
-            if not image_sources:
-                # Per-tile images
-                tiles = challenge_frame.locator("img.rc-image-tile-33, img.rc-image-tile-44, td img")
-                n = await tiles.count()
-                for i in range(min(n, 16)):
+                # 3. Extract task description
+                task = ""
+                for sel in [".rc-imageselect-desc-wrapper", ".rc-imageselect-desc-text", ".rc-imageselect-desc", "strong"]:
                     try:
-                        src = await tiles.nth(i).get_attribute("src")
-                        if src:
-                            image_sources.append(src)
+                        loc = challenge_frame.locator(sel).first
+                        if await loc.count() > 0:
+                            task = (await loc.inner_text()).strip()
+                            if task:
+                                break
+                    except Exception:
+                        continue
+
+                if not task:
+                    if solved_any:
+                        return True
+                    break
+
+                # 4. Detect grid size
+                grid = "3x3"
+                try:
+                    if await challenge_frame.locator("table.rc-imageselect-table-44").count() > 0:
+                        grid = "4x4"
+                    elif await challenge_frame.locator("table.rc-imageselect-table-33").count() > 0:
+                        grid = "3x3"
+                except Exception:
+                    pass
+
+                # 5. Extract image: prefer direct element screenshot for maximum reliability
+                image_sources = []
+                try:
+                    target_img = challenge_frame.locator(".rc-image-tile-wrapper img, #rc-imageselect-target img, table.rc-imageselect-table-33, table.rc-imageselect-table-44").first
+                    if await target_img.count() > 0 and await target_img.is_visible():
+                        img_bytes = await target_img.screenshot()
+                        if img_bytes and len(img_bytes) > 100:
+                            image_sources = [img_bytes]
+                except Exception as ie:
+                    log("WARN", f"[{self.name}] Screenshot tile extraction failed: {ie}")
+
+                if not image_sources:
+                    try:
+                        img = challenge_frame.locator(".rc-image-tile-wrapper img, img.rc-image-tile-33, img.rc-image-tile-44").first
+                        if await img.count() > 0:
+                            src = await img.get_attribute("src")
+                            if src:
+                                image_sources = [src]
                     except Exception:
                         pass
 
-            if not image_sources:
-                log("WARN", f"[{self.name}] Captcha challenge found but no images")
-                return False
-
-            result = solver.recognize(task, image_sources, grid)
-            if result.get("error"):
-                log("WARN", f"[{self.name}] Solver error: {result['error']}")
-                return False
-
-            clicks = result.get("data") or []
-            # Click matching tiles
-            cells = challenge_frame.locator("td, .rc-imageselect-tile")
-            cell_count = await cells.count()
-            clicked = 0
-            for i, should in enumerate(clicks):
-                if not should or i >= cell_count:
-                    continue
-                try:
-                    await cells.nth(i).click(timeout=2000)
-                    clicked += 1
-                    await asyncio.sleep(random.uniform(0.15, 0.35))
-                except Exception:
-                    continue
-
-            await asyncio.sleep(0.5)
-            # Verify / Next
-            for sel in ["#recaptcha-verify-button", ".rc-button-default", "button"]:
-                try:
-                    btn = challenge_frame.locator(sel).first
-                    if await btn.count() > 0 and await btn.is_visible():
-                        txt = ""
+                if not image_sources:
+                    # Per-tile images fallback
+                    tiles = challenge_frame.locator("img.rc-image-tile-33, img.rc-image-tile-44, td img")
+                    n = await tiles.count()
+                    for i in range(min(n, 16)):
                         try:
-                            txt = (await btn.inner_text()).lower()
+                            src = await tiles.nth(i).get_attribute("src")
+                            if src:
+                                image_sources.append(src)
                         except Exception:
                             pass
-                        if sel.startswith("#") or "verify" in txt or "next" in txt or not txt:
-                            await btn.click(timeout=3000)
-                            break
-                except Exception:
-                    continue
 
-            await asyncio.sleep(2)
-            log("OK", f"[{self.name}] Image captcha solved (task={task[:40]!r}, clicks={clicked}, grid={grid})")
-            self._set_step(f"Captcha solved ({clicked} tiles)")
-            return clicked > 0
+                if not image_sources:
+                    log("WARN", f"[{self.name}] Captcha challenge found but could not extract images (round {round_idx+1})")
+                    break
+
+                # 6. Run ONNX recognition
+                result = solver.recognize(task, image_sources, grid, randomize_20pct=False)
+                if result.get("error"):
+                    log("WARN", f"[{self.name}] Solver error: {result['error']}")
+                    break
+
+                clicks = result.get("data") or []
+                cells = challenge_frame.locator(".rc-imageselect-tile, td.rc-imageselect-tile, table tr td")
+                cell_count = await cells.count()
+                clicked = 0
+                for i, should in enumerate(clicks):
+                    if not should or i >= cell_count:
+                        continue
+                    try:
+                        await cells.nth(i).click(timeout=2000)
+                        clicked += 1
+                        await asyncio.sleep(random.uniform(0.18, 0.32))
+                    except Exception:
+                        continue
+
+                await asyncio.sleep(0.6)
+                # 7. Click Verify / Next button
+                for sel in ["#recaptcha-verify-button", ".rc-button-default", "button#recaptcha-verify-button", "button"]:
+                    try:
+                        btn = challenge_frame.locator(sel).first
+                        if await btn.count() > 0 and await btn.is_visible():
+                            txt = ""
+                            try:
+                                txt = (await btn.inner_text()).lower()
+                            except Exception:
+                                pass
+                            if sel.startswith("#") or "verify" in txt or "next" in txt or not txt:
+                                await btn.click(timeout=3000)
+                                break
+                    except Exception:
+                        continue
+
+                solved_any = True
+                await asyncio.sleep(2.0)
+                log("OK", f"[{self.name}] Image captcha round {round_idx+1} answered (task={task[:35]!r}, clicks={clicked}, grid={grid})")
+                self._set_step(f"Captcha round {round_idx+1} submitted ({clicked} tiles)")
+
+            # Final check for token / aria-checked
+            for f in page.frames:
+                try:
+                    if await f.locator("#recaptcha-anchor[aria-checked='true']").count() > 0:
+                        return True
+                except Exception:
+                    pass
+            tok_final = await page.evaluate("""() => {
+                const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response');
+                return (el && el.value && el.value.length > 20) ? el.value : null;
+            }""")
+            return bool(tok_final or solved_any)
         except Exception as e:
             log("WARN", f"[{self.name}] solve_recaptcha_image_challenge: {type(e).__name__}: {e}")
             return False
@@ -4008,13 +4432,12 @@ RC_MINT_JS = r"""async (OPTS) => {
             }"""
 
 RC_V2_WIDGET_JS = """async (SITE) => {
-  // mount a V2 checkbox under the escalation sitekey in a detached corner —
-  // this mirrors what arena's own client does after a validation failure
+  // mount a V2 checkbox under the escalation sitekey in the viewport corner
   try {
     if (!document.getElementById('bgn-v2-host')) {
       const host = document.createElement('div');
       host.id = 'bgn-v2-host';
-      host.style.cssText = 'position:fixed;left:-320px;top:10px;width:304px;height:78px;z-index:2147483647;opacity:0.99';
+      host.style.cssText = 'position:fixed;bottom:12px;right:12px;width:304px;height:78px;z-index:2147483647;opacity:1;background:#fff;border-radius:4px;box-shadow:0 0 10px rgba(0,0,0,0.15);';
       document.body.appendChild(host);
       const api = (window.grecaptcha && window.grecaptcha.enterprise) ? grecaptcha.enterprise : grecaptcha;
       window.__bgnV2 = api.render(host, {sitekey: SITE, size: 'normal',
@@ -4062,7 +4485,8 @@ def _find_session(jar_id=None):
 
 
 async def mint_v3(jar_id=None):
-    """Primary token: read/execute on a live keeper page. None + loud WARN."""
+    """Primary token: evaluate grecaptcha v3 on a live keeper page. If v3 bypass
+    fails or produces no token, automatically falls back to visual image challenge solving."""
     global _mint_last_no_session
     sid, s = _find_session(jar_id)
     if not s:
@@ -4081,58 +4505,52 @@ async def mint_v3(jar_id=None):
                 await s.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
                 await s.page.wait_for_load_state("domcontentloaded")
                 s.last_nav = time.time()
-            # Arena hydrates the enterprise widget asynchronously after the
-            # document is ready. Minting in the same second as keeper startup
-            # used to observe no window.grecaptcha and fail prematurely.
+
+            v3_token = None
             try:
                 await s.page.wait_for_function(
                     "() => !!(window.grecaptcha && (window.grecaptcha.enterprise || window.grecaptcha.execute))",
-                    timeout=15000,
+                    timeout=8000,
                 )
-            except Exception:
-                try:
-                    diag = await s.page.evaluate(r"""() => ({
-                        url: location.href,
-                        title: document.title,
-                        ready: document.readyState,
-                        scripts: [...document.scripts].map(x => x.src).filter(x =>
-                          /recaptcha|google\.com\/recaptcha|gstatic\.com\/recaptcha/i.test(x)).slice(0, 6)
-                    })""")
-                except Exception as diag_e:
-                    diag = {"diagnostic": f"{type(diag_e).__name__}: {diag_e}"}
-                log("WARN", f"recaptcha runtime absent after 15s: {redact(json.dumps(diag, ensure_ascii=False))[:700]}")
-                return None
-            res = await s.page.evaluate(RC_MINT_JS, {
-                "fallbackSitekey": ARENA_RECAPTCHA_SITEKEY,
-                "allowConfiguredFallback": ALLOW_CONFIGURED_RECAPTCHA_FALLBACK,
-                "action": RECAPTCHA_ACTION,
-            })
-            if isinstance(res, str) and len(res) > 20:
-                return res
-            if isinstance(res, dict) and isinstance(res.get("token"), str) and len(res["token"]) > 20:
-                log("OK", "recaptcha token minted via " + str(res.get("source", "unknown"))
-                    + " · key " + str(res.get("keyHint", "unknown"))
-                    + " · action " + str(res.get("action", RECAPTCHA_ACTION)))
-                return res["token"]
-            why = res.get("err") if isinstance(res, dict) else "evaluate returned nothing"
-            detail = (" · source " + str(res.get("source", "unknown"))
-                      + " · key " + str(res.get("keyHint", "unknown"))
-                      + " · action " + str(res.get("action", RECAPTCHA_ACTION))) if isinstance(res, dict) else ""
-            log("WARN", f"recaptcha token: {why}{detail}")
+                res = await s.page.evaluate(RC_MINT_JS, {
+                    "fallbackSitekey": ARENA_RECAPTCHA_SITEKEY,
+                    "allowConfiguredFallback": True,
+                    "action": RECAPTCHA_ACTION,
+                })
+                if isinstance(res, str) and len(res) > 20:
+                    v3_token = res
+                elif isinstance(res, dict) and isinstance(res.get("token"), str) and len(res["token"]) > 20:
+                    log("OK", "recaptcha v3 token minted via " + str(res.get("source", "unknown"))
+                        + " · key " + str(res.get("keyHint", "unknown"))
+                        + " · action " + str(res.get("action", RECAPTCHA_ACTION)))
+                    v3_token = res["token"]
+                else:
+                    why = res.get("err") if isinstance(res, dict) else "evaluate returned nothing"
+                    log("WARN", f"recaptcha v3 bypass unavailable ({why}) — triggering image solver fallback")
+            except Exception as v3_err:
+                log("WARN", f"recaptcha v3 evaluate timed out/failed: {v3_err} — triggering image solver fallback")
 
-            if isinstance(why, str) and (
-                "no grecaptcha" in why.lower() or "no valid site key" in why.lower()
-            ):
-                return None
+            if v3_token:
+                return v3_token
 
-            # image challenge fallback on that same locked page
+            # V3 bypass failed — FALLBACK to visible image challenge / V2 escalation
+            log("INFO", f"[{sid}] reCAPTCHA v3 bypass did not produce a token; falling back to challenge solver")
+
+            # 1. Try solving any challenge already open in the keeper session
             if hasattr(s, "solve_recaptcha_image_challenge") and await s.solve_recaptcha_image_challenge():
                 tok = await s.page.evaluate("""() => {
                     const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response');
-                    return (el && el.value) ? el.value : null;
+                    return (el && el.value && el.value.length > 20) ? el.value : null;
                 }""")
                 if tok:
+                    log("OK", f"recaptcha token harvested from live challenge fallback ({len(tok)} chars)")
                     return tok
+
+            # 2. Trigger V2 escalation widget & solve
+            esc_token = await mint_v2_escalation(jar_id=sid, settle_s=35.0)
+            if esc_token:
+                return esc_token
+
     except Exception as e:
         log("WARN", f"recaptcha token: browser transaction failed: {type(e).__name__}: {e}")
     return None
@@ -4150,32 +4568,41 @@ async def mint_v2_escalation(jar_id=None, settle_s: float = 45.0):
         mount = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_V2_SITEKEY)
         if not (isinstance(mount, dict) and mount.get("ok")):
             log("WARN", f"recaptcha token: V2 mount failed: {(mount or {}).get('err') if isinstance(mount, dict) else mount}")
-            return None
-        # click the checkbox / run the image challenge via the keeper solver
+            mount2 = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_SITEKEY)
+            if not (isinstance(mount2, dict) and mount2.get("ok")):
+                return None
+
+        await asyncio.sleep(1.0)
+        # click the checkbox across all frames
         clicked = False
-        try:
-            for frame in s.page.frames:
-                u = (frame.url or "").lower()
-                if "recaptcha" in u and "bframe" in u:
-                    cb = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border")
-                    if await cb.count() > 0:
-                        await cb.first.click(timeout=2500)
-                        clicked = True
-                        break
-        except Exception:
-            pass
-        await asyncio.sleep(1.2)
+        for frame in s.page.frames:
+            try:
+                cb = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border")
+                if await cb.count() > 0 and await cb.first.is_visible():
+                    await cb.first.click(timeout=3000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        await asyncio.sleep(1.5)
+        # run the image challenge via the keeper solver
         if hasattr(s, "solve_recaptcha_image_challenge"):
             await s.solve_recaptcha_image_challenge()
+
         deadline = time.time() + settle_s
         while time.time() < deadline:
             tok = await s.page.evaluate(RC_V2_READ_JS)
+            if not tok:
+                tok = await s.page.evaluate("""() => {
+                    const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response');
+                    return (el && el.value && el.value.length > 20) ? el.value : null;
+                }""")
             if tok:
                 log("OK", f"recaptcha V2 token harvested ({len(tok)} chars)")
                 return tok
             await asyncio.sleep(1.0)
-        log("WARN", "recaptcha token: V2 challenge did not complete in window "
-                    f"(clicked checkbox={clicked}) — models/onnxruntime present?")
+        log("WARN", f"recaptcha token: V2 challenge did not complete in window (clicked checkbox={clicked})")
         return None
     except Exception as e:
         log("WARN", f"recaptcha token: V2 escalation error: {type(e).__name__}: {e}")
@@ -4519,9 +4946,18 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
 
         tok = await mint_v3(jar.get("id"))
         if not tok:
-            yield ("error", "503: The same-exit keeper is live but could not mint a reCAPTCHA token. No request was sent to Arena; inspect the keeper status/screenshot and retry.")
+            log("INFO", f"[{jar.get('name')}] Minting v3 token unavailable — attempting v2 escalation challenge fallback")
+            tok = await mint_v2_escalation(jar.get("id"), settle_s=35.0)
+            if tok:
+                _attach_v2(base, tok)
+        else:
+            if not base.get("recaptchaV2Token"):
+                _attach_v3(base, tok)
+
+        if not tok and not base.get("recaptchaV2Token") and not base.get("recaptchaV3Token"):
+            yield ("error", "503: The same-exit keeper is live but could not mint or solve a reCAPTCHA token. "
+                            "No request was sent to Arena; inspect keeper status/models and retry.")
             return
-        _attach_v3(base, tok)
         url = follow_url or f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
         # Existing Arena conversations are session-bound. Restore the exact exit
         # that created the thread before the normal sticky picker runs.
@@ -4634,7 +5070,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 log("WARN", f"[{jar.get('name')}] browser-origin unavailable ({type(browser_e).__name__}: {browser_e}) — curl fallback")
 
         headers = _headers_for(jar, p, json_body=True)
-        headers["X-Recaptcha-Token"] = tok
+        headers["X-Recaptcha-Token"] = tok or base.get("recaptchaV2Token") or base.get("recaptchaV3Token") or ""
         headers["X-Recaptcha-Action"] = RECAPTCHA_ACTION
         kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
         if proxy:
