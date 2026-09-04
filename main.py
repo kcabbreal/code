@@ -70,7 +70,7 @@ ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
 REQUEST_MAX_ATTEMPTS = max(1, min(3, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "2"))))
 STREAM_TAIL_GRACE_MS = max(1000, min(15000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "5000"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.25-message-envelope")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.26-api-key-console")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -1088,6 +1088,32 @@ def get_config() -> dict:
 
 def save_config(config: dict) -> None:
     atomic_write(CONFIG_FILE, config)
+
+
+def _api_key_hash(raw: str) -> str:
+    return hashlib.sha256(str(raw).encode("utf-8")).hexdigest()
+
+
+def _normalize_api_key_records(config: dict) -> bool:
+    """Migrate legacy plaintext API keys to stable hashed records in-place."""
+    changed = False
+    records = config.setdefault("api_keys", [])
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        raw = record.get("key")
+        if raw and not record.get("key_hash"):
+            record["key_hash"] = _api_key_hash(raw)
+            record["prefix"] = str(raw)[:14]
+            record.pop("key", None)
+            changed = True
+        if not record.get("id"):
+            record["id"] = "key_" + secrets.token_hex(8)
+            changed = True
+        if not record.get("prefix"):
+            record["prefix"] = "sk-void-…"
+            changed = True
+    return changed
 
 def get_models() -> list:
     global _models_cache, _models_cache_time
@@ -5001,6 +5027,7 @@ def page(title: str, body: str, active: str = "", *, raw_js: str = "", wide=Fals
     if active or title:
         items = [("Dashboard", "/dashboard", "dash"), ("Proxy Pool", "/pool", "pool"),
                  ("Accounts", "/jars", "jars"), ("Models", "/models-page", "models"),
+                 ("API Keys", "/api-keys", "keys"),
                  ("Live Chat", "/chat", "chat"), ("Logs", "/logs", "logs")]
         nav = '<div class="rail">' + "".join(
             f'<a href="{href}" class="{"on" if k==active else ""}">{lbl}</a>' for lbl, href, k in items) + "</div>"
@@ -5082,6 +5109,48 @@ async function act(u,method){try{const r=await fetch(u,{method:method||'GET'});t
 function consRefresh(){fetch('/debug-logs/data').then(r=>r.json()).then(d=>{var c=document.getElementById('cons');if(!c)return;
  c.innerHTML=d.map(x=>'<div class="'+(x.lvl||'INFO')+'">'+(x.line||x.message||'')+'</div>').join('');c.scrollTop=c.scrollHeight;}).catch(()=>{})}
 setInterval(consRefresh,4000);""")
+
+
+def api_keys_page(records: list) -> str:
+    rows = "".join(
+        f"<tr><td><b>{esc(record.get('name') or 'Unnamed key')}</b></td>"
+        f"<td class=mono>{esc(record.get('prefix') or 'sk-void-…')}••••••</td>"
+        f"<td>{int(record.get('rpm') or 60)} RPM</td>"
+        f"<td>{time.strftime('%Y-%m-%d %H:%M', time.localtime(record.get('created') or 0)) if record.get('created') else '—'}</td>"
+        f"<td><form method=post action=/delete-key onsubmit=\"return confirm('Revoke this API key?')\">"
+        f"<input type=hidden name=key_id value=\"{esc(record.get('id') or '')}\">"
+        f"<button class='btn sm' type=submit>Revoke</button></form></td></tr>"
+        for record in records if isinstance(record, dict)
+    ) or '<tr><td colspan=5 class=muted>No API keys yet.</td></tr>'
+    return page("API Keys", f"""
+<div class=pagehead><div><h1>API Keys</h1><p>Create credentials for OpenAI-compatible clients. Secrets are displayed once.</p></div></div>
+<div class=split>
+ <div class=card><h3>Create key</h3>
+  <form method=post action=/create-key>
+   <label for=key-name>Name</label><input id=key-name name=name required maxlength=80 placeholder="Windows stream test">
+   <label for=key-rpm>Rate limit</label><input id=key-rpm name=rpm type=number min=1 max=1000 value=60 required>
+   <button class='btn primary' type=submit style='margin-top:16px'>Generate API key</button>
+  </form>
+ </div>
+ <div class=card><h3>Security</h3><p class=muted>Only a SHA-256 verifier and short prefix are stored. Copy a new secret before leaving its confirmation page. Revocation takes effect immediately.</p></div>
+</div>
+<div class=card style='margin-top:16px'><h3>Active keys</h3>
+ <table><thead><tr><th>Name</th><th>Prefix</th><th>Limit</th><th>Created</th><th></th></tr></thead><tbody>{rows}</tbody></table>
+</div>
+""", "keys")
+
+
+def api_key_created_page(name: str, raw_key: str) -> str:
+    token_json = json.dumps(raw_key)
+    return page("API key created", f"""
+<div style='max-width:760px;margin:40px auto'>
+ <div class=card><span class='pill ok'>Created</span><h1 style='margin:16px 0 8px'>Save this key now</h1>
+ <p class=muted>This is the only time the full secret for <b>{esc(name)}</b> will be displayed.</p>
+ <div class=card style='margin-top:18px;background:var(--panel2)'><code id=created-key style='font-size:14px;word-break:break-all'>{esc(raw_key)}</code></div>
+ <div class=row style='margin-top:18px'><button class='btn primary' onclick='copyCreatedKey()'>Copy key</button><a class=btn href=/api-keys>Done</a></div>
+ </div>
+</div>
+""", "keys", raw_js=f"""async function copyCreatedKey(){{try{{await navigator.clipboard.writeText({token_json});toast('API key copied')}}catch(e){{toast('Copy failed — select it manually')}}}}""")
 
 
 def pool_page(rows: list, stats: dict) -> str:
@@ -5362,10 +5431,13 @@ async def _require_key(request: Request) -> Optional[dict]:
     hdr = request.headers.get("authorization", "")
     key = hdr[7:].strip() if hdr.lower().startswith("bearer ") else request.query_params.get("api_key", "")
     cfg = get_config()
+    if _normalize_api_key_records(cfg):
+        save_config(cfg)
+    supplied_hash = _api_key_hash(key) if key else ""
     for k in cfg.get("api_keys", []):
-        if k.get("key") and k["key"] == key:
+        if k.get("key_hash") and hmac.compare_digest(str(k["key_hash"]), supplied_hash):
             rpm = int(k.get("rpm", 60))
-            rl = check_rate_limit(k.get("key"), rpm)
+            rl = check_rate_limit(k.get("id") or supplied_hash, rpm)
             if rl.get("limited"):
                 raise HTTPException(status_code=429, detail=rl.get("detail", "rate-limited"))
             return k
@@ -5466,6 +5538,17 @@ async def models_view(request: Request):
         return g
     state = load_state()
     return models_page(get_models(), state.get("blocked_models", []))
+
+
+@app.get("/api-keys", response_class=HTMLResponse)
+async def api_keys_view(request: Request):
+    g = await _page_guard(request)
+    if g:
+        return g
+    config = get_config()
+    if _normalize_api_key_records(config):
+        save_config(config)
+    return api_keys_page(config.get("api_keys", []))
 
 
 @app.get("/chat", response_class=HTMLResponse)
@@ -5785,13 +5868,20 @@ async def create_key(request: Request, name: str = Form(...), rpm: int = Form(..
     if g:
         return g
     config = get_config()
+    _normalize_api_key_records(config)
+    raw_key = "sk-void-" + secrets.token_urlsafe(32)
+    clean_name = name.strip() or "API key"
     config.setdefault("api_keys", []).append({
-        "name": name.strip(), "key": f"sk-lmab-{uuid.uuid4()}",
-        "rpm": max(1, min(rpm, 1000)), "created": int(time.time()),
+        "id": "key_" + secrets.token_hex(8),
+        "name": clean_name,
+        "key_hash": _api_key_hash(raw_key),
+        "prefix": raw_key[:14],
+        "rpm": max(1, min(rpm, 1000)),
+        "created": int(time.time()),
     })
     save_config(config)
-    log("OK", f"API key created: {name}")
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+    log("OK", f"API key created: {clean_name}")
+    return HTMLResponse(api_key_created_page(clean_name, raw_key))
 
 
 @app.post("/delete-key")
@@ -5800,9 +5890,13 @@ async def delete_key(request: Request, key_id: str = Form(...)):
     if g:
         return g
     config = get_config()
-    config["api_keys"] = [k for k in config.get("api_keys", []) if k["key"] != key_id]
+    _normalize_api_key_records(config)
+    before = len(config.get("api_keys", []))
+    config["api_keys"] = [k for k in config.get("api_keys", []) if k.get("id") != key_id]
     save_config(config)
-    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+    if len(config["api_keys"]) != before:
+        log("OK", f"API key revoked: {key_id}")
+    return RedirectResponse(url="/api-keys", status_code=status.HTTP_303_SEE_OTHER)
 
 
 # ---------- jars add (cookie file / paste) ----------
