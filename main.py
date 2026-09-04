@@ -64,8 +64,12 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
                                             "6Ld7ePYrAAAAAB34ovoFoDau1fqCJ6IyOjFEQaMn")
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
 ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
+ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
+    "BRIDGENA_ALLOW_RECAPTCHA_FALLBACK", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+REQUEST_MAX_ATTEMPTS = max(1, min(3, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "2"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.21-claude-tail-grace")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.22-stability-containment")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -2039,7 +2043,9 @@ class KeeperSession:
         # Page pool for concurrent requests
         self._page_pool: list = []  # list of extra pages
         self._page_pool_lock = asyncio.Lock()
-        self._max_pool_pages = 4  # max extra pages beyond self.page
+        # Serialize through the keeper page unless an operator explicitly opts
+        # into extra tabs after validating upstream capacity.
+        self._max_pool_pages = max(0, min(2, int(os.environ.get("BRIDGENA_KEEPER_EXTRA_PAGES", "0"))))
 
     def _set_step(self, step_text: str):
         """Record and broadcast a detailed login/keeper progress step."""
@@ -3843,6 +3849,7 @@ import asyncio, time  # noqa
 
 RC_MINT_JS = r"""async (OPTS) => {
                 const FALLBACK = String(OPTS?.fallbackSitekey || '');
+                const ALLOW_FALLBACK = !!OPTS?.allowConfiguredFallback;
                 const ACTION = String(OPTS?.action || 'chat_submit');
                 const validKey = (v) => typeof v === 'string' && /^6[0-9A-Za-z_-]{30,}$/.test(v);
                 const hint = (v) => validKey(v) ? `${v.slice(0, 8)}…${v.slice(-4)}` : 'none';
@@ -3896,8 +3903,8 @@ RC_MINT_JS = r"""async (OPTS) => {
                         }
                     } catch (e) {}
                 }
-                const KEY = sitekey || FALLBACK;
-                source = source || 'configured-fallback';
+                const KEY = sitekey || (ALLOW_FALLBACK ? FALLBACK : '');
+                source = source || (ALLOW_FALLBACK ? 'configured-fallback' : 'none');
                 if (!validKey(KEY)) return {err: 'no valid site key discovered', source, keyHint: hint(KEY), action: ACTION};
                 const ex = (a1, a2) => new Promise((res2, rej2) => {
                     const fail = setTimeout(() => rej2(new Error('execute-timeout (12s)')), 12000);
@@ -4033,6 +4040,7 @@ async def mint_v3(jar_id=None):
                 return None
             res = await s.page.evaluate(RC_MINT_JS, {
                 "fallbackSitekey": ARENA_RECAPTCHA_SITEKEY,
+                "allowConfiguredFallback": ALLOW_CONFIGURED_RECAPTCHA_FALLBACK,
                 "action": RECAPTCHA_ACTION,
             })
             if isinstance(res, str) and len(res) > 20:
@@ -4342,7 +4350,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         return
     conv = get_conversation(chat_id) or {}
     mc = conv.get("arena", {}).get(model_name) if conv.get("model") == model_name else None
-    max_attempts = 6
+    max_attempts = REQUEST_MAX_ATTEMPTS
     route_fails: list = []
     cf_clear_attempts = 0
     same_jar_429 = 0
@@ -4512,21 +4520,9 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     if attempt + 1 < max_attempts:
                         continue
                 if verdict == "RATELIMIT":
-                    same_jar_429 += 1
-                    wait_s = min(8.0, 1.5 * same_jar_429)
-                    if same_jar_429 >= 3:
-                        if mc:
-                            yield ("error", "429: This thread's bound Arena session is rate-limited — wait 30-60s or start a new thread")
-                            return
-                        nxt = acquire_jar(prefer_live=True)
-                        if nxt and nxt["id"] not in tried:
-                            jar = nxt
-                            tried.add(nxt["id"])
-                            same_jar_429 = 0
-                            log("WARN", f"browser-origin 429 persisted — rotating to '{jar.get('name')}'")
-                    if attempt + 1 < max_attempts:
-                        await asyncio.sleep(wait_s)
-                        continue
+                    log("WARN", f"[{jar.get('name')}] upstream prompt throttle — request stopped; no account rotation")
+                    yield ("error", "429: Arena throttled or rejected this prompt. No account rotation was attempted; wait 30-60 seconds, then retry or start a new chat.")
+                    return
                 if verdict == "UPSTREAM" and attempt + 1 < max_attempts:
                     await asyncio.sleep(min(5.0, 1.0 + attempt))
                     continue
@@ -4665,28 +4661,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         return
 
                     if verdict == "RATELIMIT":
-                        same_jar_429 += 1
-                        wait_s = min(8, 1.5 * same_jar_429)
-                        log("WARN", f"[{jar.get('name')}] 429 — backoff {wait_s:.1f}s")
-                        def _soft(jars):
-                            for j in jars:
-                                j["limited_until"] = 0
-                                if j.get("status") == "limited":
-                                    j["status"] = "ok"
-                        mutate_jars(_soft)
-                        await asyncio.sleep(wait_s)
-                        jar = await _live_cookies(jar)
-                        if same_jar_429 < 3:
-                            continue
-                        if mc:
-                            yield ("error", "429: This thread's bound Arena session is rate-limited — wait 30-60s or start a new thread")
-                            return
-                        nxt = acquire_jar(prefer_live=True)
-                        if nxt and nxt["id"] not in tried:
-                            jar, _ = nxt, tried.add(nxt["id"])
-                            same_jar_429 = 0
-                            continue
-                        yield ("error", "429: rate-limited; accounts fine — wait 30-60s")
+                        log("WARN", f"[{jar.get('name')}] upstream prompt throttle — request stopped; no account rotation")
+                        yield ("error", "429: Arena throttled or rejected this prompt. No account rotation was attempted; wait 30-60 seconds, then retry or start a new chat.")
                         return
 
                     if verdict == "UPSTREAM":
