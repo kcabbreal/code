@@ -4498,6 +4498,22 @@ RC_V2_READ_JS = """() => {
   } catch (e) { return null; }
 }"""
 
+RC_V2_CLEAR_JS = """() => {
+  try {
+    window.__bgnV2Token = null;
+    window.__bgnV2Done = false;
+    window.__bgnV2Err = null;
+    const api = (window.grecaptcha && window.grecaptcha.enterprise) ? grecaptcha.enterprise : grecaptcha;
+    if (window.__bgnV2 !== undefined && typeof api.reset === 'function') {
+      try { api.reset(window.__bgnV2); } catch(e) {}
+    }
+    document.querySelectorAll('textarea[name="g-recaptcha-response"]').forEach(el => {
+      el.value = '';
+      el.innerHTML = '';
+    });
+  } catch (e) {}
+}"""
+
 _mint_last_no_session = 0.0
 
 
@@ -4605,11 +4621,8 @@ async def mint_v2_escalation(jar_id=None, settle_s: float = 20.0):
         ext_path = os.environ.get("BRIDGENA_CAPTCHA_EXT", "")
         has_ext = bool(ext_path and os.path.exists(os.path.join(ext_path, "manifest.json")))
 
-        # Check if already solved or present
-        tok = await s.page.evaluate(RC_V2_READ_JS)
-        if tok and not str(tok).startswith("__ERR__"):
-            log("OK", f"recaptcha V2 token already present ({len(tok)} chars)")
-            return tok
+        # Clear any stale tokens before starting escalation
+        await s.page.evaluate(RC_V2_CLEAR_JS)
 
         # If solver is available, attempt to solve any challenge frame already open
         if has_onnx and hasattr(s, "solve_recaptcha_image_challenge"):
