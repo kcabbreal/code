@@ -70,8 +70,9 @@ ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
 REQUEST_MAX_ATTEMPTS = max(1, min(3, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "2"))))
 STREAM_TAIL_GRACE_MS = max(5000, min(60000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "30000"))))
 KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
+API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.28-lossless-stream-eof")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.29-prompt-control")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -3073,11 +3074,16 @@ class KeeperSession:
                 for index, line in enumerate(result.get("lines") or []):
                     if index not in seen_indices:
                         yield line
-                log("INFO", f"[{self.name}] stream audit · frames {len(result.get('lines') or [])} · "
-                            f"finish {'yes' if result.get('finishSeen') else 'no'} · "
-                            f"stop {result.get('stopReason') or 'unknown'}")
             status_code = (result.get("status") if isinstance(result, dict) else None) or meta.get("status", 0)
             error_body = (result.get("error") if isinstance(result, dict) else None) or meta.get("error", "")
+            if isinstance(result, dict):
+                frame_count = len(result.get("lines") or [])
+                if status_code == 200:
+                    log("INFO", f"[{self.name}] stream audit · HTTP 200 · frames {frame_count} · "
+                                f"finish {'yes' if result.get('finishSeen') else 'no'} · "
+                                f"stop {result.get('stopReason') or 'unknown'}")
+                else:
+                    log("INFO", f"[{self.name}] stream audit · HTTP {status_code or 0} rejected before stream · frames {frame_count}")
             if status_code != 200:
                 raise BridgeHTTPError(status_code, error_body)
         finally:
@@ -4247,6 +4253,8 @@ def _classify(status: int, body: str) -> str:
         if "captcha" in low or "recaptcha" in low:
             return "RECAPTCHA"
         return "SESSION" if status == 401 or "auth" in low else "RECAPTCHA"  # conservative: unknown 403s never burn jars
+    if status == 429 and "prompt failed" in low:
+        return "PROMPT"
     if status == 429:
         return "RATELIMIT"
     if status >= 500 or 520 <= status <= 527:
@@ -4580,6 +4588,10 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     log("WARN", f"[{jar.get('name')}] stale Arena thread/model binding cleared — rebuilding as create-evaluation")
                     if attempt + 1 < max_attempts:
                         continue
+                if verdict == "PROMPT":
+                    log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming — no retry or rotation")
+                    yield ("error", "422: Arena rejected this prompt before generation. Bridgena did not retry or rotate accounts; shorten the request or remove unsupported tool/system payloads.")
+                    return
                 if verdict == "RATELIMIT":
                     log("WARN", f"[{jar.get('name')}] upstream prompt throttle — request stopped; no account rotation")
                     yield ("error", "429: Arena throttled or rejected this prompt. No account rotation was attempted; wait 30-60 seconds, then retry or start a new chat.")
@@ -4719,6 +4731,11 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         yield ("error", "403: arena's recaptcha check rejected us and the keeper could not mint a token on this exit. "
                                         "Jars were NOT expired. Fix order: keeper live on this exit → solver models present "
                                         "(recaptcha_solver.py + models/ + onnxruntime) → 'recaptcha token:' WARN says which link.")
+                        return
+
+                    if verdict == "PROMPT":
+                        log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming — no retry or rotation")
+                        yield ("error", "422: Arena rejected this prompt before generation. Bridgena did not retry or rotate accounts; shorten the request or remove unsupported tool/system payloads.")
                         return
 
                     if verdict == "RATELIMIT":
@@ -5401,6 +5418,8 @@ from fastapi.security import APIKeyHeader
 app = FastAPI(title="Bridgena", version="2.0")
 _api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 _dashboard_sessions: dict = {}
+_recent_api_requests: dict = {}
+_recent_api_requests_lock = threading.Lock()
 
 
 @app.middleware("http")
@@ -5630,6 +5649,28 @@ def _last_openai_user_prompt(body: dict) -> str:
     return prompts[-1] if prompts else ""
 
 
+def _reserve_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> bool:
+    """Reject exact rapid duplicates before they create another upstream job."""
+    if not API_DUPLICATE_WINDOW_SEC:
+        return True
+    identity = str((keyinfo or {}).get("id") or (keyinfo or {}).get("name") or "anonymous")
+    model = str(body.get("model") or "auto")
+    fingerprint = hashlib.sha256(
+        (identity + "\0" + model + "\0" + prompt).encode("utf-8", "ignore")
+    ).hexdigest()
+    now = time.monotonic()
+    with _recent_api_requests_lock:
+        cutoff = now - API_DUPLICATE_WINDOW_SEC
+        for old_fp, seen_at in list(_recent_api_requests.items()):
+            if seen_at < cutoff:
+                _recent_api_requests.pop(old_fp, None)
+        previous = _recent_api_requests.get(fingerprint, 0.0)
+        if previous >= cutoff:
+            return False
+        _recent_api_requests[fingerprint] = now
+    return True
+
+
 async def openai_stream(body: dict, keyinfo: dict):
     prompt = _last_openai_user_prompt(body)
     if not prompt:
@@ -5675,12 +5716,16 @@ async def openai_stream(body: dict, keyinfo: dict):
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_completions(request: Request):
-    await _require_key(request)
+    keyinfo = await _require_key(request)
     body = await request.json()
+    prompt = _last_openai_user_prompt(body)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="no user message")
+    if not _reserve_api_request(body, keyinfo, prompt):
+        log("WARN", f"duplicate API request suppressed · model {str(body.get('model') or 'auto')[:80]} · "
+                    f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
+        raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
     if not body.get("stream", True):
-        prompt = _last_openai_user_prompt(body)
-        if not prompt:
-            raise HTTPException(status_code=400, detail="no user message")
         out = {"id": "chatcmpl-" + uuid7()[:23], "object": "chat.completion", "created": int(time.time()),
                "model": body.get("model", "auto"), "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]}
         acc = ""
