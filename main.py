@@ -34,6 +34,11 @@ try:
 except ImportError:
     ort = None
 
+try:
+    from recaptcha_solver import get_solver as get_verification_solver
+except ImportError:
+    get_verification_solver = None
+
 # legacy global keeper UA: chrome131 on Windows — matches curl_cffi impersonate
 # default so cf_clearance (UA+IP-bound) stays coherent for persona-less jars.
 KEEPER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -51,7 +56,9 @@ import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)) or "."
 PORT = int(os.environ.get("BRIDGENA_PORT", "8000"))
-ARENA_BASE = os.environ.get("BRIDGENA_ARENA_BASE", "https://arena.ai")
+ARENA_BASE = os.environ.get("BRIDGENA_ARENA_BASE", "http://localhost:6767")
+_ARENA_PARSED = urlparse(ARENA_BASE)
+LOCAL_UPSTREAM = (_ARENA_PARSED.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
 ARENA_MODES = ["direct-battle", "direct"]
 MAX_PROMPT = 50000
 COOLDOWN_SEC = 60                 # soft preference; the pool is never hard-locked
@@ -79,6 +86,7 @@ REQUEST_MAX_ATTEMPTS = max(1, min(5, int(os.environ.get("BRIDGENA_REQUEST_MAX_AT
 STREAM_TAIL_GRACE_MS = max(5000, min(60000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "30000"))))
 KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
+VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 
 BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.32-newapi-usage")
 
@@ -920,9 +928,9 @@ def _probe_hostport() -> Tuple[str, int]:
     try:
         from urllib.parse import urlparse
         u = urlparse(ARENA_BASE)
-        return (u.hostname or "arena.ai"), (u.port or 443)
+        return (u.hostname or "localhost"), (u.port or (443 if u.scheme == "https" else 6767))
     except Exception:
-        return "arena.ai", 443
+        return "localhost", 6767
 
 def _socks_client_handshake(s, scheme: str, host: str, port: int, u, why=None) -> bool:
     """SOCKS4/4a/5 client handshake through an already-connected socket.
@@ -1018,7 +1026,7 @@ def _socks_client_handshake(s, scheme: str, host: str, port: int, u, why=None) -
 
 def _proxy_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> Tuple[bool, int]:
     """(alive, latency_ms) — a REAL handshake per scheme: http/https via CONNECT,
-    socks4/4a/5 via native SOCKS4/SOCKS5 connect to arena.ai:443. Every failure
+    socks4/4a/5 via native SOCKS4/SOCKS5 connect to localhost:6767. Every failure
     records WHERE it died in _probe_fail_reason so the pool page can tell an ISP
     black-hole from a bad-creds rejection from a billing refusal — each needs a
     different fix, and bare 'dead' blamed the wrong party for months."""
@@ -1150,7 +1158,7 @@ def _normalize_proxy(raw: str) -> Optional[str]:
     # socks5h:// is PRESERVED. The suffix is the ONE signal that means
     # "resolve the target at the gateway" — libcurl and the raw probe honor it,
     # and it is what protects authenticated-proxy users from a poisoned local
-    # resolver (an app host resolving arena.ai itself can hand the gateway a
+    # resolver (an app host resolving localhost:6767 itself can hand the gateway a
     # sinkhole IP, which comes back as a fatal-looking (97)/(4) that was never
     # the proxy's fault). Only the Playwright dict re-maps it; Chromium's
     # socks5:// already sends domains — see playwright_proxy_from_url.
@@ -1567,7 +1575,7 @@ def to_playwright_cookies(cookies: list) -> list:
             continue
         item = {
             "name": name, "value": value,
-            "domain": c.get("domain") or ".arena.ai",
+            "domain": c.get("domain") or "localhost",
             "path": c.get("path") or "/",
             "secure": bool(c.get("secure", True)),
             "httpOnly": bool(c.get("httpOnly", False)),
@@ -2101,7 +2109,7 @@ def _validate_cookies(raw_data: Union[str, list, dict]) -> list:
                         if "=" in p:
                             k, v = p.strip().split("=", 1)
                             if k.lower() not in ("path", "domain", "expires", "max-age", "samesite"):
-                                items.append({"name": k.strip(), "value": v.strip(), "domain": ".arena.ai", "path": "/"})
+                                items.append({"name": k.strip(), "value": v.strip(), "domain": "localhost", "path": "/"})
     out, seen = [], set()
     for c in items:
         if not isinstance(c, dict):
@@ -2116,7 +2124,7 @@ def _validate_cookies(raw_data: Union[str, list, dict]) -> list:
         seen.add(key)
         out.append({
             "name": name, "value": val,
-            "domain": c.get("domain") or ".arena.ai",
+            "domain": c.get("domain") or "localhost",
             "path": c.get("path") or "/",
             "secure": bool(c.get("secure", True)),
             "httpOnly": bool(c.get("httpOnly", False)),
@@ -2786,22 +2794,18 @@ class KeeperSession:
             return False
 
     async def _ensure_sidebar_cookie(self):
-        """Set sidebar_state cookie so the arena.ai sidebar stays open."""
+        """Set sidebar_state cookie so the localhost:6767 sidebar stays open."""
         try:
             if self.context:
                 await self.context.add_cookies([
                     {"name": "sidebar_state", "value": "true",
-                     "domain": ".arena.ai", "path": "/", "secure": True, "httpOnly": False},
-                    {"name": "sidebar_state", "value": "true",
-                     "domain": "arena.ai", "path": "/", "secure": True, "httpOnly": False},
-                    {"name": "sidebar_state", "value": "true",
-                     "domain": ".lmarena.ai", "path": "/", "secure": True, "httpOnly": False},
+                     "domain": "localhost", "path": "/", "secure": False, "httpOnly": False},
                 ])
         except Exception:
             pass
 
     async def _verify_auth_state(self, page) -> bool:
-        """Thorough check to verify whether user is genuinely logged into arena.ai."""
+        """Thorough check to verify whether user is genuinely logged into localhost:6767."""
         try:
             # 1. If page contains expected email near footer/chip -> logged in
             if self.email:
@@ -2831,7 +2835,7 @@ class KeeperSession:
                 
             # 4. Fallback: Check if the user profile avatar or settings button is present
             profile_btn = page.locator("button:has(svg), button[aria-label='User Profile'], button[aria-label='Settings']").last
-            if await profile_btn.count() > 0 and "arena.ai" in (page.url or ""):
+            if await profile_btn.count() > 0 and "localhost:6767" in (page.url or ""):
                 return True
 
             # 5. Check actual unified history API status
@@ -2884,7 +2888,7 @@ class KeeperSession:
     # --- Multi-Step Native Email/Password Login ---
 
     async def _login_email_native(self) -> Tuple[bool, str]:
-        """Multi-step email + password login on arena.ai modal.
+        """Multi-step email + password login on localhost:6767 modal.
         Uses instant fill for speed and reliability.
         Handles: Log In button -> email input -> Continue with email -> password -> Login."""
         page = self.page
@@ -2897,7 +2901,7 @@ class KeeperSession:
 
         try:
             # ---- STEP 1: Navigate ----
-            self._set_step("[1/6] Navigating to arena.ai...")
+            self._set_step("[1/6] Navigating to localhost:6767...")
             await self._ensure_sidebar_cookie()
             await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
             await self._wait_cloudflare(page)
@@ -3015,7 +3019,7 @@ class KeeperSession:
             # ---- STEP 4: Click "Continue with email" ----
             self._set_step("[4/6] Clicking 'Continue with email'...")
 
-            # The arena.ai modal has a specific "Continue with email" button
+            # The localhost:6767 modal has a specific "Continue with email" button
             # Try multiple strategies to find and click it
             submit_clicked = False
 
@@ -3079,7 +3083,7 @@ class KeeperSession:
             try:
                 create_heading = page.locator("text='Create Account'").first
                 if await create_heading.count() > 0 and await create_heading.is_visible():
-                    err = f"Account {self.email} is not registered on arena.ai (shows 'Create Account')"
+                    err = f"Account {self.email} is not registered on localhost:6767 (shows 'Create Account')"
                     self._set_step(f"[FAILED at Step 4] {err}")
                     await self._screenshot(page, "create_account_shown")
                     return False, err
@@ -3128,7 +3132,7 @@ class KeeperSession:
             # ---- STEP 6: Submit password and verify ----
             self._set_step("[6/6] Submitting credentials & verifying...")
 
-            # Arena.ai password screen has a "Login" button (not "Log In")
+            # localhost:6767 password screen has a "Login" button (not "Log In")
             login_clicked = False
             login_btn_selectors = [
                 "button:has-text('Login')",
@@ -3713,7 +3717,7 @@ class KeeperSession:
                 except Exception as e:
                     log("WARN", f"[{self.name}] Cookie restore partial: {e}")
 
-            self._set_step("Navigating to arena.ai...")
+            self._set_step("Navigating to localhost:6767...")
             await self._ensure_sidebar_cookie()
             await self.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=25000)
             await self._wait_cloudflare(self.page)
@@ -4040,6 +4044,8 @@ async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bo
                            exclude: Optional[set] = None) -> Optional[str]:
     """Rotation-aware pick among exits PROVEN to tunnel to arena recently.
     Unknown lines are probed inside a per-cycle budget, never blocking traffic."""
+    if LOCAL_UPSTREAM:
+        return None
     assignment_mode = _rotation_mode() == "assignment"
     excluded = set(exclude or ())
     cands = [c for c in proxy_candidates(jar, prefer_sticky=assignment_mode and not rotate)
@@ -4517,6 +4523,65 @@ RC_V2_CLEAR_JS = """() => {
 _mint_last_no_session = 0.0
 
 
+async def _solve_with_verification_adapter(challenge_type: str, session,
+                                            site_key: str, action: Optional[str] = None):
+    """Request a token from the optional async verification adapter.
+
+    Cookie values and tokens are deliberately excluded from logs. The bundled
+    ONNX get_solver() remains independent from the adapter factory alias.
+    """
+    if get_verification_solver is None:
+        return None
+    try:
+        factory_result = get_verification_solver()
+        solver = await factory_result if hasattr(factory_result, "__await__") else factory_result
+        if solver is None or not hasattr(solver, "solve"):
+            log("WARN", "verification adapter unavailable: factory returned no solver")
+            return None
+
+        cookie_map = {}
+        if getattr(session, "context", None):
+            for cookie in await session.context.cookies([ARENA_BASE]):
+                name, value = cookie.get("name"), cookie.get("value")
+                if name and value:
+                    cookie_map[name] = value
+
+        persona = getattr(session, "persona", None)
+        user_agent = (getattr(persona, "ua", None)
+                      or getattr(session, "user_agent", None)
+                      or KEEPER_UA)
+        proxy = getattr(session, "_used_proxy", None) or None
+        page_url = getattr(getattr(session, "page", None), "url", None) or ARENA_BASE
+        if not str(page_url).startswith(ARENA_BASE):
+            page_url = ARENA_BASE
+
+        result = await solver.solve(
+            challenge_type=challenge_type,
+            site_key=site_key,
+            page_url=page_url,
+            action=action,
+            enterprise=True,
+            user_agent=user_agent,
+            proxy=proxy,
+            cookies=cookie_map,
+            timeout=VERIFICATION_TIMEOUT_SEC,
+        )
+        token = result.get("token") if isinstance(result, dict) and result.get("ok") else None
+        if isinstance(token, str) and len(token) > 20:
+            log("OK", "verification adapter completed"
+                + f" · provider {result.get('provider', 'wrapper')}"
+                + f" · task {str(result.get('task_id') or '-')[:12]}"
+                + f" · {int(result.get('elapsed_ms') or 0)}ms")
+            return token
+        error = result.get("error") if isinstance(result, dict) else "invalid adapter response"
+        log("WARN", f"verification adapter failed: {str(error)[:180]}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log("WARN", f"verification adapter error: {type(exc).__name__}: {str(exc)[:180]}")
+    return None
+
+
 def _find_session(jar_id=None):
     """Same contract as the legacy helper: (sid, session) for a RUNNING keeper
     whose page is alive; prefer this jar's own keeper (its exit is where the
@@ -4554,6 +4619,12 @@ async def mint_v3(jar_id=None):
         return None
     try:
         async with s._action_lock:
+            adapter_token = await _solve_with_verification_adapter(
+                "enterprise_v3", s, ARENA_RECAPTCHA_SITEKEY, RECAPTCHA_ACTION
+            )
+            if adapter_token:
+                return adapter_token
+
             # The live client loads enterprise reCAPTCHA on the direct-chat
             # route. Stabilize there, then evaluate in the same locked browser
             # transaction so catalog/health navigation cannot destroy context.
@@ -4615,6 +4686,13 @@ async def mint_v2_escalation(jar_id=None, settle_s: float = 20.0):
         log("WARN", "recaptcha token: V2 escalation skipped — no live keeper session")
         return None
     try:
+        async with s._action_lock:
+            adapter_token = await _solve_with_verification_adapter(
+                "recaptcha_enterprise_v2", s, ARENA_RECAPTCHA_V2_SITEKEY
+            )
+        if adapter_token:
+            return adapter_token
+
         # Check if ONNX solver or extension is present
         solver = get_solver() if "get_solver" in globals() else None
         has_onnx = bool(solver and solver.available())
@@ -5059,7 +5137,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         # Existing Arena conversations are session-bound. Restore the exact exit
         # that created the thread before the normal sticky picker runs.
         bound_proxy = (_normalize_proxy(mc.get("proxy"))
-                       if mc and mc.get("proxy") and _rotation_mode() == "assignment" else None)
+                       if (not LOCAL_UPSTREAM and mc and mc.get("proxy")
+                           and _rotation_mode() == "assignment") else None)
         if bound_proxy:
             if not await asyncio.to_thread(proxy_alive, bound_proxy):
                 yield ("error", "409: This Arena thread's original exit is unavailable. Start a new Bridgena thread; its conversation ID cannot safely move to another IP.")
@@ -5225,8 +5304,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                                 continue
                             hosts = " · ".join(dict.fromkeys(h for h, _ in route_fails)) or "the pool"
                             warp_only = bool(route_fails) and all(h.startswith(("127.0.0.1:", "[::1]:", "localhost:")) for h, _ in route_fails)
-                            why = ("WARP-only pool: arena.ai's edge routinely rejects Cloudflare's own egress IPs — expected, not fixable from here"
-                                   if warp_only else "the gateways answered 'can't route' — arena.ai is rejecting these exits' egress IPs right now")
+                            why = ("WARP-only pool: localhost:6767's edge routinely rejects Cloudflare's own egress IPs — expected, not fixable from here"
+                                   if warp_only else "the gateways answered 'can't route' — localhost:6767 is rejecting these exits' egress IPs right now")
                             yield ("error", f"503: {hosts} — {len(route_fails)} exit(s) connected+authed but none could route ({why}). "
                                             "Nothing exiled; flags self-expire (~3h). 'Scan pool' re-probes now.")
                             return
@@ -5700,7 +5779,7 @@ def dashboard_page(overview: dict) -> str:
 <div class="row"><button class="btn" onclick="act('/proxies/api/check','POST')">⚡ Scan pool</button>
 <button class="btn primary" onclick="location='/chat'">Open chat →</button></div></div>
 <div class="grid metrics">
- <div class="card metric"><div class="k">exits alive</div><div class="v" style="color:var(--teal)">{m['alive']}<span class="muted" style="font-size:18px">/{m['pool_total']}</span></div><div class="s">proven to arena.ai</div></div>
+ <div class="card metric"><div class="k">exits alive</div><div class="v" style="color:var(--teal)">{m['alive']}<span class="muted" style="font-size:18px">/{m['pool_total']}</span></div><div class="s">proven to localhost:6767</div></div>
  <div class="card metric"><div class="k">flagged</div><div class="v" style="color:var(--amber)">{m['flagged']}</div><div class="s">arena-blocked, self-expire ~3h</div></div>
  <div class="card metric"><div class="k">accounts</div><div class="v">{m['jars_ok']}<span class="muted" style="font-size:18px">/{m['jars_total']}</span></div><div class="s">healthy · {m['keepers_live']} keepers live</div></div>
  <div class="card metric"><div class="k">models</div><div class="v">{m['models']}</div><div class="s">selectable in fleet</div></div></div>
@@ -5769,7 +5848,7 @@ def pool_page(rows: list, stats: dict) -> str:
         f"<td><div class=row><form method=post action=/proxies/api/remove-one style=margin:0><input type=hidden name=key value='{esc(r['key'])}'><button class='btn sm ghost' title='remove'>✕</button></form></div></td></tr>"
         for r in rows) or '<tr><td colspan=7 class=muted>Empty pool.</td></tr>'
     return page("Proxy Pool", f"""
-<div class="pagehead"><div><h1>Exit Pool</h1><p>{stats['alive']} alive · {stats['flagged']} arena-blocked · {stats['total']} lines — verdicts from real handshakes against arena.ai:443</p></div>
+<div class="pagehead"><div><h1>Exit Pool</h1><p>{stats['alive']} alive · {stats['flagged']} upstream-blocked · {stats['total']} lines — verdicts from real handshakes against localhost:6767</p></div>
 <div class="row"><button class="btn" onclick="scan()">⚡ Scan pool</button><span id="sc" class="small muted"></span></div></div>
 <div class="split">
 <div class="card"><table><thead><tr><th>exit (host:port)</th><th>scheme</th><th>verdict</th><th>diagnosis</th><th>rtt</th><th>seen by</th><th></th></tr></thead><tbody>{body}</tbody></table></div>
