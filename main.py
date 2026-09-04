@@ -65,7 +65,7 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
 ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.19-lossless-browser-stream")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.20-claude-finish")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -2975,6 +2975,7 @@ class KeeperSession:
                     const reader = r.body.getReader();
                     const dec = new TextDecoder();
                     let buffer = '';
+                    let protocolFinished = false;
                     while (true) {
                         const {done, value} = await reader.read();
                         if (value) buffer += dec.decode(value, {stream: true});
@@ -2982,9 +2983,17 @@ class KeeperSession:
                         const parts = buffer.split(/\\r?\\n/);
                         buffer = parts.pop() || '';
                         for (const line of parts) {
-                            if (line.trim()) emit(line);
+                            if (line.trim()) {
+                                emit(line);
+                                if (/^(ad|d|e):/.test(line.trim())) protocolFinished = true;
+                            }
                         }
-                        if (done) break;
+                        if (done || protocolFinished) {
+                            if (protocolFinished && !done) {
+                                try { await reader.cancel(); } catch (_) {}
+                            }
+                            break;
+                        }
                     }
                     if (buffer.trim()) emit(buffer);
                     P('D' + JSON.stringify(null));
@@ -4517,6 +4526,15 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 if verdict == "RECAPTCHA":
                     yield ("error", "403: Arena rejected this session's verification token. The request was stopped without repeated retries; wait briefly and try a new chat.")
                     return
+                if e.status == 400 and "user message is invalid" in (e.body or "").lower() and mc:
+                    clear_conversation_model(chat_id, model_name)
+                    mc = None
+                    conv = {}
+                    response_text = ""
+                    reasoning_text = ""
+                    log("WARN", f"[{jar.get('name')}] follow-up envelope rejected — rebuilding once as create-evaluation")
+                    if attempt + 1 < max_attempts:
+                        continue
                 if e.status == 400 and "user message is invalid" in (e.body or "").lower():
                     yield ("error", "400: Arena rejected the message content. Send plain text or supported text content parts; images and unsupported multimodal parts are not accepted by this bridge yet.")
                     return
@@ -4587,6 +4605,16 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         response_text = ""
                         reasoning_text = ""
                         log("WARN", f"[{jar.get('name')}] stale Arena thread/model binding cleared — rebuilding as create-evaluation")
+                        if attempt + 1 < max_attempts:
+                            continue
+
+                    if resp.status_code == 400 and "user message is invalid" in body.lower() and mc:
+                        clear_conversation_model(chat_id, model_name)
+                        mc = None
+                        conv = {}
+                        response_text = ""
+                        reasoning_text = ""
+                        log("WARN", f"[{jar.get('name')}] follow-up envelope rejected — rebuilding once as create-evaluation")
                         if attempt + 1 < max_attempts:
                             continue
 
