@@ -72,7 +72,7 @@ STREAM_TAIL_GRACE_MS = max(5000, min(60000, int(os.environ.get("BRIDGENA_STREAM_
 KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.29-prompt-control")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.30-newapi-terminal")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -5700,12 +5700,18 @@ async def openai_stream(body: dict, keyinfo: dict):
                     yield chunk({"reasoning_content": payload})
                 elif kind == "error":
                     yield _sse({"error": {"message": payload}})
+                    # New API's OpenAI-stream translator does not consider a
+                    # top-level error plus [DONE] terminal by itself. Emit the
+                    # ordinary terminal choice as well so downstream Claude
+                    # clients always leave their generating state.
+                    yield chunk({}, finish="stop")
                     yield "data: [DONE]\n\n"
                     return
                 elif kind == "done":
                     break
         except Exception as e:
             yield _sse({"error": {"message": f"{type(e).__name__}: {e}"}})
+            yield chunk({}, finish="stop")
             yield "data: [DONE]\n\n"
             return
         yield chunk({}, finish="stop")
