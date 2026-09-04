@@ -59,6 +59,8 @@ PORT = int(os.environ.get("BRIDGENA_PORT", "8000"))
 ARENA_BASE = os.environ.get("BRIDGENA_ARENA_BASE", "http://localhost:6767")
 _ARENA_PARSED = urlparse(ARENA_BASE)
 LOCAL_UPSTREAM = (_ARENA_PARSED.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
+PUBLIC_AUTH_BASE = os.environ.get("BRIDGENA_PUBLIC_AUTH_BASE", "https://arena.ai").rstrip("/")
+PUBLIC_AUTH_URL = os.environ.get("BRIDGENA_PUBLIC_AUTH_URL", f"{PUBLIC_AUTH_BASE}/?mode=direct")
 ARENA_MODES = ["direct-battle", "direct"]
 MAX_PROMPT = 50000
 COOLDOWN_SEC = 60                 # soft preference; the pool is never hard-locked
@@ -927,8 +929,8 @@ PROBE_EXILE_AFTER  = 2
 def _probe_hostport() -> Tuple[str, int]:
     try:
         from urllib.parse import urlparse
-        u = urlparse(ARENA_BASE)
-        return (u.hostname or "localhost"), (u.port or (443 if u.scheme == "https" else 6767))
+        u = urlparse(PUBLIC_AUTH_BASE if LOCAL_UPSTREAM else ARENA_BASE)
+        return (u.hostname or "localhost"), (u.port or (443 if u.scheme == "https" else 80))
     except Exception:
         return "localhost", 6767
 
@@ -2468,6 +2470,7 @@ class KeeperSession:
         self._nav_fail_count = 0
         self.active_requests = 0
         self._auth_sig_cache = None
+        self._public_cookie_snapshot = []
         self._cur_x = 200.0
         self._cur_y = 200.0
         # Page pool for concurrent requests
@@ -2827,7 +2830,7 @@ class KeeperSession:
                 return False
 
             # 3. Check for typical auth cookies directly in the browser context
-            cookies = await page.context.cookies()
+            cookies = await page.context.cookies([page.url])
             auth_cookie_names = ["arena-auth", "arena-auth-prod-v1.0", "arena-auth-prod-v1.1", "__session", "session", "authToken", "clerk-db-jwt"]
             has_auth = any(any(n in c["name"] for n in auth_cookie_names) for c in cookies)
             if has_auth:
@@ -2835,7 +2838,8 @@ class KeeperSession:
                 
             # 4. Fallback: Check if the user profile avatar or settings button is present
             profile_btn = page.locator("button:has(svg), button[aria-label='User Profile'], button[aria-label='Settings']").last
-            if await profile_btn.count() > 0 and "localhost:6767" in (page.url or ""):
+            if await profile_btn.count() > 0 and any(
+                    origin in (page.url or "") for origin in (ARENA_BASE, PUBLIC_AUTH_BASE)):
                 return True
 
             # 5. Check actual unified history API status
@@ -2888,7 +2892,7 @@ class KeeperSession:
     # --- Multi-Step Native Email/Password Login ---
 
     async def _login_email_native(self) -> Tuple[bool, str]:
-        """Multi-step email + password login on localhost:6767 modal.
+        """Authenticate on the public application before activating the local mirror.
         Uses instant fill for speed and reliability.
         Handles: Log In button -> email input -> Continue with email -> password -> Login."""
         page = self.page
@@ -2901,12 +2905,16 @@ class KeeperSession:
 
         try:
             # ---- STEP 1: Navigate ----
-            self._set_step("[1/6] Navigating to localhost:6767...")
-            await self._ensure_sidebar_cookie()
-            await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
+            self._set_step("[1/6] Navigating to public authentication...")
+            await page.goto(f"{PUBLIC_AUTH_BASE}/", wait_until="domcontentloaded")
             await self._wait_cloudflare(page)
             await self._handle_turnstile(page)
             await asyncio.sleep(2)
+
+            if await self._verify_auth_state(page):
+                await self._harvest_cookies()
+                self._set_step("[SUCCESS] Existing public session is authenticated")
+                return True, "Existing session authenticated"
 
             # ---- Dismiss any promo banners blocking the UI ----
             await self._dismiss_promos(page)
@@ -3200,17 +3208,19 @@ class KeeperSession:
 
     async def _harvest_cookies(self):
         try:
-            await self._ensure_sidebar_cookie()
             if not self.context:
                 return
-            cookies = await self.context.cookies()
+            # Persist only the public authenticated jar. Local mirror cookies
+            # are derived copies and must never overwrite the source snapshot.
+            cookies = await self.context.cookies([PUBLIC_AUTH_BASE])
             simplified = [
                 {"name": c.get("name", ""), "value": c.get("value", ""),
                  "domain": c.get("domain", ""), "path": c.get("path", "/"),
                  "secure": c.get("secure", False), "httpOnly": c.get("httpOnly", False),
-                 "expirationDate": c.get("expires")}
+                 "sameSite": c.get("sameSite"), "expirationDate": c.get("expires")}
                 for c in cookies if c.get("name")
             ]
+            self._public_cookie_snapshot = simplified
             auth_val = (find_cookie(simplified, "arena-auth-prod-v1.0")
                         or find_cookie(simplified, "arena-auth-prod-v1.1")
                         or find_cookie(simplified, "arena-auth-prod-v1") or "")
@@ -3238,6 +3248,47 @@ class KeeperSession:
                 pass
         except Exception as e:
             log("WARN", f"[{self.name}] Cookie harvest failed: {e}")
+
+    async def _activate_local_mirror(self) -> bool:
+        """Clone the authenticated public jar into localhost scope and switch pages."""
+        if not self.context or not self.page:
+            return False
+        source = self._public_cookie_snapshot
+        if not source:
+            jar = next((j for j in load_jars() if j.get("id") == self.jar_id), None)
+            source = list((jar or {}).get("cookies") or [])
+        if not source:
+            self.error = "Public authentication produced no cookies"
+            return False
+
+        local_cookies = []
+        for cookie in source:
+            name, value = cookie.get("name"), cookie.get("value")
+            if not name or not value:
+                continue
+            item = {
+                "name": name,
+                "value": value,
+                "url": ARENA_BASE,
+                "httpOnly": bool(cookie.get("httpOnly", False)),
+                "secure": _ARENA_PARSED.scheme == "https",
+                "sameSite": (cookie.get("sameSite")
+                             if cookie.get("sameSite") in {"Strict", "Lax"}
+                             or (_ARENA_PARSED.scheme == "https" and cookie.get("sameSite") == "None")
+                             else "Lax"),
+            }
+            expires = cookie.get("expirationDate") or cookie.get("expires")
+            if isinstance(expires, (int, float)) and expires > 0:
+                item["expires"] = expires
+            local_cookies.append(item)
+
+        await self.context.add_cookies(local_cookies)
+        self._set_step(f"Injected {len(local_cookies)} authenticated cookies into local mirror")
+        await self.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
+        await self.page.wait_for_load_state("domcontentloaded")
+        await self._ensure_sidebar_cookie()
+        self.last_nav = time.time()
+        return True
 
     # --- Activity & Health ---
 
@@ -3314,6 +3365,10 @@ class KeeperSession:
                 if ok:
                     await asyncio.sleep(2)
                     await self._harvest_cookies()
+                    if not await self._activate_local_mirror():
+                        self.error = self.error or "Failed to activate local mirror"
+                        self._schedule_retry()
+                        return False
                     self.relogin_count += 1
                     self.status = "running"
                     self.fail_count = 0
@@ -3717,12 +3772,10 @@ class KeeperSession:
                 except Exception as e:
                     log("WARN", f"[{self.name}] Cookie restore partial: {e}")
 
-            self._set_step("Navigating to localhost:6767...")
-            await self._ensure_sidebar_cookie()
-            await self.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=25000)
+            self._set_step("Checking public authentication...")
+            await self.page.goto(PUBLIC_AUTH_URL, wait_until="domcontentloaded", timeout=25000)
             await self._wait_cloudflare(self.page)
             await self._handle_turnstile(self.page)
-            await self._ensure_sidebar_cookie()
             await self._inject_visual_cursor(self.page)
 
             # Dismiss any promo banners that might block the UI
@@ -3736,7 +3789,11 @@ class KeeperSession:
             self._set_step("Keeper session active")
             log("OK", f"[{self.name}] Keeper started ({'headless' if self.headless else 'LIVE WINDOW'})")
 
-            if not await self.check_health():
+            if await self._verify_auth_state(self.page):
+                await self._harvest_cookies()
+                if not await self._activate_local_mirror():
+                    log("WARN", f"[{self.name}] Public session valid but local cookie injection failed")
+            else:
                 log("WARN", f"[{self.name}] Initial health check negative — triggering relogin")
                 await self.relogin()
 
@@ -4044,7 +4101,7 @@ async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bo
                            exclude: Optional[set] = None) -> Optional[str]:
     """Rotation-aware pick among exits PROVEN to tunnel to arena recently.
     Unknown lines are probed inside a per-cycle budget, never blocking traffic."""
-    if LOCAL_UPSTREAM:
+    if LOCAL_UPSTREAM and purpose == "api":
         return None
     assignment_mode = _rotation_mode() == "assignment"
     excluded = set(exclude or ())
@@ -5146,7 +5203,10 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
             proxy = bound_proxy
         else:
             proxy = await apick_live_proxy(jar, purpose="api")
-        proxy, cycled = await anchor_proxy_to_keeper(jar.get("id"), proxy)
+        if LOCAL_UPSTREAM:
+            proxy, cycled = None, False
+        else:
+            proxy, cycled = await anchor_proxy_to_keeper(jar.get("id"), proxy)
         if cycled:
             jar = await _live_cookies(jar)
         if proxy:
