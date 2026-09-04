@@ -61,11 +61,10 @@ MAX_CONVERSATIONS = 500
 ARENA_RECAPTCHA_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_SITEKEY",
                                          "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0")
 ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
-                                            "6Ld7ePYrAAAAAB34ovoFoDau1fqCJ6IyOjFEQaMn")
-RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
-ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
+                                            "6Le3_cYsAAAAAGwWOK2RLDgNI15Bh8C0yLBOL1yL")
+RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "submit")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.11-live-model-resolution")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.5-browser-transaction-lock")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -223,48 +222,18 @@ def model_name(m) -> str:
     return m.get("name") or m.get("publicName") or m.get("id") or ""
 
 
-def _model_key(value: str) -> str:
-    """Canonical comparison key for Arena display labels and API slugs."""
-    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
-
-
-# Captured from Arena's working direct-chat client on 2026-09-03. These are
-# compatibility pins, not substitutes for catalog refresh: a JSON environment
-# override lets an operator update a changed UUID without editing this file.
-_VERIFIED_MODEL_IDS = {
-    "gemini-3-8-flash-high": "01a0681c-b561-76b6-b338-a44ff0cff460",
-    "minimax-m3": "019e809d-f62d-7192-bb7f-1657e066b5f2",
-}
-try:
-    _VERIFIED_MODEL_IDS.update({
-        _model_key(k): str(v) for k, v in
-        json.loads(os.environ.get("BRIDGENA_MODEL_ID_OVERRIDES", "{}")).items()
-    })
-except Exception:
-    pass
-
-
 def resolve_model_id(public_name: str, jar: Optional[dict] = None) -> str:
     """Resolve Arena's public label to the internal UUID required by the
     create-evaluation contract. Sending a label here currently produces an
     opaque upstream 500, while Arena's own client always sends the UUID."""
-    wanted = _model_key(public_name)
-    if wanted in _VERIFIED_MODEL_IDS:
-        return _VERIFIED_MODEL_IDS[wanted]
-    # The shared catalog is replaced atomically by the latest successful live
-    # refresh. Prefer it over a jar's historical snapshot.
+    mapped = (jar or {}).get("model_map", {}).get(public_name)
+    if mapped:
+        return mapped
     for item in get_models():
         if not isinstance(item, dict):
             continue
-        labels = (item.get("name"), item.get("publicName"), item.get("id"))
-        if public_name in labels or wanted in {_model_key(x) for x in labels if x}:
+        if public_name in (item.get("name"), item.get("publicName"), item.get("id")):
             return item.get("id") or public_name
-    jar_map = (jar or {}).get("model_map", {})
-    mapped = jar_map.get(public_name)
-    if not mapped:
-        mapped = next((v for k, v in jar_map.items() if _model_key(k) == wanted), None)
-    if mapped:
-        return mapped
     return public_name
 
 
@@ -1341,7 +1310,7 @@ async def refresh_models_via_worker(worker):
     log("INFO", f"[{worker.name}] Refreshing models via worker navigation...")
     try:
         async with worker._action_lock:
-            await worker.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
+            await worker.page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded", timeout=30000)
             await worker.page.wait_for_load_state("domcontentloaded")
             body = await worker.page.content()
             try:
@@ -2778,7 +2747,7 @@ class KeeperSession:
                     return False
                 if ARENA_BASE not in (page.url or "") and self.active_requests == 0:
                     await self._ensure_sidebar_cookie()
-                    await page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded")
+                    await page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
                     await self._wait_cloudflare(page)
                 if await self._verify_auth_state(page):
                     self.last_health_ok = time.time()
@@ -2876,7 +2845,7 @@ class KeeperSession:
             if len(self._page_pool) < self._max_pool_pages and self.context:
                 try:
                     new_page = await self.context.new_page()
-                    await new_page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded")
+                    await new_page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded")
                     await asyncio.sleep(0.5)
                     idx = len(self._page_pool)
                     self._page_pool.append((new_page, True))
@@ -2939,48 +2908,38 @@ class KeeperSession:
         page.on("console", on_console)
         self.active_requests += 1
         try:
-            script = """async ([url, payload, rid, action]) => {
+            script = """async ([url, payload, rid]) => {
                 const P = s => console.log('__NX' + rid + s);
                 try {
-                    const token = String(payload?.recaptchaV3Token || '');
                     const r = await fetch(url, {
                         method: 'POST', credentials: 'include',
-                        headers: {
-                          'Content-Type': 'application/json',
-                          ...(token ? {'X-Recaptcha-Token': token, 'X-Recaptcha-Action': action} : {})
-                        },
+                        headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify(payload)
                     });
                     P('S' + r.status);
-                    if (!r.ok) { P('E' + (await r.text()).slice(0, 400)); P('Dnull'); return; }
+                    if (!r.ok) { P('E' + (await r.text()).slice(0, 400)); return; }
                     const reader = r.body.getReader();
                     const dec = new TextDecoder();
-                    let buffer = '';
                     while (true) {
                         const {done, value} = await reader.read();
-                        if (value) buffer += dec.decode(value, {stream: true});
-                        if (done) buffer += dec.decode();
-                        const parts = buffer.split(/\\r?\\n/);
-                        buffer = parts.pop() || '';
-                        for (const line of parts) {
+                        if (done) break;
+                        const text = dec.decode(value, {stream: true});
+                        for (const line of text.split('\n')) {
                             if (line.trim()) P('D' + JSON.stringify(line));
                         }
-                        if (done) break;
                     }
-                    if (buffer.trim()) P('D' + JSON.stringify(buffer));
                     P('D' + JSON.stringify(null));
                 } catch(e) {
-                    P('S500'); P('E' + e.message); P('Dnull');
+                    P('S500'); P('E' + e.message);
                 }
             }"""
-            eval_task = asyncio.create_task(page.evaluate(script, [url, payload, req_id, RECAPTCHA_ACTION]))
+            eval_task = asyncio.create_task(page.evaluate(script, [url, payload, req_id]))
             while True:
                 line = await queue.get()
                 if line is None:
                     break
                 yield line
-            await eval_task
-            if eval_task.exception():
+            if eval_task.done() and eval_task.exception():
                 raise RuntimeError(f"Bridge evaluate exception: {eval_task.exception()}")
             status_code = meta.get("status", 0)
             if status_code != 200:
@@ -3162,7 +3121,7 @@ class KeeperSession:
 
             self._set_step("Navigating to arena.ai...")
             await self._ensure_sidebar_cookie()
-            await self.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=25000)
+            await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded", timeout=25000)
             await self._wait_cloudflare(self.page)
             await self._handle_turnstile(self.page)
             await self._ensure_sidebar_cookie()
@@ -3278,7 +3237,7 @@ class KeeperSession:
                     try:
                         async with self._action_lock:
                             await self._ensure_sidebar_cookie()
-                            await self.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=45000)
+                            await self.page.goto(f"{ARENA_BASE}/", wait_until="domcontentloaded", timeout=45000)
                             await self._wait_cloudflare(self.page)
                             self.last_nav = time.time()
                             self._nav_fail_count = 0
@@ -3792,11 +3751,7 @@ def snapshot_rows() -> List[dict]:
 # ============================================================
 import asyncio, time  # noqa
 
-RC_MINT_JS = r"""async (OPTS) => {
-                const FALLBACK = String(OPTS?.fallbackSitekey || '');
-                const ACTION = String(OPTS?.action || 'chat_submit');
-                const validKey = (v) => typeof v === 'string' && /^6[0-9A-Za-z_-]{30,}$/.test(v);
-                const hint = (v) => validKey(v) ? `${v.slice(0, 8)}…${v.slice(-4)}` : 'none';
+RC_MINT_JS = r"""async (SITE) => {
                 const grab = () => {
                     try {
                         const el = document.querySelector(
@@ -3806,61 +3761,26 @@ RC_MINT_JS = r"""async (OPTS) => {
                     return null;
                 };
                 let t = grab();
-                if (t) return {token: t, source: 'response-field', keyHint: 'widget', action: ACTION};
+                if (t) return t;
                 const g = window.grecaptcha;
                 if (!g) return {err: 'no grecaptcha object on keeper page (arena widget script not on this URL?)'};
                 try {
                     const r0 = (g.getResponse && g.getResponse())
                             || (g.enterprise && g.enterprise.getResponse && g.enterprise.getResponse());
-                    if (r0 && r0.length > 20) return {token: r0, source: 'getResponse', keyHint: 'widget', action: ACTION};
+                    if (r0 && r0.length > 20) return r0;
                 } catch (e) {}
                 let sitekey = null;
-                let source = null;
                 const node = document.querySelector('[data-sitekey]');
-                if (node && validKey(node.getAttribute('data-sitekey'))) {
-                    sitekey = node.getAttribute('data-sitekey'); source = 'data-sitekey';
-                }
-                if (!sitekey) {
-                    for (const script of [...document.scripts]) {
-                        try {
-                            const render = new URL(script.src, location.href).searchParams.get('render');
-                            if (validKey(render) && render !== 'explicit') {
-                                sitekey = render; source = 'api.js?render'; break;
-                            }
-                        } catch (e) {}
-                    }
-                }
-                if (!sitekey) {
-                    for (const frame of [...document.querySelectorAll('iframe[src]')]) {
-                        try {
-                            const key = new URL(frame.src, location.href).searchParams.get('k');
-                            if (validKey(key)) { sitekey = key; source = 'recaptcha-iframe'; break; }
-                        } catch (e) {}
-                    }
-                }
+                if (node) sitekey = node.getAttribute('data-sitekey');
                 if (!sitekey && window.___grecaptcha_cfg && ___grecaptcha_cfg.clients) {
                     try {
-                        const seen = new WeakSet();
-                        const scan = (value, depth = 0) => {
-                            if (validKey(value)) return value;
-                            if (!value || typeof value !== 'object' || depth > 7 || seen.has(value)) return null;
-                            seen.add(value);
-                            for (const [name, child] of Object.entries(value)) {
-                                if (/token|response/i.test(name)) continue;
-                                const found = scan(child, depth + 1);
-                                if (found) return found;
-                            }
-                            return null;
-                        };
                         for (const c of Object.values(___grecaptcha_cfg.clients)) {
-                            const k = scan(c);
-                            if (k) { sitekey = k; source = 'grecaptcha-client'; break; }
+                            const k = c?.sitekey || c?.settings?.sitekey;
+                            if (k) { sitekey = k; break; }
                         }
                     } catch (e) {}
                 }
-                const KEY = sitekey || FALLBACK;
-                source = source || 'configured-fallback';
-                if (!validKey(KEY)) return {err: 'no valid site key discovered', source, keyHint: hint(KEY), action: ACTION};
+                const KEY = sitekey || SITE;
                 const ex = (a1, a2) => new Promise((res2, rej2) => {
                     const fail = setTimeout(() => rej2(new Error('execute-timeout (12s)')), 12000);
                     const go = () => {
@@ -3881,22 +3801,22 @@ RC_MINT_JS = r"""async (OPTS) => {
                     // arena's own shape (proven against the live page 2026-09-03):
                     // POSITIONAL (sitekey, {action}) inside enterprise.ready. The object
                     // form throws 'No reCAPTCHA clients exist.' on this widget build.
-                    const tok = await ex(KEY, {action: ACTION});
-                    if (tok && tok.length > 20) return {token: tok, source, keyHint: hint(KEY), action: ACTION};
-                    return {err: 'enterprise.execute resolved empty (Google scored this session low — image challenge may follow)', source, keyHint: hint(KEY), action: ACTION};
+                    const tok = await ex(KEY, {action: 'submit'});
+                    if (tok && tok.length > 20) return tok;
+                    return {err: 'enterprise.execute resolved empty (Google scored this session low — image challenge may follow)'};
                 } catch (e1) {
                     try {
-                        const t2 = await ex({sitekey: KEY, action: ACTION});
-                        if (t2 && t2.length > 20) return {token: t2, source, keyHint: hint(KEY), action: ACTION};
+                        const t2 = await ex({sitekey: KEY, action: 'submit'});
+                        if (t2 && t2.length > 20) return t2;
                     } catch (e2) {}
                     try {
                         if (typeof g.execute === 'function') {
-                            const t3 = await Promise.race([g.execute(KEY, {action: ACTION}),
+                            const t3 = await Promise.race([g.execute(KEY, {action: 'submit'}),
                                                            new Promise((_, r) => setTimeout(() => r(new Error('v3-timeout')), 8000))]);
-                            if (t3 && t3.length > 20) return {token: t3, source, keyHint: hint(KEY), action: ACTION};
+                            if (t3 && t3.length > 20) return t3;
                         }
                     } catch (e3) {}
-                    return {err: 'execute failed: ' + String(e1).slice(0, 160), source, keyHint: hint(KEY), action: ACTION};
+                    return {err: 'execute failed: ' + String(e1).slice(0, 160)};
                 }
             }"""
 
@@ -3968,50 +3888,15 @@ async def mint_v3(jar_id=None):
             # The live client loads enterprise reCAPTCHA on the direct-chat
             # route. Stabilize there, then evaluate in the same locked browser
             # transaction so catalog/health navigation cannot destroy context.
-            if "mode=direct" not in (s.page.url or ""):
-                await s.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
+            if "/text/direct" not in (s.page.url or ""):
+                await s.page.goto(f"{ARENA_BASE}/text/direct", wait_until="domcontentloaded", timeout=30000)
                 await s.page.wait_for_load_state("domcontentloaded")
                 s.last_nav = time.time()
-            # Arena hydrates the enterprise widget asynchronously after the
-            # document is ready. Minting in the same second as keeper startup
-            # used to observe no window.grecaptcha and fail prematurely.
-            try:
-                await s.page.wait_for_function(
-                    "() => !!(window.grecaptcha && (window.grecaptcha.enterprise || window.grecaptcha.execute))",
-                    timeout=15000,
-                )
-            except Exception:
-                try:
-                    diag = await s.page.evaluate(r"""() => ({
-                        url: location.href,
-                        title: document.title,
-                        ready: document.readyState,
-                        scripts: [...document.scripts].map(x => x.src).filter(x =>
-                          /recaptcha|google\.com\/recaptcha|gstatic\.com\/recaptcha/i.test(x)).slice(0, 6)
-                    })""")
-                except Exception as diag_e:
-                    diag = {"diagnostic": f"{type(diag_e).__name__}: {diag_e}"}
-                log("WARN", f"recaptcha runtime absent after 15s: {redact(json.dumps(diag, ensure_ascii=False))[:700]}")
-                return None
-            res = await s.page.evaluate(RC_MINT_JS, {
-                "fallbackSitekey": ARENA_RECAPTCHA_SITEKEY,
-                "action": RECAPTCHA_ACTION,
-            })
+            res = await s.page.evaluate(RC_MINT_JS.replace("ARENA_MARK", ""), ARENA_RECAPTCHA_SITEKEY)
             if isinstance(res, str) and len(res) > 20:
                 return res
-            if isinstance(res, dict) and isinstance(res.get("token"), str) and len(res["token"]) > 20:
-                log("OK", "recaptcha token minted via " + str(res.get("source", "unknown"))
-                    + " · key " + str(res.get("keyHint", "unknown"))
-                    + " · action " + str(res.get("action", RECAPTCHA_ACTION)))
-                return res["token"]
             why = res.get("err") if isinstance(res, dict) else "evaluate returned nothing"
-            detail = (" · source " + str(res.get("source", "unknown"))
-                      + " · key " + str(res.get("keyHint", "unknown"))
-                      + " · action " + str(res.get("action", RECAPTCHA_ACTION))) if isinstance(res, dict) else ""
-            log("WARN", f"recaptcha token: {why}{detail}")
-
-            if isinstance(why, str) and "no grecaptcha" in why.lower():
-                return None
+            log("WARN", f"recaptcha token: {why}")
 
             # image challenge fallback on that same locked page
             if hasattr(s, "solve_recaptcha_image_challenge") and await s.solve_recaptcha_image_challenge():
@@ -4263,31 +4148,15 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         base = {"mode": "direct-battle", "modelAId": model_id, "modality": "chat"}
         follow_url = None
         if mc and mc.get("arena_id"):
-            # post-to-evaluation is not a minimal "conversation id + text"
-            # endpoint. Arena expects a complete new message envelope for every
-            # continuation, with fresh message UUIDs and the selected model.
-            # `mode` belongs to create-evaluation and is intentionally omitted
-            # from this follow-up body, matching the live client contract.
-            base = {
-                "id": mc["arena_id"],
-                "modelAId": model_id,
-                "userMessageId": str(uuid7()),
-                "modelAMessageId": str(uuid7()),
-                "modality": "chat",
-            }
+            base = {"id": mc["arena_id"], "mode": "direct"}
             follow_url = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/{mc['arena_id']}"
         else:
             base.update({"id": str(uuid7()), "userMessageId": str(uuid7()),
                          "modelAMessageId": str(uuid7())})
         content = prompt if len(prompt) <= MAX_PROMPT else prompt[:MAX_PROMPT]
-        # These apparently optional fields are always emitted by Arena's live
-        # client. Its follow-up validator returns a generic 500 when they are
-        # absent, so preserve the exact captured envelope even when both empty.
-        user_message = {
-            "content": content,
-            "experimental_attachments": attachments or [],
-            "metadata": {},
-        }
+        user_message = {"content": content}
+        if attachments:
+            user_message["experimental_attachments"] = attachments
         base["userMessage"] = user_message
 
         tok = await mint_v3(jar.get("id"))
@@ -4315,54 +4184,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         f"model {str(model_id)[:8]}… · token {'yes' if tok else 'no'}")
         else:
             log("WARN", f"[{jar.get('name')}] No live proxy — using server IP (easy to rate-limit)")
-
-        # Preferred transport: execute the POST inside the already-authenticated
-        # keeper origin. This preserves the exact browser cookie jar, TLS/browser
-        # identity and proxy exit that minted the token. curl remains a fallback
-        # only for browser-evaluation failures.
-        browser_session = keeper.sessions.get(jar.get("id"))
-        if browser_session and browser_session.running and browser_session.page:
-            try:
-                log("INFO", f"[{jar.get('name')}] transport browser-origin")
-                async with browser_session._action_lock:
-                    async for line in browser_session.bridge_fetch(url, base):
-                        ev = _parse_stream_line(str(line).strip())
-                        if not ev:
-                            continue
-                        kind, payload = ev
-                        if kind == "content" and isinstance(payload, str):
-                            response_text += payload
-                            yield ("content", payload)
-                        elif kind == "reasoning":
-                            yield ("reasoning", payload if isinstance(payload, str) else json.dumps(payload))
-                if proxy:
-                    _proxy_health_record(proxy, True, 0, source="browser-stream")
-                    _flagged_exits.pop(_proxy_hkey(proxy), None)
-                if not follow_url:
-                    conv2 = dict(conv)
-                    conv2["model"] = model_name
-                    conv2["arena"] = dict(conv2.get("arena") or {})
-                    conv2["arena"][model_name] = {
-                        "arena_id": base["id"], "mode": "direct",
-                        "jar_id": jar.get("id"), "proxy": proxy,
-                    }
-                    save_conversation(chat_id, conv2)
-                yield ("done", response_text)
-                return
-            except BridgeHTTPError as e:
-                verdict = _classify(e.status, e.body)
-                log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status}: {e.body[:300]}")
-                if verdict in ("RECAPTCHA", "RATELIMIT", "UPSTREAM") and attempt + 1 < max_attempts:
-                    await asyncio.sleep(min(5.0, 1.0 + attempt))
-                    continue
-                yield ("error", f"{e.status or 502}: Arena browser-origin request failed: {e.body[:350] or 'empty response'}")
-                return
-            except Exception as browser_e:
-                log("WARN", f"[{jar.get('name')}] browser-origin unavailable ({type(browser_e).__name__}: {browser_e}) — curl fallback")
-
         headers = _headers_for(jar, p, json_body=True)
-        headers["X-Recaptcha-Token"] = tok
-        headers["X-Recaptcha-Action"] = RECAPTCHA_ACTION
         kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
         if proxy:
             kw["proxy"] = proxy
