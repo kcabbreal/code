@@ -70,7 +70,7 @@ ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
 REQUEST_MAX_ATTEMPTS = max(1, min(3, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "2"))))
 STREAM_TAIL_GRACE_MS = max(1000, min(15000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "5000"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.23-claude-tail-drain")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.24-cache-tail-integrity")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -4344,6 +4344,17 @@ def _parse_stream_line(line: str):
         message = parsed.get("message") if isinstance(parsed, dict) else parsed
         return ("error", str(message or "Provider stream error"))
     if prefix in ("ad", "d", "e"):
+        # Most finish frames contain metadata only, but some adapters attach a
+        # final delta to the terminal envelope. Preserve that text; bridge_fetch
+        # already owns transport termination and run_turn emits the final done.
+        terminal_event = _collapse_stream_events(_events_from_stream_data(parsed))
+        if terminal_event and terminal_event[0] in ("content", "reasoning", "error"):
+            return terminal_event
+        if isinstance(parsed, dict):
+            for key in ("text", "content", "delta"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value:
+                    return ("content", value)
         return ("done", payload)
     return None
 
@@ -5305,6 +5316,25 @@ from fastapi.security import APIKeyHeader
 app = FastAPI(title="Bridgena", version="2.0")
 _api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 _dashboard_sessions: dict = {}
+
+
+@app.middleware("http")
+async def bridgena_delivery_headers(request: Request, call_next):
+    """Prevent stale UI assets and intermediary buffering of streamed deltas."""
+    response = await call_next(request)
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "text/html" in content_type:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["CDN-Cache-Control"] = "no-store"
+        response.headers["Cloudflare-CDN-Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    elif "text/event-stream" in content_type:
+        response.headers["Cache-Control"] = "no-cache, no-transform"
+        response.headers["CDN-Cache-Control"] = "no-store"
+        response.headers["Cloudflare-CDN-Cache-Control"] = "no-store"
+        response.headers["X-Accel-Buffering"] = "no"
+    return response
 
 
 async def _current_session(request: Request) -> Optional[str]:
