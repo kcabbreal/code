@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v2 — single-file arena bridge (built from v2/ at build time)
 #  modules: core · identity · primitives · pool · tokens · arena · pages · api
-#  Deploy: replace main.py, restart. Same files, same env, same API keys.
+#  Deploy: run bridgena.py and restart. Same files, same env, same API keys.
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -87,10 +87,11 @@ ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
 REQUEST_MAX_ATTEMPTS = max(1, min(5, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "3"))))
 STREAM_TAIL_GRACE_MS = max(5000, min(60000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "30000"))))
 KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
+KEEPER_REQUEST_READY_SEC = max(30, min(180, int(os.environ.get("BRIDGENA_KEEPER_REQUEST_READY_SEC", "100"))))
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.32-newapi-usage")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.33-local-mirror-control-plane")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -1101,6 +1102,42 @@ def _proxy_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> Tuple[bool, 
                     if code in ("402", "407"):
                         quarantine_proxy(proxy_url, f"CONNECT refused {code} — billing/auth, not transient")
                     return False, -1
+
+            # CONNECT alone only proves that the gateway accepted a tunnel.
+            # Complete TLS and request an actual upstream resource so scans do
+            # not report a dead or intercepted exit as usable.
+            try:
+                target = urlparse(PUBLIC_AUTH_BASE if LOCAL_UPSTREAM else ARENA_BASE)
+                s.settimeout(timeout)
+                transport = s
+                if (target.scheme or "https").lower() == "https":
+                    import ssl as _ssl
+                    ctx = _ssl.create_default_context()
+                    transport = ctx.wrap_socket(s, server_hostname=host)
+                    transport.settimeout(timeout)
+                path = (target.path or "/").rstrip("/") + "/robots.txt"
+                req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+                       "User-Agent: Bridgena-Proxy-Probe/2\r\nAccept: */*\r\n"
+                       "Connection: close\r\n\r\n")
+                transport.sendall(req.encode("ascii", "ignore"))
+                response = b""
+                while b"\r\n" not in response and len(response) < 8192:
+                    chunk = transport.recv(2048)
+                    if not chunk:
+                        break
+                    response += chunk
+                first = response.split(b"\r\n", 1)[0].decode("latin1", "ignore")
+                status_match = re.match(r"HTTP/[\d.]+\s+(\d+)", first)
+                status_code = int(status_match.group(1)) if status_match else 0
+                if not status_code:
+                    _probe_fail_reason[proxy_url] = "tunnel opened but upstream returned no HTTP response"
+                    return False, -1
+                if status_code in (403, 407, 429) or status_code >= 500:
+                    _probe_fail_reason[proxy_url] = f"upstream HTTP {status_code} through tunnel"
+                    return False, -1
+            except Exception as verify_error:
+                _probe_fail_reason[proxy_url] = f"tunnel opened but TLS/HTTP validation failed ({type(verify_error).__name__})"
+                return False, -1
         finally:
             try:
                 s.close()
@@ -2586,6 +2623,28 @@ class KeeperSession:
         except Exception:
             pass
 
+    async def _navigate_resilient(self, page, url: str, timeout: int = 60000) -> bool:
+        """Navigate without declaring a usable committed page dead just because
+        a third-party resource kept domcontentloaded pending."""
+        last_error = None
+        attempts = (("domcontentloaded", timeout), ("commit", min(30000, timeout)))
+        for wait_until, budget in attempts:
+            try:
+                await page.goto(url, wait_until=wait_until, timeout=budget)
+                return True
+            except Exception as exc:
+                last_error = exc
+                try:
+                    target = urlparse(url)
+                    current = urlparse(page.url or "")
+                    if current.hostname == target.hostname and current.path:
+                        log("WARN", f"[{self.name}] Navigation committed but {wait_until} timed out; continuing")
+                        return True
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+        raise last_error or TimeoutError(f"navigation failed: {url}")
+
     async def _handle_turnstile(self, page):
         try:
             for frame in page.frames:
@@ -2906,7 +2965,7 @@ class KeeperSession:
         try:
             # ---- STEP 1: Navigate ----
             self._set_step("[1/6] Navigating to public authentication...")
-            await page.goto(f"{PUBLIC_AUTH_BASE}/", wait_until="domcontentloaded")
+            await self._navigate_resilient(page, f"{PUBLIC_AUTH_BASE}/", timeout=60000)
             await self._wait_cloudflare(page)
             await self._handle_turnstile(page)
             await asyncio.sleep(2)
@@ -3284,7 +3343,7 @@ class KeeperSession:
 
         await self.context.add_cookies(local_cookies)
         self._set_step(f"Injected {len(local_cookies)} authenticated cookies into local mirror")
-        await self.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
+        await self._navigate_resilient(self.page, ARENA_DIRECT_URL, timeout=45000)
         await self.page.wait_for_load_state("domcontentloaded")
         await self._ensure_sidebar_cookie()
         self.last_nav = time.time()
@@ -3773,7 +3832,7 @@ class KeeperSession:
                     log("WARN", f"[{self.name}] Cookie restore partial: {e}")
 
             self._set_step("Checking public authentication...")
-            await self.page.goto(PUBLIC_AUTH_URL, wait_until="domcontentloaded", timeout=25000)
+            await self._navigate_resilient(self.page, PUBLIC_AUTH_URL, timeout=60000)
             await self._wait_cloudflare(self.page)
             await self._handle_turnstile(self.page)
             await self._inject_visual_cursor(self.page)
@@ -4015,6 +4074,7 @@ _proxy_strikes: Dict[str, int] = {}
 _pick_ctr = 0
 import threading as _th
 _pick_mu = _th.Lock()
+_proxy_sweep_mu = _th.Lock()
 
 
 def _pool_lines() -> List[str]:
@@ -4176,7 +4236,7 @@ async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bo
 
 
 # ---------- sweep (Scan pool) ----------
-def sweep_all() -> dict:
+def _sweep_all_impl() -> dict:
     now = time.time()
     lines = _pool_lines()
     stats = {"total": len(lines), "alive": 0, "flagged": 0, "dead": 0}
@@ -4216,6 +4276,17 @@ def sweep_all() -> dict:
     log("OK", f"proxy sweep done: {stats['alive']}/{stats['total']} usable against Arena "
              f"(tunnel-dead nodes got strikes; Arena-blocked exits flagged ~3h)")
     return stats
+
+
+def sweep_all() -> dict:
+    """Run at most one full pool scan per process."""
+    if not _proxy_sweep_mu.acquire(blocking=False):
+        return {"running": True, "total": len(_pool_lines()), "alive": 0,
+                "flagged": 0, "dead": 0}
+    try:
+        return _sweep_all_impl()
+    finally:
+        _proxy_sweep_mu.release()
 
 
 # ---------- ingest / prune / revive ----------
@@ -4313,6 +4384,32 @@ def remove_one(hkey: str) -> int:
     pool_save(keep)
     _QUARANTINED_KEYS.add(hkey)
     return len(lines) - len(keep)
+
+
+def delete_all_proxies() -> dict:
+    """Clear the active pool, retaining a timestamped recovery snapshot."""
+    lines = [line for line in _pool_lines() if line.strip() and not line.startswith("#")]
+    if not lines:
+        return {"removed": 0, "backup": None}
+    source = _proxies_file() or os.path.join(".", PROXIES_FILE)
+    backup = os.path.join(os.path.dirname(source) or ".",
+                          f"proxies.deleted.{int(time.time())}.txt")
+    try:
+        shutil.copyfile(source, backup)
+    except OSError:
+        backup = None
+    pool_save([])
+    cfg = get_config()
+    if cfg.get("proxies"):
+        cfg["proxies"] = []
+        save_config(cfg)
+    _proxy_probe_cache.clear()
+    _proxy_latency.clear()
+    _proxy_strikes.clear()
+    _flagged_exits.clear()
+    log("WARN", f"proxy manager: deleted all {len(lines)} active proxies"
+        + (f" · backup {os.path.basename(backup)}" if backup else ""))
+    return {"removed": len(lines), "backup": os.path.basename(backup) if backup else None}
 
 
 def revive_one(hkey: str) -> dict:
@@ -5108,7 +5205,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
     # wait briefly for this exact jar's page instead of sending invalid traffic.
     if not _find_session(jar.get("id"))[1]:
         await keeper.sync()
-        deadline = time.monotonic() + 35.0
+        deadline = time.monotonic() + KEEPER_REQUEST_READY_SEC
         while time.monotonic() < deadline and not _find_session(jar.get("id"))[1]:
             s_wait = keeper.sessions.get(jar.get("id"))
             if s_wait and s_wait.status == "error":
@@ -5761,6 +5858,32 @@ table{border-spacing:0}th{height:40px}td{height:46px}.console{height:390px;box-s
 @media(max-width:900px){.topbar{padding:0 14px}.main{padding:28px 18px 56px}.shell{grid-template-columns:1fr}}
 """
 
+# v2.33 control-plane redesign: one restrained visual language shared with
+# chat, with Open WebUI density and Vercel-style operational hierarchy.
+CSS += """
+:root{--bg:#080808;--bg2:#0b0b0b;--panel:#0d0d0d;--panel2:#151515;--hair:#252525;
+ --ink:#f5f5f5;--ink2:#a3a3a3;--ink3:#666;--teal:#34d399;--amber:#fbbf24;--red:#fb7185}
+[data-theme=light]{--bg:#fff;--bg2:#fff;--panel:#fff;--panel2:#f7f7f7;--hair:#e7e7e7;
+ --ink:#111;--ink2:#666;--ink3:#9a9a9a;--teal:#059669;--amber:#b45309;--red:#e11d48}
+body{background:var(--bg)}.topbar{height:62px;padding:0 26px;background:color-mix(in srgb,var(--bg) 94%,transparent)}
+.topbar .brand .dot{border:1px solid var(--hair);background:var(--ink);box-shadow:0 0 0 4px color-mix(in srgb,var(--ink) 5%,transparent)}
+.shell{grid-template-columns:238px minmax(0,1fr);min-height:calc(100vh - 62px)}
+.rail{top:62px;height:calc(100vh - 62px);padding:20px 10px;background:var(--bg);border-color:var(--hair)}
+.rail::before{content:"Control plane"}.rail a{font-size:13px;min-height:40px;padding:10px 12px;color:var(--ink2)}
+.rail a.on{background:var(--panel2);box-shadow:none;color:var(--ink)}
+.main{max-width:1440px;padding:42px 48px 80px}.pagehead{padding-bottom:22px;border-bottom:1px solid var(--hair)}
+.pagehead h1{font-size:30px}.pagehead p{font-size:13px;max-width:680px}.metrics{gap:14px}
+.card{background:var(--panel);border-radius:12px;box-shadow:none}.card:hover{border-color:color-mix(in srgb,var(--hair) 65%,var(--ink3))}
+.metric{min-height:142px;padding:20px}.metric .k{display:flex;align-items:center;gap:8px}.metric .k::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--ink3)}
+.metric:nth-child(1) .k::before,.metric:nth-child(3) .k::before{background:var(--teal)}
+.metric:nth-child(2) .k::before{background:var(--amber)}.metric .v{font-size:38px;margin-top:18px}
+.btn{border-radius:8px;box-shadow:none}.btn.primary{background:var(--ink);color:var(--bg)}
+.console{background:#050505;border-radius:10px}.split{grid-template-columns:minmax(0,1.35fr) minmax(360px,.65fr);gap:14px}
+@media(max-width:1050px){.split{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:900px){.shell{grid-template-columns:1fr}.main{padding:28px 18px 60px}}
+@media(max-width:560px){.metrics{grid-template-columns:1fr}.main{padding-inline:14px}.pagehead{border-bottom:0}}
+"""
+
 JS_THEME = """
 (function(){try{var t=localStorage.getItem('bgn.theme');if(t)document.documentElement.dataset.theme=t;}catch(e){}})();
 function bgnToggleTheme(){var h=document.documentElement;var n=(h.dataset.theme==='light')?'':'light';h.dataset.theme=n;try{localStorage.setItem('bgn.theme',n)}catch(e){}}
@@ -5835,21 +5958,21 @@ def dashboard_page(overview: dict) -> str:
     m = overview["metrics"]
     logl = "".join(f'<div class="{esc(x["lvl"])}">{esc(x["line"])}</div>' for x in overview["logtail"])
     return page("Dashboard", f"""
-<div class="pagehead"><div><h1>Operations</h1><p>fleet status at a glance — full controls live in the rail</p></div>
-<div class="row"><button class="btn" onclick="act('/proxies/api/check','POST')">⚡ Scan pool</button>
-<button class="btn primary" onclick="location='/chat'">Open chat →</button></div></div>
+<div class="pagehead"><div><span class="pill ok" style="margin-bottom:12px">All systems monitored</span><h1>Bridgena Control Plane</h1><p>Live infrastructure, keeper health, model availability, and verified exit telemetry in one workspace.</p></div>
+<div class="row"><button class="btn" onclick="act('/proxies/api/check','POST')">Run network scan</button>
+<button class="btn primary" onclick="location='/chat'">Launch chat&nbsp; ↗</button></div></div>
 <div class="grid metrics">
- <div class="card metric"><div class="k">exits alive</div><div class="v" style="color:var(--teal)">{m['alive']}<span class="muted" style="font-size:18px">/{m['pool_total']}</span></div><div class="s">proven to localhost:6767</div></div>
- <div class="card metric"><div class="k">flagged</div><div class="v" style="color:var(--amber)">{m['flagged']}</div><div class="s">arena-blocked, self-expire ~3h</div></div>
- <div class="card metric"><div class="k">accounts</div><div class="v">{m['jars_ok']}<span class="muted" style="font-size:18px">/{m['jars_total']}</span></div><div class="s">healthy · {m['keepers_live']} keepers live</div></div>
- <div class="card metric"><div class="k">models</div><div class="v">{m['models']}</div><div class="s">selectable in fleet</div></div></div>
+ <div class="card metric"><div class="k">Verified exits</div><div class="v" style="color:var(--teal)">{m['alive']}<span class="muted" style="font-size:18px"> / {m['pool_total']}</span></div><div class="s">TLS and upstream response confirmed</div></div>
+ <div class="card metric"><div class="k">Restricted exits</div><div class="v" style="color:var(--amber)">{m['flagged']}</div><div class="s">Temporarily held outside rotation</div></div>
+ <div class="card metric"><div class="k">Account fleet</div><div class="v">{m['jars_ok']}<span class="muted" style="font-size:18px"> / {m['jars_total']}</span></div><div class="s">{m['keepers_live']} browser keepers currently live</div></div>
+ <div class="card metric"><div class="k">Available models</div><div class="v">{m['models']}</div><div class="s">Published through the unified API</div></div></div>
 <div class="split" style="margin-top:16px">
- <div class="card"><h3>Top exits <span class="spacer"></span><a class="small" href="/pool">manage →</a></h3>
+ <div class="card"><h3>Network health <span class="spacer"></span><a class="small" href="/pool">View all ↗</a></h3>
   <table><thead><tr><th>exit</th><th>verdict</th><th>why</th><th>latency</th></tr></thead><tbody>{rows_pool}</tbody></table></div>
- <div class="card"><h3>Accounts <a class="spacer" style="flex:1"></a><a class="small" href="/jars">manage →</a></h3>
+ <div class="card"><h3>Keeper fleet <a class="spacer" style="flex:1"></a><a class="small" href="/jars">Manage ↗</a></h3>
   <table><thead><tr><th>jar</th><th>device persona</th><th>keeper</th><th>health</th></tr></thead><tbody>{jrows}</tbody></table></div>
 </div>
-<div class="card" style="margin-top:16px"><h3>Recent signal <span class="spacer" style="flex:1"></span><span class="mono small muted">tail ·500</span></h3>
+<div class="card" style="margin-top:16px"><h3>Runtime activity <span class="spacer" style="flex:1"></span><span class="mono small muted">live tail</span></h3>
   <div class="console" id="cons">{logl}</div></div>""", active="dash", raw_js="""
 async function act(u,method){try{const r=await fetch(u,{method:method||'GET'});toast('done: '+(await r.text()).slice(0,80))}catch(e){toast('error: '+e)}}
 function consRefresh(){fetch('/debug-logs/data').then(r=>r.json()).then(d=>{var c=document.getElementById('cons');if(!c)return;
@@ -5917,12 +6040,15 @@ def pool_page(rows: list, stats: dict) -> str:
 <textarea name=text placeholder="socks5h://user:pass@host:port&#10;Host,Port,Username,Password,Type&#10;..." style="min-height:180px"></textarea>
 <div class="row" style="margin-top:12px"><button class="btn primary">Merge →</button>
 <button type="button" class="btn danger" onclick="act('/proxies/api/prune','POST')">Prune dead</button>
-<button type="button" class="btn ghost" onclick="act('/proxies/api/revive','POST')">Revive all</button></div></form>
+<button type="button" class="btn ghost" onclick="act('/proxies/api/revive','POST')">Revive all</button>
+<button type="button" class="btn danger" onclick="deleteAll()">Delete all</button></div></form>
 <p class="small muted" style="margin-top:14px">Prune cuts only lines whose verdicts say tunnel-dead (strikes ×{esc(3)}). Arena-blocked exits are flagged, never exiled — flags self-expire (~3h) and a delivered 200 clears them instantly.</p></div>
 </div>""", active="pool", raw_js="""
 async function scan(){var s=document.getElementById('sc');s.textContent='scanning…';try{const r=await fetch('/proxies/api/check',{method:'POST'});
-const d=await r.json();s.textContent=d.alive+'/'+d.total+' usable';setTimeout(()=>location.reload(),900)}catch(e){s.textContent='scan failed: '+e}}
-async function act(u,m){try{const r=await fetch(u,{method:m});toast((await r.text()).slice(0,90));setTimeout(()=>location.reload(),700)}catch(e){toast('error')}}""")
+const d=await r.json();if(d.running){s.textContent='scan already running';return}s.textContent=d.alive+'/'+d.total+' verified';setTimeout(()=>location.reload(),900)}catch(e){s.textContent='scan failed: '+e}}
+async function act(u,m){try{const r=await fetch(u,{method:m});toast((await r.text()).slice(0,90));setTimeout(()=>location.reload(),700)}catch(e){toast('error')}}
+async function deleteAll(){if(!confirm('Delete every active proxy? A recovery snapshot will be retained.'))return;
+ try{const r=await fetch('/proxies/api/delete-all',{method:'POST'}),d=await r.json();if(!r.ok)throw new Error(d.detail||'request failed');toast('Deleted '+d.removed+' proxies');setTimeout(()=>location.reload(),700)}catch(e){toast('Delete failed: '+e)}}""")
 
 
 def jars_page(jars: list) -> str:
@@ -6077,10 +6203,29 @@ button,input,textarea{font:inherit}button{color:inherit}.icon{width:17px;height:
 .compose{width:min(860px,100%);border-radius:16px;padding:13px 13px 10px;box-shadow:0 14px 45px rgba(0,0,0,.16)}.compose:focus-within{box-shadow:0 16px 50px rgba(0,0,0,.2),0 0 0 1px color-mix(in srgb,var(--text) 12%,transparent)}
 .send{border-radius:10px}.runtime{width:min(860px,100%)}
 @media(max-width:760px){.app{grid-template-columns:1fr}.sidebar{position:fixed;z-index:50;inset:0 auto 0 0;width:280px;transform:translateX(-100%);transition:.2s;box-shadow:var(--shadow)}.sidebar.open{transform:none}.mobile{display:grid}.top{padding:0 12px}.dock{left:0;padding-inline:12px}.conversation{padding:30px 18px 180px}.status span{display:none}.modelbtn{max-width:54vw}.msg.user{margin-left:4%}}
+/* Open WebUI-inspired workspace */
+:root{--bg:#fff;--panel:#f8f8f8;--soft:#f2f2f2;--line:#e8e8e8;--text:#111;--muted:#707070;--hover:#ededed}
+[data-theme=dark]{--bg:#0b0b0b;--panel:#111;--soft:#191919;--line:#282828;--text:#f4f4f4;--muted:#999;--hover:#1d1d1d}
+.app{grid-template-columns:270px minmax(0,1fr)}.sidebar{background:var(--panel);border-color:var(--line)}
+.sidehead{height:62px;padding:0 18px}.mark{width:30px;height:30px;border-radius:10px;box-shadow:0 0 0 4px color-mix(in srgb,var(--text) 5%,transparent)}
+.wordmark{font-size:15px;font-weight:680}.sidebody{padding:8px 10px}.newbtn{justify-content:flex-start;padding:0 13px;border:0;background:transparent;box-shadow:none}
+.newbtn:hover{background:var(--hover)}.sectionlabel{text-transform:uppercase;letter-spacing:.08em;font-size:10px;padding:24px 11px 8px}
+.thread{font-size:13px;padding:9px 11px}.sidefoot{padding:10px}.ops{font-size:13px}
+.top{height:62px;border-color:var(--line);padding:0 22px;background:color-mix(in srgb,var(--bg) 92%,transparent)}
+.main{background:var(--bg)}.conversation{width:min(900px,100%);padding:54px 30px 210px}.welcome{min-height:calc(100vh - 310px)}
+.welcome h1{font-size:32px;font-weight:650}.welcome p{font-size:14px}.msg{grid-template-columns:34px minmax(0,1fr);margin-bottom:38px}
+.avatar{width:32px;height:32px;border-radius:10px}.msg.user{display:flex;justify-content:flex-end;margin-left:24%}.msg.user .avatar{display:none}
+.msg.user>div:last-child{max-width:80%;background:var(--soft);border:0;border-radius:18px;padding:10px 15px}.msgbody{line-height:1.8}
+.dock{left:270px;padding:64px 20px 20px;background:linear-gradient(transparent,var(--bg) 48%)}
+.compose{width:min(900px,100%);border-radius:22px;padding:14px 14px 11px;border-color:var(--line);box-shadow:0 8px 32px rgba(0,0,0,.16)}
+.compose:focus-within{border-color:color-mix(in srgb,var(--text) 25%,var(--line));box-shadow:0 10px 38px rgba(0,0,0,.2)}
+.send{border-radius:50%;width:34px;height:34px}.runtime{opacity:.72}.picker{border-radius:14px;background:var(--panel)}
+.promptgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:28px auto 0;max-width:600px}.promptchip{border:1px solid var(--line);background:var(--panel);color:var(--muted);padding:12px 14px;border-radius:12px;text-align:left;cursor:pointer}.promptchip:hover{background:var(--hover);color:var(--text)}
+@media(max-width:760px){.app{grid-template-columns:1fr}.dock{left:0}.promptgrid{grid-template-columns:1fr}.msg.user{margin-left:8%}.conversation{padding-inline:16px}}
 </style></head><body><div class="app">
 <aside class="sidebar" id="sidebar"><div class="sidehead"><div class="mark">B</div><div class="wordmark">Bridgena</div></div><div class="sidebody"><button class="newbtn" onclick="newChat()">＋ New chat</button><div class="sectionlabel">Recent</div><div id="threads"></div></div><div class="sidefoot"><a class="ops" href="/dashboard">⚙ Operations</a></div></aside>
 <main class="main"><header class="top"><button class="ghost mobile" onclick="toggleSidebar()">☰</button><div class="modelwrap"><button class="modelbtn" id="modelBtn" onclick="togglePicker()"><span id="modelLabel"></span><span class="chev">⌄</span></button><div class="picker" id="picker"><div class="searchbox"><input id="modelSearch" placeholder="Search models…" autocomplete="off"></div><div class="modellist" id="modelList"></div></div></div><div class="status"><i class="statusdot" id="statusDot"></i><span id="statusText">Ready</span></div><button class="ghost" onclick="toggleTheme()" title="Toggle theme">◐</button></header>
-<div class="scroll" id="scroll"><div class="conversation" id="conversation"><div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:38px;height:38px">B</div><h1>How can I help?</h1><p>Choose an Arena model and start a conversation. Bridgena keeps the account, browser identity, and exit aligned for the thread.</p></div></div></div></div>
+<div class="scroll" id="scroll"><div class="conversation" id="conversation"><div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:42px;height:42px">B</div><h1>What are we building?</h1><p>Choose a model and start a conversation with your Bridgena workspace.</p><div class="promptgrid"><button class="promptchip" onclick="usePrompt('Explain this code and identify reliability risks')">Review code</button><button class="promptchip" onclick="usePrompt('Help me debug a failed API request')">Debug a request</button><button class="promptchip" onclick="usePrompt('Design a production rollout plan')">Plan a rollout</button><button class="promptchip" onclick="usePrompt('Summarize the latest runtime signals')">Inspect runtime</button></div></div></div></div></div>
 <div class="dock"><div class="compose"><textarea id="input" rows="1" placeholder="Message Bridgena"></textarea><div class="composefoot"><span class="hint">Enter to send · Shift+Enter for newline</span><button class="send" id="send" onclick="sendMessage()" aria-label="Send">↑</button></div></div><div class="runtime"><details><summary>Runtime signal</summary><pre id="signal">Waiting for activity…</pre></details></div></div></main></div>
 <script>
 const MODELS=__MODELS_JSON__, DEFAULT_MODEL=__DEFAULT_MODEL__;
@@ -6103,7 +6248,8 @@ function writeLocalChats(all){const ids=Object.keys(all).sort((a,b)=>(all[b].upd
 function saveLocalMessage(role,content){const all=localChats(),c=all[chatId]||(all[chatId]={messages:[],updated:0});c.messages=(c.messages||[]).concat([{role,content}]).slice(-200);c.updated=Date.now();c.title=c.title||(role==='user'?content.slice(0,44):chatId);writeLocalChats(all)}
 function loadThreads(){const d=localChats(),rows=Object.keys(d).sort((a,b)=>(d[b].updated||0)-(d[a].updated||0));$('threads').innerHTML=rows.map(id=>'<button class="thread '+(id===chatId?'on':'')+'" data-id="'+escHtml(id)+'">'+escHtml(d[id].title||id)+'</button>').join('');document.querySelectorAll('.thread').forEach(b=>b.onclick=()=>openChat(b.dataset.id))}
 function openChat(id){chatId=id;localStorage.setItem('bgn.chat',id);$('conversation').innerHTML='';const c=localChats()[id];if(!c||!(c.messages||[]).length){showWelcome()}else c.messages.forEach(m=>addMessage(m.role==='user'?'user':'ai',m.content));loadThreads();$('sidebar').classList.remove('open')}
-function showWelcome(){$('conversation').innerHTML='<div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:38px;height:38px">B</div><h1>How can I help?</h1><p>Choose an Arena model and start a conversation.</p></div></div>'}
+function showWelcome(){$('conversation').innerHTML='<div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:42px;height:42px">B</div><h1>What are we building?</h1><p>Choose a model and start a conversation with your Bridgena workspace.</p><div class="promptgrid"><button class="promptchip" onclick="usePrompt(\'Explain this code and identify reliability risks\')">Review code</button><button class="promptchip" onclick="usePrompt(\'Help me debug a failed API request\')">Debug a request</button></div></div></div>'}
+function usePrompt(text){$('input').value=text;$('input').dispatchEvent(new Event('input'));$('input').focus()}
 function newChat(){chatId=makeId();localStorage.setItem('bgn.chat',chatId);showWelcome();loadThreads();$('sidebar').classList.remove('open');$('input').focus()}
 async function sendMessage(){if(busy)return;const input=$('input'),text=input.value.trim();if(!text)return;busy=true;input.value='';input.style.height='44px';$('send').disabled=true;setStatus('Generating','busy');addMessage('user',text);saveLocalMessage('user',text);const out=addMessage('ai','Thinking…','thinking');let acc='';try{const history=((localChats()[chatId]||{}).messages||[]).slice(-16).map(m=>({role:m.role,content:m.content}));const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,messages:history.length?history:[{role:'user',content:text}],stream:true,chat_id:chatId})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let nl;while((nl=buf.indexOf('\n'))>=0){const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);if(!line.startsWith('data: '))continue;const p=line.slice(6);if(p==='[DONE]')continue;let j;try{j=JSON.parse(p)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta?.content;if(d){acc+=d;out.classList.remove('thinking');out.innerHTML=md(acc);$('scroll').scrollTop=$('scroll').scrollHeight}}}if(!acc)throw new Error('Arena returned an empty response');saveLocalMessage('assistant',acc);setStatus('Ready','ok')}catch(e){out.classList.remove('thinking');out.innerHTML='<div class="errorbox">'+escHtml(e.message||e)+'</div>';setStatus('Error','err')}finally{busy=false;$('send').disabled=false;loadThreads()}}
 const input=$('input');input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px'});input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}});
@@ -6722,6 +6868,13 @@ async def proxies_prune():
 @app.post("/proxies/api/remove-one")
 async def proxies_remove_one(key: str = Form(...)):
     return JSONResponse({"removed": remove_one(key)})
+
+
+@app.post("/proxies/api/delete-all")
+async def proxies_delete_all(request: Request):
+    if not await _current_session(request):
+        raise HTTPException(status_code=401, detail="dashboard session required")
+    return JSONResponse(delete_all_proxies())
 
 
 @app.post("/proxies/api/revive")
