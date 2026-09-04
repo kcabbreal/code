@@ -369,17 +369,30 @@ def ensure_models_dir(base_dir: Optional[str] = None) -> str:
         log("WARN", f"ensure_models_dir: could not create directory '{models_dir}': {e}")
         return models_dir
 
+    parent = os.path.dirname(os.path.abspath(base))
     for fn in ("type.onnx", "grid.onnx", "grid.meta.json"):
         dst = os.path.join(models_dir, fn)
-        src_root = os.path.join(base, fn)
         if not os.path.exists(dst):
-            if os.path.exists(src_root):
-                try:
-                    shutil.copy2(src_root, dst)
-                    log("OK", f"Copied model asset '{fn}' from root to '{models_dir}'")
-                except Exception as ce:
-                    log("WARN", f"Failed copying '{fn}' from root to '{models_dir}': {ce}")
-            elif fn == "grid.meta.json":
+            candidates = [
+                os.path.join(base, fn),
+                os.path.join(parent, fn),
+                os.path.join(parent, "models", fn),
+                os.path.join(".", fn),
+                os.path.join("models", fn),
+            ]
+            found = False
+            for src_cand in candidates:
+                cand_abs = os.path.abspath(src_cand)
+                dst_abs = os.path.abspath(dst)
+                if cand_abs != dst_abs and os.path.exists(cand_abs):
+                    try:
+                        shutil.copy2(cand_abs, dst)
+                        log("OK", f"Copied model asset '{fn}' from '{cand_abs}' to '{models_dir}'")
+                        found = True
+                        break
+                    except Exception as ce:
+                        log("WARN", f"Failed copying '{fn}' from '{cand_abs}' to '{models_dir}': {ce}")
+            if not found and fn == "grid.meta.json":
                 try:
                     with open(dst, "w", encoding="utf-8") as f:
                         json.dump(DEFAULT_GRID_META, f, indent=2)
@@ -4892,6 +4905,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         return
     response_text = ""
     reasoning_text = ""
+    pending_v2_token = None
     for attempt in range(max_attempts):
         p = bind_persona(jar)
         jar = await _live_cookies(jar)
@@ -4941,14 +4955,19 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         log("INFO", f"[{jar.get('name')}] outbound {'follow-up' if follow_url else 'create'} envelope · "
                     f"content string {len(content)} chars · attachments {len(attachments or [])}")
 
-        tok = await mint_v3(jar.get("id"))
-        if not tok:
-            log("INFO", f"[{jar.get('name')}] Minting v3 token unavailable — attempting v2 escalation challenge fallback")
-            tok = await mint_v2_escalation(jar.get("id"), settle_s=35.0)
-            if tok:
-                _attach_v2(base, tok)
+        if pending_v2_token:
+            _attach_v2(base, pending_v2_token)
+            tok = pending_v2_token
+            pending_v2_token = None
+            log("INFO", f"[{jar.get('name')}] Using harvested V2 escalation token ({len(tok)} chars) — skipping V3 minting")
         else:
-            if not base.get("recaptchaV2Token"):
+            tok = await mint_v3(jar.get("id"))
+            if not tok:
+                log("INFO", f"[{jar.get('name')}] Minting v3 token unavailable — attempting v2 escalation challenge fallback")
+                tok = await mint_v2_escalation(jar.get("id"), settle_s=35.0)
+                if tok:
+                    _attach_v2(base, tok)
+            else:
                 _attach_v3(base, tok)
 
         if not tok and not base.get("recaptchaV2Token") and not base.get("recaptchaV3Token"):
@@ -5025,9 +5044,9 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 verdict = _classify(e.status, e.body)
                 log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status} (verdict={verdict}): {e.body[:250]}")
 
-                # If a follow-up request failed on post-to-evaluation (403, 400, 404):
+                # If a follow-up request failed on post-to-evaluation with non-captcha error (400, 404, 500):
                 # Clear the stale Arena thread and rebuild as a fresh create-evaluation turn
-                if mc:
+                if mc and verdict != "RECAPTCHA":
                     clear_conversation_model(chat_id, model_name)
                     mc = None
                     conv = {}
@@ -5057,10 +5076,19 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         log("WARN", f"[{jar.get('name')}] Arena verification rejected token (HTTP {e.status}) — escalating to V2 challenge solver")
                         esc = await mint_v2_escalation(jar.get("id"), settle_s=35.0)
                         if esc:
-                            _attach_v2(base, esc)
+                            pending_v2_token = esc
                             log("OK", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar")
                             if attempt + 1 < max_attempts:
                                 continue
+                    if mc:
+                        clear_conversation_model(chat_id, model_name)
+                        mc = None
+                        conv = {}
+                        response_text = ""
+                        reasoning_text = ""
+                        log("WARN", f"[{jar.get('name')}] follow-up verification failed — rebuilding as fresh create-evaluation")
+                        if attempt + 1 < max_attempts:
+                            continue
                     log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation failed")
                     yield ("error", "403: Arena rejected this session's verification token. The request was stopped without repeated retries; wait briefly and try a new chat.")
                     return
