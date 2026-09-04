@@ -35,29 +35,45 @@ except ImportError:
     ort = None
 
 def _discover_verification_factory():
-    """Resolve both a flat recaptcha_solver.py and common package layouts."""
+    """Resolve function-, class-, and singleton-based adapter packages."""
     import importlib
     errors = []
+    factory_names = ("get_solver", "AuthorizedVerificationAdapter",
+                     "VerificationAdapter", "RecaptchaSolver", "Solver")
+
+    def resolve(module, requested=None):
+        names = (requested,) if requested else factory_names
+        for name in names:
+            candidate = getattr(module, name, None)
+            if callable(candidate):
+                return candidate, name
+        for name in ("solver", "adapter", "client"):
+            instance = getattr(module, name, None)
+            if instance is not None and callable(getattr(instance, "solve", None)):
+                return (lambda instance=instance: instance), name
+        return None, None
+
     configured = os.environ.get("BRIDGENA_VERIFICATION_FACTORY", "").strip()
     candidates = ([configured] if configured else []) + [
-        "recaptcha_solver:get_solver",
-        "recaptcha_solver.recaptcha_solver:get_solver",
-        "recaptcha_solver.solver:get_solver",
-        "recaptcha_solver.adapter:get_solver",
-        "recaptcha_solver.client:get_solver",
+        "recaptcha_solver",
+        "recaptcha_solver.recaptcha_solver",
+        "recaptcha_solver.solver",
+        "recaptcha_solver.adapter",
+        "recaptcha_solver.client",
     ]
     seen = set()
     for spec in candidates:
         if not spec or spec in seen:
             continue
         seen.add(spec)
-        module_name, _, attr = spec.partition(":")
-        attr = attr or "get_solver"
+        module_name, separator, attr = spec.partition(":")
         try:
             module = importlib.import_module(module_name)
-            factory = getattr(module, attr)
-            if callable(factory):
-                return factory, None, spec
+            factory, resolved_name = resolve(module, attr if separator else None)
+            if factory:
+                return factory, None, f"{module_name}:{resolved_name}"
+            public = [name for name in dir(module) if not name.startswith("_")][:20]
+            errors.append(f"{spec}=no compatible factory (exports: {', '.join(public)})")
         except Exception as exc:
             errors.append(f"{spec}={type(exc).__name__}: {exc}")
     try:
@@ -68,14 +84,14 @@ def _discover_verification_factory():
             for info in pkgutil.iter_modules(package_path):
                 if not any(hint in info.name.lower() for hint in ("solver", "adapter", "client", "service")):
                     continue
-                spec = f"recaptcha_solver.{info.name}:get_solver"
+                spec = f"recaptcha_solver.{info.name}"
                 if spec in seen:
                     continue
                 try:
                     module = importlib.import_module(f"recaptcha_solver.{info.name}")
-                    factory = getattr(module, "get_solver", None)
-                    if callable(factory):
-                        return factory, None, spec
+                    factory, resolved_name = resolve(module)
+                    if factory:
+                        return factory, None, f"{spec}:{resolved_name}"
                 except Exception as exc:
                     errors.append(f"{spec}={type(exc).__name__}: {exc}")
     except Exception as exc:
@@ -137,7 +153,7 @@ KEEPER_REQUEST_READY_SEC = max(30, min(180, int(os.environ.get("BRIDGENA_KEEPER_
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.36-wrapper-ui-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.37-adapter-export-fix")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
