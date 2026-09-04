@@ -65,7 +65,7 @@ ARENA_RECAPTCHA_V2_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_V2_SITEKEY",
 RECAPTCHA_ACTION = os.environ.get("BRIDGENA_RECAPTCHA_ACTION", "chat_submit")
 ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?mode=direct")
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.20-claude-finish")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.21-claude-tail-grace")
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -2976,8 +2976,20 @@ class KeeperSession:
                     const dec = new TextDecoder();
                     let buffer = '';
                     let protocolFinished = false;
+                    const readWithGrace = () => new Promise((resolve, reject) => {
+                        const timer = setTimeout(() => resolve({graceExpired: true}), 450);
+                        reader.read().then(
+                            value => { clearTimeout(timer); resolve(value); },
+                            error => { clearTimeout(timer); reject(error); }
+                        );
+                    });
                     while (true) {
-                        const {done, value} = await reader.read();
+                        const packet = protocolFinished ? await readWithGrace() : await reader.read();
+                        if (packet.graceExpired) {
+                            try { await reader.cancel(); } catch (_) {}
+                            break;
+                        }
+                        const {done, value} = packet;
                         if (value) buffer += dec.decode(value, {stream: true});
                         if (done) buffer += dec.decode();
                         const parts = buffer.split(/\\r?\\n/);
@@ -2988,12 +3000,7 @@ class KeeperSession:
                                 if (/^(ad|d|e):/.test(line.trim())) protocolFinished = true;
                             }
                         }
-                        if (done || protocolFinished) {
-                            if (protocolFinished && !done) {
-                                try { await reader.cancel(); } catch (_) {}
-                            }
-                            break;
-                        }
+                        if (done) break;
                     }
                     if (buffer.trim()) emit(buffer);
                     P('D' + JSON.stringify(null));
