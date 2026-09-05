@@ -263,7 +263,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.3.0-throughput-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.3.1-reliability-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2307,10 +2307,12 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
         healthy = bool(s and s.last_health_ok and (now - s.last_health_ok) < 900)
         available = jar_available(j, now)
         captcha_clean = 1 if (now - _captcha_failed_jars.get(sid, 0.0) > 300) else 0
+        idle = 1 if (not s or not getattr(s, "_action_lock", None) or not s._action_lock.locked()) else 0
         # last_used is inverted so older = higher priority
         recency = -float(j.get("last_used", 0) or 0)
         return (
             captcha_clean,
+            idle,
             1 if (prefer_live and is_live and healthy) else 0,
             1 if (prefer_live and has_session and healthy) else 0,
             1 if available else 0,
@@ -5033,14 +5035,15 @@ RC_MINT_JS = r"""async (OPTS) => {
                     if (tok && tok.length > 20) return {token: tok, source, keyHint: hint(KEY), action: ACTION};
                     return {err: 'enterprise.execute resolved empty (Google scored this session low — image challenge may follow)', source, keyHint: hint(KEY), action: ACTION};
                 } catch (e1) {
+                    // The object-form enterprise call is known-bad on the current
+                    // live widget and only adds another full timeout. Skip it.
                     try {
-                        const t2 = await ex({sitekey: KEY, action: ACTION});
-                        if (t2 && t2.length > 20) return {token: t2, source, keyHint: hint(KEY), action: ACTION};
-                    } catch (e2) {}
-                    try {
-                        if (typeof g.execute === 'function') {
-                            const t3 = await Promise.race([g.execute(KEY, {action: ACTION}),
-                                                           new Promise((_, r) => setTimeout(() => r(new Error('v3-timeout')), 8000))]);
+                        if ((!g.enterprise || typeof g.enterprise.execute !== 'function')
+                            && typeof g.execute === 'function') {
+                            const t3 = await Promise.race([
+                                g.execute(KEY, {action: ACTION}),
+                                new Promise((_, r) => setTimeout(() => r(new Error('v3-timeout')), 5000))
+                            ]);
                             if (t3 && t3.length > 20) return {token: t3, source, keyHint: hint(KEY), action: ACTION};
                         }
                     } catch (e3) {}
@@ -5280,12 +5283,25 @@ async def mint_v3(jar_id=None):
             if adapter_token:
                 return adapter_token
 
-            # The live client loads enterprise reCAPTCHA on the direct-chat
-            # route. Stabilize there, then evaluate in the same locked browser
-            # transaction so catalog/health navigation cannot destroy context.
-            if "mode=direct" not in (s.page.url or ""):
-                await s.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
-                await s.page.wait_for_load_state("domcontentloaded")
+            # Avoid unnecessary navigation: if this keeper already has a live
+            # grecaptcha client, use it in-place. Navigation is the dominant source
+            # of ERR_NETWORK_CHANGED / destroyed execution contexts on tunnel churn.
+            try:
+                has_grecaptcha = bool(await s.page.evaluate(
+                    "() => !!(window.grecaptcha && (window.grecaptcha.enterprise || window.grecaptcha.execute))"
+                ))
+            except Exception:
+                has_grecaptcha = False
+
+            if not has_grecaptcha and "mode=direct" not in (s.page.url or ""):
+                try:
+                    await s.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=15000)
+                except Exception as nav_exc:
+                    if "ERR_NETWORK_CHANGED" not in str(nav_exc):
+                        raise
+                    log("WARN", f"[{sid}] keeper navigation saw network change; retrying once after route settles")
+                    await asyncio.sleep(0.75)
+                    await s.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=15000)
                 s.last_nav = time.time()
 
             if not LOCAL_VERIFICATION_ENHANCED:
@@ -5434,6 +5450,15 @@ async def mint_v2_escalation(jar_id=None, settle_s: float = 20.0):
 
 
 async def _mint_v2_escalation_legacy(jar_id=None, settle_s: float = 20.0):
+    """Run legacy V2 escalation as one locked browser transaction."""
+    sid, s = _find_session(jar_id)
+    if not s:
+        return None
+    async with s._action_lock:
+        return await _mint_v2_escalation_legacy_inner(jar_id, settle_s)
+
+
+async def _mint_v2_escalation_legacy_inner(jar_id=None, settle_s: float = 20.0):
     """Baseline-compatible V2 escalation retained outside localhost."""
     sid, s = _find_session(jar_id)
     if not s:
@@ -5961,12 +5986,9 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                 return
             except BridgeHTTPError as e:
                 if not e.status:
-                    # No HTTP response was observed by the browser transport.
-                    # Fall through to the existing same-jar/same-exit curl transport
-                    # instead of making that documented fallback unreachable.
-                    log("WARN", f"[{jar.get('name')}] browser transport failed before an HTTP response; falling back to curl transport")
-                    # Do not rotate the account here: keep the jar/persona/proxy
-                    # selected above so the fallback remains session-coherent.
+                    log("WARN", f"[{jar.get('name')}] browser transport failed before an HTTP response; request ended as transient network failure")
+                    yield ("error", "502: Browser transport lost the route before an HTTP response. Retry the request; no cross-transport replay was attempted.")
+                    return
                 else:
                     verdict = _classify(e.status, e.body)
                     log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status} (verdict={verdict}): {e.body[:250]}")
@@ -6030,7 +6052,9 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     yield ("error", f"{e.status or 502}: Arena browser-origin request failed: {e.body[:350] or 'empty response'}")
                     return
             except Exception as browser_e:
-                log("WARN", f"[{jar.get('name')}] browser-origin failed ({type(browser_e).__name__}: {browser_e}); falling back to curl transport")
+                log("WARN", f"[{jar.get('name')}] browser-origin failed ({type(browser_e).__name__}: {browser_e}); request ended without cross-transport replay")
+                yield ("error", "502: Browser request was interrupted before a reliable HTTP response. Retry the request.")
+                return
 
         headers = _headers_for(jar, p, json_body=True)
         kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
@@ -7403,6 +7427,20 @@ def _reserve_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> tu
     return True, 0
 
 
+def _release_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> None:
+    """Release a request reservation when its stream/response has terminated.
+
+    Duplicate suppression is for genuinely overlapping jobs, not for blocking a
+    client's legitimate retry for 15 seconds after a terminal 4xx/5xx.
+    """
+    if not API_DUPLICATE_WINDOW_SEC:
+        return
+    fp = _api_request_fingerprint(body, keyinfo, prompt)
+    with _recent_api_requests_lock:
+        _recent_api_requests.pop(fp, None)
+        _duplicate_notices.pop(fp, None)
+
+
 async def openai_stream(body: dict, keyinfo: dict):
     prompt = _format_conversation_prompt(body)
     if not prompt:
@@ -7481,6 +7519,7 @@ async def openai_stream(body: dict, keyinfo: dict):
             terminal_sent = True
             return
         finally:
+            _release_api_request(body, keyinfo, prompt)
             if terminal_sent:
                 log("INFO", f"OpenAI stream {rid[-8:]} delivered · outcome {outcome} · "
                             f"content {content_chunks} chunks/{len(acc)} chars · terminal yes")
@@ -7522,14 +7561,17 @@ async def chat_completions(request: Request):
         out = {"id": "chatcmpl-" + uuid7()[:23], "object": "chat.completion", "created": int(time.time()),
                "model": body.get("model", "auto"), "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]}
         acc = ""
-        async for kind, payload in run_turn(body.get("chat_id") or ("api-" + uuid7()), prompt,
-                                            body.get("model", "auto"), attachments=body.get("attachments")):
-            if kind == "content":
-                acc += payload
-            elif kind == "error":
-                raise HTTPException(status_code=502, detail=payload)
-        out["choices"][0]["message"]["content"] = acc
-        return JSONResponse(out)
+        try:
+            async for kind, payload in run_turn(body.get("chat_id") or ("api-" + uuid7()), prompt,
+                                                body.get("model", "auto"), attachments=body.get("attachments")):
+                if kind == "content":
+                    acc += payload
+                elif kind == "error":
+                    raise HTTPException(status_code=502, detail=payload)
+            out["choices"][0]["message"]["content"] = acc
+            return JSONResponse(out)
+        finally:
+            _release_api_request(body, keyinfo, prompt)
     return await openai_stream(body, keyinfo)
 
 
@@ -7642,18 +7684,21 @@ async def anthropic_messages(request: Request):
 
     if not body.get("stream", False):
         acc = ""
-        async for kind, payload in run_turn(chat_id, prompt, model,
-                                            attachments=body.get("attachments")):
-            if kind in ("content", "reasoning") and isinstance(payload, str):
-                acc += payload
-            elif kind == "error":
-                raise HTTPException(status_code=502, detail=payload)
-        return JSONResponse({
-            "id": message_id, "type": "message", "role": "assistant", "model": model,
-            "content": [{"type": "text", "text": acc}], "stop_reason": "end_turn",
-            "stop_sequence": None,
-            "usage": {"input_tokens": input_tokens, "output_tokens": _rough_tokens(acc)},
-        })
+        try:
+            async for kind, payload in run_turn(chat_id, prompt, model,
+                                                attachments=body.get("attachments")):
+                if kind in ("content", "reasoning") and isinstance(payload, str):
+                    acc += payload
+                elif kind == "error":
+                    raise HTTPException(status_code=502, detail=payload)
+            return JSONResponse({
+                "id": message_id, "type": "message", "role": "assistant", "model": model,
+                "content": [{"type": "text", "text": acc}], "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": _rough_tokens(acc)},
+            })
+        finally:
+            _release_api_request(body, keyinfo, prompt)
 
     async def gen():
         acc = ""
@@ -7714,6 +7759,7 @@ async def anthropic_messages(request: Request):
                 "type": "api_error", "message": f"{type(e).__name__}: {e}",
             }})
         finally:
+            _release_api_request(body, keyinfo, prompt)
             level = "INFO" if terminal_sent or outcome == "upstream-error" else "WARN"
             log(level, f"Anthropic stream {message_id[-8:]} delivered · outcome {outcome} · "
                        f"content {chunks} chunks/{len(acc)} chars · terminal {'yes' if terminal_sent else 'no'}")
@@ -7874,7 +7920,7 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.3.0", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.3.1", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
@@ -8306,4 +8352,3 @@ def _cli():
 
 if __name__ == "__main__":
     _cli()
- 
