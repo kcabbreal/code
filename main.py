@@ -244,18 +244,21 @@ ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
 ).strip().lower() in {"1", "true", "yes", "on"}
 REQUEST_MAX_ATTEMPTS = max(1, min(3, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "1"))))
 STREAM_TAIL_GRACE_MS = max(250, min(10000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "1500"))))
-KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
+KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "3"))))
 KEEPER_REQUEST_READY_SEC = max(2, min(20, int(os.environ.get("BRIDGENA_KEEPER_REQUEST_READY_SEC", "6"))))
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
+API_PACE_INTERVAL_SEC = max(0.0, min(5.0, float(os.environ.get("BRIDGENA_API_PACE_INTERVAL_SEC", "0.75"))))
+API_PACE_MAX_WAIT_SEC = max(1.0, min(30.0, float(os.environ.get("BRIDGENA_API_PACE_MAX_WAIT_SEC", "8"))))
+CONVERSATION_MIN_GAP_SEC = max(0.0, min(5.0, float(os.environ.get("BRIDGENA_CONVERSATION_MIN_GAP_SEC", "0.9"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 VERIFICATION_MIN_TOKEN_LEN = max(
     32, min(512, int(os.environ.get("BRIDGENA_VERIFICATION_MIN_TOKEN_LEN", "80")))
 )
 KEEPER_START_CONCURRENCY = max(
-    1, min(8, int(os.environ.get("BRIDGENA_KEEPER_START_CONCURRENCY", "3")))
+    1, min(16, int(os.environ.get("BRIDGENA_KEEPER_START_CONCURRENCY", "7")))
 )
 KEEPER_LOGIN_CONCURRENCY = max(
-    1, min(4, int(os.environ.get("BRIDGENA_KEEPER_LOGIN_CONCURRENCY", "2")))
+    1, min(16, int(os.environ.get("BRIDGENA_KEEPER_LOGIN_CONCURRENCY", "7")))
 )
 API_TURN_CONCURRENCY = max(
     1, min(128, int(os.environ.get("BRIDGENA_API_TURN_CONCURRENCY", "32")))
@@ -263,7 +266,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.4-live-proxy-rebind-stable-lane")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.6-readiness-barrier-paced-admission")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1840,6 +1843,8 @@ _API_FAILURE_QUARANTINE_S = max(15.0, float(os.environ.get("BRIDGENA_FAILURE_QUA
 _api_verified_keepers: Dict[str, float] = {}
 _api_keeper_quarantine_until: Dict[str, float] = {}
 _api_ready_event = asyncio.Event()
+_initial_verification_sweep_done = asyncio.Event()
+_keeper_fleet_launch_event = asyncio.Event()
 
 def _api_keeper_verified(sid: Optional[str]) -> bool:
     if not sid:
@@ -2698,7 +2703,7 @@ async def auto_login_on_boot():
     """Auto-start keeper sessions for all accounts with email+password on boot.
     Checks if already authenticated first to avoid unnecessary login.
     Works headless (no display required)."""
-    await asyncio.sleep(5)  # Let the app fully start
+    await asyncio.sleep(1)  # Minimal app bootstrap; keeper startup is intentionally parallel
     jars = load_jars()
     accounts_with_creds = [j for j in jars if j.get("email") and j.get("password") and j.get("enabled", True)]
     if not accounts_with_creds:
@@ -2721,7 +2726,8 @@ async def auto_login_on_boot():
     # Do not wait for the supervisor's next 15-second tick. Register every
     # session immediately; sync() starts browsers as background tasks.
     await keeper.sync()
-    log("INFO", f"Auto-login: {len(accounts_with_creds)} keeper session(s) launched")
+    _keeper_fleet_launch_event.set()
+    log("INFO", f"Auto-login: {len(accounts_with_creds)} keeper session(s) launched · startup verification barrier released")
 
 def uuid7() -> str:
     ts = int(time.time() * 1000)
@@ -4577,7 +4583,7 @@ class KeeperSession:
             if self.status != "running":
                 self.ready_at = float("inf")
             if self.status == "running" and KEEPER_WARMUP_SEC:
-                log("INFO", f"[{self.name}] Keeper warm-up gate {KEEPER_WARMUP_SEC}s before API traffic")
+                log("INFO", f"[{self.name}] Keeper warm-up gate {KEEPER_WARMUP_SEC}s before parallel verification preflight")
 
             self._loop_task = asyncio.create_task(self._session_loop())
             return True
@@ -6170,6 +6176,46 @@ _browser_turn_gate = asyncio.Semaphore(API_TURN_CONCURRENCY)
 _conversation_turn_locks: Dict[str, asyncio.Lock] = {}
 _conversation_turn_locks_guard = threading.Lock()
 
+_tenant_pace_locks: Dict[str, asyncio.Lock] = {}
+_tenant_pace_next: Dict[str, float] = {}
+_tenant_pace_guard = threading.Lock()
+_conversation_next_start: Dict[str, float] = {}
+
+def _tenant_pace_lock(tenant_id: str) -> asyncio.Lock:
+    key = str(tenant_id or "anonymous")
+    with _tenant_pace_guard:
+        lock = _tenant_pace_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _tenant_pace_locks[key] = lock
+        return lock
+
+async def _pace_api_request(tenant_id: str) -> float:
+    """Smooth bursty clients instead of letting them hammer the upstream.
+
+    Returns seconds waited. Requests wait up to API_PACE_MAX_WAIT_SEC; only a
+    truly excessive queue gets a local 429 with Retry-After.
+    """
+    if API_PACE_INTERVAL_SEC <= 0:
+        return 0.0
+    key = str(tenant_id or "anonymous")
+    async with _tenant_pace_lock(key):
+        now = time.monotonic()
+        due = max(now, _tenant_pace_next.get(key, now))
+        wait = max(0.0, due - now)
+        if wait > API_PACE_MAX_WAIT_SEC:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many requests queued for this API key. Retry in {max(1, int(wait))}s.",
+                headers={"Retry-After": str(max(1, int(wait)))},
+            )
+        if wait:
+            log("INFO", f"API admission pacing · tenant {key[:10]}… · delaying {wait:.2f}s")
+            await asyncio.sleep(wait)
+        _tenant_pace_next[key] = time.monotonic() + API_PACE_INTERVAL_SEC
+        return wait
+
+
 def _conversation_gate(chat_id: str) -> asyncio.Lock:
     """Serialize only writes to one exact stateful Arena conversation."""
     key = str(chat_id or "anonymous")
@@ -6190,6 +6236,14 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
     the exact same Arena conversation are ordered to preserve transcript state.
     """
     async with _conversation_gate(chat_id):
+        if CONVERSATION_MIN_GAP_SEC > 0:
+            now = time.monotonic()
+            due = _conversation_next_start.get(str(chat_id), now)
+            if due > now:
+                wait = due - now
+                log("INFO", f"conversation pacing · {str(chat_id)[:10]}… · delaying {wait:.2f}s")
+                await asyncio.sleep(wait)
+            _conversation_next_start[str(chat_id)] = time.monotonic() + CONVERSATION_MIN_GAP_SEC
         async with _browser_turn_gate:
             turn = _run_turn_impl(chat_id, prompt, model_name, attachments, jar_hint,
                                   system_prompt=system_prompt)
@@ -7993,19 +8047,26 @@ async def openai_stream(body: dict, keyinfo: dict):
 
 async def _require_api_ready():
     models_ready = bool(get_models())
-    ready_jars = []
-    for jar in load_jars():
-        if not jar.get("enabled", True) or not jar_has_auth(jar):
-            continue
-        session = keeper.sessions.get(jar.get("id"))
-        if keeper_session_ready(session):
-            ready_jars.append(jar)
-    if models_ready and ready_jars:
+
+    # Do not let early chat traffic compete with the startup verification cohort.
+    if not _initial_verification_sweep_done.is_set():
+        raise HTTPException(
+            status_code=503,
+            detail="Bridgena is warming the keeper fleet in parallel. Retry in a moment.",
+            headers={"Retry-After": "2"},
+        )
+
+    _refresh_api_ready_event()
+    if models_ready and _api_ready_event.is_set():
         return
+
+    verified = _verified_keeper_count()
+    exits = _verified_exit_count()
     raise HTTPException(
         status_code=503,
-        detail=(f"Bridgena is starting: models={'ready' if models_ready else 'loading'}, "
-                f"authenticated keepers={len(ready_jars)}. Retry shortly."),
+        detail=(f"Bridgena verification capacity is recovering: "
+                f"verified keepers={verified}/{_API_MIN_VERIFIED_KEEPERS}, "
+                f"verified exits={exits}/{_API_MIN_VERIFIED_EXITS}. Retry shortly."),
         headers={"Retry-After": "2"},
     )
 
@@ -8024,12 +8085,13 @@ async def chat_completions(request: Request):
                 f"tools {len(body.get('tools') or []) if isinstance(body.get('tools') or [], list) else 0} · "
                 f"max_tokens {body.get('max_tokens') or body.get('max_completion_tokens') or 'default'} · "
                 f"usage {'yes' if (body.get('stream_options') or {}).get('include_usage') else 'no'}")
+    await _pace_api_request(_tenant_identity(keyinfo))
     reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
     if not reserved:
         if duplicate_count == 1:
             log("INFO", f"duplicate API retries suppressed · model {str(body.get('model') or 'auto')[:80]} · "
                         f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
-        raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
+        raise HTTPException(status_code=429, detail="An identical request is already in flight. Wait for it to finish before retrying.", headers={"Retry-After": "2"})
     if not body.get("stream", True):
         out = {"id": "chatcmpl-" + uuid7()[:23], "object": "chat.completion", "created": int(time.time()),
                "model": body.get("model", "auto"), "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]}
@@ -8148,6 +8210,7 @@ async def anthropic_messages(request: Request):
     prompt = _anthropic_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
+    reserved, duplicate_count = await _pace_api_request(_tenant_identity(keyinfo))
     reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
     if not reserved:
         if duplicate_count == 1:
@@ -8446,7 +8509,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.4",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.6",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -8826,75 +8889,135 @@ except Exception as _v3_static_exc:
     log('WARN',f'noVNC static mount unavailable: {type(_v3_static_exc).__name__}')
 
 # ---------- startup ----------
-async def _api_verification_readiness_loop():
-    """Keep external API admission closed until a keeper proves auth + V3 capability.
+async def _preflight_one_keeper(sid: str, session, jar: dict) -> tuple:
+    """Run one browser-local V3 readiness preflight for one keeper.
 
-    The preflight is browser-local: it does not create an Arena evaluation or
-    consume a user message. Runtime network/session failures revoke the keeper
-    and require it to pass this preflight again before selection.
+    This never creates an Arena evaluation. Every keeper owns its own action
+    lock/page, so separate keepers can preflight concurrently.
     """
-    announced_wait = False
+    name = getattr(session, "name", sid)
+    try:
+        token = await asyncio.wait_for(mint_v3(sid), timeout=15.0)
+        if not _verification_token_ok(token):
+            log("WARN", f"[{name}] verification preflight failed · no valid V3 token")
+            return sid, False
+        _api_verified_keepers[sid] = time.monotonic()
+        _api_keeper_quarantine_until.pop(sid, None)
+        log("OK", f"[{name}] verification preflight passed · Enterprise V3 ready · token shape {len(token)} chars")
+        return sid, True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log("WARN", f"[{name}] verification preflight failed · "
+                    f"{type(exc).__name__}: {redact(str(exc))[:160]}")
+        return sid, False
+
+
+async def _api_verification_readiness_loop():
+    """Drive startup verification as one fleet-wide cohort.
+
+    Chat traffic stays behind an initial barrier until the first parallel
+    verification sweep completes. This prevents API requests from stealing
+    keeper action locks while the fleet is still warming.
+    """
     announced_ready = False
+    initial_done = False
+
+    try:
+        await asyncio.wait_for(_keeper_fleet_launch_event.wait(), timeout=30.0)
+    except asyncio.TimeoutError:
+        log("WARN", "Verification fleet preflight · keeper launch barrier timed out; continuing with available sessions")
+
     while True:
         try:
-            _refresh_api_ready_event()
-            if _api_ready_event.is_set():
-                if not announced_ready:
-                    names = [getattr(keeper.sessions.get(sid), "name", sid)
-                             for sid in _api_verified_keepers
-                             if _api_keeper_verified(sid)
-                             and keeper_session_ready(keeper.sessions.get(sid))]
-                    log("OK", "API READY · auth + V3 capability quorum passed"
-                        + f" · verified keepers {len(names)}"
-                        + f" · verified exits {_verified_exit_count()}"
-                        + (f" · {', '.join(names[:4])}" if names else ""))
-                    announced_ready = True
-                    announced_wait = False
-                await asyncio.sleep(10.0)
-                continue
+            jars_by_id = {
+                str(j.get("id") or ""): j
+                for j in load_jars()
+                if j.get("id") and j.get("enabled", True) and jar_has_auth(j)
+            }
 
-            announced_ready = False
-            if not announced_wait:
-                log("INFO", "API NOT READY · waiting for authenticated keeper quorum + Enterprise V3 capability; "
-                            "chat requests will receive 503 until verification is ready")
-                announced_wait = True
+            # During first startup sweep, wait for the cohort to converge instead
+            # of preflighting the first one or two keepers early.
+            if not initial_done and jars_by_id:
+                deadline = time.monotonic() + 35.0
+                last_ready = -1
+                while time.monotonic() < deadline:
+                    ready = [
+                        sid for sid in jars_by_id
+                        if keeper_session_ready(keeper.sessions.get(sid))
+                    ]
+                    if len(ready) != last_ready:
+                        log("INFO", f"Verification startup barrier · browser-ready {len(ready)}/{len(jars_by_id)}")
+                        last_ready = len(ready)
+                    if len(ready) >= len(jars_by_id):
+                        break
+                    await asyncio.sleep(0.35)
 
-            for jar in load_jars():
-                sid = str(jar.get("id") or "")
-                if not sid or _api_keeper_verified(sid) or not jar.get("enabled", True):
+            now_mono = time.monotonic()
+            eligible = []
+            for sid, jar in jars_by_id.items():
+                if _api_keeper_verified(sid):
                     continue
-                if time.monotonic() < _api_keeper_quarantine_until.get(sid, 0.0):
+                if now_mono < _api_keeper_quarantine_until.get(sid, 0.0):
                     continue
                 session = keeper.sessions.get(sid)
-                if not keeper_session_ready(session) or not jar_has_auth(jar):
+                if not keeper_session_ready(session):
                     continue
-                if session.active_requests or session._action_lock.locked():
+                if session.active_requests:
                     continue
-                try:
-                    healthy = await asyncio.wait_for(session.check_health(), timeout=8.0)
-                    if not healthy:
-                        continue
-                    token = await asyncio.wait_for(mint_v3(sid), timeout=15.0)
-                    if not _verification_token_ok(token):
-                        log("WARN", f"[{getattr(session, 'name', sid)}] verification preflight failed · no valid V3 token")
-                        continue
-                    _api_verified_keepers[sid] = time.monotonic()
-                    log("OK", f"[{getattr(session, 'name', sid)}] verification preflight passed · "
-                              f"Enterprise V3 ready · token shape {len(token)} chars")
-                    _refresh_api_ready_event()
-                    if (_verified_keeper_count() >= _API_MIN_VERIFIED_KEEPERS
-                            and _verified_exit_count() >= _API_MIN_VERIFIED_EXITS):
-                        break
-                except Exception as exc:
-                    log("WARN", f"[{getattr(session, 'name', sid)}] verification preflight failed · "
-                                f"{type(exc).__name__}: {redact(str(exc))[:160]}")
+                if getattr(session, "_action_lock", None) and session._action_lock.locked():
+                    continue
+                eligible.append((sid, session, jar))
+
+            if eligible:
+                names = ", ".join(getattr(s, "name", sid) for sid, s, _ in eligible)
+                log("INFO", f"Verification fleet preflight · firing {len(eligible)} keeper(s) concurrently"
+                            + (f" · {names}" if names else ""))
+                results = await asyncio.gather(
+                    *(_preflight_one_keeper(sid, session, jar)
+                      for sid, session, jar in eligible),
+                    return_exceptions=False,
+                )
+                passed = sum(1 for _, ok in results if ok)
+                log("INFO", f"Verification fleet preflight · cohort complete · {passed}/{len(results)} passed")
+
             _refresh_api_ready_event()
-            await asyncio.sleep(2.0 if not _api_ready_event.is_set() else 10.0)
+
+            if not initial_done:
+                initial_done = True
+                _initial_verification_sweep_done.set()
+                log("INFO", "Verification startup barrier · initial fleet sweep complete · API admission may open")
+
+            verified_now = [
+                sid for sid in jars_by_id
+                if _api_keeper_verified(sid)
+                and keeper_session_ready(keeper.sessions.get(sid))
+            ]
+            authenticated_ready = sum(
+                1 for sid in jars_by_id
+                if keeper_session_ready(keeper.sessions.get(sid))
+            )
+
+            if _api_ready_event.is_set():
+                if not announced_ready:
+                    log("OK", f"API READY · verified keepers {len(verified_now)}/{authenticated_ready or len(jars_by_id)}"
+                              f" · verified exits {_verified_exit_count()}")
+                    announced_ready = True
+            else:
+                announced_ready = False
+
+            all_ready_verified = bool(authenticated_ready) and len(verified_now) >= authenticated_ready
+            await asyncio.sleep(8.0 if all_ready_verified else 1.5)
+
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log("WARN", f"API verification readiness loop recovered from {type(exc).__name__}: {redact(str(exc))[:160]}")
-            await asyncio.sleep(3.0)
+            if not initial_done:
+                _initial_verification_sweep_done.set()
+                initial_done = True
+            log("WARN", f"API verification readiness loop recovered from "
+                        f"{type(exc).__name__}: {redact(str(exc))[:160]}")
+            await asyncio.sleep(2.0)
 
 def jars_have_creds() -> bool:
     return any(j.get("email") and j.get("password") and j.get("enabled", True) for j in load_jars())
@@ -8915,11 +9038,14 @@ async def _lifespan(app):
              asyncio.create_task(get_initial_data(), name="initial-catalog")]
     if jars_have_creds():
         tasks.append(asyncio.create_task(auto_login_on_boot(), name="auto-login"))
+        tasks.append(asyncio.create_task(_api_verification_readiness_loop(), name="verification-readiness"))
     app.state.background_tasks = tasks
     app.state.ready_at = time.time()
     log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
+    log("INFO", f"Keeper startup · parallel starts {KEEPER_START_CONCURRENCY} · parallel logins {KEEPER_LOGIN_CONCURRENCY} · warm-up {KEEPER_WARMUP_SEC}s · fleet readiness barrier ON")
+    log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
     log("INFO", "Capacity target · queued multi-user admission · one stable browser transport lane per keeper")
     log("INFO", "Proxy allocator · full-pool startup scan + distinct keeper assignment enabled")
     if get_verification_solver:
