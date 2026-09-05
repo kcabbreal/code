@@ -263,7 +263,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.3.1-reliability-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.3.2-verification-protocol-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -5157,6 +5157,9 @@ def _externally_reachable_proxy(session) -> Optional[str]:
     return candidate
 
 
+_verification_adapter_bad_shapes = 0
+_verification_adapter_disabled_until = 0.0
+
 async def _solve_with_verification_adapter(challenge_type: str, session,
                                             site_key: str, action: Optional[str] = None):
     """Request a token from the optional async verification adapter.
@@ -5165,6 +5168,12 @@ async def _solve_with_verification_adapter(challenge_type: str, session,
     ONNX get_solver() remains independent from the adapter factory alias.
     """
     global _verification_adapter_warned_at
+    global _verification_adapter_bad_shapes, _verification_adapter_disabled_until
+
+    now_mono = time.monotonic()
+    if now_mono < _verification_adapter_disabled_until:
+        return None
+
     if get_verification_solver is None:
         now = time.time()
         if now - _verification_adapter_warned_at > 300:
@@ -5224,14 +5233,20 @@ async def _solve_with_verification_adapter(challenge_type: str, session,
                   if hasattr(solve_result, "__await__") else solve_result)
         token = result.get("token") if isinstance(result, dict) and result.get("ok") else None
         if _verification_token_ok(token):
+            _verification_adapter_bad_shapes = 0
             log("OK", "verification adapter completed"
                 + f" · provider {result.get('provider', 'wrapper')}"
                 + f" · task {str(result.get('task_id') or '-')[:12]}"
                 + f" · {int(result.get('elapsed_ms') or 0)}ms")
             return token
         if isinstance(token, str):
+            _verification_adapter_bad_shapes += 1
             log("WARN", "verification adapter returned an invalid token shape"
                 + f" ({len(token)} chars; minimum {VERIFICATION_MIN_TOKEN_LEN})")
+            if _verification_adapter_bad_shapes >= 2:
+                _verification_adapter_disabled_until = time.monotonic() + 300.0
+                log("WARN", "verification adapter circuit-open for 300s after repeated invalid token shapes; "
+                            "keeper-native verification will be used")
             return None
         error = result.get("error") if isinstance(result, dict) else "invalid adapter response"
         log("WARN", f"verification adapter failed: {str(error)[:180]}")
@@ -5603,9 +5618,12 @@ def _classify(status: int, body: str) -> str:
         if "captcha" in low or "recaptcha" in low:
             return "RECAPTCHA"
         return "SESSION" if status == 401 or "auth" in low else "RECAPTCHA"  # conservative: unknown 403s never burn jars
-    # HTTP status is authoritative. Treating a vague 429 body as CAPTCHA caused
-    # expensive V2 escalation and cross-account retry storms.
+    # Arena's live client uses a specific 429 {"error":"prompt failed"} as
+    # the signal to mount the Enterprise checkbox and retry with recaptchaV2Token.
+    # Other 429 responses remain ordinary throttling.
     if status == 429:
+        if "prompt failed" in low:
+            return "RECAPTCHA"
         return "RATELIMIT"
     if status >= 500 or 520 <= status <= 527:
         return "UPSTREAM"
@@ -5891,17 +5909,25 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         else:
             tok = await mint_v3(jar.get("id"))
             if not tok:
-                log("INFO", f"[{jar.get('name')}] Minting v3 token unavailable — attempting v2 escalation challenge fallback")
-                tok = await mint_v2_escalation(jar.get("id"), settle_s=20.0)
-                if tok:
-                    _attach_v2(base, tok)
+                # The live Arena client does NOT proactively render V2 when
+                # enterprise.execute() fails. V2 is mounted only after an
+                # upstream verification-escalation response.
+                log("WARN", f"[{jar.get('name')}] V3 token unavailable — no request sent; "
+                            "V2 escalation is server-triggered and was not launched proactively")
             else:
                 _attach_v3(base, tok)
 
         if not tok and not base.get("recaptchaV2Token") and not base.get("recaptchaV3Token"):
-            yield ("error", "503: The same-exit keeper is live but could not mint or solve a reCAPTCHA token. "
-                            "No request was sent to Arena; inspect keeper status/models and retry.")
+            yield ("error", "503: The same-exit keeper could not mint a fresh Enterprise V3 token. "
+                            "No request was sent and no unsolicited V2 challenge was started; retry on a healthy keeper.")
             return
+        # Live wire invariant: normal requests contain V3 only; challenge retries
+        # contain V2 only. Never send both fields together.
+        if base.get("recaptchaV2Token"):
+            base.pop("recaptchaV3Token", None)
+        elif base.get("recaptchaV3Token"):
+            base.pop("recaptchaV2Token", None)
+
         url = follow_url or f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
         # Existing Arena conversations are session-bound. Restore the exact exit
         # that created the thread before the normal sticky picker runs.
@@ -6021,7 +6047,10 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         _captcha_failed_jars[failed_jar_id] = time.time()
                         if rc_attempts.get(failed_jar_id, 0) < 1:
                             rc_attempts[failed_jar_id] = rc_attempts.get(failed_jar_id, 0) + 1
-                            log("WARN", f"[{jar.get('name')}] Arena verification rejected token (HTTP {e.status}) — escalating to V2 challenge solver")
+                            reason = ("server requested V2 escalation"
+                                      if e.status == 429 and "prompt failed" in (e.body or "").lower()
+                                      else "V3 verification rejected")
+                            log("WARN", f"[{jar.get('name')}] {reason} (HTTP {e.status}) — starting Enterprise V2 challenge")
                             esc = await mint_v2_escalation(failed_jar_id, settle_s=20.0)
                             if esc:
                                 pending_v2_token = esc
@@ -6155,10 +6184,14 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         _captcha_failed_jars[failed_jar_id] = time.time()
                         if rc_attempts.get(failed_jar_id, 0) < 1:
                             rc_attempts[failed_jar_id] = rc_attempts.get(failed_jar_id, 0) + 1
+                            reason = ("server requested V2 escalation"
+                                      if resp.status_code == 429 and "prompt failed" in body.lower()
+                                      else "V3 verification rejected")
+                            log("WARN", f"[{jar.get('name')}] {reason} (HTTP {resp.status_code}) — starting Enterprise V2 challenge")
                             esc = await mint_v2_escalation(failed_jar_id, settle_s=20.0)
                             if esc:
                                 _attach_v2(base, esc)
-                                log("WARN", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar")
+                                log("OK", f"[{jar.get('name')}] V2 token harvested ({len(esc)} chars) — retrying SAME jar with V2 only")
                                 continue
                         if mc:
                             clear_conversation_model(chat_id, model_name)
@@ -7920,7 +7953,7 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.3.1", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.3.2", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
