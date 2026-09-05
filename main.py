@@ -180,10 +180,10 @@ def _validated_public_url(value):
     return value.rstrip("/")
 
 PUBLIC_APP_URL = _validated_public_url(os.environ.get(
-    "BRIDGENA_PUBLIC_URL", "https://arena.ai"
+    "BRIDGENA_PUBLIC_URL", "https://arena.itio.dpdns.org"
 ))
 ARENA_BASE = _validated_public_url(os.environ.get(
-    "BRIDGENA_ARENA_BASE", "https://arena.ai"
+    "BRIDGENA_ARENA_BASE", "https://arena.itio.dpdns.org"
 ))
 _ARENA_PARSED = urlparse(ARENA_BASE)
 LOCAL_UPSTREAM = (_ARENA_PARSED.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
@@ -241,7 +241,7 @@ KEEPER_LOGIN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.6-unified-base")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.7-admission-native-messages")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -3613,6 +3613,14 @@ class KeeperSession:
         """Clone the authenticated public jar into localhost scope and switch pages."""
         if not self.context or not self.page:
             return False
+        if ARENA_BASE.rstrip("/") == PUBLIC_AUTH_BASE.rstrip("/"):
+            # Authentication already occurred on the target origin. Rewriting
+            # cookies here can alter their paths and navigating again races
+            # with the application hydration that just completed.
+            self.last_nav = time.time()
+            self.last_health_ok = time.time()
+            self.last_public_auth_check = time.time()
+            return True
         source = self._public_cookie_snapshot
         if not source:
             jar = next((j for j in load_jars() if j.get("id") == self.jar_id), None)
@@ -3943,13 +3951,16 @@ class KeeperSession:
                     return {status: r.status, error: '', lines: captured,
                             finishSeen: protocolFinished, stopReason};
                 } catch(e) {
-                    P('S500'); P('E' + e.message); P('Dnull');
-                    return {status: 500, error: String(e.message || e), lines: captured};
+                    P('S0'); P('E' + e.message); P('Dnull');
+                    return {status: 0, error: String(e.message || e), lines: captured};
                 }
             }"""
-            eval_task = asyncio.create_task(page.evaluate(
+            eval_task = asyncio.create_task(asyncio.wait_for(page.evaluate(
                 script, [url, payload, req_id, RECAPTCHA_ACTION, STREAM_TAIL_GRACE_MS]
-            ))
+            ), timeout=180.0))
+            # Navigation can destroy evaluate before its console sentinel.
+            # Always wake the consumer; the result supplies any missing frames.
+            eval_task.add_done_callback(lambda task: queue.put_nowait(None))
             # Console delivery is fast but may skip an event under load. Keep
             # indexed frames ordered: later chunks wait behind a gap until the
             # page result supplies the missing frame at EOF. This prevents a
@@ -3994,6 +4005,10 @@ class KeeperSession:
             if status_code != 200:
                 raise BridgeHTTPError(status_code, error_body)
         finally:
+            if 'eval_task' in locals():
+                if not eval_task.done():
+                    eval_task.cancel()
+                await asyncio.gather(eval_task, return_exceptions=True)
             self.active_requests -= 1
             page.remove_listener("console", on_console)
             await self._release_page(pool_idx)
@@ -5694,7 +5709,33 @@ def _parse_stream_line(line: str):
     return None
 
 
+_browser_turn_gate = asyncio.Lock()
+_browser_cooldown_until = 0.0
+
+
 async def run_turn(chat_id: str, prompt: str, model_name: str,
+                   attachments: Optional[list] = None, jar_hint: Optional[str] = None):
+    """One browser turn per process; reject overload without creating a queue."""
+    global _browser_cooldown_until
+    remaining = _browser_cooldown_until - time.monotonic()
+    if remaining > 0:
+        yield ("error", "429: Upstream cooling down; retry after %d seconds." % math.ceil(remaining))
+        return
+    if _browser_turn_gate.locked():
+        yield ("error", "503: Browser chat is busy. Wait for the active request to finish.")
+        return
+    async with _browser_turn_gate:
+        turn = _run_turn_impl(chat_id, prompt, model_name, attachments, jar_hint)
+        try:
+            async for kind, payload in turn:
+                if kind == "error" and str(payload).startswith("429:"):
+                    _browser_cooldown_until = time.monotonic() + 30.0
+                yield kind, payload
+        finally:
+            await turn.aclose()
+
+
+async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                    attachments: Optional[list] = None, jar_hint: Optional[str] = None):
     """Async generator yielding ('content'|'reasoning'|'error'|'done', text).
     One bounded attempt budget over the PROVEN exit pool; jars survive every
@@ -5886,20 +5927,21 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 yield ("done", response_text)
                 return
             except BridgeHTTPError as e:
+                if not e.status:
+                    log("WARN", f"[{jar.get('name')}] browser transport failed without an HTTP response")
+                    yield ("error", "502: Browser transport failed; delivery is uncertain, so the request was not replayed.")
+                    return
                 verdict = _classify(e.status, e.body)
                 log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status} (verdict={verdict}): {e.body[:250]}")
 
-                # If a follow-up request failed on post-to-evaluation with non-captcha error (400, 404, 500):
-                # Clear the stale Arena thread and rebuild as a fresh create-evaluation turn
-                if mc and verdict != "RECAPTCHA":
-                    clear_conversation_model(chat_id, model_name)
-                    mc = None
-                    conv = {}
-                    response_text = ""
-                    reasoning_text = ""
-                    log("WARN", f"[{jar.get('name')}] follow-up rejected by Arena (HTTP {e.status}) — rebuilding as fresh create-evaluation")
-                    if attempt + 1 < max_attempts:
-                        continue
+                # A failed POST may already have been processed. Do not turn
+                # it into a new conversation or replay it automatically.
+                if verdict == "SESSION":
+                    browser_session.status = "degraded"
+                    browser_session.ready_at = float("inf")
+                    browser_session.error = "Upstream rejected authentication; sign in again"
+                    yield ("error", "401: Upstream rejected this session. Sign in again in Accounts.")
+                    return
 
                 if verdict == "PROMPT":
                     log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming (HTTP {e.status}) — no retry or rotation")
@@ -5911,9 +5953,9 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     yield ("error", f"429: Arena returned Too Many Requests for model '{model_name}'. This model is currently rate-limited upstream on Arena; wait 30-60s or select another model in your chat.")
                     return
 
-                if verdict == "UPSTREAM" and attempt + 1 < max_attempts:
-                    await asyncio.sleep(min(5.0, 1.0 + attempt))
-                    continue
+                if verdict == "UPSTREAM":
+                    yield ("error", "502: Upstream request failed; it was not replayed because delivery may have occurred.")
+                    return
 
                 if verdict == "RECAPTCHA":
                     failed_jar_id = jar.get("id")
@@ -5951,7 +5993,9 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 yield ("error", f"{e.status or 502}: Arena browser-origin request failed: {e.body[:350] or 'empty response'}")
                 return
             except Exception as browser_e:
-                log("WARN", f"[{jar.get('name')}] browser-origin unavailable ({type(browser_e).__name__}: {browser_e}) — curl fallback")
+                log("WARN", f"[{jar.get('name')}] browser-origin failed ({type(browser_e).__name__}); no automatic replay")
+                yield ("error", "502: Browser request interrupted. No automatic replay was attempted.")
+                return
 
         headers = _headers_for(jar, p, json_body=True)
         kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
@@ -5998,7 +6042,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 verdict = _classify(resp.status_code, "")
                 if resp.status_code != 200:
                     raw = b""
-                    async for chunk in resp.aiter_content():
+                    async for chunk in resp.itio.dpdns.orgter_content():
                         raw += chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8", "ignore")
                         if len(raw) > 40000:
                             break
@@ -6121,7 +6165,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         _proxy_health_record(proxy, True, ms, source="stream")
                     _flagged_exits.pop(_proxy_hkey(proxy), None)
                 buffer = b""
-                async for chunk in resp.aiter_content():
+                async for chunk in resp.itio.dpdns.orgter_content():
                     if not chunk:
                         continue
                     if isinstance(chunk, str):
@@ -6309,8 +6353,8 @@ td .mono,.mono{font-family:var(--mono);font-size:12.5px}
 .transcript{flex:1;overflow:auto;padding:26px 8%;display:flex;flex-direction:column;gap:16px}
 .bubble{max-width:78%;padding:12px 16px;border-radius:14px;font-size:15px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word}
 .bubble.user{align-self:flex-end;background:color-mix(in srgb,var(--amber) 14%,var(--panel));border:1px solid color-mix(in srgb,var(--amber) 26%,transparent);border-bottom-right-radius:4px}
-.bubble.ai{align-self:flex-start;background:var(--panel);border:1px solid var(--hair);border-bottom-left-radius:4px}
-.bubble.ai .who,.bubble.user .who{display:block;font:600 10px var(--mono);letter-spacing:1.2px;text-transform:uppercase;color:var(--ink3);margin-bottom:6px}
+.bubble.itio.dpdns.org{align-self:flex-start;background:var(--panel);border:1px solid var(--hair);border-bottom-left-radius:4px}
+.bubble.itio.dpdns.org .who,.bubble.user .who{display:block;font:600 10px var(--mono);letter-spacing:1.2px;text-transform:uppercase;color:var(--ink3);margin-bottom:6px}
 .bubble pre{background:#07090E;border:1px solid var(--hair);border-radius:8px;padding:10px 12px;overflow:auto;font:400 12.5px/1.6 var(--mono)}
 .bubble pre code{background:transparent;padding:0;color:inherit}
 .bubble code{background:var(--panel2);border:1px solid var(--hair);border-radius:4px;padding:1px 5px;font:400 13px var(--mono)}
@@ -7446,13 +7490,98 @@ async def chat_completions(request: Request):
     return await openai_stream(body, keyinfo)
 
 
+def _anthropic_error(status: int, message: str, error_type: str = "invalid_request_error"):
+    return JSONResponse({"type": "error", "error": {
+        "type": error_type, "message": message,
+    }}, status_code=status)
+
+
+async def _native_anthropic_request(request: Request, endpoint: str):
+    """Forward the native protocol unchanged to Anthropic's official API.
+
+    Client gateway credentials are checked locally and never forwarded.
+    Provider credentials must be supplied by the operator, outside this file.
+    """
+    provider_key = os.environ.get("BRIDGENA_ANTHROPIC_API_KEY", "").strip()
+    if not provider_key:
+        return _anthropic_error(503, "Native Anthropic routing requires BRIDGENA_ANTHROPIC_API_KEY.", "api_error")
+    try:
+        import httpx
+    except ImportError:
+        return _anthropic_error(503, "Native Anthropic routing requires the httpx package.", "api_error")
+    headers = {
+        "x-api-key": provider_key,
+        "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
+        "content-type": "application/json",
+    }
+    if request.headers.get("anthropic-beta"):
+        headers["anthropic-beta"] = request.headers["anthropic-beta"]
+    client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0),
+                               follow_redirects=False)
+    response = None
+    try:
+        outgoing = client.build_request("POST", "https://api.anthropic.com/v1/" + endpoint,
+                                        headers=headers, content=await request.body(),
+                                        params=request.query_params.multi_items())
+        response = await client.send(outgoing, stream=True)
+        response_headers = {k: v for k, v in response.headers.items()
+                            if k in {"content-type", "request-id", "retry-after"}
+                            or k.startswith("anthropic-ratelimit-")}
+        response_headers["cache-control"] = "no-store"
+        response_headers["x-accel-buffering"] = "no"
+        if response.status_code >= 400 or "text/event-stream" not in response.headers.get("content-type", ""):
+            data = await response.aread()
+            return Response(content=data, status_code=response.status_code, headers=response_headers)
+
+        async def forward():
+            try:
+                async for chunk in response.itio.dpdns.orgter_bytes():
+                    yield chunk
+            except httpx.HTTPError:
+                yield _anthropic_sse("error", {"type": "error", "error": {
+                    "type": "api_error", "message": "Provider stream interrupted; no automatic replay attempted.",
+                }}).encode("utf-8")
+            finally:
+                await response.aclose()
+                await client.aclose()
+
+        # Ownership transfers to the streaming response, including disconnect cleanup.
+        stream_response = StreamingResponse(forward(), status_code=response.status_code,
+                                            headers=response_headers)
+        handed_off = True
+        return stream_response
+    except httpx.HTTPError:
+        return _anthropic_error(502, "Provider connection failed; no automatic replay attempted.", "api_error")
+    finally:
+        if not locals().get("handed_off", False):
+            if response is not None:
+                await response.aclose()
+            await client.aclose()
+
+
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(request: Request):
+    await _require_key(request)
+    return await _native_anthropic_request(request, "messages/count_tokens")
+
+
 @app.post("/v1/messages")
 @app.post("/messages")
 async def anthropic_messages(request: Request):
     """Native Anthropic Messages surface for clients that should not traverse
     an OpenAI-to-Anthropic stream converter."""
     keyinfo = await _require_key(request)
+    if os.environ.get("BRIDGENA_ANTHROPIC_API_KEY", "").strip():
+        return await _native_anthropic_request(request, "messages")
     body = await request.json()
+    if body.get("tools") or body.get("tool_choice") or body.get("thinking") or any(
+        isinstance(block, dict) and block.get("type") not in {"text"}
+        for message in body.get("messages", []) if isinstance(message, dict)
+        for block in (message.get("content") if isinstance(message.get("content"), list) else [])
+    ):
+        return _anthropic_error(400,
+            "Browser text mode cannot preserve tools, thinking, or non-text blocks. "
+            "Configure BRIDGENA_ANTHROPIC_API_KEY for native Claude Code requests.")
     prompt = _anthropic_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
@@ -7682,7 +7811,7 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.6", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.7", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
