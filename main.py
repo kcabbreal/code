@@ -266,7 +266,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.6-readiness-barrier-paced-admission")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.7-cohort-readiness-startup-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1845,6 +1845,7 @@ _api_keeper_quarantine_until: Dict[str, float] = {}
 _api_ready_event = asyncio.Event()
 _initial_verification_sweep_done = asyncio.Event()
 _keeper_fleet_launch_event = asyncio.Event()
+_verification_preflight_retry_after: Dict[str, float] = {}
 
 def _api_keeper_verified(sid: Optional[str]) -> bool:
     if not sid:
@@ -3256,26 +3257,25 @@ class KeeperSession:
             pass
 
     async def _navigate_resilient(self, page, url: str, timeout: int = 60000) -> bool:
-        """Navigate without declaring a usable committed page dead just because
-        a third-party resource kept domcontentloaded pending."""
+        """Commit the Arena document quickly; slow third-party assets are non-blocking."""
         last_error = None
-        attempts = (("domcontentloaded", timeout), ("commit", min(30000, timeout)))
-        for wait_until, budget in attempts:
+        try:
+            await page.goto(url, wait_until="commit", timeout=min(15000, timeout))
+        except Exception as exc:
+            last_error = exc
             try:
-                await page.goto(url, wait_until=wait_until, timeout=budget)
-                return True
-            except Exception as exc:
-                last_error = exc
-                try:
-                    target = urlparse(url)
-                    current = urlparse(page.url or "")
-                    if current.hostname == target.hostname and current.path:
-                        log("WARN", f"[{self.name}] Navigation committed but {wait_until} timed out; continuing")
-                        return True
-                except Exception:
-                    pass
-                await asyncio.sleep(1)
-        raise last_error or TimeoutError(f"navigation failed: {url}")
+                target = urlparse(url)
+                current = urlparse(page.url or "")
+                if current.hostname != target.hostname:
+                    raise last_error
+            except Exception:
+                raise last_error
+
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=min(6000, timeout))
+        except Exception:
+            log("WARN", f"[{self.name}] Navigation committed; domcontentloaded still pending — continuing startup")
+        return True
 
     async def _handle_turnstile(self, page):
         try:
@@ -4679,6 +4679,14 @@ class KeeperSession:
             await self.start()
 
     async def _session_loop(self):
+        while self.running and not _initial_verification_sweep_done.is_set():
+            try:
+                await asyncio.wait_for(_initial_verification_sweep_done.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+
         while self.running:
             try:
                 await self._do_activity()
@@ -8052,7 +8060,7 @@ async def _require_api_ready():
     if not _initial_verification_sweep_done.is_set():
         raise HTTPException(
             status_code=503,
-            detail="Bridgena is warming the keeper fleet in parallel. Retry in a moment.",
+            detail="Bridgena is warming the keeper fleet and verification clients in parallel. Retry in a moment.",
             headers={"Retry-After": "2"},
         )
 
@@ -8509,7 +8517,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.6",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.7",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -8890,43 +8898,76 @@ except Exception as _v3_static_exc:
 
 # ---------- startup ----------
 async def _preflight_one_keeper(sid: str, session, jar: dict) -> tuple:
-    """Run one browser-local V3 readiness preflight for one keeper.
-
-    This never creates an Arena evaluation. Every keeper owns its own action
-    lock/page, so separate keepers can preflight concurrently.
-    """
+    """Check that the authenticated keeper's Enterprise verification client is loaded."""
     name = getattr(session, "name", sid)
     try:
-        token = await asyncio.wait_for(mint_v3(sid), timeout=15.0)
-        if not _verification_token_ok(token):
-            log("WARN", f"[{name}] verification preflight failed · no valid V3 token")
-            return sid, False
-        _api_verified_keepers[sid] = time.monotonic()
-        _api_keeper_quarantine_until.pop(sid, None)
-        log("OK", f"[{name}] verification preflight passed · Enterprise V3 ready · token shape {len(token)} chars")
-        return sid, True
+        async with session._action_lock:
+            page = session.page
+            if not page or page.is_closed():
+                return sid, False
+            state = await asyncio.wait_for(page.evaluate("""async () => {
+              const until = Date.now() + 8000;
+              while (Date.now() < until) {
+                const g = window.grecaptcha;
+                const e = g && g.enterprise;
+                if (e && typeof e.ready === 'function' && typeof e.execute === 'function') {
+                  try {
+                    await new Promise((resolve, reject) => {
+                      let done = false;
+                      const timer = setTimeout(() => {
+                        if (!done) reject(new Error('ready-timeout'));
+                      }, 3000);
+                      e.ready(() => {
+                        if (!done) {
+                          done = true;
+                          clearTimeout(timer);
+                          resolve();
+                        }
+                      });
+                    });
+                    return {ready:true, enterprise:true, execute:true};
+                  } catch (_) {}
+                }
+                await new Promise(r => setTimeout(r, 250));
+              }
+              const g = window.grecaptcha;
+              const e = g && g.enterprise;
+              return {
+                ready:false,
+                enterprise:!!e,
+                execute:!!(e && typeof e.execute === 'function')
+              };
+            }"""), timeout=10.0)
+
+        ok = bool(isinstance(state, dict) and state.get("ready"))
+        if ok:
+            _api_verified_keepers[sid] = time.monotonic()
+            _api_keeper_quarantine_until.pop(sid, None)
+            log("OK", f"[{name}] verification client ready · Enterprise execute available")
+            return sid, True
+
+        log("WARN", f"[{name}] verification client not ready · "
+                    f"enterprise={bool((state or {}).get('enterprise'))} "
+                    f"execute={bool((state or {}).get('execute'))}")
+        return sid, False
+
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        log("WARN", f"[{name}] verification preflight failed · "
+        log("WARN", f"[{name}] verification client readiness failed · "
                     f"{type(exc).__name__}: {redact(str(exc))[:160]}")
         return sid, False
 
 
 async def _api_verification_readiness_loop():
-    """Drive startup verification as one fleet-wide cohort.
-
-    Chat traffic stays behind an initial barrier until the first parallel
-    verification sweep completes. This prevents API requests from stealing
-    keeper action locks while the fleet is still warming.
-    """
-    announced_ready = False
+    """Bring the whole authenticated keeper fleet to browser verification-ready."""
     initial_done = False
+    announced_ready = False
 
     try:
         await asyncio.wait_for(_keeper_fleet_launch_event.wait(), timeout=30.0)
     except asyncio.TimeoutError:
-        log("WARN", "Verification fleet preflight · keeper launch barrier timed out; continuing with available sessions")
+        log("WARN", "Verification startup · keeper registration timed out; using available fleet")
 
     while True:
         try:
@@ -8936,86 +8977,84 @@ async def _api_verification_readiness_loop():
                 if j.get("id") and j.get("enabled", True) and jar_has_auth(j)
             }
 
-            # During first startup sweep, wait for the cohort to converge instead
-            # of preflighting the first one or two keepers early.
             if not initial_done and jars_by_id:
-                deadline = time.monotonic() + 35.0
+                deadline = time.monotonic() + 75.0
                 last_ready = -1
                 while time.monotonic() < deadline:
-                    ready = [
+                    ready_ids = [
                         sid for sid in jars_by_id
                         if keeper_session_ready(keeper.sessions.get(sid))
                     ]
-                    if len(ready) != last_ready:
-                        log("INFO", f"Verification startup barrier · browser-ready {len(ready)}/{len(jars_by_id)}")
-                        last_ready = len(ready)
-                    if len(ready) >= len(jars_by_id):
+                    if len(ready_ids) != last_ready:
+                        log("INFO", f"Verification startup cohort · browser-ready {len(ready_ids)}/{len(jars_by_id)}")
+                        last_ready = len(ready_ids)
+                    if len(ready_ids) == len(jars_by_id):
                         break
-                    await asyncio.sleep(0.35)
+                    await asyncio.sleep(0.25)
 
-            now_mono = time.monotonic()
+            now = time.monotonic()
             eligible = []
             for sid, jar in jars_by_id.items():
                 if _api_keeper_verified(sid):
                     continue
-                if now_mono < _api_keeper_quarantine_until.get(sid, 0.0):
+                if now < _api_keeper_quarantine_until.get(sid, 0.0):
+                    continue
+                if now < _verification_preflight_retry_after.get(sid, 0.0):
                     continue
                 session = keeper.sessions.get(sid)
                 if not keeper_session_ready(session):
                     continue
                 if session.active_requests:
                     continue
-                if getattr(session, "_action_lock", None) and session._action_lock.locked():
-                    continue
                 eligible.append((sid, session, jar))
 
             if eligible:
-                names = ", ".join(getattr(s, "name", sid) for sid, s, _ in eligible)
-                log("INFO", f"Verification fleet preflight · firing {len(eligible)} keeper(s) concurrently"
-                            + (f" · {names}" if names else ""))
+                names = ", ".join(getattr(sess, "name", sid) for sid, sess, _ in eligible)
+                log("INFO", f"Verification startup cohort · checking {len(eligible)} keeper(s) concurrently · {names}")
                 results = await asyncio.gather(
                     *(_preflight_one_keeper(sid, session, jar)
                       for sid, session, jar in eligible),
                     return_exceptions=False,
                 )
-                passed = sum(1 for _, ok in results if ok)
-                log("INFO", f"Verification fleet preflight · cohort complete · {passed}/{len(results)} passed")
+                passed = 0
+                for sid, ok in results:
+                    if ok:
+                        passed += 1
+                        _verification_preflight_retry_after.pop(sid, None)
+                    else:
+                        _verification_preflight_retry_after[sid] = time.monotonic() + 12.0
+                log("INFO", f"Verification startup cohort · pass {passed}/{len(results)}")
 
             _refresh_api_ready_event()
 
             if not initial_done:
                 initial_done = True
                 _initial_verification_sweep_done.set()
-                log("INFO", "Verification startup barrier · initial fleet sweep complete · API admission may open")
+                log("INFO", "Verification startup cohort · initial sweep complete · background keeper activity enabled")
 
-            verified_now = [
-                sid for sid in jars_by_id
-                if _api_keeper_verified(sid)
-                and keeper_session_ready(keeper.sessions.get(sid))
-            ]
-            authenticated_ready = sum(
+            verified = _verified_keeper_count()
+            ready_count = sum(
                 1 for sid in jars_by_id
                 if keeper_session_ready(keeper.sessions.get(sid))
             )
 
             if _api_ready_event.is_set():
                 if not announced_ready:
-                    log("OK", f"API READY · verified keepers {len(verified_now)}/{authenticated_ready or len(jars_by_id)}"
-                              f" · verified exits {_verified_exit_count()}")
+                    log("OK", f"API READY · verification clients {verified}/{ready_count or len(jars_by_id)}"
+                              f" · distinct exits {_verified_exit_count()}")
                     announced_ready = True
             else:
                 announced_ready = False
 
-            all_ready_verified = bool(authenticated_ready) and len(verified_now) >= authenticated_ready
-            await asyncio.sleep(8.0 if all_ready_verified else 1.5)
+            await asyncio.sleep(8.0 if verified >= max(1, ready_count) else 2.0)
 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             if not initial_done:
-                _initial_verification_sweep_done.set()
                 initial_done = True
-            log("WARN", f"API verification readiness loop recovered from "
+                _initial_verification_sweep_done.set()
+            log("WARN", f"Verification cohort scheduler recovered from "
                         f"{type(exc).__name__}: {redact(str(exc))[:160]}")
             await asyncio.sleep(2.0)
 
@@ -9044,7 +9083,7 @@ async def _lifespan(app):
     log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
-    log("INFO", f"Keeper startup · parallel starts {KEEPER_START_CONCURRENCY} · parallel logins {KEEPER_LOGIN_CONCURRENCY} · warm-up {KEEPER_WARMUP_SEC}s · fleet readiness barrier ON")
+    log("INFO", f"Keeper startup · parallel starts {KEEPER_START_CONCURRENCY} · parallel logins {KEEPER_LOGIN_CONCURRENCY} · warm-up {KEEPER_WARMUP_SEC}s · cohort readiness barrier ON")
     log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
     log("INFO", "Capacity target · queued multi-user admission · one stable browser transport lane per keeper")
     log("INFO", "Proxy allocator · full-pool startup scan + distinct keeper assignment enabled")
