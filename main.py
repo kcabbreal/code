@@ -257,10 +257,13 @@ KEEPER_START_CONCURRENCY = max(
 KEEPER_LOGIN_CONCURRENCY = max(
     1, min(4, int(os.environ.get("BRIDGENA_KEEPER_LOGIN_CONCURRENCY", "2")))
 )
+API_TURN_CONCURRENCY = max(
+    1, min(8, int(os.environ.get("BRIDGENA_API_TURN_CONCURRENCY", "3")))
+)
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.9-stream-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.3.0-throughput-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -5728,27 +5731,29 @@ def _parse_stream_line(line: str):
     return None
 
 
-_browser_turn_gate = asyncio.Lock()
-_browser_cooldown_until = 0.0
+_browser_turn_gate = asyncio.Semaphore(API_TURN_CONCURRENCY)
+_model_cooldown_until: Dict[str, float] = {}
 
 
 async def run_turn(chat_id: str, prompt: str, model_name: str,
                    attachments: Optional[list] = None, jar_hint: Optional[str] = None):
-    """One browser turn per process; reject overload without creating a queue."""
-    global _browser_cooldown_until
-    remaining = _browser_cooldown_until - time.monotonic()
+    """Bound concurrent work across independent keepers.
+
+    Upstream throttling is model-scoped instead of process-wide, so a 429 for one
+    model does not stall unrelated models or every account.
+    """
+    cooldown_key = _model_key(model_name or "auto")
+    remaining = _model_cooldown_until.get(cooldown_key, 0.0) - time.monotonic()
     if remaining > 0:
-        yield ("error", "429: Upstream cooling down; retry after %d seconds." % math.ceil(remaining))
+        yield ("error", "429: This model is cooling down; retry after %d seconds." % math.ceil(remaining))
         return
-    if _browser_turn_gate.locked():
-        yield ("error", "503: Browser chat is busy. Wait for the active request to finish.")
-        return
+
     async with _browser_turn_gate:
         turn = _run_turn_impl(chat_id, prompt, model_name, attachments, jar_hint)
         try:
             async for kind, payload in turn:
                 if kind == "error" and str(payload).startswith("429:"):
-                    _browser_cooldown_until = time.monotonic() + 30.0
+                    _model_cooldown_until[cooldown_key] = time.monotonic() + 30.0
                 yield kind, payload
         finally:
             await turn.aclose()
@@ -5907,8 +5912,14 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         if keeper_session_ready(browser_session):
             try:
                 log("INFO", f"[{jar.get('name')}] transport browser-origin")
+                _transport_t0 = time.monotonic()
+                _first_stream_frame_at = None
                 async with browser_session._action_lock:
                     async for line in browser_session.bridge_fetch(url, base):
+                        if _first_stream_frame_at is None:
+                            _first_stream_frame_at = time.monotonic()
+                            log("INFO", f"[{jar.get('name')}] first upstream stream frame · "
+                                        f"{(_first_stream_frame_at - _transport_t0):.2f}s after POST")
                         ev = _parse_stream_line(str(line).strip())
                         if not ev:
                             continue
@@ -5943,6 +5954,9 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         "jar_id": jar.get("id"), "proxy": proxy,
                     }
                     save_conversation(chat_id, conv2)
+                log("INFO", f"[{jar.get('name')}] browser stream complete · "
+                            f"{(time.monotonic() - _transport_t0):.2f}s transport total · "
+                            f"{len(response_text)} text chars")
                 yield ("done", response_text)
                 return
             except BridgeHTTPError as e:
@@ -7860,7 +7874,7 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.9", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.3.0", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
