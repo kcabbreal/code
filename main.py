@@ -268,7 +268,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.1-reliability-slo-transport-recovery")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.2-predispatch-transport-guard")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1858,6 +1858,21 @@ _transport_recovery_tasks: Dict[str, asyncio.Task] = {}
 _reliability_window = deque(maxlen=max(20, min(500, int(os.environ.get("BRIDGENA_RELIABILITY_WINDOW", "100")))))
 _reliability_guard = threading.Lock()
 _RELIABILITY_TARGET = max(0.1, min(1.0, float(os.environ.get("BRIDGENA_RELIABILITY_TARGET", "0.70"))))
+TRANSPORT_PROBE_TIMEOUT_MS = max(1200, min(10000, int(os.environ.get("BRIDGENA_TRANSPORT_PROBE_TIMEOUT_MS", "4500"))))
+TRANSPORT_PROBE_EVERY_REQUEST = os.environ.get("BRIDGENA_TRANSPORT_PROBE_EVERY_REQUEST", "1").strip().lower() not in ("0", "false", "no", "off")
+TRANSPORT_PROBE_FRESH_SEC = max(0.0, min(60.0, float(os.environ.get("BRIDGENA_TRANSPORT_PROBE_FRESH_SEC", "4"))))
+PREDISPATCH_RECOVERY_WAIT_SEC = max(4.0, min(30.0, float(os.environ.get("BRIDGENA_PREDISPATCH_RECOVERY_WAIT_SEC", "16"))))
+_transport_guard_stats = {"probe_ok": 0, "probe_fail": 0, "recovered_before_post": 0, "recovery_timeout": 0}
+_transport_guard_stats_lock = threading.Lock()
+
+def _bump_transport_guard(key: str) -> None:
+    with _transport_guard_stats_lock:
+        _transport_guard_stats[key] = int(_transport_guard_stats.get(key, 0)) + 1
+
+def _transport_guard_snapshot() -> dict:
+    with _transport_guard_stats_lock:
+        return dict(_transport_guard_stats)
+
 
 def _record_reliability_outcome(success: bool, reason: str = "") -> dict:
     with _reliability_guard:
@@ -1873,13 +1888,22 @@ def _record_reliability_outcome(success: bool, reason: str = "") -> dict:
 
 def _reliability_snapshot() -> dict:
     with _reliability_guard:
-        total = len(_reliability_window)
-        passed = sum(1 for ok, _ in _reliability_window if ok)
+        rows = list(_reliability_window)
+    total = len(rows)
+    passed = sum(1 for ok, _ in rows if ok)
+    failures = {}
+    for ok, reason in rows:
+        if ok:
+            continue
+        key = str(reason or "unknown")
+        failures[key] = failures.get(key, 0) + 1
     rate = (passed / total) if total else None
     return {"sample": total, "successes": passed,
             "success_rate": (round(rate, 4) if rate is not None else None),
             "target": _RELIABILITY_TARGET,
-            "target_met": (bool(rate is not None and rate >= _RELIABILITY_TARGET))}
+            "target_met": (bool(rate is not None and rate >= _RELIABILITY_TARGET)),
+            "failures_by_reason": failures,
+            "transport_guard": _transport_guard_snapshot()}
 
 
 def _api_keeper_verified(sid: Optional[str]) -> bool:
@@ -3174,6 +3198,10 @@ class KeeperSession:
         self.last_public_auth_check = 0.0
         self.last_nav = 0.0
         self.last_restart = 0.0
+        self.last_transport_ok = 0.0
+        self.last_transport_probe = 0.0
+        self.transport_fail_streak = 0
+        self.last_transport_probe_error = ""
         self.ready_at = float("inf")
         self.fail_count = 0
         self.next_retry = 0.0
@@ -4261,6 +4289,73 @@ class KeeperSession:
                         pass
             self._page_pool = remaining
 
+    async def probe_transport(self, *, force: bool = False) -> tuple:
+        """Check whether the keeper browser can currently reach Arena.
+
+        This is a harmless same-origin HEAD request. Any HTTP response proves
+        the browser/proxy route is alive; no model prompt or evaluation is sent.
+        """
+        if not self.context or not self.page or self.page.is_closed() or not self.running:
+            self.last_transport_probe_error = "keeper browser unavailable"
+            return False, 0, self.last_transport_probe_error
+
+        now = time.monotonic()
+        if (not force and not TRANSPORT_PROBE_EVERY_REQUEST
+                and self.last_transport_ok
+                and now - self.last_transport_ok <= TRANSPORT_PROBE_FRESH_SEC):
+            return True, 200, "recent-ok"
+
+        async with self._action_lock:
+            page = self.page
+            if not page or page.is_closed():
+                self.last_transport_probe_error = "keeper page closed"
+                return False, 0, self.last_transport_probe_error
+            self.last_transport_probe = time.monotonic()
+            try:
+                result = await asyncio.wait_for(
+                    page.evaluate("""async ([url, timeoutMs]) => {
+                      const ctl = new AbortController();
+                      const timer = setTimeout(() => ctl.abort(), timeoutMs);
+                      try {
+                        const r = await fetch(url, {
+                          method: 'HEAD',
+                          credentials: 'include',
+                          cache: 'no-store',
+                          redirect: 'follow',
+                          signal: ctl.signal
+                        });
+                        return {ok:true, status:r.status, online:navigator.onLine};
+                      } catch (e) {
+                        return {
+                          ok:false,
+                          status:0,
+                          online:navigator.onLine,
+                          error:String((e && e.message) || e || 'transport probe failed')
+                        };
+                      } finally {
+                        clearTimeout(timer);
+                      }
+                    }""", [ARENA_BASE + "/", TRANSPORT_PROBE_TIMEOUT_MS]),
+                    timeout=(TRANSPORT_PROBE_TIMEOUT_MS / 1000.0) + 1.5,
+                )
+            except Exception as exc:
+                self.transport_fail_streak += 1
+                self.last_transport_probe_error = f"{type(exc).__name__}: {redact(str(exc))[:140]}"
+                return False, 0, self.last_transport_probe_error
+
+        ok = bool(isinstance(result, dict) and result.get("ok") and int(result.get("status") or 0) > 0)
+        status_code = int((result or {}).get("status") or 0) if isinstance(result, dict) else 0
+        if ok:
+            self.last_transport_ok = time.monotonic()
+            self.transport_fail_streak = 0
+            self.last_transport_probe_error = ""
+            return True, status_code, ""
+
+        self.transport_fail_streak += 1
+        self.last_transport_probe_error = str((result or {}).get("error") or "route probe failed")[:180]
+        return False, status_code, self.last_transport_probe_error
+
+
     async def bridge_fetch(self, url: str, payload: dict):
         if not self.context or not self.page or self.page.is_closed():
             raise RuntimeError("Keeper browser page is closed")
@@ -4417,6 +4512,12 @@ class KeeperSession:
             if isinstance(result, dict):
                 frame_count = len(result.get("lines") or [])
                 response_started = bool(result.get("responseStarted"))
+                if response_started and status_code:
+                    self.last_transport_ok = time.monotonic()
+                    self.transport_fail_streak = 0
+                    self.last_transport_probe_error = ""
+                elif not response_started and not status_code:
+                    self.transport_fail_streak += 1
                 stream_error = bool(result.get("streamError"))
                 finish_seen = bool(result.get("finishSeen"))
                 stop_reason = str(result.get("stopReason") or "unknown")
@@ -6597,6 +6698,51 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 await turn.aclose()
 
 
+async def _ensure_predispatch_transport(jar: dict) -> bool:
+    """Do not submit a model POST through a keeper whose browser route is dead.
+
+    On a failed harmless probe we recover the same keeper, wait for readmission,
+    then probe once more. This prevents a large class of avoidable HTTP-0
+    failures without replaying a user prompt.
+    """
+    sid = str(jar.get("id") or "")
+    session = keeper.sessions.get(sid)
+    if not sid or not keeper_session_ready(session):
+        return False
+
+    ok, status_code, detail = await session.probe_transport(force=TRANSPORT_PROBE_EVERY_REQUEST)
+    if ok:
+        _bump_transport_guard("probe_ok")
+        return True
+
+    _bump_transport_guard("probe_fail")
+    log("WARN", f"[{jar.get('name')}] pre-dispatch transport probe failed · "
+                f"status {status_code or 0} · {redact(detail)[:160]} · recovering before POST")
+    _quarantine_api_keeper(sid, "pre-dispatch route probe failed", TRANSPORT_FAILURE_QUARANTINE_SEC)
+    _schedule_transport_recovery(sid, "pre-dispatch route probe failed")
+
+    deadline = time.monotonic() + PREDISPATCH_RECOVERY_WAIT_SEC
+    while time.monotonic() < deadline:
+        task = _transport_recovery_tasks.get(sid)
+        if task and task.done():
+            await asyncio.gather(task, return_exceptions=True)
+        session = keeper.sessions.get(sid)
+        if (_api_keeper_verified(sid) and keeper_session_ready(session)):
+            ok2, status2, detail2 = await session.probe_transport(force=True)
+            if ok2:
+                _bump_transport_guard("recovered_before_post")
+                log("OK", f"[{jar.get('name')}] pre-dispatch transport recovered · "
+                          f"HTTP {status2} route probe · continuing original request")
+                return True
+            detail = detail2
+        await asyncio.sleep(0.5)
+
+    _bump_transport_guard("recovery_timeout")
+    log("WARN", f"[{jar.get('name')}] pre-dispatch transport recovery timed out · "
+                f"request was never sent upstream")
+    return False
+
+
 async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                    attachments: Optional[list] = None, jar_hint: Optional[str] = None,
                    system_prompt: str = ""):
@@ -6671,6 +6817,15 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         detail = redact(getattr(s_wait, "error", "") or getattr(s_wait, "current_step", "") or "keeper is still starting")
         yield ("error", f"503: The selected account has no ready same-exit keeper ({detail}). Check Accounts, then retry.")
         return
+
+    # Catch dead SOCKS/browser routes before minting a token or submitting a
+    # model request. If recovery succeeds, the user's original request simply
+    # waits and continues; no prompt replay is involved.
+    if not await _ensure_predispatch_transport(jar):
+        yield ("error", "503: The selected keeper's browser route failed its pre-dispatch health check "
+                        "and could not recover in time. No request was sent upstream; retry shortly.")
+        return
+
     response_text = ""
     reasoning_text = ""
     pending_v2_token = None
@@ -9018,7 +9173,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.1",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.2",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -9576,12 +9731,18 @@ def _schedule_transport_recovery(sid: Optional[str], reason: str) -> None:
 
             jar = next((j for j in load_jars() if str(j.get("id")) == sid), None)
             if jar and keeper_session_ready(session):
-                _, ok = await _preflight_one_keeper(sid, session, jar)
-                if ok:
+                _, verification_ok = await _preflight_one_keeper(sid, session, jar)
+                route_ok, route_status, route_detail = await session.probe_transport(force=True)
+                if verification_ok and route_ok:
                     _api_keeper_quarantine_until.pop(sid, None)
                     _refresh_api_ready_event()
-                    log("OK", f"[{getattr(session, 'name', sid)}] transport recovery complete · keeper readmitted")
+                    log("OK", f"[{getattr(session, 'name', sid)}] transport recovery complete · "
+                              f"keeper readmitted · route HTTP {route_status}")
                     return
+                if not route_ok:
+                    _mark_api_keeper_unready(sid, "recovery route probe still failing")
+                    log("WARN", f"[{getattr(session, 'name', sid)}] transport recovery route probe failed · "
+                                f"{redact(route_detail)[:160]}")
 
             log("WARN", f"[{getattr(session, 'name', sid)}] transport recovery incomplete · "
                         "readiness loop will continue repairing it")
@@ -9650,6 +9811,14 @@ async def _recover_unready_keeper(sid: str, session, jar: dict) -> bool:
                         session.next_retry = 0
                 if not auth_ok:
                     await session.relogin()
+                # A keeper is not really recovered if verification JS is alive
+                # but the browser route cannot reach Arena.
+                route_ok, route_status, route_detail = await session.probe_transport(force=True)
+                if route_ok:
+                    log("INFO", f"[{name}] readiness recovery · route probe HTTP {route_status}")
+                else:
+                    log("WARN", f"[{name}] readiness recovery · route probe failed · "
+                                f"{redact(route_detail)[:150]}")
                 _verification_preflight_retry_after[sid] = time.monotonic() + _keeper_recovery_retry_sec
                 return True
 
@@ -9821,6 +9990,7 @@ async def _lifespan(app):
     log("INFO", f"Keeper startup · parallel starts {KEEPER_START_CONCURRENCY} · parallel logins {KEEPER_LOGIN_CONCURRENCY} · warm-up {KEEPER_WARMUP_SEC}s · cohort readiness barrier ON")
     log("INFO", f"Keeper recovery · soft refresh then restart after {_keeper_recovery_restart_after} failed readiness checks · parallel {_keeper_recovery_gate._value}")
     log("INFO", f"Transport recovery · same-keeper restart ON · quarantine {TRANSPORT_FAILURE_QUARANTINE_SEC:.0f}s · bound wait {BOUND_KEEPER_RECOVERY_WAIT_SEC:.0f}s")
+    log("INFO", f"Pre-dispatch transport guard · HEAD probe every request {'ON' if TRANSPORT_PROBE_EVERY_REQUEST else 'OFF'} · timeout {TRANSPORT_PROBE_TIMEOUT_MS}ms · recovery wait {PREDISPATCH_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Reliability SLO · rolling window {_reliability_window.maxlen} · target {_RELIABILITY_TARGET*100:.0f}%")
     log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
     log("INFO", "Stream decoder · Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini · snapshot de-dup ON")
