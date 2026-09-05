@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # ================================================================
-#  BRIDGENA v2 — single-file arena bridge (built from v2/ at build time)
-#  modules: core · identity · primitives · pool · tokens · arena · pages · api
-#  Deploy: run bridgena.py and restart. Same files, same env, same API keys.
+#  BRIDGENA v3 — production control plane + compatibility engine
+#  modules: core · identity · pool · keepers · verification · UI · API · VNC
+#  Deploy: run bridgena-v3.py. Existing state, jars and API clients stay valid.
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -38,8 +38,11 @@ def _discover_verification_factory():
     """Resolve function-, class-, and singleton-based adapter packages."""
     import importlib
     errors = []
+    # Do not accept the package's legacy image/ONNX RecaptchaSolver here. It is
+    # a different component and may construct to None; only the documented
+    # verification adapter API is compatible with solve(**challenge_context).
     factory_names = ("get_solver", "AuthorizedVerificationAdapter",
-                     "VerificationAdapter", "RecaptchaSolver", "Solver")
+                     "VerificationAdapter")
 
     def resolve(module, requested=None):
         names = (requested,) if requested else factory_names
@@ -47,7 +50,7 @@ def _discover_verification_factory():
             candidate = getattr(module, name, None)
             if callable(candidate):
                 return candidate, name
-        for name in ("solver", "adapter", "client"):
+        for name in ("verification_adapter", "adapter", "client"):
             instance = getattr(module, name, None)
             if instance is not None and callable(getattr(instance, "solve", None)):
                 return (lambda instance=instance: instance), name
@@ -121,6 +124,15 @@ PORT = int(os.environ.get("BRIDGENA_PORT", "8000"))
 ARENA_BASE = os.environ.get("BRIDGENA_ARENA_BASE", "http://localhost:6767")
 _ARENA_PARSED = urlparse(ARENA_BASE)
 LOCAL_UPSTREAM = (_ARENA_PARSED.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
+LOCAL_VERIFICATION_ENHANCED = LOCAL_UPSTREAM and os.environ.get(
+    "BRIDGENA_LOCAL_VERIFICATION_ENHANCED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+LOCAL_VERIFICATION_MAX_ROUNDS = max(
+    1, min(12, int(os.environ.get("BRIDGENA_LOCAL_VERIFICATION_MAX_ROUNDS", "6")))
+)
+LOCAL_VERIFICATION_POLL_MS = max(
+    100, min(2000, int(os.environ.get("BRIDGENA_LOCAL_VERIFICATION_POLL_MS", "300")))
+)
 PUBLIC_AUTH_BASE = os.environ.get("BRIDGENA_PUBLIC_AUTH_BASE", "https://arena.ai").rstrip("/")
 PUBLIC_AUTH_URL = os.environ.get("BRIDGENA_PUBLIC_AUTH_URL", f"{PUBLIC_AUTH_BASE}/?mode=direct")
 ARENA_MODES = ["direct-battle", "direct"]
@@ -153,7 +165,8 @@ KEEPER_REQUEST_READY_SEC = max(30, min(180, int(os.environ.get("BRIDGENA_KEEPER_
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v2.37-adapter-export-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2-stable-control-plane")
+DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
 MODELS_FILE = "models.json"
@@ -189,22 +202,68 @@ OX_SESSION_TTL = 20 * 60
 # ---------------- log bus ----------------
 class LogBus:
     def __init__(self, path: str = LOG_FILE, ring: int = 400):
-        import threading
+        import queue, threading
         self.path, self.ring, self._mu = path, [], threading.Lock()
         self.subs: list = []
+        self._disk_queue = queue.Queue(maxsize=8192)
+        self._disk_io_mu = threading.Lock()
+        self._closed = threading.Event()
+        self._writer = threading.Thread(target=self._write_loop, name="bridgena-log-writer", daemon=True)
+        self._writer.start()
+
+    def _write_loop(self) -> None:
+        import queue
+        pending = []
+        while not self._closed.is_set() or not self._disk_queue.empty():
+            with self._disk_io_mu:
+                try:
+                    pending.append(self._disk_queue.get(timeout=.25))
+                    while len(pending) < 256:
+                        pending.append(self._disk_queue.get_nowait())
+                except queue.Empty:
+                    pass
+                if pending:
+                    try:
+                        with open(self.path, "a", encoding="utf-8") as stream:
+                            stream.write("".join(pending))
+                    except OSError:
+                        pass
+                    pending.clear()
+
+    def close(self) -> None:
+        self._closed.set()
+        if self._writer.is_alive():
+            self._writer.join(timeout=2)
+
+    def clear(self) -> None:
+        """Atomically discard the in-memory ring and every queued disk entry."""
+        import queue
+        with self._disk_io_mu:
+            while True:
+                try:
+                    self._disk_queue.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                with open(self.path, "w", encoding="utf-8"):
+                    pass
+            except OSError:
+                pass
+        with self._mu:
+            self.ring.clear()
 
     def log(self, level: str, msg: str) -> None:
-        import json, time
+        import json, queue, time
+        now = time.time()
         ts = time.strftime("%H:%M:%S")
         line = f"[{ts}] [{level}] {msg}"
         print(line, flush=True)
         try:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"t": time.time(), "lvl": level, "m": msg}) + "\n")
-        except OSError:
+            self._disk_queue.put_nowait(json.dumps({"t": now, "lvl": level, "m": msg}) + "\n")
+        except queue.Full:
             pass
         with self._mu:
-            self.ring.append({"t": time.time(), "lvl": level, "m": msg, "line": line})
+            self.ring.append({"t": now, "lvl": level, "m": msg, "line": line})
             del self.ring[:-400]
         for q in list(self.subs):
             try:
@@ -245,13 +304,18 @@ def read_json(path: str, default):
         return default
 
 
+_FILE_THREAD_LOCKS: Dict[str, threading.RLock] = {}
+_FILE_THREAD_LOCKS_GUARD = threading.Lock()
+
+
 class FileLock:
     """Dual-use lock: `with FileLock(p):` AND @FileLock(p) decorator form.
     Thread lock always; flock best-effort for cross-worker sanity."""
     def __init__(self, path: str, timeout: float = 10.0):
         self.path, self.timeout = path, timeout
-        import threading
-        self._mu = threading.Lock()
+        lock_key = os.path.abspath(path)
+        with _FILE_THREAD_LOCKS_GUARD:
+            self._mu = _FILE_THREAD_LOCKS.setdefault(lock_key, threading.RLock())
         self._fd = None
 
     def _acquire_fd(self):
@@ -269,7 +333,8 @@ class FileLock:
                 return
             except OSError:
                 if time.time() > deadline:
-                    return               # degraded: thread lock already held
+                    self._release_fd()
+                    raise TimeoutError(f"timed out acquiring file lock: {self.path}")
                 time.sleep(0.05)
 
     def _release_fd(self):
@@ -1829,9 +1894,28 @@ def playwright_proxy_from_url(proxy_url: str) -> Optional[dict]:
 
 def atomic_write(path: str, data: Any) -> None:
     tmp = f"{path}.tmp{os.getpid()}_{secrets.token_hex(4)}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, separators=(",", ":"), ensure_ascii=False)
+            if DURABLE_WRITES:
+                stream.flush()
+                os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        if DURABLE_WRITES:
+            try:
+                directory_fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
 
 async def keeper_election_loop():
     log("INFO", "Session keeper background supervisor active")
@@ -2925,7 +3009,10 @@ class KeeperSession:
                 const el = document.querySelector('textarea[name="g-recaptcha-response"], #g-recaptcha-response');
                 return (el && el.value && el.value.length > 20) ? el.value : null;
             }""")
-            return bool(tok_final or solved_any)
+            if tok_final:
+                return True
+            log("WARN", f"[{self.name}] image challenge rounds submitted but no verified token/checkmark was observed")
+            return False
         except Exception as e:
             log("WARN", f"[{self.name}] solve_recaptcha_image_challenge: {type(e).__name__}: {e}")
             return False
@@ -4075,6 +4162,23 @@ class KeeperSession:
 class SessionKeeper:
     def __init__(self):
         self.sessions: Dict[str, KeeperSession] = {}
+        self._tasks: set = set()
+
+    def _spawn(self, coro, label: str):
+        task = asyncio.create_task(coro, name=f"keeper:{label}")
+        self._tasks.add(task)
+        def finished(done):
+            self._tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except Exception:
+                error = None
+            if error:
+                log("ERROR", f"Keeper task {label} failed: {type(error).__name__}: {error}")
+        task.add_done_callback(finished)
+        return task
 
     def status(self) -> list:
         now = time.time()
@@ -4105,7 +4209,7 @@ class SessionKeeper:
             if s is None:
                 s = KeeperSession(jar, headless=jar.get("keeper_headless", None))
                 self.sessions[jid] = s
-                asyncio.create_task(s.start())
+                self._spawn(s.start(), f"start:{jid[:8]}")
             else:
                 if (s.email != (jar.get("email") or "") or s.password != (jar.get("password") or "")
                         or s.login_method != (jar.get("login_method") or "email")):
@@ -4116,7 +4220,7 @@ class SessionKeeper:
                     s.next_retry = 0
                     log("INFO", f"[{s.name}] Credentials updated in keeper")
                 if s.status == "error" and time.time() - s.last_restart > 120:
-                    asyncio.create_task(s.restart())
+                    self._spawn(s.restart(), f"restart:{jid[:8]}")
 
     async def start_live(self, jar_id: str) -> tuple:
         jar = next((j for j in load_jars() if j["id"] == jar_id), None)
@@ -4127,8 +4231,19 @@ class SessionKeeper:
             await existing.stop()
         s = KeeperSession(jar, headless=False, keep_forever=True)
         self.sessions[jar_id] = s
-        asyncio.create_task(s.start())
+        self._spawn(s.start(), f"live:{jar_id[:8]}")
         return True, f"Live browser launching for '{jar.get('name')}'"
+
+    async def close(self):
+        sessions = list(self.sessions.values())
+        if sessions:
+            await asyncio.gather(*(session.stop() for session in sessions), return_exceptions=True)
+        for task in list(self._tasks):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+        self._tasks.clear()
+        self.sessions.clear()
 
 keeper = SessionKeeper()
 
@@ -4907,14 +5022,15 @@ async def mint_v3(jar_id=None):
                 await s.page.wait_for_load_state("domcontentloaded")
                 s.last_nav = time.time()
 
-            try:
-                if hasattr(s, "_human_move") and s.page:
-                    size = s.page.viewport_size or {"width": 1920, "height": 1080}
-                    tx = random.randint(350, max(351, size.get("width", 1920) - 150))
-                    ty = random.randint(200, max(201, size.get("height", 1080) - 200))
-                    await s._human_move(s.page, tx, ty, steps=random.randint(4, 7))
-            except Exception:
-                pass
+            if not LOCAL_VERIFICATION_ENHANCED:
+                try:
+                    if hasattr(s, "_human_move") and s.page:
+                        size = s.page.viewport_size or {"width": 1920, "height": 1080}
+                        tx = random.randint(350, max(351, size.get("width", 1920) - 150))
+                        ty = random.randint(200, max(201, size.get("height", 1080) - 200))
+                        await s._human_move(s.page, tx, ty, steps=random.randint(4, 7))
+                except Exception:
+                    pass
 
             v3_token = None
             try:
@@ -4950,15 +5066,16 @@ async def mint_v3(jar_id=None):
 
 
 async def mint_v2_escalation(jar_id=None, settle_s: float = 20.0):
-    """The path arena's OWN client uses after recaptcha_validation_failed:
-    mount the V2 checkbox, let the keeper's ONNX grid solver or extension work it,
-    harvest the response. Returns token or None.
-    CRITICAL: Must fail fast if checkbox cannot be clicked or if no solver is available,
-    to prevent client connection timeouts."""
+    """Escalate V2 verification.
+
+    Localhost uses the authorized deterministic v3.1 flow:
+    mount -> click -> inspect -> solve -> verify.
+    """
     sid, s = _find_session(jar_id)
     if not s:
-        log("WARN", "recaptcha token: V2 escalation skipped — no live keeper session")
+        log("WARN", "verification V2 escalation skipped — no live keeper session")
         return None
+
     try:
         async with s._action_lock:
             adapter_token = await _solve_with_verification_adapter(
@@ -4966,91 +5083,143 @@ async def mint_v2_escalation(jar_id=None, settle_s: float = 20.0):
             )
         if adapter_token:
             return adapter_token
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log("WARN", f"[{sid}] verification adapter preflight failed: {type(exc).__name__}: {exc}")
 
-        # Check if ONNX solver or extension is present
+    if not LOCAL_VERIFICATION_ENHANCED:
+        return await _mint_v2_escalation_legacy(jar_id, settle_s)
+
+    solver = get_solver() if "get_solver" in globals() else None
+    has_onnx = bool(solver and solver.available())
+
+    async with s._action_lock:
+        try:
+            try:
+                await s.page.evaluate(RC_V2_CLEAR_JS)
+            except Exception:
+                pass
+
+            mount = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_V2_SITEKEY)
+            if not (isinstance(mount, dict) and mount.get("ok")):
+                err = mount.get("err") if isinstance(mount, dict) else mount
+                log("WARN", f"[{sid}] local verification: V2 mount failed: {err}")
+                return None
+
+            clicked = False
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not clicked:
+                for frame in s.page.frames:
+                    try:
+                        cb = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border").first
+                        if await cb.count() and await cb.is_visible():
+                            await cb.click(timeout=1500)
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    await asyncio.sleep(LOCAL_VERIFICATION_POLL_MS / 1000.0)
+
+            if not clicked:
+                log("WARN", f"[{sid}] local verification: mounted widget but anchor never became clickable")
+                return None
+
+            await asyncio.sleep(LOCAL_VERIFICATION_POLL_MS / 1000.0)
+            tok = await s.page.evaluate(RC_V2_READ_JS)
+            if tok and not str(tok).startswith("__ERR__"):
+                log("OK", f"[{sid}] local verification: V2 auto-pass token captured ({len(tok)} chars)")
+                return tok
+
+            if not has_onnx:
+                log("WARN", f"[{sid}] local verification: interactive challenge shown but ONNX solver unavailable")
+                return None
+
+            solved = await s.solve_recaptcha_image_challenge(
+                max_rounds=LOCAL_VERIFICATION_MAX_ROUNDS
+            )
+            if not solved:
+                log("WARN", f"[{sid}] local verification: image solver ended without verified state")
+                return None
+
+            verify_deadline = time.monotonic() + max(2.0, min(float(settle_s), 20.0))
+            while time.monotonic() < verify_deadline:
+                tok = await s.page.evaluate(RC_V2_READ_JS)
+                if tok:
+                    if str(tok).startswith("__ERR__"):
+                        log("WARN", f"[{sid}] local verification widget error: {tok}")
+                        return None
+                    log("OK", f"[{sid}] local verification: V2 token verified ({len(tok)} chars)")
+                    return tok
+                await asyncio.sleep(LOCAL_VERIFICATION_POLL_MS / 1000.0)
+
+            log("WARN", f"[{sid}] local verification: solver completed but no token appeared")
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log("WARN", f"[{sid}] local verification escalation failed: {type(exc).__name__}: {exc}")
+            return None
+
+
+async def _mint_v2_escalation_legacy(jar_id=None, settle_s: float = 20.0):
+    """Baseline-compatible V2 escalation retained outside localhost."""
+    sid, s = _find_session(jar_id)
+    if not s:
+        return None
+    try:
         solver = get_solver() if "get_solver" in globals() else None
         has_onnx = bool(solver and solver.available())
         ext_path = os.environ.get("BRIDGENA_CAPTCHA_EXT", "")
         has_ext = bool(ext_path and os.path.exists(os.path.join(ext_path, "manifest.json")))
 
-        # Clear any stale tokens before starting escalation
         await s.page.evaluate(RC_V2_CLEAR_JS)
-
-        # If solver is available, attempt to solve any challenge frame already open
-        if has_onnx and hasattr(s, "solve_recaptcha_image_challenge"):
-            if await s.solve_recaptcha_image_challenge():
-                tok = await s.page.evaluate(RC_V2_READ_JS)
-                if tok and not str(tok).startswith("__ERR__"):
-                    log("OK", f"recaptcha V2 token harvested via ONNX solver ({len(tok)} chars)")
-                    return tok
-
-        # 1. Mount V2 checkbox widget with verified Arena V2 escalation sitekey
         mount = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_V2_SITEKEY)
         if not (isinstance(mount, dict) and mount.get("ok")):
-            log("WARN", f"recaptcha token: V2 mount failed: {(mount or {}).get('err') if isinstance(mount, dict) else mount}")
             if ARENA_RECAPTCHA_SITEKEY != ARENA_RECAPTCHA_V2_SITEKEY:
-                mount2 = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_SITEKEY)
-                if not (isinstance(mount2, dict) and mount2.get("ok")):
-                    return None
+                mount = await s.page.evaluate(RC_V2_WIDGET_JS, ARENA_RECAPTCHA_SITEKEY)
+            if not (isinstance(mount, dict) and mount.get("ok")):
+                return None
 
-        # 2. Click the checkbox across all frames (give iframe up to 2.5s to mount)
         clicked = False
         for _ in range(5):
             await asyncio.sleep(0.5)
             for frame in s.page.frames:
                 try:
-                    cb = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border")
-                    if await cb.count() > 0 and await cb.first.is_visible():
-                        await cb.first.click(timeout=2000)
+                    cb = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border").first
+                    if await cb.count() and await cb.is_visible():
+                        await cb.click(timeout=2000)
                         clicked = True
                         break
                 except Exception:
                     continue
             if clicked:
                 break
-
-        # FAST-FAIL 1: If no checkbox was clicked, there is NO challenge to solve
         if not clicked:
-            log("WARN", f"[{sid}] recaptcha token: V2 escalation skipped — no visible checkbox anchor on keeper page")
             return None
 
-        # 3. Check for instant auto-pass checkmark
         await asyncio.sleep(1.2)
         tok = await s.page.evaluate(RC_V2_READ_JS)
         if tok and not str(tok).startswith("__ERR__"):
-            log("OK", f"recaptcha V2 token harvested from auto-pass checkmark ({len(tok)} chars)")
             return tok
 
-        # FAST-FAIL 2: If neither ONNX solver nor browser extension is present, fail fast
-        if not has_onnx and not has_ext:
-            await asyncio.sleep(1.0)
-            tok = await s.page.evaluate(RC_V2_READ_JS)
-            if tok and not str(tok).startswith("__ERR__"):
-                log("OK", f"recaptcha V2 token harvested ({len(tok)} chars)")
-                return tok
-            log("WARN", f"[{sid}] reCAPTCHA challenge presented but ONNX solver/extension not available — failing fast to rotate account")
-            return None
-
-        # 4. Solver or extension is available: run solver
         if has_onnx and hasattr(s, "solve_recaptcha_image_challenge"):
             await s.solve_recaptcha_image_challenge()
+        elif not has_ext:
+            return None
 
-        max_wait = min(settle_s, 20.0 if has_onnx else 15.0)
-        deadline = time.time() + max_wait
+        deadline = time.time() + min(settle_s, 20.0 if has_onnx else 15.0)
         while time.time() < deadline:
             tok = await s.page.evaluate(RC_V2_READ_JS)
             if tok:
-                if str(tok).startswith("__ERR__"):
-                    log("WARN", f"[{sid}] reCAPTCHA widget reported error: {tok}")
-                    return None
-                log("OK", f"recaptcha V2 token harvested ({len(tok)} chars)")
-                return tok
+                return None if str(tok).startswith("__ERR__") else tok
             await asyncio.sleep(1.0)
-        log("WARN", f"recaptcha token: V2 challenge did not complete in window (clicked={clicked}, solver={has_onnx or has_ext})")
-        return None
-    except Exception as e:
-        log("WARN", f"recaptcha token: V2 escalation error: {type(e).__name__}: {e}")
-        return None
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log("WARN", f"legacy V2 escalation error: {type(exc).__name__}: {exc}")
+    return None
 
 
 # ────────────────────────── module: arena.py ──────────────────────────────
@@ -5136,9 +5305,9 @@ def _classify(status: int, body: str) -> str:
         if "captcha" in low or "recaptcha" in low:
             return "RECAPTCHA"
         return "SESSION" if status == 401 or "auth" in low else "RECAPTCHA"  # conservative: unknown 403s never burn jars
+    # HTTP status is authoritative. Treating a vague 429 body as CAPTCHA caused
+    # expensive V2 escalation and cross-account retry storms.
     if status == 429:
-        if "prompt failed" in low or "captcha" in low or "recaptcha" in low:
-            return "RECAPTCHA"
         return "RATELIMIT"
     if status >= 500 or 520 <= status <= 527:
         return "UPSTREAM"
@@ -5429,8 +5598,10 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         if proxy:
             log("INFO", f"[{jar.get('name')}] via {p.key} persona · exit {_proxy_hkey(proxy)} · "
                         f"model {str(model_id)[:8]}… · token {'yes' if tok else 'no'}")
+        elif LOCAL_UPSTREAM:
+            log("INFO", f"[{jar.get('name')}] local mirror transport · outbound egress is owned by {ARENA_BASE}")
         else:
-            log("WARN", f"[{jar.get('name')}] No live proxy — using server IP (easy to rate-limit)")
+            log("WARN", f"[{jar.get('name')}] No live proxy — request will use server egress")
 
         # Preferred transport: execute the POST inside the already-authenticated
         # keeper origin. This preserves the exact browser cookie jar, TLS/browser
@@ -5500,13 +5671,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     return
 
                 if verdict == "RATELIMIT":
-                    if not mc and attempt + 1 < max_attempts:
-                        nxt = acquire_jar(prefer_live=True, exclude=tried)
-                        if nxt and nxt["id"] not in tried:
-                            jar, _ = nxt, tried.add(nxt["id"])
-                            log("WARN", f"[{jar.get('name')}] model rate-limited (HTTP 429) — rotating account to try remaining quota")
-                            continue
-                    log("WARN", f"[{jar.get('name')}] upstream prompt throttle (HTTP {e.status}) — request stopped; no account rotation")
+                    log("WARN", f"[{jar.get('name')}] upstream throttle (HTTP {e.status}) — request stopped; no retry storm")
                     yield ("error", f"429: Arena returned Too Many Requests for model '{model_name}'. This model is currently rate-limited upstream on Arena; wait 30-60s or select another model in your chat.")
                     return
 
@@ -5533,12 +5698,6 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         reasoning_text = ""
                         log("WARN", f"[{jar.get('name')}] follow-up verification failed — rebuilding as fresh create-evaluation")
                         if attempt + 1 < max_attempts:
-                            continue
-                    if not mc and attempt + 1 < max_attempts:
-                        nxt = acquire_jar(prefer_live=True, exclude=tried)
-                        if nxt and nxt["id"] not in tried:
-                            jar, _ = nxt, tried.add(nxt["id"])
-                            log("INFO", f"[{jar.get('name')}] Rotating to live account after captcha rejection on previous exit")
                             continue
                     log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation failed")
                     yield ("error", "403: Arena rejected this session's verification token. The request was stopped without repeated retries; wait briefly and try a new chat.")
@@ -6383,6 +6542,44 @@ loadThreads();openChat(chatId);
     return template.replace("__MODELS_JSON__", payload).replace("__DEFAULT_MODEL__", selected)
 
 
+
+# ============================================================
+# BRIDGENA v3 CANONICAL CONTROL PLANE
+# ============================================================
+V3_CSS = r'''
+:root{--bg:#09090b;--surface:#0c0c0e;--surface2:#111113;--surface3:#18181b;--line:#27272a;--line2:#323236;--text:#fafafa;--muted:#a1a1aa;--dim:#71717a;--ok:#4ade80;--warn:#fbbf24;--bad:#fb7185;--info:#60a5fa;--radius:12px;--sans:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}
+[data-theme=light]{--bg:#fff;--surface:#fff;--surface2:#fafafa;--surface3:#f4f4f5;--line:#e4e4e7;--line2:#d4d4d8;--text:#09090b;--muted:#71717a;--dim:#a1a1aa;--ok:#16a34a;--warn:#b45309;--bad:#e11d48;--info:#2563eb}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text)}body{font:14px/1.55 var(--sans);-webkit-font-smoothing:antialiased}a{color:inherit;text-decoration:none}button,input,textarea,select{font:inherit}.topbar{position:sticky;top:0;z-index:50;height:60px;display:flex;align-items:center;gap:12px;padding:0 18px;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(18px);border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:10px;font-weight:680;letter-spacing:-.025em}.brand .dot{width:28px;height:28px;border-radius:9px;background:var(--text);color:var(--bg);display:grid;place-items:center;font-size:11px}.brand .dot:after{content:"B"}.brand small{font:500 10px var(--mono);color:var(--dim)}.spacer{flex:1}.shell{display:grid;grid-template-columns:232px minmax(0,1fr);min-height:calc(100vh - 60px)}.rail{position:sticky;top:60px;height:calc(100vh - 60px);border-right:1px solid var(--line);padding:16px 10px;background:var(--bg)}.rail .rail-label{padding:5px 10px 10px;font-size:10px;color:var(--dim);font-weight:650;text-transform:uppercase;letter-spacing:.08em}.rail a{display:flex;align-items:center;min-height:38px;padding:9px 11px;border-radius:8px;color:var(--muted);font-weight:540}.rail a:hover,.rail a.on{background:var(--surface3);color:var(--text)}.main{width:100%;max-width:1520px;padding:34px 38px 72px;min-width:0}.pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding-bottom:22px;margin-bottom:20px;border-bottom:1px solid var(--line)}.pagehead h1{font-size:28px;line-height:1.1;letter-spacing:-.045em;margin:0;font-weight:690}.pagehead p{color:var(--muted);margin:7px 0 0;max-width:720px}.grid{display:grid;gap:12px}.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.split{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(320px,.65fr);gap:12px}.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:17px;box-shadow:0 1px 2px rgba(0,0,0,.08);min-width:0}.card h3{font-size:13px;margin:0 0 13px;font-weight:650;display:flex;align-items:center;gap:8px}.metric{min-height:124px;display:flex;flex-direction:column;justify-content:space-between}.metric .k{color:var(--muted);font-size:12px;font-weight:550}.metric .v{font-size:33px;line-height:1;font-weight:690;letter-spacing:-.045em}.metric .s{font-size:11px;color:var(--dim)}.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:35px;border:1px solid var(--line);background:var(--surface);color:var(--text);border-radius:8px;padding:7px 11px;cursor:pointer;font-weight:550;box-shadow:0 1px 2px rgba(0,0,0,.08)}.btn:hover{background:var(--surface3)}.btn.primary{background:var(--text);color:var(--bg);border-color:var(--text)}.btn.danger{color:var(--bad)}.btn.ghost{background:transparent;box-shadow:none}.btn.sm{min-height:31px;padding:5px 9px;font-size:12px}.chip,.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 8px;font-size:10px;font-weight:650}.pill.ok,.chip.live{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 26%,var(--line));background:color-mix(in srgb,var(--ok) 7%,transparent)}.pill.warn{color:var(--warn)}.pill.bad{color:var(--bad)}.pill.idle{color:var(--dim)}.dotlive{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok)}table{width:100%;border-collapse:collapse}th{text-align:left;color:var(--dim);font-size:10px;font-weight:650;text-transform:uppercase;letter-spacing:.05em;padding:9px;border-bottom:1px solid var(--line)}td{padding:10px 9px;border-bottom:1px solid var(--line);font-size:12.5px;vertical-align:middle}tr:last-child td{border-bottom:0}tr:hover td{background:var(--surface2)}.mono{font-family:var(--mono);font-size:11.5px}.muted{color:var(--muted)}.small{font-size:12px}input,textarea,select{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 10px;outline:0}input:focus,textarea:focus,select:focus{border-color:var(--line2);box-shadow:0 0 0 3px color-mix(in srgb,var(--text) 6%,transparent)}textarea{resize:vertical;min-height:100px}label{display:block;font-size:12px;font-weight:600;margin:13px 0 6px}.kv{display:flex;justify-content:space-between;gap:20px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:12px;color:var(--muted)}.kv b{color:var(--text)}.console{height:360px;overflow:auto;background:#050505;border:1px solid var(--line);border-radius:9px;padding:12px;font:11px/1.7 var(--mono);color:#d4d4d8}[data-theme=light] .console{background:#fafafa;color:#27272a}.console .WARN{color:var(--warn)}.console .ERROR{color:var(--bad)}.console .OK{color:var(--ok)}.bar{width:78px;height:5px;background:var(--surface3);border-radius:99px;overflow:hidden}.bar i{display:block;height:100%;background:var(--text)}.toast{position:fixed;z-index:100;left:50%;bottom:24px;transform:translate(-50%,20px);opacity:0;pointer-events:none;background:var(--text);color:var(--bg);border-radius:999px;padding:9px 13px;font-size:12px;transition:.18s}.toast.show{opacity:1;transform:translate(-50%,0)}.auth{min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(900px 500px at 50% -250px,color-mix(in srgb,var(--text) 8%,transparent),transparent 75%)}.authbox{width:min(390px,100%)}.authlogo{width:42px;height:42px;margin:0 auto 18px;border-radius:12px;background:var(--text);color:var(--bg);display:grid;place-items:center;font-weight:800}.auth h1{text-align:center;font-size:25px;letter-spacing:-.04em;margin:0}.auth p{text-align:center;color:var(--muted);margin:8px 0 24px}.err{color:var(--bad);font-size:12px;text-align:center;min-height:18px;margin-top:12px}.v3-health{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px}.v3-health i{width:7px;height:7px;border-radius:50%;background:var(--ok)}@media(max-width:1000px){.metrics{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}}@media(max-width:760px){.shell{grid-template-columns:1fr}.rail{display:none}.main{padding:24px 14px 52px}.topbar{padding:0 12px}.metrics{grid-template-columns:1fr}.pagehead{align-items:flex-start;flex-direction:column}}
+'''
+V3_THEME_JS = r'''function bgnToggleTheme(){const r=document.documentElement,n=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=n;localStorage.setItem('bgn.theme',n)}document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||'dark';function toast(s){const t=document.getElementById('toast');if(!t)return;t.textContent=s;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2300)}'''
+
+def page(title: str, content: str, active: str = "", raw_js: str = "", wide: bool = False) -> str:
+    nav=[('dash','/dashboard','Overview'),('chat','/chat','Chat'),('browser','/browser-view','Browser'),('pool','/pool','Network'),('jars','/jars','Accounts'),('models','/models-page','Models'),('keys','/api-keys','API keys'),('logs','/logs','Logs')]
+    links=''.join(f'<a class="{"on" if active==k else ""}" href="{h}">{esc(l)}</a>' for k,h,l in nav)
+    return f'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark light"><title>{esc(title)} · Bridgena</title><style>{V3_CSS}</style></head><body><header class="topbar"><a class="brand" href="/dashboard"><span class="dot"></span><span>Bridgena</span><small>{esc(BUILD_STAMP)}</small></a><div class="spacer"></div><div class="v3-health"><i></i><span>control plane online</span></div><button class="btn sm ghost" onclick="bgnToggleTheme()">◐</button><a class="btn sm ghost" href="/logout">Sign out</a></header><div class="shell"><aside class="rail"><div class="rail-label">Workspace</div>{links}</aside><main class="main">{content}</main></div><div id="toast" class="toast"></div><script>{V3_THEME_JS}{raw_js}</script></body></html>'''
+
+def login_page(err: str = "") -> str:
+    return f'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Bridgena</title><style>{V3_CSS}</style></head><body><div class="auth"><div class="authbox"><div class="authlogo">B</div><h1>Bridgena</h1><p>Sign in to the v3 control plane.</p><form class="card" method="post" action="/login"><label for="p">Dashboard password</label><input id="p" name="password" type="password" autocomplete="current-password" autofocus><button class="btn primary" style="width:100%;margin-top:14px">Continue</button><div class="err">{esc(err)}</div></form><div style="text-align:center;margin-top:14px"><button class="btn sm ghost" onclick="bgnToggleTheme()">◐ Theme</button></div></div></div><script>{V3_THEME_JS}</script></body></html>'''
+
+def dashboard_page(overview: dict) -> str:
+    m=overview['metrics']
+    rows_pool=''.join(f"<tr><td class=mono>{esc(r['display'])}</td><td>{_verdict_pill(r['verdict'])}</td><td class=muted>{esc(r.get('why') or '—')}</td><td>{esc(r.get('latency') or '—')}{' ms' if r.get('latency') else ''}</td></tr>" for r in overview['pool'][:8]) or '<tr><td colspan=4 class=muted>No network entries yet.</td></tr>'
+    jrows=''.join(f"<tr><td><b>{esc(j['name'])}</b></td><td class=mono>{esc(j.get('persona','—'))}</td><td>{'<span class=\"pill ok\">live</span>' if j['id'] in overview['live_ids'] else '<span class=\"pill idle\">offline</span>'}</td><td>{_verdict_pill('alive' if j.get('ok') else ('arena-blocked' if j.get('limited') else 'unknown'))}</td></tr>" for j in overview['jars']) or '<tr><td colspan=4 class=muted>No accounts configured.</td></tr>'
+    logl=''.join(f'<div class="{esc(x["lvl"])}">{esc(x["line"])}</div>' for x in overview['logtail'])
+    return page('Overview',f'''<div class="pagehead"><div><h1>Control plane</h1><p>Request engine, browser keepers, network health, model catalog and API compatibility from one workspace.</p></div><div class="row"><a class="btn" href="/browser-view">Open browser observer</a><a class="btn primary" href="/chat">New chat</a></div></div><div class="grid metrics"><div class="card metric"><div class="k">Healthy exits</div><div class="v">{m['alive']}<span class="muted" style="font-size:17px">/{m['pool_total']}</span></div><div class="s">Current network pool</div></div><div class="card metric"><div class="k">Restricted</div><div class="v">{m['flagged']}</div><div class="s">Temporarily excluded by existing policy</div></div><div class="card metric"><div class="k">Keepers</div><div class="v">{m['keepers_live']}</div><div class="s">{m['jars_ok']} healthy of {m['jars_total']} accounts</div></div><div class="card metric"><div class="k">Models</div><div class="v">{m['models']}</div><div class="s">Published by the compatibility API</div></div></div><div class="split" style="margin-top:12px"><section class="card"><h3>Network snapshot <span class=spacer></span><a class=muted href="/pool">View network →</a></h3><div style="overflow:auto"><table><thead><tr><th>Exit</th><th>State</th><th>Diagnosis</th><th>RTT</th></tr></thead><tbody>{rows_pool}</tbody></table></div></section><section class="card"><h3>Keeper fleet <span class=spacer></span><a class=muted href="/browser-view">Watch →</a></h3><div style="overflow:auto"><table><thead><tr><th>Account</th><th>Persona</th><th>Browser</th><th>Health</th></tr></thead><tbody>{jrows}</tbody></table></div></section></div><section class="card" style="margin-top:12px"><h3>Runtime activity <span class=spacer></span><span class="muted small">auto-refresh</span></h3><div class="console" id="cons">{logl}</div></section>''','dash',r'''async function consRefresh(){try{const r=await fetch('/debug-logs/data',{cache:'no-store'});if(!r.ok)return;const d=await r.json(),c=document.getElementById('cons');c.innerHTML=d.map(x=>'<div class="'+(x.lvl||'INFO')+'">'+String(x.line||x.message||'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))+'</div>').join('');c.scrollTop=c.scrollHeight}catch(e){}}setInterval(consRefresh,3000);''')
+
+def chat_page(models: list, default_model: str) -> str:
+    names=[m.get('name','') for m in models if isinstance(m,dict) and m.get('name')]
+    mj=_json.dumps(names,ensure_ascii=False).replace('</','<\\/')
+    dj=_json.dumps(default_model or (names[0] if names else 'auto'),ensure_ascii=False)
+    template=r'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chat · Bridgena</title><style>
+:root{--bg:#09090b;--side:#0d0d0f;--soft:#18181b;--line:#27272a;--text:#fafafa;--muted:#a1a1aa;--dim:#71717a;--ok:#4ade80;--bad:#fb7185;--warn:#fbbf24}[data-theme=light]{--bg:#fff;--side:#fafafa;--soft:#f4f4f5;--line:#e4e4e7;--text:#09090b;--muted:#71717a;--dim:#a1a1aa;--ok:#16a34a;--bad:#e11d48;--warn:#b45309}*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font:14px/1.6 Inter,ui-sans-serif,system-ui,sans-serif}button,input,textarea{font:inherit}.app{height:100%;display:grid;grid-template-columns:260px minmax(0,1fr)}.side{display:flex;flex-direction:column;border-right:1px solid var(--line);background:var(--side);min-width:0}.sidehead{height:60px;display:flex;align-items:center;gap:10px;padding:0 14px}.logo{width:30px;height:30px;border-radius:9px;background:var(--text);color:var(--bg);display:grid;place-items:center;font-size:11px;font-weight:800}.sidebody{flex:1;overflow:auto;padding:8px}.new,.thread,.ghost,.modelbtn,.chipbtn{border:0;color:inherit;cursor:pointer}.new{width:100%;height:39px;border-radius:8px;text-align:left;padding:0 11px;background:transparent}.new:hover,.thread:hover,.ghost:hover,.modelbtn:hover,.chipbtn:hover{background:var(--soft)}.label{padding:22px 10px 8px;color:var(--dim);text-transform:uppercase;font-size:10px;font-weight:650;letter-spacing:.07em}.thread{width:100%;display:flex;background:transparent;border-radius:8px;padding:9px 10px;color:var(--muted);text-align:left}.thread span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.thread.on{background:var(--soft);color:var(--text)}.sidefoot{padding:9px;border-top:1px solid var(--line)}.sidefoot a{display:block;color:var(--muted);text-decoration:none;padding:9px 10px;border-radius:8px}.sidefoot a:hover{background:var(--soft);color:var(--text)}.main{min-width:0;min-height:0;display:flex;flex-direction:column}.top{height:60px;display:flex;align-items:center;gap:8px;padding:0 16px;border-bottom:1px solid var(--line)}.modelwrap{position:relative}.modelbtn{height:36px;max-width:min(480px,60vw);border-radius:8px;padding:0 10px;background:transparent;font-weight:620;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{margin-left:auto;display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px}.status i{width:7px;height:7px;border-radius:50%;background:var(--ok)}.ghost{width:35px;height:35px;border-radius:8px;background:transparent}.picker{display:none;position:absolute;top:42px;left:0;z-index:40;width:min(500px,calc(100vw - 30px));background:var(--bg);border:1px solid var(--line);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.35);overflow:hidden}.picker.open{display:block}.picker input{width:100%;height:42px;border:0;border-bottom:1px solid var(--line);outline:0;background:transparent;color:var(--text);padding:0 12px}.modellist{max-height:360px;overflow:auto;padding:5px}.modelopt{width:100%;border:0;border-radius:7px;background:transparent;color:var(--text);padding:9px 10px;text-align:left;cursor:pointer}.modelopt:hover,.modelopt.on{background:var(--soft)}.scroll{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}.conversation{width:min(900px,100%);margin:0 auto;padding:42px 24px 205px}.welcome{min-height:58vh;display:grid;place-items:center;text-align:center}.welcome h1{font-size:32px;letter-spacing:-.045em;margin:0 0 8px}.welcome p{margin:0;color:var(--muted)}.suggestions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:24px;width:min(580px,100%)}.chipbtn{padding:11px 13px;text-align:left;border:1px solid var(--line);border-radius:10px;background:transparent;color:var(--muted)}.msg{display:grid;grid-template-columns:32px minmax(0,1fr);gap:13px;margin-bottom:34px}.avatar{width:31px;height:31px;border-radius:9px;background:var(--soft);display:grid;place-items:center;font-size:10px;font-weight:800}.msg.user{display:flex;justify-content:flex-end;margin-left:18%}.msg.user .avatar,.msg.user .head{display:none}.msg.user .body{max-width:82%;padding:10px 14px;border-radius:17px;background:var(--soft)}.head{font-size:11px;color:var(--dim);margin-bottom:5px;font-weight:650}.body{font-size:15px;line-height:1.78;word-break:break-word}.body pre{overflow:auto;background:#050505;border:1px solid var(--line);border-radius:9px;padding:12px;font:12px/1.6 ui-monospace,monospace}.body code{font-family:ui-monospace,monospace;background:var(--soft);border-radius:5px;padding:1px 4px}.body pre code{background:none;padding:0}.reason{margin:0 0 12px;color:var(--muted);font-size:12px;border-left:2px solid var(--line);padding-left:10px;white-space:pre-wrap}.error{color:var(--bad)}.dock{position:fixed;left:260px;right:0;bottom:0;padding:54px 18px 18px;background:linear-gradient(transparent,var(--bg) 48%);pointer-events:none}.compose{pointer-events:auto;width:min(900px,100%);margin:0 auto;border:1px solid var(--line);border-radius:20px;background:var(--bg);padding:12px;box-shadow:0 10px 36px rgba(0,0,0,.2)}.compose textarea{width:100%;min-height:44px;max-height:190px;resize:none;border:0;outline:0;background:transparent;color:var(--text);padding:4px}.composefoot{display:flex;align-items:center;color:var(--dim);font-size:10px}.send{margin-left:auto;width:34px;height:34px;border:0;border-radius:50%;background:var(--text);color:var(--bg);cursor:pointer}.send.stop{background:var(--bad);color:#fff}.runtime{position:fixed;z-index:70;top:72px;right:14px;bottom:14px;width:min(520px,calc(100vw - 28px));background:var(--side);border:1px solid var(--line);border-radius:13px;box-shadow:0 24px 70px rgba(0,0,0,.4);padding:12px;display:none}.runtime.open{display:flex;flex-direction:column}.runtime pre{flex:1;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;color:var(--muted);white-space:pre-wrap;font:11px/1.5 ui-monospace,monospace}.mobile{display:none}@media(max-width:760px){.app{grid-template-columns:1fr}.side{position:fixed;inset:0 auto 0 0;width:260px;z-index:90;transform:translateX(-100%);transition:.18s}.side.open{transform:none}.mobile{display:block}.dock{left:0}.conversation{padding:28px 15px 190px}.suggestions{grid-template-columns:1fr}.msg.user{margin-left:5%}}
+</style></head><body><div class=app><aside class=side id=side><div class=sidehead><div class=logo>B</div><b>Bridgena</b></div><div class=sidebody><button class=new onclick="newChat()">＋ New chat</button><div class=label>Recent</div><div id=threads></div></div><div class=sidefoot><a href="/dashboard">← Control plane</a></div></aside><main class=main><header class=top><button class="ghost mobile" onclick="side.classList.toggle('open')">☰</button><div class=modelwrap><button class=modelbtn id=modelBtn onclick="togglePicker()">Model</button><div class=picker id=picker><input id=modelSearch placeholder="Search models"><div class=modellist id=modelList></div></div></div><div class=status><i id=statusDot></i><span id=statusText>Ready</span></div><button class=ghost onclick="toggleRuntime()">⌁</button><button class=ghost onclick="toggleTheme()">◐</button></header><div class=scroll id=scroll><div class=conversation id=conversation></div></div><div class=dock><div class=compose><textarea id=input placeholder="Message Bridgena"></textarea><div class=composefoot><span>Enter to send · Shift+Enter newline</span><button class=send id=send onclick="sendOrStop()">↑</button></div></div></div></main></div><aside class=runtime id=runtime><div style="display:flex;align-items:center"><b>Runtime signal</b><button class=ghost style="margin-left:auto" onclick="toggleRuntime()">×</button></div><pre id=signal>Waiting for activity…</pre></aside><script>
+const MODELS=__MODELS__,DEFAULT_MODEL=__DEFAULT__,$=id=>document.getElementById(id),side=$('side');let controller=null,busy=false,model=localStorage.getItem('bgn.v3.model')||DEFAULT_MODEL,chatId=localStorage.getItem('bgn.v3.chat')||newId();function newId(){return 'c-'+crypto.getRandomValues(new Uint32Array(2)).join('-')}function store(){try{return JSON.parse(localStorage.getItem('bgn.v3.chats')||'{}')}catch(e){return {}}}function saveStore(v){localStorage.setItem('bgn.v3.chats',JSON.stringify(v))}function current(){const s=store();return s[chatId]||{id:chatId,title:'New chat',messages:[],updated:Date.now()}}function saveCurrent(c){const s=store();s[chatId]=c;saveStore(s);localStorage.setItem('bgn.v3.chat',chatId);renderThreads()}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function md(s){let x=esc(s);x=x.replace(/```([\s\S]*?)```/g,(_,b)=>'<pre><code>'+b+'</code></pre>');x=x.replace(/`([^`]+)`/g,'<code>$1</code>');x=x.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');return x.replace(/\n/g,'<br>')}function renderThreads(){const s=store(),items=Object.values(s).sort((a,b)=>(b.updated||0)-(a.updated||0)).slice(0,60);$('threads').innerHTML=items.map(c=>'<button class="thread '+(c.id===chatId?'on':'')+'" onclick="openChat(\''+c.id.replace(/'/g,'')+'\')"><span>'+esc(c.title||'New chat')+'</span></button>').join('')}function openChat(id){chatId=id;localStorage.setItem('bgn.v3.chat',id);renderConversation();renderThreads();side.classList.remove('open')}function newChat(){chatId=newId();saveCurrent({id:chatId,title:'New chat',messages:[],updated:Date.now()});renderConversation()}function renderConversation(){const c=current(),root=$('conversation');root.innerHTML='';if(!c.messages.length){root.innerHTML='<div class=welcome><div><div class=logo style="margin:0 auto 16px;width:42px;height:42px">B</div><h1>How can I help?</h1><p>Chat through the same v3 compatibility surface your clients use.</p><div class=suggestions><button class=chipbtn onclick="usePrompt(\'Review this code and identify reliability risks\')">Review code</button><button class=chipbtn onclick="usePrompt(\'Help me diagnose a failed request\')">Diagnose a request</button></div></div></div>';return}c.messages.forEach(m=>appendRendered(m.role,m.content,m.reasoning||''));scrollBottom(false)}function appendRendered(role,content,reasoning=''){const root=$('conversation'),w=root.querySelector('.welcome');if(w)w.remove();const d=document.createElement('div');d.className='msg '+role;d.innerHTML='<div class=avatar>'+(role==='user'?'U':'B')+'</div><div><div class=head>'+(role==='user'?'You':'Bridgena')+'</div><div class=body>'+(reasoning?'<div class=reason>'+esc(reasoning)+'</div>':'')+md(content)+'</div></div>';root.appendChild(d);return d.querySelector('.body')}function setStatus(t,state='ok'){$('statusText').textContent=t;$('statusDot').style.background=state==='bad'?'var(--bad)':state==='busy'?'var(--warn)':'var(--ok)'}function scrollBottom(s=true){$('scroll').scrollTo({top:$('scroll').scrollHeight,behavior:s?'smooth':'auto'})}function toggleTheme(){const r=document.documentElement,n=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=n;localStorage.setItem('bgn.theme',n)}document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||'dark';function togglePicker(){$('picker').classList.toggle('open');if($('picker').classList.contains('open')){$('modelSearch').value='';renderModels('');$('modelSearch').focus()}}function renderModels(q=''){const x=q.toLowerCase(),arr=MODELS.filter(m=>m.toLowerCase().includes(x)).slice(0,250);$('modelList').innerHTML=arr.map(m=>'<button class="modelopt '+(m===model?'on':'')+'" data-m="'+esc(m)+'">'+esc(m)+'</button>').join('')||'<div style="padding:20px;color:var(--muted)">No matching models</div>';document.querySelectorAll('.modelopt').forEach(b=>b.onclick=()=>{model=b.dataset.m;localStorage.setItem('bgn.v3.model',model);$('modelBtn').textContent=model;$('picker').classList.remove('open')})}$('modelSearch').addEventListener('input',e=>renderModels(e.target.value));$('modelBtn').textContent=model;renderModels('');function usePrompt(s){$('input').value=s;$('input').focus();autoSize()}function autoSize(){const t=$('input');t.style.height='44px';t.style.height=Math.min(190,t.scrollHeight)+'px'}$('input').addEventListener('input',autoSize);$('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendOrStop()}});function toggleRuntime(){$('runtime').classList.toggle('open')}async function refreshSignal(){try{const r=await fetch('/debug-logs/data',{cache:'no-store'});if(!r.ok)return;const d=await r.json();$('signal').textContent=d.slice(-120).map(x=>x.line||x.message||'').join('\n')}catch(e){}}setInterval(refreshSignal,2500);function saveMsg(role,content,reasoning=''){const c=current();c.messages.push({role,content,reasoning,ts:Date.now()});if(c.title==='New chat'&&role==='user')c.title=content.replace(/\s+/g,' ').slice(0,48)||'New chat';c.updated=Date.now();saveCurrent(c)}function sendOrStop(){if(busy){controller?.abort();return}sendMessage()}async function sendMessage(){const input=$('input'),text=input.value.trim();if(!text)return;busy=true;controller=new AbortController();input.value='';autoSize();$('send').textContent='■';$('send').classList.add('stop');setStatus('Generating','busy');saveMsg('user',text);appendRendered('user',text);const body=appendRendered('assistant','');let acc='',reason='';scrollBottom();try{const c=current();const messages=c.messages.slice(-24).map(m=>({role:m.role==='assistant'?'assistant':'user',content:m.content}));const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({model,messages,stream:true,chat_id:chatId,stream_options:{include_usage:true}})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let cut;while((cut=buf.indexOf('\n'))>=0){const line=buf.slice(0,cut).trim();buf=buf.slice(cut+1);if(!line.startsWith('data: '))continue;const raw=line.slice(6);if(raw==='[DONE]')continue;let j;try{j=JSON.parse(raw)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta||{};if(d.reasoning_content)reason+=d.reasoning_content;if(d.content)acc+=d.content;body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc);scrollBottom(false)}}if(!acc)throw new Error('The upstream completed without assistant content.');saveMsg('assistant',acc,reason);setStatus('Ready')}catch(e){if(e.name==='AbortError'){body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc||'Generation stopped.');if(acc)saveMsg('assistant',acc,reason);setStatus('Stopped')}else{body.innerHTML='<div class=error>'+esc(e.message||e)+'</div>';setStatus('Error','bad')}}finally{busy=false;controller=null;$('send').textContent='↑';$('send').classList.remove('stop');renderThreads()}}renderThreads();renderConversation();refreshSignal();document.addEventListener('click',e=>{if(!$('picker').contains(e.target)&&e.target!==$('modelBtn'))$('picker').classList.remove('open')});
+</script></body></html>'''
+    return template.replace('__MODELS__',mj).replace('__DEFAULT__',dj)
+
+
 # ────────────────────────── module: api.py ──────────────────────────────
 
 # ============================================================
@@ -6395,17 +6592,111 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import glob
-from fastapi import FastAPI, File, Form, Request, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, Request, HTTPException, UploadFile, status, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
 from fastapi.security import APIKeyHeader
 
-app = FastAPI(title="Bridgena", version="2.0")
+app = FastAPI(title="Bridgena", version="3.2")
+
+# ---------- v3 optional VNC integration ----------
+_V3_VNC_PROCS=[]
+_V3_VNC_DISPLAY=os.environ.get('BRIDGENA_VNC_DISPLAY',':99')
+_V3_VNC_PORT=int(os.environ.get('BRIDGENA_VNC_PORT','5900'))
+_V3_VNC_ENABLED=os.environ.get('BRIDGENA_VNC','0').lower() in ('1','true','yes','on')
+_V3_NOVNC_ROOTS=('/usr/share/novnc','/opt/novnc')
+async def _v3_vnc_start():
+    if not _V3_VNC_ENABLED:return False,'disabled'
+    import shutil as _shutil,subprocess as _subprocess
+    xvfb,x11vnc=_shutil.which('Xvfb'),_shutil.which('x11vnc')
+    if not xvfb or not x11vnc:
+        log('WARN','v3 VNC requested but Xvfb/x11vnc are not installed');return False,'missing dependencies'
+    display_num=_V3_VNC_DISPLAY.lstrip(':').split('.')[0]
+    try:
+        if not os.path.exists(f'/tmp/.X11-unix/X{display_num}'):
+            _V3_VNC_PROCS.append(_subprocess.Popen([xvfb,_V3_VNC_DISPLAY,'-screen','0',os.environ.get('BRIDGENA_VNC_SCREEN','1440x900x24'),'-nolisten','tcp','-ac'],stdout=_subprocess.DEVNULL,stderr=_subprocess.DEVNULL));await asyncio.sleep(.35)
+        os.environ['DISPLAY']=_V3_VNC_DISPLAY
+        _V3_VNC_PROCS.append(_subprocess.Popen([x11vnc,'-display',_V3_VNC_DISPLAY,'-rfbport',str(_V3_VNC_PORT),'-localhost','-forever','-shared','-nopw','-noxdamage'],stdout=_subprocess.DEVNULL,stderr=_subprocess.DEVNULL))
+        log('OK',f'v3 VNC display {_V3_VNC_DISPLAY} ready on localhost:{_V3_VNC_PORT}');return True,'ready'
+    except Exception as exc:
+        log('ERROR',f'v3 VNC start failed: {type(exc).__name__}: {exc}');return False,str(exc)
+async def _v3_vnc_stop():
+    processes=list(reversed(_V3_VNC_PROCS))
+    for p in processes:
+        try:
+            if p.poll() is None:p.terminate()
+        except Exception:pass
+    for p in processes:
+        try:
+            if p.poll() is None:await asyncio.to_thread(p.wait,5)
+        except Exception:
+            try:p.kill()
+            except Exception:pass
+    _V3_VNC_PROCS.clear()
+def _v3_novnc_root():
+    for root in _V3_NOVNC_ROOTS:
+        if os.path.isfile(os.path.join(root,'vnc.html')):return root
+    return None
+@app.websocket('/vnc/ws')
+async def v3_vnc_ws(ws: WebSocket):
+    if not verify_session_token(ws.cookies.get('session_id','')):
+        await ws.close(code=4401);return
+    origin=ws.headers.get('origin','')
+    if origin and urlparse(origin).netloc != ws.headers.get('host',''):
+        await ws.close(code=4403);return
+    if not _V3_VNC_ENABLED:
+        await ws.close(code=4404);return
+    try: reader,writer=await asyncio.wait_for(asyncio.open_connection('127.0.0.1',_V3_VNC_PORT),timeout=5)
+    except Exception:
+        await ws.close(code=1013);return
+    await ws.accept()
+    async def c2v():
+        try:
+            while True:
+                msg=await ws.receive()
+                if msg.get('type')=='websocket.disconnect':break
+                data=msg.get('bytes')
+                if data is None and msg.get('text') is not None:data=msg['text'].encode('latin1','ignore')
+                if data:writer.write(data);await writer.drain()
+        finally:
+            try:writer.close()
+            except Exception:pass
+    async def v2c():
+        try:
+            while True:
+                data=await reader.read(65536)
+                if not data:break
+                await ws.send_bytes(data)
+        finally:
+            try:await ws.close()
+            except Exception:pass
+    tasks=[asyncio.create_task(c2v(),name='vnc-browser-to-server'),asyncio.create_task(v2c(),name='vnc-server-to-browser')]
+    try:
+        _,pending=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:task.cancel()
+        await asyncio.gather(*pending,return_exceptions=True)
+    finally:
+        for task in tasks:
+            if not task.done():task.cancel()
+        await asyncio.gather(*tasks,return_exceptions=True)
+        try:writer.close();await writer.wait_closed()
+        except Exception:pass
+@app.get('/vnc',response_class=HTMLResponse)
+async def v3_vnc_page(request: Request):
+    g=await _page_guard(request)
+    if g:return g
+    root=_v3_novnc_root()
+    if not _V3_VNC_ENABLED:return HTMLResponse(page('VNC','<div class=pagehead><div><h1>VNC console</h1><p>Optional real VNC for headed keeper sessions.</p></div></div><div class=card><h3>Disabled</h3><p class=muted>Set <code>BRIDGENA_VNC=1</code> and install the bundled VNC dependencies. The Browser Observer works without them.</p><a class="btn primary" href="/browser-view">Open Browser Observer</a></div>','browser'))
+    if not root:return HTMLResponse(page('VNC','<div class=pagehead><div><h1>VNC console</h1><p>VNC is enabled, but noVNC web assets were not found.</p></div></div><div class=card><p class=muted>Install the <code>novnc</code> system package and restart Bridgena.</p><a class=btn href="/browser-view">Browser Observer</a></div>','browser'))
+    return HTMLResponse('''<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>VNC · Bridgena</title><style>html,body{margin:0;width:100%;height:100%;background:#09090b}iframe{border:0;width:100%;height:100%}</style></head><body><iframe src="/novnc/vnc.html?autoconnect=1&resize=scale&path=vnc%2Fws"></iframe></body></html>''')
+
 _api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 _dashboard_sessions: dict = {}
 _recent_api_requests: dict = {}
 _recent_api_requests_lock = threading.Lock()
 _duplicate_notices: dict = {}
+_login_failures: dict = {}
+_login_failures_lock = threading.Lock()
 
 
 @app.middleware("http")
@@ -6467,6 +6758,21 @@ async def _require_key(request: Request) -> Optional[dict]:
     raise HTTPException(status_code=401, detail="missing api key")
 
 
+
+# ---------- v3 control-plane security / telemetry ----------
+_V3_CONTROL_PREFIXES=('/proxies/api','/jars/','/keeper/','/models/block','/create-key','/delete-key','/clear-logs','/debug-logs/data','/debug/raw-models','/control/api','/screenshots','/browser-view','/vnc','/refresh-tokens','/oxalpha/')
+_V3_PUBLIC_PATHS={'/login','/logout','/healthz','/v1/models','/models','/v1/chat/completions','/chat/completions','/v1/messages','/messages'}
+@app.middleware('http')
+async def v3_control_plane_middleware(request: Request,call_next):
+    started=time.perf_counter();rid=request.headers.get('x-request-id') or ('req_'+secrets.token_hex(6));path=request.url.path
+    if path not in _V3_PUBLIC_PATHS and any(path.startswith(p) for p in _V3_CONTROL_PREFIXES):
+        if not await _current_session(request):return JSONResponse({'detail':'dashboard session required'},status_code=401)
+        if request.method not in ('GET','HEAD','OPTIONS'):
+            origin=request.headers.get('origin')
+            if origin:
+                if urlparse(origin).netloc != request.headers.get('host',''):return JSONResponse({'detail':'cross-origin control-plane mutation rejected'},status_code=403)
+    response=await call_next(request);response.headers['X-Bridgena-Request-ID']=rid;response.headers['X-Bridgena-Version']=BUILD_STAMP;response.headers['X-Content-Type-Options']='nosniff';response.headers['X-Frame-Options']='SAMEORIGIN';response.headers['Referrer-Policy']='same-origin';response.headers['Permissions-Policy']='camera=(), microphone=(), geolocation=()';response.headers['Server-Timing']=f"app;dur={(time.perf_counter()-started)*1000:.1f}";return response
+
 # ---------- pages ----------
 @app.get("/login", response_class=HTMLResponse)
 async def login_get(request: Request):
@@ -6476,13 +6782,28 @@ async def login_get(request: Request):
 @app.post("/login")
 async def login_post(request: Request, password: str = Form("")):
     cfg = get_config()
-    if password and password == cfg.get("password", "admin"):
+    peer = request.client.host if request.client else "unknown"
+    now = time.time()
+    with _login_failures_lock:
+        attempts = [stamp for stamp in _login_failures.get(peer, []) if now - stamp < 300]
+        _login_failures[peer] = attempts
+    if len(attempts) >= 8:
+        return HTMLResponse(login_page("Too many attempts. Wait five minutes."), status_code=429)
+    expected = str(cfg.get("password", "admin"))
+    if password and hmac.compare_digest(str(password), expected):
+        with _login_failures_lock:
+            _login_failures.pop(peer, None)
         tok = create_session_token("admin")
         resp = RedirectResponse(url="/dashboard", status_code=303)
-        resp.set_cookie("session_id", tok, httponly=True, samesite="lax", max_age=86400 * 30)
+        forwarded_https = request.headers.get("x-forwarded-proto", "").split(",")[0].strip() == "https"
+        resp.set_cookie("session_id", tok, httponly=True,
+                        secure=request.url.scheme == "https" or forwarded_https,
+                        samesite="lax", max_age=86400 * 30, path="/")
         log("OK", "dashboard login")
         return resp
-    return login_page("wrong password")
+    with _login_failures_lock:
+        _login_failures.setdefault(peer, []).append(now)
+    return HTMLResponse(login_page("Incorrect password."), status_code=401)
 
 
 @app.get("/logout")
@@ -6584,6 +6905,12 @@ async def chat_view(request: Request):
               for m in get_models() if model_name(m) not in blocked]
     return chat_page(models, models[0]["name"] if models else "")
 
+
+
+@app.get('/control/api/status')
+async def v3_control_status(request: Request):
+    if not await _current_session(request):raise HTTPException(status_code=401,detail='dashboard session required')
+    jars=load_jars();return JSONResponse({'build':BUILD_STAMP,'upstream':ARENA_BASE,'local_upstream':LOCAL_UPSTREAM,'models':len(get_models()),'accounts':len(jars),'keepers':keeper.status(),'vnc':{'enabled':_V3_VNC_ENABLED,'display':_V3_VNC_DISPLAY if _V3_VNC_ENABLED else None,'novnc_assets':bool(_v3_novnc_root())},'time':int(time.time())})
 
 # ---------- chat history (page) ----------
 @app.get("/chat/api/chats")
@@ -7083,22 +7410,31 @@ async def debug_logs():
 
 @app.post("/clear-logs")
 async def clear_logs():
-    try:
-        open(LOG_FILE, "w").close()
-    except OSError:
-        pass
-    with LOG._mu:
-        LOG.ring.clear()
+    await asyncio.to_thread(LOG.clear)
     return JSONResponse({"ok": True})
 
 
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
-                         "keepers_live": len(keeper.sessions)})
+                         "keepers_live": sum(1 for session in keeper.sessions.values() if session.running),
+                         "verification_adapter": bool(get_verification_solver),
+                         "vnc_enabled": _V3_VNC_ENABLED})
+
+
+@app.get("/readyz")
+async def readyz():
+    models_ready = bool(get_models())
+    keeper_ready = any(session.running and getattr(session, "page", None)
+                       for session in keeper.sessions.values())
+    ready = models_ready and keeper_ready
+    return JSONResponse({"ready": ready, "build": BUILD_STAMP,
+                         "checks": {"models": models_ready, "keeper": keeper_ready,
+                                    "verification_adapter": bool(get_verification_solver)}},
+                        status_code=200 if ready else 503)
 
 
 # ---------- misc legacy shims ----------
@@ -7265,27 +7601,122 @@ async def oxalpha_retired(request: Request):
         "error": "gone", "detail": "oxalpha direct transport retired in v2 — keeper jars own auth now (see /jars)"})
 
 
+
+# ---------- v3 live browser observer ----------
+@app.get("/browser-view", response_class=HTMLResponse)
+async def browser_view(request: Request):
+    """Operator-only live keeper observer. Uses Playwright screenshots so the
+    control plane does not require a second browser, X11 server, or VNC daemon."""
+    g = await _page_guard(request)
+    if g:
+        return g
+    return HTMLResponse("""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bridgena · Browser Observer</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#09090b;color:#fafafa;font-family:Inter,system-ui,sans-serif}
+header{height:64px;display:flex;align-items:center;gap:12px;padding:0 22px;border-bottom:1px solid #27272a}
+header b{font-size:14px}.muted{color:#a1a1aa}.wrap{padding:22px;display:grid;grid-template-columns:260px 1fr;gap:16px;height:calc(100vh - 64px)}
+.panel{border:1px solid #27272a;border-radius:12px;background:#0c0c0e;overflow:hidden}
+.side{padding:12px;overflow:auto}.session{width:100%;text-align:left;padding:10px;margin-bottom:7px;border:1px solid #27272a;border-radius:8px;background:#18181b;color:#fafafa;cursor:pointer}
+.session:hover,.session.on{background:#27272a}.viewer{display:flex;flex-direction:column;min-width:0}
+.toolbar{padding:10px 12px;border-bottom:1px solid #27272a;display:flex;justify-content:space-between}
+.stage{flex:1;display:grid;place-items:center;overflow:auto;background:#050506}
+.stage img{max-width:100%;max-height:100%;object-fit:contain}.empty{color:#71717a}
+@media(max-width:800px){.wrap{grid-template-columns:1fr}.side{max-height:180px}}
+</style></head>
+<body><header><b>Bridgena</b><span class="muted">/ Browser Observer</span><span style="flex:1"></span><a style="color:#fafafa" href="/vnc">VNC</a><a style="color:#fafafa;margin-left:12px" href="/dashboard">Dashboard</a></header>
+<div class="wrap"><div class="panel side" id="sessions"></div>
+<div class="panel viewer"><div class="toolbar"><span id="title">Select a keeper</span><span class="muted" id="status">idle</span></div>
+<div class="stage"><div class="empty" id="empty">No keeper selected.</div><img id="screen" hidden></div></div></div>
+<script>
+let selected=null, timer=null;
+async function loadSessions(){
+  const r=await fetch('/keeper/status',{cache:'no-store'}); const d=await r.json();
+  const root=document.getElementById('sessions'); root.innerHTML='';
+  const sessions=Array.isArray(d)?d:(d.sessions||Object.values(d||{}));
+  if(!sessions.length){root.innerHTML='<div class="muted">No live keepers.</div>';return}
+  sessions.forEach((s,i)=>{
+    const id=s.jar_id||s.id||s.name; const b=document.createElement('button');
+    b.className='session'+(selected===id?' on':''); b.textContent=(s.name||id||('Keeper '+(i+1)))+' · '+(s.status||'unknown');
+    b.onclick=()=>selectKeeper(id,s.name||id); root.appendChild(b);
+  });
+}
+function selectKeeper(id,name){
+  selected=id; document.getElementById('title').textContent=name; document.getElementById('empty').hidden=true;
+  document.getElementById('screen').hidden=false; refresh(); loadSessions();
+}
+async function refresh(){
+  if(document.hidden||!selected)return;
+  const img=document.getElementById('screen'), st=document.getElementById('status');
+  st.textContent='refreshing';
+  img.src='/keeper/screenshot/'+encodeURIComponent(selected)+'?t='+Date.now();
+  img.onload=()=>st.textContent='live · '+new Date().toLocaleTimeString();
+  img.onerror=()=>st.textContent='keeper unavailable';
+}
+setInterval(()=>{if(!document.hidden)loadSessions()},4000); setInterval(refresh,1500); loadSessions();
+</script></body></html>""")
+
+
+@app.get("/keeper/screenshot/{jar_id}")
+async def keeper_screenshot(request: Request, jar_id: str):
+    """Return an in-memory screenshot of a live keeper page."""
+    if not await _current_session(request):
+        raise HTTPException(status_code=401, detail="dashboard session required")
+    session = keeper.sessions.get(jar_id)
+    if not session or not session.running or not session.page or session.page.is_closed():
+        raise HTTPException(status_code=404, detail="keeper page unavailable")
+    if session.active_requests > 0 or session._action_lock.locked():
+        raise HTTPException(status_code=409, detail="keeper busy with API traffic")
+    try:
+        async with session._action_lock:
+            png = await asyncio.wait_for(
+                session.page.screenshot(type="png", animations="disabled"), timeout=6)
+        return Response(content=png, media_type="image/png",
+                        headers={"Cache-Control": "no-store, max-age=0"})
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"screenshot unavailable: {type(exc).__name__}")
+
+
 # ---------- screenshots ----------
 @app.get("/screenshots")
-async def list_screenshots():
+async def list_screenshots(request: Request):
     files = sorted(glob.glob("*.png"), key=os.path.getmtime, reverse=True)  # keeper writes to cwd, legacy convention
-    body = "".join(f'<li><a href="/screenshots/{os.path.basename(f)}">{os.path.basename(f)}</a></li>' for f in files[:200])
-    return HTMLResponse(f"<h1>Screenshots</h1><ul>{body}</ul>")
+    cards = "".join(
+        f'<a class="card" href="/screenshots/{quote(os.path.basename(filename))}">'
+        f'<img src="/screenshots/{quote(os.path.basename(filename))}" loading="lazy" alt="Keeper screenshot" '
+        f'style="display:block;width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:8px;background:var(--surface3)">'
+        f'<div class="mono muted" style="padding-top:9px;overflow:hidden;text-overflow:ellipsis">{esc(os.path.basename(filename))}</div></a>'
+        for filename in files[:200]
+    ) or '<div class="card muted">No screenshots available.</div>'
+    content = (f'<div class="pagehead"><div><h1>Keeper screenshots</h1><p>Saved browser captures for visual diagnosis.</p></div>'
+               f'<a class="btn primary" href="/browser-view">Open live observer</a></div>'
+               f'<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">{cards}</div>')
+    return HTMLResponse(page("Screenshots", content, "browser"))
 
 
 @app.get("/screenshots/{filename}")
-async def screenshot_file(filename: str):
+async def screenshot_file(request: Request, filename: str):
     p = os.path.basename(filename)
     if not os.path.isfile(p):
         raise HTTPException(status_code=404)
     return FileResponse(p, media_type="image/png")
 
 
+
+try:
+    from fastapi.staticfiles import StaticFiles as _V3StaticFiles
+    _v3_root=_v3_novnc_root()
+    if _v3_root:app.mount('/novnc',_V3StaticFiles(directory=_v3_root,html=True),name='novnc')
+except Exception as _v3_static_exc:
+    log('WARN',f'noVNC static mount unavailable: {type(_v3_static_exc).__name__}')
+
 # ---------- startup ----------
 def jars_have_creds() -> bool:
     return any(j.get("email") and j.get("password") and j.get("enabled", True) for j in load_jars())
 @asynccontextmanager
 async def _lifespan(app):
+    await _v3_vnc_start()
     def _remove_legacy_transcripts(state):
         state.pop("chats", None)
     mutate_state(_remove_legacy_transcripts)
@@ -7295,19 +7726,27 @@ async def _lifespan(app):
                 jar["persona"] = "ubuntu"
                 jar["user_agent"] = PERSONAS["ubuntu"].ua
     mutate_jars(_normalize_personas)
-    tasks = [asyncio.create_task(keeper_election_loop()),
-             asyncio.create_task(periodic_model_refresher()),
-             asyncio.create_task(get_initial_data())]
+    tasks = [asyncio.create_task(keeper_election_loop(), name="keeper-election"),
+             asyncio.create_task(periodic_model_refresher(), name="model-refresher"),
+             asyncio.create_task(get_initial_data(), name="initial-catalog")]
     if jars_have_creds():
-        tasks.append(asyncio.create_task(auto_login_on_boot()))
-    log("INFO", f"BRIDGENA build {BUILD_STAMP} · v2 engine · recaptcha V3/V2 protocol ON")
+        tasks.append(asyncio.create_task(auto_login_on_boot(), name="auto-login"))
+    app.state.background_tasks = tasks
+    app.state.ready_at = time.time()
+    log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
     if get_verification_solver:
         log("OK", f"Verification adapter factory loaded: {_VERIFICATION_FACTORY_SPEC}")
     else:
         log("ERROR", f"Verification adapter factory unavailable: {_VERIFICATION_IMPORT_ERROR}")
-    yield
-    for t in tasks:
-        t.cancel()
+    try:
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await keeper.close()
+        await _v3_vnc_stop()
+        LOG.close()
 
 
 app.router.lifespan_context = _lifespan  # starlette late-bind
@@ -7319,13 +7758,13 @@ app.router.lifespan_context = _lifespan  # starlette late-bind
 # ================================================================
 def _cli():
     import argparse
-    ap = argparse.ArgumentParser(description="Bridgena v2")
+    ap = argparse.ArgumentParser(description="Bridgena v3")
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--workers", type=int, default=int(os.environ.get("BRIDGENA_WORKERS", "1")))
     args = ap.parse_args()
     jars_count = len([j for j in load_jars() if not j.get("expired")])
     print("=" * 62)
-    print("  BRIDGENA v2 — Arena Bridge (" + BUILD_STAMP + ")")
+    print("  BRIDGENA v3 — Arena Bridge (" + BUILD_STAMP + ")")
     print("=" * 62)
     print(f"  * Live Chat   : http://localhost:{args.port}/chat")
     print(f"  * Dashboard   : http://localhost:{args.port}/dashboard")
