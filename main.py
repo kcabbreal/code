@@ -243,7 +243,7 @@ ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
     "BRIDGENA_ALLOW_RECAPTCHA_FALLBACK", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 REQUEST_MAX_ATTEMPTS = max(1, min(5, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "3"))))
-STREAM_TAIL_GRACE_MS = max(5000, min(60000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "30000"))))
+STREAM_TAIL_GRACE_MS = max(250, min(10000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "1500"))))
 KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
 KEEPER_REQUEST_READY_SEC = max(30, min(180, int(os.environ.get("BRIDGENA_KEEPER_REQUEST_READY_SEC", "100"))))
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
@@ -260,7 +260,7 @@ KEEPER_LOGIN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.8-dotenv")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.9-stream-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -5947,74 +5947,76 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                 return
             except BridgeHTTPError as e:
                 if not e.status:
-                    log("WARN", f"[{jar.get('name')}] browser transport failed without an HTTP response")
-                    yield ("error", "502: Browser transport failed; delivery is uncertain, so the request was not replayed.")
-                    return
-                verdict = _classify(e.status, e.body)
-                log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status} (verdict={verdict}): {e.body[:250]}")
+                    # No HTTP response was observed by the browser transport.
+                    # Fall through to the existing same-jar/same-exit curl transport
+                    # instead of making that documented fallback unreachable.
+                    log("WARN", f"[{jar.get('name')}] browser transport failed before an HTTP response; falling back to curl transport")
+                    # Do not rotate the account here: keep the jar/persona/proxy
+                    # selected above so the fallback remains session-coherent.
+                else:
+                    verdict = _classify(e.status, e.body)
+                    log("WARN", f"[{jar.get('name')}] browser-origin HTTP {e.status} (verdict={verdict}): {e.body[:250]}")
 
-                # A failed POST may already have been processed. Do not turn
-                # it into a new conversation or replay it automatically.
-                if verdict == "SESSION":
-                    browser_session.status = "degraded"
-                    browser_session.ready_at = float("inf")
-                    browser_session.error = "Upstream rejected authentication; sign in again"
-                    yield ("error", "401: Upstream rejected this session. Sign in again in Accounts.")
-                    return
+                    # A failed POST may already have been processed. Do not turn
+                    # it into a new conversation or replay it automatically.
+                    if verdict == "SESSION":
+                        browser_session.status = "degraded"
+                        browser_session.ready_at = float("inf")
+                        browser_session.error = "Upstream rejected authentication; sign in again"
+                        yield ("error", "401: Upstream rejected this session. Sign in again in Accounts.")
+                        return
 
-                if verdict == "PROMPT":
-                    log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming (HTTP {e.status}) — no retry or rotation")
-                    yield ("error", "422: Arena rejected this prompt before generation. Bridgena did not retry or rotate accounts; shorten the request or remove unsupported tool/system payloads.")
-                    return
+                    if verdict == "PROMPT":
+                        log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming (HTTP {e.status}) — no retry or rotation")
+                        yield ("error", "422: Arena rejected this prompt before generation. Bridgena did not retry or rotate accounts; shorten the request or remove unsupported tool/system payloads.")
+                        return
 
-                if verdict == "RATELIMIT":
-                    log("WARN", f"[{jar.get('name')}] upstream throttle (HTTP {e.status}) — request stopped; no retry storm")
-                    yield ("error", f"429: Arena returned Too Many Requests for model '{model_name}'. This model is currently rate-limited upstream on Arena; wait 30-60s or select another model in your chat.")
-                    return
+                    if verdict == "RATELIMIT":
+                        log("WARN", f"[{jar.get('name')}] upstream throttle (HTTP {e.status}) — request stopped; no retry storm")
+                        yield ("error", f"429: Arena returned Too Many Requests for model '{model_name}'. This model is currently rate-limited upstream on Arena; wait 30-60s or select another model in your chat.")
+                        return
 
-                if verdict == "UPSTREAM":
-                    yield ("error", "502: Upstream request failed; it was not replayed because delivery may have occurred.")
-                    return
+                    if verdict == "UPSTREAM":
+                        yield ("error", "502: Upstream request failed; it was not replayed because delivery may have occurred.")
+                        return
 
-                if verdict == "RECAPTCHA":
-                    failed_jar_id = jar.get("id")
-                    _captcha_failed_jars[failed_jar_id] = time.time()
-                    if rc_attempts.get(failed_jar_id, 0) < 1:
-                        rc_attempts[failed_jar_id] = rc_attempts.get(failed_jar_id, 0) + 1
-                        log("WARN", f"[{jar.get('name')}] Arena verification rejected token (HTTP {e.status}) — escalating to V2 challenge solver")
-                        esc = await mint_v2_escalation(failed_jar_id, settle_s=20.0)
-                        if esc:
-                            pending_v2_token = esc
-                            log("OK", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar")
-                            if attempt + 1 < max_attempts:
+                    if verdict == "RECAPTCHA":
+                        failed_jar_id = jar.get("id")
+                        _captcha_failed_jars[failed_jar_id] = time.time()
+                        if rc_attempts.get(failed_jar_id, 0) < 1:
+                            rc_attempts[failed_jar_id] = rc_attempts.get(failed_jar_id, 0) + 1
+                            log("WARN", f"[{jar.get('name')}] Arena verification rejected token (HTTP {e.status}) — escalating to V2 challenge solver")
+                            esc = await mint_v2_escalation(failed_jar_id, settle_s=20.0)
+                            if esc:
+                                pending_v2_token = esc
+                                log("OK", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar")
+                                if attempt + 1 < max_attempts:
+                                    continue
+                        if mc:
+                            clear_conversation_model(chat_id, model_name)
+                            mc = None
+                            conv = {}
+                            response_text = ""
+                            reasoning_text = ""
+                        if attempt + 1 < max_attempts:
+                            next_jar = acquire_ready_jar(exclude=tried)
+                            if next_jar:
+                                tried.add(next_jar["id"])
+                                pending_v2_token = None
+                                log("WARN", f"[{next_jar.get('name')}] Rotating to a ready account after verification rejection on {jar.get('name')}")
+                                jar = next_jar
                                 continue
-                    if mc:
-                        clear_conversation_model(chat_id, model_name)
-                        mc = None
-                        conv = {}
-                        response_text = ""
-                        reasoning_text = ""
-                    if attempt + 1 < max_attempts:
-                        next_jar = acquire_ready_jar(exclude=tried)
-                        if next_jar:
-                            tried.add(next_jar["id"])
-                            pending_v2_token = None
-                            log("WARN", f"[{next_jar.get('name')}] Rotating to a ready account after verification rejection on {jar.get('name')}")
-                            jar = next_jar
-                            continue
-                    log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation failed")
-                    yield ("error", "403: Arena rejected this session's verification token. The request was stopped without repeated retries; wait briefly and try a new chat.")
-                    return
+                        log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation failed")
+                        yield ("error", "403: Arena rejected this session's verification token. The request was stopped without repeated retries; wait briefly and try a new chat.")
+                        return
 
-                if e.status == 400 and "user message is invalid" in (e.body or "").lower():
-                    yield ("error", "400: Arena rejected the message content. Send plain text or supported text content parts; images and unsupported multimodal parts are not accepted by this bridge yet.")
+                    if e.status == 400 and "user message is invalid" in (e.body or "").lower():
+                        yield ("error", "400: Arena rejected the message content. Send plain text or supported text content parts; images and unsupported multimodal parts are not accepted by this bridge yet.")
+                        return
+                    yield ("error", f"{e.status or 502}: Arena browser-origin request failed: {e.body[:350] or 'empty response'}")
                     return
-                yield ("error", f"{e.status or 502}: Arena browser-origin request failed: {e.body[:350] or 'empty response'}")
-                return
             except Exception as browser_e:
-                log("WARN", f"[{jar.get('name')}] browser-origin failed ({type(browser_e).__name__}); no automatic replay")
-                yield ("error", "502: Browser request interrupted. No automatic replay was attempted.")
-                return
+                log("WARN", f"[{jar.get('name')}] browser-origin failed ({type(browser_e).__name__}: {browser_e}); falling back to curl transport")
 
         headers = _headers_for(jar, p, json_body=True)
         kw = dict(json=base, headers=headers, stream=True, timeout=120.0)
@@ -7471,7 +7473,15 @@ async def openai_stream(body: dict, keyinfo: dict):
             else:
                 log("WARN", f"OpenAI stream {rid[-8:]} disconnected before terminal · outcome {outcome} · "
                             f"content {content_chunks} chunks/{len(acc)} chars")
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.post("/v1/chat/completions")
@@ -7656,6 +7666,18 @@ async def anthropic_messages(request: Request):
                     yield _anthropic_sse("error", {"type": "error", "error": {
                         "type": "api_error", "message": payload,
                     }})
+                    # Some desktop clients wait for the ordinary terminal
+                    # sequence even after receiving an error event.
+                    yield _anthropic_sse("content_block_stop", {
+                        "type": "content_block_stop", "index": 0
+                    })
+                    yield _anthropic_sse("message_delta", {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "usage": {"output_tokens": _rough_tokens(acc)},
+                    })
+                    yield _anthropic_sse("message_stop", {"type": "message_stop"})
+                    terminal_sent = True
                     return
                 elif kind == "done":
                     complete = payload if isinstance(payload, str) else ""
@@ -7682,7 +7704,15 @@ async def anthropic_messages(request: Request):
             log(level, f"Anthropic stream {message_id[-8:]} delivered · outcome {outcome} · "
                        f"content {chunks} chunks/{len(acc)} chars · terminal {'yes' if terminal_sent else 'no'}")
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/v1/models")
@@ -7830,7 +7860,7 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.8", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.9", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
