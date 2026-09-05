@@ -268,7 +268,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.2-predispatch-transport-guard")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.4-account-failover-thread-handoff")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1862,6 +1862,18 @@ TRANSPORT_PROBE_TIMEOUT_MS = max(1200, min(10000, int(os.environ.get("BRIDGENA_T
 TRANSPORT_PROBE_EVERY_REQUEST = os.environ.get("BRIDGENA_TRANSPORT_PROBE_EVERY_REQUEST", "1").strip().lower() not in ("0", "false", "no", "off")
 TRANSPORT_PROBE_FRESH_SEC = max(0.0, min(60.0, float(os.environ.get("BRIDGENA_TRANSPORT_PROBE_FRESH_SEC", "4"))))
 PREDISPATCH_RECOVERY_WAIT_SEC = max(4.0, min(30.0, float(os.environ.get("BRIDGENA_PREDISPATCH_RECOVERY_WAIT_SEC", "16"))))
+ACCOUNT_FAILOVER_MAX = max(0, min(6, int(os.environ.get("BRIDGENA_ACCOUNT_FAILOVER_MAX", "3"))))
+_account_failover_stats = {"attempted": 0, "successful_handoff": 0, "exhausted": 0, "session_401": 0, "predispatch": 0, "keeper_unready": 0}
+_account_failover_stats_lock = threading.Lock()
+
+def _bump_account_failover(key: str) -> None:
+    with _account_failover_stats_lock:
+        _account_failover_stats[key] = int(_account_failover_stats.get(key, 0)) + 1
+
+def _account_failover_snapshot() -> dict:
+    with _account_failover_stats_lock:
+        return dict(_account_failover_stats)
+
 _transport_guard_stats = {"probe_ok": 0, "probe_fail": 0, "recovered_before_post": 0, "recovery_timeout": 0}
 _transport_guard_stats_lock = threading.Lock()
 
@@ -1903,7 +1915,8 @@ def _reliability_snapshot() -> dict:
             "target": _RELIABILITY_TARGET,
             "target_met": (bool(rate is not None and rate >= _RELIABILITY_TARGET)),
             "failures_by_reason": failures,
-            "transport_guard": _transport_guard_snapshot()}
+            "transport_guard": _transport_guard_snapshot(),
+            "account_failover": _account_failover_snapshot()}
 
 
 def _api_keeper_verified(sid: Optional[str]) -> bool:
@@ -2510,7 +2523,9 @@ def acquire_ready_jar(exclude: Optional[set] = None) -> Optional[dict]:
             continue
         if getattr(session, "_action_lock", None) and session._action_lock.locked():
             continue
-        if _api_ready_event.is_set() and not _api_keeper_verified(sid):
+        if time.monotonic() < _api_keeper_quarantine_until.get(str(sid), 0.0):
+            continue
+        if not _api_keeper_verified(sid):
             continue
         candidates.append(jar)
     if not candidates:
@@ -6673,11 +6688,20 @@ def _conversation_gate(chat_id: str) -> asyncio.Lock:
 
 async def run_turn(chat_id: str, prompt: str, model_name: str,
                    attachments: Optional[list] = None, jar_hint: Optional[str] = None,
-                   system_prompt: str = "", tenant_id: str = "anonymous"):
-    """Unlimited concurrency per API key, bounded only by service capacity.
+                   system_prompt: str = "", tenant_id: str = "anonymous",
+                   handoff_prompt: str = ""):
+    """Coordinate one logical turn with bounded account failover.
 
-    Different chats from the same API key run in parallel. Concurrent writes to
-    the exact same Arena conversation are ordered to preserve transcript state.
+    Account failover is deliberately conservative:
+      * allowed before the model POST is sent;
+      * allowed after an explicit LOGIN_GATE/401 that returned no stream frames;
+      * never used for 429 throttling, reCAPTCHA/verification rejection,
+        or after any model stream has started.
+
+    Existing Arena conversations remain pinned during normal operation. If the
+    bound account fails before generation, Bridgena may rebuild the thread on a
+    different healthy configured account using the client-provided transcript.
+    It never performs this handoff after partial model output has started.
     """
     async with _conversation_gate(chat_id):
         if CONVERSATION_MIN_GAP_SEC > 0:
@@ -6688,17 +6712,90 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 log("INFO", f"conversation pacing · {str(chat_id)[:10]}… · delaying {wait:.2f}s")
                 await asyncio.sleep(wait)
             _conversation_next_start[str(chat_id)] = time.monotonic() + CONVERSATION_MIN_GAP_SEC
+
         async with _browser_turn_gate:
-            turn = _run_turn_impl(chat_id, prompt, model_name, attachments, jar_hint,
-                                  system_prompt=system_prompt)
-            try:
-                async for kind, payload in turn:
-                    yield kind, payload
-            finally:
-                await turn.aclose()
+            excluded = set()
+            next_hint = jar_hint
+            failovers = 0
+            active_prompt = prompt
+            active_system_prompt = system_prompt
+            migrated_thread = False
+
+            while True:
+                turn = _run_turn_impl(
+                    chat_id, active_prompt, model_name, attachments, next_hint,
+                    system_prompt=active_system_prompt,
+                    exclude_jars=excluded,
+                )
+                retry_info = None
+                emitted_user_output = False
+                try:
+                    async for kind, payload in turn:
+                        if kind == "retry-account":
+                            retry_info = payload if isinstance(payload, dict) else {"reason": str(payload)}
+                            break
+                        emitted_user_output = True
+                        yield kind, payload
+                finally:
+                    await turn.aclose()
+
+                if not retry_info:
+                    return
+
+                failed_id = str(retry_info.get("jar_id") or "")
+                failed_name = str(retry_info.get("jar_name") or failed_id or "unknown")
+                reason = str(retry_info.get("reason") or "account unavailable")
+                migrate_thread = bool(retry_info.get("migrate_thread"))
+                if failed_id:
+                    excluded.add(failed_id)
+
+                if migrate_thread:
+                    if not handoff_prompt:
+                        log("WARN", f"Thread handoff unavailable · no client transcript · {failed_name}: {reason}")
+                        yield ("error", "503: This Arena thread's account failed, and the client did not provide "
+                                        "enough conversation history to rebuild it safely on another account.")
+                        return
+                    clear_conversation_model(chat_id, model_name)
+                    active_prompt = handoff_prompt
+                    active_system_prompt = system_prompt
+                    migrated_thread = True
+                    log("WARN", f"Thread handoff armed · rebuilding {str(chat_id)[:10]}… as a new Arena conversation "
+                                f"on another healthy account · {reason}")
+
+                # Internal failover events are only valid before user-visible
+                # stream output. Be defensive if a future code path violates it.
+                if emitted_user_output:
+                    log("ERROR", f"Account failover suppressed after output began · {failed_name} · {reason}")
+                    yield ("error", "502: Account failover was suppressed because the upstream response had already started.")
+                    return
+
+                if failovers >= ACCOUNT_FAILOVER_MAX:
+                    _bump_account_failover("exhausted")
+                    log("WARN", f"Account failover exhausted · tried {len(excluded)} account(s) · last {failed_name}: {reason}")
+                    yield ("error", f"503: No healthy configured account was available after {len(excluded)} attempt(s). "
+                                    "Failed keepers are being recovered in the background.")
+                    return
+
+                nxt = acquire_ready_jar(exclude=excluded)
+                if not nxt:
+                    _bump_account_failover("exhausted")
+                    log("WARN", f"Account failover stopped · no alternate ready keeper · last {failed_name}: {reason}")
+                    yield ("error", "503: The selected account failed and no other verified keeper is ready right now. "
+                                    "Recovery is running in the background.")
+                    return
+
+                failovers += 1
+                _bump_account_failover("attempted")
+                _bump_account_failover("successful_handoff")
+                next_hint = nxt.get("id")
+                log("WARN", f"Account failover {failovers}/{ACCOUNT_FAILOVER_MAX} · "
+                            f"{failed_name} → {nxt.get('name')} · "
+                            f"{'thread handoff · ' if migrate_thread else ''}{reason}")
 
 
-async def _ensure_predispatch_transport(jar: dict) -> bool:
+
+
+async def _ensure_predispatch_transport(jar: dict, *, wait_for_recovery: bool = True) -> bool:
     """Do not submit a model POST through a keeper whose browser route is dead.
 
     On a failed harmless probe we recover the same keeper, wait for readmission,
@@ -6720,6 +6817,9 @@ async def _ensure_predispatch_transport(jar: dict) -> bool:
                 f"status {status_code or 0} · {redact(detail)[:160]} · recovering before POST")
     _quarantine_api_keeper(sid, "pre-dispatch route probe failed", TRANSPORT_FAILURE_QUARANTINE_SEC)
     _schedule_transport_recovery(sid, "pre-dispatch route probe failed")
+
+    if not wait_for_recovery:
+        return False
 
     deadline = time.monotonic() + PREDISPATCH_RECOVERY_WAIT_SEC
     while time.monotonic() < deadline:
@@ -6745,7 +6845,7 @@ async def _ensure_predispatch_transport(jar: dict) -> bool:
 
 async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                    attachments: Optional[list] = None, jar_hint: Optional[str] = None,
-                   system_prompt: str = ""):
+                   system_prompt: str = "", exclude_jars: Optional[set] = None):
     """Async generator yielding ('content'|'reasoning'|'error'|'done', text).
     One bounded attempt budget over the PROVEN exit pool; jars survive every
     failure class except true session death."""
@@ -6759,17 +6859,24 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
     cf_clear_attempts = 0
     same_jar_429 = 0
     rc_attempts: Dict[str, int] = {}
-    tried = set()
+    excluded = set(exclude_jars or ())
+    tried = set(excluded)
     bound_jar_id = (mc or {}).get("jar_id")
     wanted_jar_id = jar_hint or bound_jar_id
     jar = (next((j for j in load_jars()
-                 if j.get("id") == wanted_jar_id and j.get("enabled", True)), None)
-           if wanted_jar_id else acquire_jar(prefer_live=True))
+                 if j.get("id") == wanted_jar_id
+                 and j.get("id") not in excluded
+                 and j.get("enabled", True)), None)
+           if wanted_jar_id else acquire_jar(prefer_live=True, exclude=excluded))
     if bound_jar_id and not jar:
-        yield ("error", "409: This Arena thread's original jar is unavailable. Start a new Bridgena thread instead of replaying its ID through another account.")
+        yield ("retry-account", {
+            "jar_id": bound_jar_id, "jar_name": bound_jar_id,
+            "reason": "bound account is unavailable before dispatch",
+            "migrate_thread": True,
+        })
         return
-    if not jar and jar_hint:
-        jar = acquire_jar(prefer_live=True)
+    if not jar and jar_hint and not bound_jar_id:
+        jar = acquire_jar(prefer_live=True, exclude=excluded)
     if not jar:
         yield ("error", "502: No jar with valid cookies/session — upload cookies or enable a keeper")
         return
@@ -6794,11 +6901,11 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                 await asyncio.sleep(0.5)
             if not (_api_keeper_verified(sid)
                     and keeper_session_ready(keeper.sessions.get(sid))):
-                retry_after = max(2, int(max(
-                    2.0, _api_keeper_quarantine_until.get(sid, 0.0) - time.monotonic()
-                )))
-                yield ("error", f"503: This conversation's keeper is recovering from a browser transport failure. "
-                                f"Retry in about {retry_after}s; Bridgena will not move the Arena thread to another account.")
+                yield ("retry-account", {
+                    "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+                    "reason": "bound keeper did not recover before dispatch",
+                    "migrate_thread": True,
+                })
                 return
 
     # Startup used to race chat: requests reached Arena with `token no` while
@@ -6815,15 +6922,37 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
     if not _find_session(jar.get("id"))[1]:
         s_wait = keeper.sessions.get(jar.get("id"))
         detail = redact(getattr(s_wait, "error", "") or getattr(s_wait, "current_step", "") or "keeper is still starting")
-        yield ("error", f"503: The selected account has no ready same-exit keeper ({detail}). Check Accounts, then retry.")
+        if not bound_jar_id:
+            _bump_account_failover("keeper_unready")
+            _verification_preflight_retry_after[str(jar.get("id"))] = 0.0
+            yield ("retry-account", {
+                "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+                "reason": f"keeper not ready: {detail}",
+            })
+            return
+        yield ("retry-account", {
+            "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+            "reason": f"bound keeper not ready before dispatch: {detail}",
+            "migrate_thread": True,
+        })
         return
 
     # Catch dead SOCKS/browser routes before minting a token or submitting a
-    # model request. If recovery succeeds, the user's original request simply
-    # waits and continues; no prompt replay is involved.
-    if not await _ensure_predispatch_transport(jar):
-        yield ("error", "503: The selected keeper's browser route failed its pre-dispatch health check "
-                        "and could not recover in time. No request was sent upstream; retry shortly.")
+    # model request. New/unbound chats fail over immediately while the broken
+    # keeper recovers in the background. Bound chats wait for the same keeper.
+    if not await _ensure_predispatch_transport(jar, wait_for_recovery=bool(bound_jar_id)):
+        if not bound_jar_id:
+            _bump_account_failover("predispatch")
+            yield ("retry-account", {
+                "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+                "reason": "pre-dispatch browser route failed before model POST",
+            })
+            return
+        yield ("retry-account", {
+            "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+            "reason": "bound keeper route failed before model POST",
+            "migrate_thread": True,
+        })
         return
 
     response_text = ""
@@ -6834,17 +6963,31 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         jar = await _live_cookies(jar)
         if not jar_has_auth(jar):
             if mc:
-                yield ("error", "409: This Arena thread lost its original authenticated jar. Start a new Bridgena thread.")
+                yield ("retry-account", {
+                    "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+                    "reason": "bound account lost authentication before model POST",
+                    "migrate_thread": True,
+                })
                 return
-            nxt = acquire_jar(prefer_live=True, exclude=tried)
-            if nxt and nxt["id"] not in tried:
-                jar, _ = nxt, tried.add(nxt["id"])
-                continue
-            yield ("error", "502: Arena session expired — no other authenticated account")
+            _bump_account_failover("keeper_unready")
+            yield ("retry-account", {
+                "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+                "reason": "account has no usable authenticated cookies",
+            })
             return
         model_id = resolve_model_id(model_name, jar)
         if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", str(model_id)):
-            yield ("error", f"422: Model '{model_name}' has no Arena UUID in the catalog. Refresh Models after a keeper is live, then retry.")
+            if not mc:
+                yield ("retry-account", {
+                    "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+                    "reason": f"model '{model_name}' is unavailable in this account's catalog",
+                })
+                return
+            yield ("retry-account", {
+                "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+                "reason": f"bound account cannot resolve model '{model_name}'",
+                "migrate_thread": True,
+            })
             return
         base = {"mode": "direct-battle", "modelAId": model_id, "modality": "chat"}
         follow_url = None
@@ -6916,7 +7059,12 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                            and _rotation_mode() == "assignment") else None)
         if bound_proxy:
             if not await asyncio.to_thread(proxy_alive, bound_proxy):
-                yield ("error", "409: This Arena thread's original exit is unavailable. Start a new Bridgena thread; its conversation ID cannot safely move to another IP.")
+                _schedule_transport_recovery(jar.get("id"), "bound exit unavailable before dispatch")
+                yield ("retry-account", {
+                    "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+                    "reason": "bound account exit is unavailable before model POST",
+                    "migrate_thread": True,
+                })
                 return
             proxy = bound_proxy
         else:
@@ -7044,8 +7192,24 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         _quarantine_api_keeper(jar.get("id"), "upstream session/login gate", 180.0)
                         browser_session.status = "degraded"
                         browser_session.ready_at = float("inf")
-                        browser_session.error = "Upstream rejected authentication; sign in again"
-                        yield ("error", "401: Upstream rejected this session. Sign in again in Accounts.")
+                        browser_session.error = "Upstream rejected authentication; recovery scheduled"
+                        _schedule_transport_recovery(jar.get("id"), "upstream LOGIN_GATE/session rejection")
+
+                        # An explicit 401/LOGIN_GATE with zero stream frames is
+                        # a definitive no-generation result. For a NEW Arena
+                        # conversation it is safe to try another configured
+                        # authenticated account automatically.
+                        if int(getattr(e, "frame_count", 0) or 0) == 0:
+                            _bump_account_failover("session_401")
+                            yield ("retry-account", {
+                                "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+                                "reason": "upstream LOGIN_GATE / session rejected before generation",
+                                "migrate_thread": bool(mc),
+                            })
+                            return
+
+                        yield ("error", "401: Upstream rejected the session after response activity began; "
+                                        "automatic account handoff was suppressed.")
                         return
 
                     if verdict == "PROMPT":
@@ -7094,7 +7258,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     yield ("error", f"{e.status or 502}: Arena browser-origin request failed: {e.body[:350] or 'empty response'}")
                     return
             except Exception as browser_e:
-                log("WARN", f"[{jar.get('name')}] browser-origin failed ({type(browser_e).__name__}: {browser_e}); request ended without cross-transport replay")
+                log("WARN", f"[{jar.get('name')}] browser-origin failed ({type(browser_e).__name__}: {browser_e}); delivery uncertain — no account failover")
                 yield ("error", "502: Browser request was interrupted before a reliable HTTP response. Retry the request.")
                 return
 
@@ -7212,14 +7376,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             conv = {}
                             response_text = ""
                             reasoning_text = ""
-                        if attempt + 1 < max_attempts:
-                            next_jar = acquire_ready_jar(exclude=tried)
-                            if next_jar:
-                                tried.add(next_jar["id"])
-                                pending_v2_token = None
-                                log("WARN", f"[{next_jar.get('name')}] Rotating to a ready account after verification rejection on {jar.get('name')}")
-                                jar = next_jar
-                                continue
+                        # Verification rejection is intentionally NOT a
+                        # cross-account failover condition. Keep recovery local.
                         log("WARN", f"[{jar.get('name')}] recaptcha unresolved — jar KEPT HEALTHY (starvation is our bug, not their death)")
                         yield ("error", "403: arena's recaptcha check rejected us and the keeper could not mint a token on this exit. "
                                         "Jars were NOT expired. Fix order: keeper live on this exit → solver models present "
@@ -8495,6 +8653,42 @@ def _anthropic_system_context(body: dict) -> str:
     return _openai_text_content(body.get("system", "")).strip()
 
 
+def _failover_handoff_prompt(body: dict) -> str:
+    """Render client-visible conversation history for emergency thread handoff.
+
+    This is never used for an ordinary Arena follow-up. It is used only when the
+    original bound account is unusable before generation (or explicitly returns
+    LOGIN_GATE with zero stream frames) and Bridgena must create a replacement
+    Arena conversation on another configured account.
+    """
+    rows = []
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        if role == "system":
+            continue
+        value = _openai_text_content(message.get("content", "")).strip()
+        if not value:
+            continue
+        label = {
+            "user": "User",
+            "assistant": "Assistant",
+            "tool": "Tool",
+            "developer": "Developer",
+        }.get(role, role.title() or "Message")
+        rows.append(f"{label}: {value}")
+
+    rendered = "\n\n".join(rows).strip()
+    if len(rendered) <= MAX_PROMPT:
+        return rendered
+
+    # Preserve the newest context when the client transcript is enormous.
+    tail = rendered[-MAX_PROMPT:]
+    cut = tail.find("\n\n")
+    return tail[cut + 2:] if cut >= 0 else tail
+
+
 def _tenant_identity(keyinfo: Optional[dict]) -> str:
     """Opaque tenant identity; never use the plaintext API key."""
     k = keyinfo or {}
@@ -8632,7 +8826,8 @@ async def openai_stream(body: dict, keyinfo: dict):
             async for kind, payload in run_turn(chat_id, prompt, model,
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
-                                                tenant_id=tenant_id):
+                                                tenant_id=tenant_id,
+                                                handoff_prompt=_failover_handoff_prompt(body)):
                 if kind == "content":
                     acc += payload
                     content_chunks += 1
@@ -8761,7 +8956,8 @@ async def chat_completions(request: Request):
                                                 body.get("model", "auto"),
                                                 attachments=body.get("attachments"),
                                                 system_prompt=_openai_system_context(body),
-                                                tenant_id=_tenant_identity(keyinfo)):
+                                                tenant_id=_tenant_identity(keyinfo),
+                                                handoff_prompt=_failover_handoff_prompt(body)):
                 if kind == "content":
                     acc += payload
                 elif kind == "error":
@@ -8891,7 +9087,8 @@ async def anthropic_messages(request: Request):
             async for kind, payload in run_turn(chat_id, prompt, model,
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
-                                                tenant_id=tenant_id):
+                                                tenant_id=tenant_id,
+                                                handoff_prompt=_failover_handoff_prompt(body)):
                 if kind in ("content", "reasoning") and isinstance(payload, str):
                     acc += payload
                 elif kind == "error":
@@ -8921,7 +9118,8 @@ async def anthropic_messages(request: Request):
             async for kind, payload in run_turn(chat_id, prompt, model,
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
-                                                tenant_id=tenant_id):
+                                                tenant_id=tenant_id,
+                                                handoff_prompt=_failover_handoff_prompt(body)):
                 if kind in ("content", "reasoning") and isinstance(payload, str):
                     acc += payload
                     chunks += 1
@@ -9173,7 +9371,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.2",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.4",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -9991,6 +10189,7 @@ async def _lifespan(app):
     log("INFO", f"Keeper recovery · soft refresh then restart after {_keeper_recovery_restart_after} failed readiness checks · parallel {_keeper_recovery_gate._value}")
     log("INFO", f"Transport recovery · same-keeper restart ON · quarantine {TRANSPORT_FAILURE_QUARANTINE_SEC:.0f}s · bound wait {BOUND_KEEPER_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Pre-dispatch transport guard · HEAD probe every request {'ON' if TRANSPORT_PROBE_EVERY_REQUEST else 'OFF'} · timeout {TRANSPORT_PROBE_TIMEOUT_MS}ms · recovery wait {PREDISPATCH_RECOVERY_WAIT_SEC:.0f}s")
+    log("INFO", f"Account failover · max {ACCOUNT_FAILOVER_MAX} alternate keeper(s) · thread handoff ON for pre-generation account/session failures · 429+verification+partial-stream excluded")
     log("INFO", f"Reliability SLO · rolling window {_reliability_window.maxlen} · target {_RELIABILITY_TARGET*100:.0f}%")
     log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
     log("INFO", "Stream decoder · Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini · snapshot de-dup ON")
