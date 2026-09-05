@@ -263,7 +263,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.1-proxy-ingest-toast-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.2-proxy-parser-shadcn-ui-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -4982,128 +4982,120 @@ def sweep_all() -> dict:
 
 # ---------- ingest / prune / revive ----------
 def _parse_proxy_line_loose(raw: str) -> Optional[str]:
-    """Parse one proxy line without requiring credentials.
-
-    Accepted unauthenticated forms include:
-      1.2.3.4:8080
-      example.net:3128
-      socks5://1.2.3.4:1080
-      socks4://1.2.3.4:1080
-      http://1.2.3.4:8080
-      1.2.3.4:1080:socks5
-      1.2.3.4 8080
-    Authenticated formats continue to be supported by _normalize_proxy().
-    """
+    """Best-effort proxy parser. Credentials are optional."""
     if raw is None:
         return None
     line = str(raw).strip().lstrip("\ufeff").strip().strip('"\'')
     if not line or line.startswith("#") or line.startswith("//"):
         return None
-
-    # First use the canonical parser; it already handles full URLs,
-    # user:pass@host:port and host:port:user:pass.
-    normal = _normalize_proxy(line)
-    if normal:
-        return normal
-
-    # Whitespace-separated provider export: "host port [scheme]".
-    fields = line.split()
-    if len(fields) >= 2 and fields[1].isdigit():
-        host, port = fields[0], fields[1]
-        scheme = fields[2].lower() if len(fields) >= 3 else "http"
-        if scheme in ("socks5h", "socks5", "socks4", "socks4a", "http", "https"):
+    line = re.sub(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)", "", line).strip()
+    n = _normalize_proxy(line)
+    if n:
+        return n
+    schemes=("socks5h","socks5","socks4a","socks4","https","http")
+    low=line.lower()
+    scheme=next((x for x in schemes if re.search(rf"(?<![a-z0-9]){re.escape(x)}(?![a-z0-9])",low)),"http")
+    fields=[x for x in re.split(r"[\s|;,]+",line) if x]
+    if len(fields)>=3:
+        if fields[0].lower() in schemes and fields[2].isdigit():
+            return _normalize_proxy(f"{fields[0].lower()}://{fields[1]}:{fields[2]}")
+        if fields[1].isdigit() and fields[2].lower() in schemes:
+            return _normalize_proxy(f"{fields[2].lower()}://{fields[0]}:{fields[1]}")
+    if len(fields)>=2 and fields[1].isdigit():
+        return _normalize_proxy(f"{scheme}://{fields[0]}:{fields[1]}")
+    m=re.fullmatch(r"(?P<host>\[[0-9a-fA-F:]+\]|[^:\s]+):(?P<port>\d{1,5}):(?P<scheme>socks5h|socks5|socks4a|socks4|https|http)",line,flags=re.I)
+    if m and 0<int(m.group('port'))<=65535:
+        return _normalize_proxy(f"{m.group('scheme').lower()}://{m.group('host')}:{m.group('port')}")
+    hp=re.search(r"(?P<host>(?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9.-]+\.[A-Za-z]{2,}|\[[0-9a-fA-F:]+\]):(?P<port>\d{1,5})(?!\d)",line)
+    if hp:
+        port=int(hp.group('port')); host=hp.group('host')
+        if 0<port<=65535:
+            if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}",host) and any(int(x)>255 for x in host.split('.')):
+                return None
             return _normalize_proxy(f"{scheme}://{host}:{port}")
-
-    # Unauthenticated "host:port:scheme".
-    parts = line.rsplit(":", 2)
-    if len(parts) == 3 and parts[1].isdigit() and parts[2].lower() in (
-        "socks5h", "socks5", "socks4", "socks4a", "http", "https"
-    ):
-        return _normalize_proxy(f"{parts[2].lower()}://{parts[0]}:{parts[1]}")
-
-    # Very explicit bare host:port fallback, including hostnames.
-    m = re.fullmatch(r"(\[[0-9a-fA-F:]+\]|[^:\s]+):(\d{1,5})", line)
-    if m:
-        host, port = m.group(1), int(m.group(2))
-        if 0 < port <= 65535:
-            return f"http://{host}:{port}"
-
     return None
 
 
-def parse_upload(text: str) -> Tuple[List[str], int, int]:
-    """Accepts plain lines AND headered CSV exports (R10 rules):
-    'Host,Port,Username,Password[,Type]' rows become scheme://u:p@host:port."""
-    import csv as _csv, io as _io
-    lines = [l.strip() for l in text.replace("\r", "").splitlines() if l.strip() and not l.strip().startswith("#")]
-    out, skipped, hinted = [], 0, 0
-    looks_csv = lines and ("," in lines[0]) and ("|" not in lines[0])
-    if looks_csv:
-        rows = list(_csv.reader(_io.StringIO("\n".join(lines)), skipinitialspace=True))
-        head = [h.strip().lower() for h in rows[0]] if rows else []
-        idx = {k: i for i, k in enumerate(head)}
-        has_head = any(k in idx for k in ("host", "ip address", "ip_address", "proxy address"))
-        body = rows[1:] if has_head else rows
-        for r in body:
-            if not r:
-                skipped += 1; continue
-            def col(*names, default=""):
-                for nm in names:
-                    if nm in idx and idx[nm] < len(r):
-                        return r[idx[nm]].strip()
-                return default
-            host = col("host", "ip address", "ip_address", "proxy address", "ip")
-            port = col("port", "proxy port")
-            user = col("username", "user", "proxy username")
-            pw = col("password", "pass", "proxy password")
-            typ = (col("type", "scheme", "proxy type", default="http") or "http").lower()
-            if not (host and str(port).isdigit()):
-                alt = _parse_proxy_line_loose(",".join(r)) if r and ":" in r[0] and not host else None
-                if alt:
-                    out.append(alt); continue
-                skipped += 1; continue
-            if typ not in ("socks5", "socks5h", "socks4", "socks4a", "http", "https"):
-                hinted += 1
-                typ = "http"
-            auth = f"{user}:{pw}@" if user else ""
-            out.append(f"{typ}://{auth}{host}:{port}")
-        if not out:
-            # headered export failed to map — fall through to plain-line parse
-            lines = [l for l in text.replace("\r", "").splitlines() if l.strip() and not l.strip().startswith("#")]
-    for l in lines if not looks_csv or not out else []:
-        raw = l.strip()
-        n = _parse_proxy_line_loose(raw)
-        if not n and "://" not in raw and raw.count(":") >= 3 and "@" not in raw:
-            parts = raw.split(":")
-            if len(parts) >= 4 and parts[1].isdigit():
-                host, port, user = parts[0], parts[1], parts[2]
-                pw = ":".join(parts[3:])
-                n = _normalize_proxy(f"http://{user}:{pw}@{host}:{port}")
-        if not n and "://" not in raw and "@" in raw:
-            n = _normalize_proxy("http://" + raw)
-        if n:
-            out.append(n)
-        else:
-            skipped += 1
-    seen, dedup = set(), []
-    for u in out:
-        if _is_loopback_proxy(u):
-            skipped += 1
+def _split_proxy_blob(text: str) -> List[str]:
+    if not text:
+        return []
+    raw_lines=[x.strip() for x in str(text).replace("\r","\n").split("\n") if x.strip()]
+    out=[]
+    for line in raw_lines:
+        if line.startswith("#") or line.startswith("//"):
             continue
-        k = _proxy_hkey(u) or u
-        if k not in seen:
-            seen.add(k); dedup.append(u)
+        hits=re.findall(r"(?:[A-Za-z][A-Za-z0-9+.-]*://)?(?:[^@\s]+@)?(?:\[[0-9a-fA-F:]+\]|(?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9.-]+\.[A-Za-z]{2,}):\d{1,5}",line)
+        if len(hits)>=2 and ',' not in line:
+            out.extend(hits)
+        else:
+            out.append(line)
+    return out
+
+
+def parse_upload(text: str) -> Tuple[List[str], int, int]:
+    """Parse pasted/uploaded proxy lists. Authentication is optional."""
+    import csv as _csv, io as _io
+    source_lines=_split_proxy_blob(text)
+    out=[]; skipped=0; hinted=0; unresolved=[]
+    for line in source_lines:
+        n=_parse_proxy_line_loose(line)
+        if n: out.append(n)
+        else: unresolved.append(line)
+    csvish=[line for line in unresolved if ',' in line]
+    skipped += len([line for line in unresolved if ',' not in line])
+    if csvish:
+        try: rows=list(_csv.reader(_io.StringIO("\n".join(csvish)),skipinitialspace=True))
+        except Exception: rows=[]
+        header=[str(x).strip().lower() for x in rows[0]] if rows else []
+        known={"host","ip","ip address","ip_address","proxy","proxy address","server","port","proxy port","username","user","password","pass","type","scheme","protocol","proxy type"}
+        has_header=any(x in known for x in header)
+        idx={name:i for i,name in enumerate(header)} if has_header else {}
+        body=rows[1:] if has_header else rows
+        for row in body:
+            row=[str(x).strip() for x in row]
+            if not row: skipped+=1; continue
+            def col(*names):
+                for name in names:
+                    if name in idx and idx[name]<len(row): return row[idx[name]]
+                return ""
+            if has_header:
+                host=col("host","ip","ip address","ip_address","proxy","proxy address","server")
+                port=col("port","proxy port"); user=col("username","user"); pw=col("password","pass")
+                typ=(col("type","scheme","protocol","proxy type") or "http").lower()
+            else:
+                host=row[0] if len(row)>0 else ""; port=row[1] if len(row)>1 else ""
+                typ=row[2].lower() if len(row)==3 and row[2].lower() in ("http","https","socks4","socks4a","socks5","socks5h") else (row[4].lower() if len(row)>=5 else "http")
+                user=row[2] if len(row)>=4 else ""; pw=row[3] if len(row)>=4 else ""
+                if len(row)==3 and row[2].lower() in ("http","https","socks4","socks4a","socks5","socks5h"): user=""
+            if not host or not str(port).isdigit() or not (0<int(port)<=65535):
+                n=_parse_proxy_line_loose(','.join(row))
+                if n: out.append(n)
+                else: skipped+=1
+                continue
+            if typ not in ("http","https","socks4","socks4a","socks5","socks5h"):
+                typ="http"; hinted+=1
+            if user:
+                from urllib.parse import quote as _q
+                auth=f"{_q(user,safe='')}:{_q(pw or '',safe='')}@"
+            else: auth=""
+            out.append(f"{typ}://{auth}{host}:{port}")
+    seen=set(); dedup=[]
+    for candidate in out:
+        n=_normalize_proxy(candidate)
+        if not n or _is_loopback_proxy(n): skipped+=1; continue
+        key=n.strip().lower()
+        if key not in seen: seen.add(key); dedup.append(n)
     return dedup, skipped, hinted
 
 
 def upload_pool(text: str) -> dict:
     new, skipped, hinted = parse_upload(text)
     cur = _pool_lines()
-    cur_keys = {_proxy_hkey(_normalize_proxy(l) or l) for l in cur if l.strip()}
-    add = [u for u in new if _proxy_hkey(u) not in cur_keys]
+    cur_keys = {(_normalize_proxy(l) or l).strip().lower() for l in cur if l.strip()}
+    add = [u for u in new if (_normalize_proxy(u) or u).strip().lower() not in cur_keys]
     merged = cur + add
     pool_save(merged)
-    log("OK", f"proxy manager: +{len(add)} from upload/paste ({len(new)} parsed, {skipped} skipped, {hinted} with list hints)")
+    log("OK", f"proxy manager: +{len(add)} from upload/paste ({len(new)} parsed, {skipped} skipped, {max(0, len(new)-len(add))} duplicates, {hinted} protocol hints)")
     return {
         "added": len(add),
         "parsed": len(new),
@@ -7012,8 +7004,8 @@ def api_key_created_page(name: str, raw_key: str) -> str:
 
 def pool_page(rows: list, stats: dict) -> str:
     body=''.join(f"<tr><td class='mono'>{esc(r['display'])}</td><td class='muted'>{esc(r.get('scheme',''))}</td><td>{_verdict_pill(r['verdict'])}</td><td class='muted' style='max-width:360px'>{esc(r['why']) or '—'}</td><td>{esc(r['latency']) if r['latency'] else '<span class=muted>—</span>'}{'ms' if r['latency'] else ''}</td><td><form method='post' action='/proxies/api/remove-one'><input type='hidden' name='key' value='{esc(r['key'])}'><button class='btn sm ghost'>Remove</button></form></td></tr>" for r in rows) or "<tr><td colspan='6' class='empty'>No proxies configured yet.</td></tr>"
-    content=f'''<div class="pagehead"><div><div class="eyebrow">Network</div><h1>Proxy pool</h1><p>Manage configured upstream routes and see current transport health.</p></div><div class="actionbar"><span class="badge-num">{stats['total']} configured</span><span class="pill ok">{stats['alive']} alive</span><span class="pill warn">{stats['flagged']} restricted</span><button class="btn" onclick="scan()">Scan pool</button></div></div><div class="proxy-add"><section class="card"><div class="row"><div><div class="eyebrow">Inventory</div><h3 style="margin:2px 0 14px">Configured exits</h3></div><span class="spacer"></span><input id="proxyFilter" placeholder="Filter exits…" style="width:220px" oninput="filterRows()"></div><div class="table-wrap"><table id="proxyTable"><thead><tr><th>Exit</th><th>Scheme</th><th>State</th><th>Diagnosis</th><th>RTT</th><th></th></tr></thead><tbody>{body}</tbody></table></div></section><aside class="card"><div class="eyebrow">Add capacity</div><h3 style="margin:2px 0 14px">Add proxies</h3><form id="proxyAddForm" data-native="1"><div class="dropbox"><label for="proxyText" style="margin-top:0">Paste proxies</label><textarea id="proxyText" name="text" placeholder="1.2.3.4:8080&#10;socks5://1.2.3.4:1080&#10;host:port:user:pass&#10;&#10;Or CSV: Host,Port,Username,Password,Type"></textarea><div class="helper">Credentials are optional. Accepts host:port, scheme://host:port, host:port:user:pass, full URLs, whitespace exports, or headered CSV.</div></div><label for="proxyFile">Or upload a text / CSV file</label><input id="proxyFile" type="file" accept=".txt,.csv,text/plain,text/csv"><div class="actionbar" style="margin-top:12px"><button class="btn primary" type="submit">Add proxies</button><button class="btn ghost" type="button" onclick="clearProxyForm()">Clear</button></div></form><div style="border-top:1px solid var(--line);margin:18px -17px 14px"></div><div class="eyebrow">Maintenance</div><h3 style="margin:2px 0 14px">Pool actions</h3><div class="actionbar"><button class="btn sm" onclick="poolAction('/proxies/api/prune','Pruning unhealthy exits…')">Prune dead</button><button class="btn sm ghost" onclick="poolAction('/proxies/api/revive','Reviving saved exits…')">Revive all</button><button class="btn sm danger" onclick="deleteAll()">Delete all</button></div></aside></div>'''
-    js=r'''function filterRows(){const q=document.getElementById('proxyFilter').value.toLowerCase();document.querySelectorAll('#proxyTable tbody tr').forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?'':'none')}function clearProxyForm(){document.getElementById('proxyText').value='';document.getElementById('proxyFile').value=''}document.getElementById('proxyAddForm').addEventListener('submit',async e=>{e.preventDefault();const text=document.getElementById('proxyText').value,file=document.getElementById('proxyFile').files[0];if(!text.trim()&&!file){bgnToast('Paste proxies or choose a file first','warn');return}const t=bgnToast('Parsing and merging proxies…','loading');try{const fd=new FormData();fd.append('text',text);if(file)fd.append('file',file);const r=await fetch('/proxies/api/upload',{method:'POST',body:fd,credentials:'same-origin'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Upload failed'));bgnToastUpdate(t,'Added '+d.added+' · parsed '+d.parsed+' · skipped '+d.skipped,d.added>0?'ok':'warn',d.added>0?'Proxies added':'Nothing new added');if(d.added>0)bgnReload(message,'ok','Proxies added',1200)}catch(err){bgnToastUpdate(t,err.message||String(err),'error')}});async function scan(){const t=bgnToast('Scanning the proxy pool…','loading');try{const r=await fetch('/proxies/api/check',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Scan failed'));if(d.running){bgnToastUpdate(t,'A scan is already running','warn');return}bgnToastUpdate(t,d.alive+' of '+d.total+' exits are healthy','ok','Scan complete');bgnReload(d.alive+' of '+d.total+' exits are healthy','ok','Scan complete',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function poolAction(url,msg){const t=bgnToast(msg,'loading');try{const r=await fetch(url,{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Action failed'));bgnToastUpdate(t,bgnResultMessage(d),'ok');bgnReload(bgnResultMessage(d),'ok','Done',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function deleteAll(){if(!confirm('Delete every active proxy? A recovery snapshot will be retained.'))return;const t=bgnToast('Deleting active proxies…','loading');try{const r=await fetch('/proxies/api/delete-all',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Delete failed'));bgnToastUpdate(t,'Deleted '+d.removed+' proxies','ok');bgnReload('Deleted '+d.removed+' proxies','ok','Pool cleared',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}'''
+    content=f'''<div class="pagehead"><div><div class="eyebrow">Network</div><h1>Proxy pool</h1><p>Manage configured upstream routes and see current transport health.</p></div><div class="actionbar"><span class="badge-num">{stats['total']} configured</span><span class="pill ok">{stats['alive']} alive</span><span class="pill warn">{stats['flagged']} restricted</span><button class="btn" onclick="scan()">Scan pool</button></div></div><div class="proxy-add"><section class="card"><div class="row"><div><div class="eyebrow">Inventory</div><h3 style="margin:2px 0 14px">Configured exits</h3></div><span class="spacer"></span><input id="proxyFilter" placeholder="Filter exits…" style="width:220px" oninput="filterRows()"></div><div class="table-wrap"><table id="proxyTable"><thead><tr><th>Exit</th><th>Scheme</th><th>State</th><th>Diagnosis</th><th>RTT</th><th></th></tr></thead><tbody>{body}</tbody></table></div></section><aside class="card"><div class="tabs" role="tablist"><button class="tab on" type="button" data-tab="add" onclick="switchProxyTab('add')">Add</button><button class="tab" type="button" data-tab="formats" onclick="switchProxyTab('formats')">Formats</button><button class="tab" type="button" data-tab="maint" onclick="switchProxyTab('maint')">Maintenance</button></div><div class="tab-panel" data-panel="add"><div class="eyebrow" style="margin-top:18px">Add capacity</div><h3 style="margin:2px 0 14px">Add proxies</h3><form id="proxyAddForm" data-native="1"><div class="dropbox"><label for="proxyText" style="margin-top:0">Paste proxies</label><textarea id="proxyText" name="text" placeholder="1.2.3.4:8080&#10;socks5://1.2.3.4:1080&#10;host:port:user:pass&#10;&#10;Or CSV: Host,Port,Username,Password,Type"></textarea><div class="helper">Credentials are optional. Accepts host:port, scheme://host:port, host:port:user:pass, full URLs, whitespace exports, or headered CSV.</div></div><label for="proxyFile">Or upload a text / CSV file</label><input id="proxyFile" type="file" accept=".txt,.csv,text/plain,text/csv"><div class="actionbar" style="margin-top:12px"><button class="btn primary" type="submit">Add proxies</button><button class="btn ghost" type="button" onclick="clearProxyForm()">Clear</button></div></form></div><div class="tab-panel" data-panel="formats" hidden><div class="eyebrow" style="margin-top:18px">Accepted input</div><h3 style="margin:2px 0 12px">Flexible parser</h3><div class="console" style="height:auto;max-height:none;padding:12px">1.2.3.4:8080<br>socks5://1.2.3.4:1080<br>SOCKS5 1.2.3.4 1080<br>1.2.3.4 1080 SOCKS5<br>1.2.3.4,1080,SOCKS5</div></div><div class="tab-panel" data-panel="maint" hidden><div class="eyebrow" style="margin-top:18px">Maintenance</div><h3 style="margin:2px 0 14px">Pool actions</h3><div class="actionbar"><button class="btn sm" onclick="poolAction('/proxies/api/prune','Pruning unhealthy exits…')">Prune dead</button><button class="btn sm ghost" onclick="poolAction('/proxies/api/revive','Reviving saved exits…')">Revive all</button><button class="btn sm danger" onclick="deleteAll()">Delete all</button></div></div></aside></div>'''
+    js=r'''function switchProxyTab(name){document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('on',b.dataset.tab===name));document.querySelectorAll('[data-panel]').forEach(p=>p.hidden=p.dataset.panel!==name)}function filterRows(){const q=document.getElementById('proxyFilter').value.toLowerCase();document.querySelectorAll('#proxyTable tbody tr').forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?'':'none')}function clearProxyForm(){document.getElementById('proxyText').value='';document.getElementById('proxyFile').value=''}document.getElementById('proxyAddForm').addEventListener('submit',async e=>{e.preventDefault();const text=document.getElementById('proxyText').value,file=document.getElementById('proxyFile').files[0];if(!text.trim()&&!file){bgnToast('Paste proxies or choose a file first','warn');return}const t=bgnToast('Parsing and merging proxies…','loading');try{const fd=new FormData();fd.append('text',text);if(file)fd.append('file',file);const r=await fetch('/proxies/api/upload',{method:'POST',body:fd,credentials:'same-origin'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Upload failed'));const message='Added '+d.added+' · parsed '+d.parsed+' · duplicates '+(d.duplicates||0)+' · skipped '+d.skipped;bgnToastUpdate(t,message,d.added>0?'ok':'warn',d.added>0?'Proxies added':'Nothing new added');if(d.added>0)bgnReload(message,'ok','Proxies added',1800)}catch(err){bgnToastUpdate(t,err.message||String(err),'error')}});async function scan(){const t=bgnToast('Scanning the proxy pool…','loading');try{const r=await fetch('/proxies/api/check',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Scan failed'));if(d.running){bgnToastUpdate(t,'A scan is already running','warn');return}bgnToastUpdate(t,d.alive+' of '+d.total+' exits are healthy','ok','Scan complete');bgnReload(d.alive+' of '+d.total+' exits are healthy','ok','Scan complete',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function poolAction(url,msg){const t=bgnToast(msg,'loading');try{const r=await fetch(url,{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Action failed'));bgnToastUpdate(t,bgnResultMessage(d),'ok');bgnReload(bgnResultMessage(d),'ok','Done',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function deleteAll(){if(!confirm('Delete every active proxy? A recovery snapshot will be retained.'))return;const t=bgnToast('Deleting active proxies…','loading');try{const r=await fetch('/proxies/api/delete-all',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Delete failed'));bgnToastUpdate(t,'Deleted '+d.removed+' proxies','ok');bgnReload('Deleted '+d.removed+' proxies','ok','Pool cleared',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}'''
     return page('Network', content, 'pool', js)
 
 def jars_page(jars: list) -> str:
@@ -7238,12 +7230,16 @@ V3_CSS = r'''
 *{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text)}body{font:14px/1.55 var(--sans);-webkit-font-smoothing:antialiased}a{color:inherit;text-decoration:none}button,input,textarea,select{font:inherit}.topbar{position:sticky;top:0;z-index:50;height:60px;display:flex;align-items:center;gap:12px;padding:0 18px;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(18px);border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:10px;font-weight:680;letter-spacing:-.025em}.brand .dot{width:28px;height:28px;border-radius:9px;background:var(--text);color:var(--bg);display:grid;place-items:center;font-size:11px}.brand .dot:after{content:"B"}.brand small{font:500 10px var(--mono);color:var(--dim)}.spacer{flex:1}.shell{display:grid;grid-template-columns:232px minmax(0,1fr);min-height:calc(100vh - 60px)}.rail{position:sticky;top:60px;height:calc(100vh - 60px);border-right:1px solid var(--line);padding:16px 10px;background:var(--bg)}.rail .rail-label{padding:5px 10px 10px;font-size:10px;color:var(--dim);font-weight:650;text-transform:uppercase;letter-spacing:.08em}.rail a{display:flex;align-items:center;min-height:38px;padding:9px 11px;border-radius:8px;color:var(--muted);font-weight:540}.rail a:hover,.rail a.on{background:var(--surface3);color:var(--text)}.main{width:100%;max-width:1520px;padding:34px 38px 72px;min-width:0}.pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding-bottom:22px;margin-bottom:20px;border-bottom:1px solid var(--line)}.pagehead h1{font-size:28px;line-height:1.1;letter-spacing:-.045em;margin:0;font-weight:690}.pagehead p{color:var(--muted);margin:7px 0 0;max-width:720px}.grid{display:grid;gap:12px}.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.split{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(320px,.65fr);gap:12px}.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:17px;box-shadow:0 1px 2px rgba(0,0,0,.08);min-width:0}.card h3{font-size:13px;margin:0 0 13px;font-weight:650;display:flex;align-items:center;gap:8px}.metric{min-height:124px;display:flex;flex-direction:column;justify-content:space-between}.metric .k{color:var(--muted);font-size:12px;font-weight:550}.metric .v{font-size:33px;line-height:1;font-weight:690;letter-spacing:-.045em}.metric .s{font-size:11px;color:var(--dim)}.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:35px;border:1px solid var(--line);background:var(--surface);color:var(--text);border-radius:8px;padding:7px 11px;cursor:pointer;font-weight:550;box-shadow:0 1px 2px rgba(0,0,0,.08)}.btn:hover{background:var(--surface3)}.btn.primary{background:var(--text);color:var(--bg);border-color:var(--text)}.btn.danger{color:var(--bad)}.btn.ghost{background:transparent;box-shadow:none}.btn.sm{min-height:31px;padding:5px 9px;font-size:12px}.chip,.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 8px;font-size:10px;font-weight:650}.pill.ok,.chip.live{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 26%,var(--line));background:color-mix(in srgb,var(--ok) 7%,transparent)}.pill.warn{color:var(--warn)}.pill.bad{color:var(--bad)}.pill.idle{color:var(--dim)}.dotlive{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok)}table{width:100%;border-collapse:collapse}th{text-align:left;color:var(--dim);font-size:10px;font-weight:650;text-transform:uppercase;letter-spacing:.05em;padding:9px;border-bottom:1px solid var(--line)}td{padding:10px 9px;border-bottom:1px solid var(--line);font-size:12.5px;vertical-align:middle}tr:last-child td{border-bottom:0}tr:hover td{background:var(--surface2)}.mono{font-family:var(--mono);font-size:11.5px}.muted{color:var(--muted)}.small{font-size:12px}input,textarea,select{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 10px;outline:0}input:focus,textarea:focus,select:focus{border-color:var(--line2);box-shadow:0 0 0 3px color-mix(in srgb,var(--text) 6%,transparent)}textarea{resize:vertical;min-height:100px}label{display:block;font-size:12px;font-weight:600;margin:13px 0 6px}.kv{display:flex;justify-content:space-between;gap:20px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:12px;color:var(--muted)}.kv b{color:var(--text)}.console{height:360px;overflow:auto;background:#050505;border:1px solid var(--line);border-radius:9px;padding:12px;font:11px/1.7 var(--mono);color:#d4d4d8}[data-theme=light] .console{background:#fafafa;color:#27272a}.console .WARN{color:var(--warn)}.console .ERROR{color:var(--bad)}.console .OK{color:var(--ok)}.bar{width:78px;height:5px;background:var(--surface3);border-radius:99px;overflow:hidden}.bar i{display:block;height:100%;background:var(--text)}.toast{position:fixed;z-index:100;left:50%;bottom:24px;transform:translate(-50%,20px);opacity:0;pointer-events:none;background:var(--text);color:var(--bg);border-radius:999px;padding:9px 13px;font-size:12px;transition:.18s}.toast.show{opacity:1;transform:translate(-50%,0)}.auth{min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(900px 500px at 50% -250px,color-mix(in srgb,var(--text) 8%,transparent),transparent 75%)}.authbox{width:min(390px,100%)}.authlogo{width:42px;height:42px;margin:0 auto 18px;border-radius:12px;background:var(--text);color:var(--bg);display:grid;place-items:center;font-weight:800}.auth h1{text-align:center;font-size:25px;letter-spacing:-.04em;margin:0}.auth p{text-align:center;color:var(--muted);margin:8px 0 24px}.err{color:var(--bad);font-size:12px;text-align:center;min-height:18px;margin-top:12px}.v3-health{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px}.v3-health i{width:7px;height:7px;border-radius:50%;background:var(--ok)}@media(max-width:1000px){.metrics{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}}@media(max-width:760px){.shell{grid-template-columns:1fr}.rail{display:none}.main{padding:24px 14px 52px}.topbar{padding:0 12px}.metrics{grid-template-columns:1fr}.pagehead{align-items:flex-start;flex-direction:column}}
 /* v3.5 control-plane redesign */
 .toast-stack{position:fixed;z-index:5000;right:20px;bottom:20px;display:flex;flex-direction:column;gap:10px;width:min(390px,calc(100vw - 28px));pointer-events:none}.toast-stack .toast{position:relative;left:auto;bottom:auto;transform:translateY(10px) scale(.985);opacity:0;pointer-events:auto;background:color-mix(in srgb,var(--surface) 96%,transparent);color:var(--text);border:1px solid var(--line2);border-radius:12px;padding:12px 14px;box-shadow:0 18px 50px rgba(0,0,0,.28);font-size:12.5px;transition:.2s;display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:10px;align-items:start;backdrop-filter:blur(18px)}.toast-stack .toast.show{opacity:1;transform:none}.toast-dot{width:8px;height:8px;border-radius:50%;margin-top:5px;background:var(--info)}.toast.ok .toast-dot{background:var(--ok)}.toast.warn .toast-dot{background:var(--warn)}.toast.error .toast-dot{background:var(--bad)}.toast.loading .toast-dot{animation:bgnpulse .8s infinite alternate}@keyframes bgnpulse{to{opacity:.25;transform:scale(.75)}}.toast-title{font-weight:650;line-height:1.25}.toast-msg{color:var(--muted);margin-top:2px;line-height:1.4;word-break:break-word}.toast-close{border:0;background:transparent;color:var(--dim);cursor:pointer;padding:0 2px;font-size:15px}.eyebrow{font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:var(--dim);font-weight:700}.hero{border:1px solid var(--line);border-radius:16px;padding:24px;background:linear-gradient(145deg,color-mix(in srgb,var(--surface2) 92%,transparent),var(--surface));position:relative;overflow:hidden}.hero:after{content:"";position:absolute;width:360px;height:360px;border-radius:50%;right:-180px;top:-220px;background:radial-gradient(circle,color-mix(in srgb,var(--info) 13%,transparent),transparent 68%);pointer-events:none}.hero h1{font-size:32px;letter-spacing:-.05em;margin:3px 0 8px;line-height:1.05}.hero p{max-width:700px;color:var(--muted);margin:0}.hero-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:20px}.status-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:12px}.status-card{border:1px solid var(--line);background:var(--surface);border-radius:12px;padding:14px}.status-card .label{font-size:11px;color:var(--muted);display:flex;justify-content:space-between;gap:12px}.status-card .num{font-size:27px;font-weight:700;letter-spacing:-.04em;margin-top:8px}.status-card .meta{font-size:10.5px;color:var(--dim);margin-top:4px}.section-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(300px,.55fr);gap:12px;margin-top:12px}.quick-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.quick{display:block;border:1px solid var(--line);border-radius:10px;padding:13px;background:var(--surface2);transition:.16s}.quick:hover{border-color:var(--line2);background:var(--surface3);transform:translateY(-1px)}.quick b{display:block;font-size:12px}.quick span{display:block;color:var(--dim);font-size:10.5px;margin-top:3px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px}.table-wrap table{min-width:680px}.empty{padding:30px;text-align:center;color:var(--muted)}.proxy-add{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:12px}.dropbox{border:1px dashed var(--line2);border-radius:12px;padding:14px;background:var(--surface2)}.dropbox textarea{min-height:220px;background:var(--surface)}.helper{font-size:10.5px;color:var(--dim);margin-top:7px}.actionbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.badge-num{font:650 10px var(--mono);padding:3px 7px;border-radius:999px;background:var(--surface3);color:var(--muted)}@media(max-width:1000px){.status-strip{grid-template-columns:repeat(2,1fr)}.section-grid,.proxy-add{grid-template-columns:1fr}}@media(max-width:640px){.status-strip{grid-template-columns:1fr}.hero{padding:19px}.hero h1{font-size:27px}.quick-grid{grid-template-columns:1fr}.toast-stack{right:14px;bottom:14px}}
+
+/* v3.5.2 shadcn-like control primitives */
+.btn{appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:7px;height:36px;padding:0 14px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--text);font-size:12px;font-weight:560;line-height:1;white-space:nowrap;cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,.12);transition:background .14s,border-color .14s,box-shadow .14s,transform .06s}.btn:hover{background:var(--surface3)}.btn:active{transform:translateY(1px)}.btn:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:none;box-shadow:0 0 0 2px var(--bg),0 0 0 4px color-mix(in srgb,var(--text) 24%,transparent)}.btn:disabled{opacity:.5;pointer-events:none}.btn.primary{background:var(--text);border-color:var(--text);color:var(--bg)}.btn.primary:hover{opacity:.92}.btn.ghost{border-color:transparent;background:transparent;box-shadow:none}.btn.ghost:hover{background:var(--surface3)}.btn.danger{background:var(--bad);border-color:var(--bad);color:#fff}.btn.sm{height:30px;padding:0 10px;font-size:11px;border-radius:6px}
+input,textarea,select{width:100%;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--text);padding:8px 10px;font-size:12px;box-shadow:0 1px 2px rgba(0,0,0,.08)}input{height:36px}textarea{min-height:110px;resize:vertical}select{height:36px}.tabs{display:inline-flex;align-items:center;height:36px;padding:3px;background:var(--surface3);border-radius:8px;border:1px solid var(--line);gap:2px}.tab{height:28px;padding:0 11px;border:0;border-radius:6px;background:transparent;color:var(--muted);font-size:11px;font-weight:560;cursor:pointer}.tab:hover{color:var(--text)}.tab.on{background:var(--bg);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.22)}.tab-panel[hidden]{display:none!important}
 '''
 V3_THEME_JS = r'''function bgnToggleTheme(){const r=document.documentElement,n=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=n;localStorage.setItem('bgn.theme',n)}document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||'dark';
-function bgnToast(message,type='ok',title=''){const stack=document.getElementById('toast-stack')||(()=>{const s=document.createElement('div');s.id='toast-stack';s.className='toast-stack';document.body.appendChild(s);return s})();const t=document.createElement('div'),msg=String(message??'').trim()||'Done',label=title||({ok:'Done',error:'Something went wrong',warn:'Notice',loading:'Working…'}[type]||'Notice');t.className='toast '+type;t.innerHTML='<i class="toast-dot"></i><div><div class="toast-title"></div><div class="toast-msg"></div></div><button class="toast-close" aria-label="Dismiss">×</button>';t.querySelector('.toast-title').textContent=label;t.querySelector('.toast-msg').textContent=msg;t.querySelector('.toast-close').onclick=()=>{t.classList.remove('show');setTimeout(()=>t.remove(),180)};stack.appendChild(t);requestAnimationFrame(()=>t.classList.add('show'));if(type!=='loading'){const ttl=type==='error'?10000:type==='warn'?8500:7000;setTimeout(()=>{if(t.isConnected){t.classList.remove('show');setTimeout(()=>t.remove(),180)}},ttl)}return t}
-function toast(m,type='ok'){return bgnToast(m,type)}function bgnToastUpdate(t,message,type='ok',title=''){if(!t||!t.isConnected)return bgnToast(message,type,title);t.className='toast '+type;t.querySelector('.toast-title').textContent=title||({ok:'Done',error:'Something went wrong',warn:'Notice'}[type]||'Done');t.querySelector('.toast-msg').textContent=String(message||'Done');if(type!=='loading'){const ttl=type==='error'?10000:type==='warn'?8500:7000;setTimeout(()=>{if(t.isConnected){t.classList.remove('show');setTimeout(()=>t.remove(),180)}},ttl)}return t}
+function bgnToast(message,type='ok',title=''){const stack=document.getElementById('toast-stack')||(()=>{const s=document.createElement('div');s.id='toast-stack';s.className='toast-stack';document.body.appendChild(s);return s})();const t=document.createElement('div'),msg=String(message??'').trim()||'Done',label=title||({ok:'Done',error:'Something went wrong',warn:'Notice',loading:'Working…'}[type]||'Notice');t.className='toast '+type;t.innerHTML='<i class="toast-dot"></i><div><div class="toast-title"></div><div class="toast-msg"></div></div><button class="toast-close" aria-label="Dismiss">×</button>';t.querySelector('.toast-title').textContent=label;t.querySelector('.toast-msg').textContent=msg;t.querySelector('.toast-close').onclick=()=>{t.classList.remove('show');setTimeout(()=>t.remove(),180)};stack.appendChild(t);requestAnimationFrame(()=>t.classList.add('show'));if(type!=='loading'){const ttl=type==='error'?12000:type==='warn'?9000:8000;setTimeout(()=>{if(t.isConnected){t.classList.remove('show');setTimeout(()=>t.remove(),180)}},ttl)}return t}
+function toast(m,type='ok'){return bgnToast(m,type)}function bgnToastUpdate(t,message,type='ok',title=''){if(!t||!t.isConnected)return bgnToast(message,type,title);t.className='toast '+type;t.querySelector('.toast-title').textContent=title||({ok:'Done',error:'Something went wrong',warn:'Notice'}[type]||'Done');t.querySelector('.toast-msg').textContent=String(message||'Done');if(type!=='loading'){const ttl=type==='error'?12000:type==='warn'?9000:8000;setTimeout(()=>{if(t.isConnected){t.classList.remove('show');setTimeout(()=>t.remove(),180)}},ttl)}return t}
 function bgnFlash(message,type='ok',title=''){try{sessionStorage.setItem('bgn.flash',JSON.stringify({message:String(message||''),type,title,at:Date.now()}))}catch(e){}}
-function bgnReload(message,type='ok',title='',delay=900){bgnFlash(message,type,title);setTimeout(()=>location.reload(),delay)}
+function bgnReload(message,type='ok',title='',delay=900){bgnFlash(message,type,title);setTimeout(()=>location.reload(),Math.max(1800,delay))}
 document.addEventListener('DOMContentLoaded',()=>{try{const raw=sessionStorage.getItem('bgn.flash');if(!raw)return;sessionStorage.removeItem('bgn.flash');const f=JSON.parse(raw);if(Date.now()-(f.at||0)<15000)bgnToast(f.message,f.type||'ok',f.title||'')}catch(e){}});
 async function bgnJson(r){const ct=r.headers.get('content-type')||'';if(ct.includes('application/json'))return await r.json();return {message:(await r.text()).trim()}}function bgnResultMessage(d,fallback='Saved'){if(!d)return fallback;if(d.detail)return typeof d.detail==='string'?d.detail:JSON.stringify(d.detail);if(d.message)return d.message;const parts=[];for(const [k,v] of Object.entries(d)){if(v===null||v===undefined||typeof v==='object')continue;parts.push(k.replaceAll('_',' ')+' '+v)}return parts.join(' · ')||fallback}
 document.addEventListener('submit',async e=>{const f=e.target;if(!(f instanceof HTMLFormElement)||f.dataset.native==='1'||(f.method||'get').toLowerCase()==='get')return;if(!f.action.startsWith(location.origin))return;e.preventDefault();const submit=e.submitter;if(submit)submit.disabled=true;const pending=bgnToast('Sending request…','loading');try{const r=await fetch(f.action,{method:(f.method||'POST').toUpperCase(),body:new FormData(f),credentials:'same-origin'});if(!r.ok){const d=await bgnJson(r);throw new Error(bgnResultMessage(d,'HTTP '+r.status))}if(r.redirected){bgnToastUpdate(pending,'Changes saved','ok');bgnFlash('Changes saved','ok');setTimeout(()=>{location.href=r.url},900);return}const d=await bgnJson(r);bgnToastUpdate(pending,bgnResultMessage(d),'ok');if(f.dataset.reload!=='0')bgnReload(bgnResultMessage(d),'ok','',900)}catch(err){bgnToastUpdate(pending,err.message||String(err),'error')}finally{if(submit)submit.disabled=false}});window.addEventListener('unhandledrejection',e=>{if(e.reason&&e.reason.message)bgnToast(e.reason.message,'error')});'''
@@ -8345,7 +8341,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.1",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.2",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -8877,4 +8873,3 @@ def _cli():
 
 if __name__ == "__main__":
     _cli()
- 
