@@ -263,7 +263,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.4.1-20user-unlimited-api-concurrency")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.4.2-proxy-allocation-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2460,6 +2460,171 @@ def acquire_ready_jar(exclude: Optional[set] = None) -> Optional[dict]:
     mutate_jars(mark_used)
     return selected
 
+async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None) -> dict:
+    """Pre-allocate distinct healthy upstream proxies to keeper accounts.
+
+    This runs before keeper browsers launch so stale sticky assignments cannot
+    collapse several accounts onto one local SOCKS shim. The configured pool is
+    deduplicated by normalized upstream proxy, fully probed once, and distinct
+    healthy proxies are assigned across enabled keeper accounts whenever enough
+    capacity exists.
+
+    Returns allocation diagnostics; proxy credentials are never logged.
+    """
+    jars = list(jars or load_jars())
+    keepers = [
+        j for j in jars
+        if j.get("enabled", True)
+        and j.get("keeper_enabled", True)
+        and j.get("email")
+        and j.get("password")
+    ]
+
+    raw_pool = get_proxy_pool()
+    normalized_pool: List[str] = []
+    seen = set()
+    for raw in raw_pool:
+        proxy = _normalize_proxy(raw)
+        if not proxy:
+            continue
+        key = _proxy_hkey(proxy)
+        if key in seen or key in _QUARANTINED_KEYS:
+            continue
+        seen.add(key)
+        normalized_pool.append(proxy)
+
+    stats = {
+        "configured": len(raw_pool),
+        "unique": len(normalized_pool),
+        "live": 0,
+        "keepers": len(keepers),
+        "distinct_assigned": 0,
+    }
+
+    if not keepers or not normalized_pool:
+        log("WARN", f"Proxy allocator · configured {len(raw_pool)} · unique {len(normalized_pool)} · "
+                    f"keepers {len(keepers)} · nothing to allocate")
+        return stats
+
+    # Probe the whole configured pool once at startup. This is intentionally
+    # different from request-time bounded probing: startup has time to establish
+    # the actual capacity map before any browser is pinned to an exit.
+    loop = asyncio.get_running_loop()
+
+    def _probe_all():
+        results = []
+        workers = max(1, min(PROBE_MAX_PARALLEL, len(normalized_pool)))
+        with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_proxy_probe, proxy): proxy for proxy in normalized_pool}
+            for future in _cf.as_completed(futs):
+                proxy = futs[future]
+                try:
+                    ok, ms = future.result()
+                except Exception:
+                    ok, ms = False, -1
+                results.append((proxy, bool(ok), int(ms or -1)))
+        return results
+
+    try:
+        probe_results = await loop.run_in_executor(None, _probe_all)
+    except Exception as exc:
+        log("WARN", f"Proxy allocator · full-pool probe failed: {redact(str(exc))}")
+        probe_results = []
+
+    now = time.time()
+    live: List[str] = []
+    for proxy, ok, ms in probe_results:
+        _proxy_probe_cache[proxy] = (
+            ok,
+            now + (PROBE_OK_TTL if ok else 120),
+        )
+        _proxy_health_record(proxy, ok, ms if ms > 0 else 0, source="startup-allocator")
+        if ok and _proxy_hkey(proxy) not in _flagged_and_quarantined(False):
+            if ms > 0:
+                _proxy_latency[proxy] = ms
+            live.append(proxy)
+
+    # Prefer lower-latency exits, but allocation is one-pass and unique: unlike
+    # request-time selection, sorting cannot cause every keeper to reuse #1.
+    live.sort(key=lambda proxy: (
+        _proxy_latency.get(proxy, 10**9),
+        _proxy_hkey(proxy),
+    ))
+    stats["live"] = len(live)
+
+    if not live:
+        log("WARN", f"Proxy allocator · configured {len(raw_pool)} · unique {len(normalized_pool)} · "
+                    f"live 0 · keepers {len(keepers)}")
+        return stats
+
+    # Preserve an existing sticky assignment only when it is live and unique.
+    # Duplicate sticky pins are deliberately broken when spare live exits exist.
+    assigned: Dict[str, str] = {}
+    used = set()
+    keeper_ids = {j.get("id") for j in keepers}
+
+    for jar in keepers:
+        sid = jar.get("id")
+        sticky = _normalize_proxy(jar.get("proxy") or jar.get("_last_proxy") or "")
+        if not sid or not sticky or sticky not in live or sticky in used:
+            continue
+        assigned[sid] = sticky
+        used.add(sticky)
+
+    remaining = [proxy for proxy in live if proxy not in used]
+    rr = 0
+    for jar in keepers:
+        sid = jar.get("id")
+        if not sid or sid in assigned:
+            continue
+        if remaining:
+            chosen = remaining.pop(0)
+        else:
+            # If there are fewer healthy exits than keepers, reuse is explicit
+            # and evenly distributed instead of silently collapsing onto one.
+            chosen = live[rr % len(live)]
+            rr += 1
+        assigned[sid] = chosen
+        used.add(chosen)
+
+    # Persist the allocation atomically in one jars mutation.
+    def _persist(jars_list):
+        for jar in jars_list:
+            sid = jar.get("id")
+            if sid in assigned:
+                jar["proxy"] = assigned[sid]
+                jar["_last_proxy"] = assigned[sid]
+    mutate_jars(_persist)
+
+    distinct = len(set(assigned.values()))
+    stats["distinct_assigned"] = distinct
+    log("INFO", f"Proxy allocator · configured {len(raw_pool)} · unique {len(normalized_pool)} · "
+                f"live {len(live)} · keepers {len(keepers)} · distinct assigned {distinct}")
+
+    # Log only opaque upstream identity + eventual local shim endpoint.
+    for jar in keepers:
+        sid = jar.get("id")
+        proxy = assigned.get(sid)
+        if not proxy:
+            continue
+        label = jar.get("label") or jar.get("email") or sid
+        opaque = _proxy_hkey(proxy)[:10]
+        try:
+            shim = shim_proxy_for(proxy) or "direct-upstream"
+        except Exception:
+            shim = "shim-unavailable"
+        log("INFO", f"[{redact(str(label))}] proxy allocation · upstream {opaque}… · route {redact(str(shim))}")
+
+    if len(live) >= len(keepers) and distinct < len(keepers):
+        log("WARN", f"Proxy allocator invariant failed · {len(live)} live exits for {len(keepers)} keepers "
+                    f"but only {distinct} distinct assignments")
+    elif len(live) < len(keepers):
+        log("WARN", f"Proxy allocator capacity shortfall · {len(live)} live exits for {len(keepers)} keepers; "
+                    "some sharing is unavoidable")
+
+    return stats
+
+
 async def auto_login_on_boot():
     """Auto-start keeper sessions for all accounts with email+password on boot.
     Checks if already authenticated first to avoid unnecessary login.
@@ -2473,12 +2638,17 @@ async def auto_login_on_boot():
 
     log("INFO", f"Auto-login: Starting keeper sessions for {len(accounts_with_creds)} account(s)...")
 
-    # Enable keeper for all accounts with credentials
+    # Enable keeper for all accounts with credentials.
     def enable_keepers(jars_list):
         for j in jars_list:
             if j.get("email") and j.get("password") and j.get("enabled", True):
                 j["keeper_enabled"] = True
     mutate_jars(enable_keepers)
+
+    # Allocate the complete proxy pool before any keeper browser is launched.
+    # Reload jars after enabling keepers so the allocator sees current state.
+    await allocate_unique_keeper_proxies(load_jars())
+
     # Do not wait for the supervisor's next 15-second tick. Register every
     # session immediately; sync() starts browsers as background tasks.
     await keeper.sync()
@@ -2898,7 +3068,7 @@ class KeeperSession:
         self._page_pool_lock = asyncio.Lock()
         # Serialize through the keeper page unless an operator explicitly opts
         # into extra tabs after validating upstream capacity.
-        self._max_pool_pages = max(0, min(4, int(os.environ.get("BRIDGENA_KEEPER_EXTRA_PAGES", "2"))))
+        self._max_pool_pages = max(0, min(4, int(os.environ.get("BRIDGENA_KEEPER_EXTRA_PAGES", "0"))))
 
     def _set_step(self, step_text: str):
         """Record and broadcast a detailed login/keeper progress step."""
@@ -8111,7 +8281,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.4.1",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.4.2",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -8121,6 +8291,12 @@ async def healthz():
                          "ready_authenticated_keepers": ready_keepers,
                          "global_concurrency": API_TURN_CONCURRENCY,
                          "per_api_concurrency": "unlimited",
+                         "configured_proxies": len(get_proxy_pool()),
+                         "distinct_keeper_routes": len({
+                             _normalize_proxy(getattr(s, "_used_proxy", "") or "")
+                             for s in keeper.sessions.values()
+                             if _normalize_proxy(getattr(s, "_used_proxy", "") or "")
+                         }),
                          "estimated_browser_lanes":
                              sum(1 + int(getattr(s, "_max_pool_pages", 0) or 0)
                                  for s in keeper.sessions.values()
@@ -8579,7 +8755,8 @@ async def _lifespan(app):
     log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
-    log("INFO", "Capacity target · ~20 simultaneous users · keeper browser pooling enabled")
+    log("INFO", "Capacity target · ~20 simultaneous users · stable keeper lanes enabled")
+    log("INFO", "Proxy allocator · full-pool startup scan + distinct keeper assignment enabled")
     if get_verification_solver:
         log("OK", f"Verification adapter factory loaded: {_VERIFICATION_FACTORY_SPEC}")
     else:
