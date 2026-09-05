@@ -268,7 +268,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.4-account-failover-thread-handoff")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.5-stream-completeness-first-token-sla")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1863,6 +1863,8 @@ TRANSPORT_PROBE_EVERY_REQUEST = os.environ.get("BRIDGENA_TRANSPORT_PROBE_EVERY_R
 TRANSPORT_PROBE_FRESH_SEC = max(0.0, min(60.0, float(os.environ.get("BRIDGENA_TRANSPORT_PROBE_FRESH_SEC", "4"))))
 PREDISPATCH_RECOVERY_WAIT_SEC = max(4.0, min(30.0, float(os.environ.get("BRIDGENA_PREDISPATCH_RECOVERY_WAIT_SEC", "16"))))
 ACCOUNT_FAILOVER_MAX = max(0, min(6, int(os.environ.get("BRIDGENA_ACCOUNT_FAILOVER_MAX", "3"))))
+FIRST_ASSISTANT_RESPONSE_SEC = max(1.0, min(30.0, float(os.environ.get("BRIDGENA_FIRST_ASSISTANT_RESPONSE_SEC", "5"))))
+REQUIRE_PROVIDER_FINISH = os.environ.get("BRIDGENA_REQUIRE_PROVIDER_FINISH", "1").strip().lower() not in ("0", "false", "no", "off")
 _account_failover_stats = {"attempted": 0, "successful_handoff": 0, "exhausted": 0, "session_401": 0, "predispatch": 0, "keeper_unready": 0}
 _account_failover_stats_lock = threading.Lock()
 
@@ -4560,6 +4562,15 @@ class KeeperSession:
                         frame_count=frame_count, response_started=True,
                         stream_error=True, finish_seen=False, stop_reason=stop_reason,
                     )
+                if status_code == 200 and REQUIRE_PROVIDER_FINISH and not finish_seen:
+                    log("WARN", f"[{self.name}] stream audit · HTTP 200 ended without provider finish · "
+                                f"frames {frame_count} · stop {stop_reason}")
+                    raise BridgeHTTPError(
+                        200, "Arena response ended without a provider finish event",
+                        frame_count=frame_count, response_started=True,
+                        stream_error=True, finish_seen=False,
+                        stop_reason=(stop_reason or "eof-without-finish"),
+                    )
                 if status_code != 200:
                     raise BridgeHTTPError(
                         status_code, error_body,
@@ -7093,34 +7104,83 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                 log("INFO", f"[{jar.get('name')}] transport browser-origin")
                 _transport_t0 = time.monotonic()
                 _first_stream_frame_at = None
+                _first_semantic_at = None
+                _raw_frames_seen = 0
                 _stream_norm = _StreamDeltaNormalizer()
                 _decoded_events = 0
                 _unknown_frames = 0
+                _semantic_deadline = _transport_t0 + FIRST_ASSISTANT_RESPONSE_SEC
+
                 async with browser_session._action_lock:
-                    async for line in browser_session.bridge_fetch(url, base):
-                        if _first_stream_frame_at is None:
-                            _first_stream_frame_at = time.monotonic()
-                            log("INFO", f"[{jar.get('name')}] first upstream stream frame · "
-                                        f"{(_first_stream_frame_at - _transport_t0):.2f}s after POST")
-                        events = _parse_stream_events(str(line).strip())
-                        if not events:
-                            _unknown_frames += 1
-                            continue
-                        for kind, payload in events:
-                            kind, payload = _stream_norm.normalize(kind, payload)
-                            if kind in ("content", "reasoning") and not payload:
-                                continue
-                            _decoded_events += 1
-                            if kind == "content" and isinstance(payload, str):
-                                response_text += payload
-                                yield ("content", payload)
-                            elif kind == "reasoning":
-                                reasoning_chunk = payload if isinstance(payload, str) else json.dumps(payload)
-                                reasoning_text += reasoning_chunk
-                                yield ("reasoning", reasoning_chunk)
-                            elif kind == "error":
-                                yield ("error", str(payload))
+                    _bridge_iter = browser_session.bridge_fetch(url, base)
+                    try:
+                        while True:
+                            try:
+                                if _first_semantic_at is None:
+                                    remaining = _semantic_deadline - time.monotonic()
+                                    if remaining <= 0:
+                                        raise asyncio.TimeoutError()
+                                    line = await asyncio.wait_for(
+                                        _bridge_iter.__anext__(), timeout=remaining
+                                    )
+                                else:
+                                    line = await _bridge_iter.__anext__()
+                            except StopAsyncIteration:
+                                break
+                            except asyncio.TimeoutError:
+                                elapsed = time.monotonic() - _transport_t0
+                                log("WARN", f"[{jar.get('name')}] first assistant response SLA missed · "
+                                            f"no decodable content/reasoning within {FIRST_ASSISTANT_RESPONSE_SEC:.1f}s · "
+                                            f"raw frames {_raw_frames_seen}")
+                                _quarantine_api_keeper(
+                                    jar.get("id"), "first assistant response timeout",
+                                    TRANSPORT_FAILURE_QUARANTINE_SEC,
+                                )
+                                _schedule_transport_recovery(
+                                    jar.get("id"), "first assistant response timeout"
+                                )
+                                yield ("error",
+                                       f"504: Arena did not begin a decodable assistant response within "
+                                       f"{FIRST_ASSISTANT_RESPONSE_SEC:.0f}s. The keeper is being recovered.")
                                 return
+
+                            _raw_frames_seen += 1
+                            if _first_stream_frame_at is None:
+                                _first_stream_frame_at = time.monotonic()
+                                log("INFO", f"[{jar.get('name')}] first upstream stream frame · "
+                                            f"{(_first_stream_frame_at - _transport_t0):.2f}s after POST")
+
+                            events = _parse_stream_events(str(line).strip())
+                            if not events:
+                                _unknown_frames += 1
+                                continue
+
+                            for kind, payload in events:
+                                kind, payload = _stream_norm.normalize(kind, payload)
+                                if kind in ("content", "reasoning") and not payload:
+                                    continue
+                                _decoded_events += 1
+
+                                if kind in ("content", "reasoning") and _first_semantic_at is None:
+                                    _first_semantic_at = time.monotonic()
+                                    log("INFO", f"[{jar.get('name')}] first assistant semantic output · "
+                                                f"{(_first_semantic_at - _transport_t0):.2f}s after POST")
+
+                                if kind == "content" and isinstance(payload, str):
+                                    response_text += payload
+                                    yield ("content", payload)
+                                elif kind == "reasoning":
+                                    reasoning_chunk = payload if isinstance(payload, str) else json.dumps(payload)
+                                    reasoning_text += reasoning_chunk
+                                    yield ("reasoning", reasoning_chunk)
+                                elif kind == "error":
+                                    yield ("error", str(payload))
+                                    return
+                    finally:
+                        try:
+                            await _bridge_iter.aclose()
+                        except Exception:
+                            pass
                 if proxy:
                     _proxy_health_record(proxy, True, 0, source="browser-stream")
                     _flagged_exits.pop(_proxy_hkey(proxy), None)
@@ -7165,8 +7225,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     )
                     _schedule_transport_recovery(jar.get("id"), "mid-stream browser transport failure")
                     if response_text or reasoning_text:
-                        yield ("error", "502: Arena started responding, but the browser transport was interrupted before "
-                                        "the provider's finish event. Partial output was preserved; the request was not replayed.")
+                        yield ("error", "502: Arena returned partial assistant output but never delivered a complete "
+                                        "provider finish event. The partial response was preserved above; the request was not replayed.")
                     else:
                         yield ("error", "502: Arena opened the response but the browser transport was interrupted before "
                                         "a decodable answer arrived. The keeper is being recovered.")
@@ -7179,8 +7239,18 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         TRANSPORT_FAILURE_QUARANTINE_SEC,
                     )
                     _schedule_transport_recovery(jar.get("id"), "pre-response browser transport failure")
-                    yield ("error", "502: Browser transport lost the route before an HTTP response. "
-                                    "The same keeper is being recovered; no cross-account replay was attempted.")
+
+                    # An immediate browser-side Failed-to-fetch used to replace
+                    # the chat answer almost instantly. Hold the user-visible
+                    # failure until the configured first-response SLA expires.
+                    elapsed = time.monotonic() - _transport_t0
+                    remaining = FIRST_ASSISTANT_RESPONSE_SEC - elapsed
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+
+                    yield ("error", f"502: No assistant response began within "
+                                    f"{FIRST_ASSISTANT_RESPONSE_SEC:.0f}s because the browser route failed. "
+                                    "The same keeper is being recovered.")
                     return
                 else:
                     verdict = _classify(e.status, e.body)
@@ -8055,7 +8125,7 @@ async function send(){{if(busy)return;const inp=document.getElementById('in');co
      const d=j.choices&&j.choices[0]&&j.choices[0].delta&&j.choices[0].delta.content;if(d){{acc+=d;holder.innerHTML='<span class=who>ai</span>'+md(acc);document.getElementById('t').scrollTop=1e9}}}}}}}}
   if(!acc){{holder.innerHTML='<span class=who>ai</span><i class=muted>empty response</i>'}}
   if(acc)saveLocal('assistant',acc);document.getElementById('st').textContent='done';
- }}catch(e){{holder.innerHTML='<span class=who>ai</span><span style=color:var(--red)>'+String(e)+'</span>';document.getElementById('st').textContent='error'}}
+ }}catch(e){{holder.innerHTML='<span class=who>ai</span>'+(acc?md(acc)+'<div style=color:var(--red);margin-top:8px>'+String(e)+'</div>':'<span style=color:var(--red)>'+String(e)+'</span>');if(acc)saveLocal('assistant',acc);document.getElementById('st').textContent='error'}}
  busy=false;document.getElementById('go').disabled=false;refreshChats()}}
 setInterval(()=>{{fetch('/debug-logs/data').then(r=>r.json()).then(d=>{{const c=document.getElementById('lc');
  c.innerHTML=d.slice(-40).map(x=>'<div class="'+(x.lvl||'INFO')+'">'+(x.line||'')+'</div>').join('');c.scrollTop=c.scrollHeight;
@@ -8155,7 +8225,7 @@ function openChat(id){chatId=id;localStorage.setItem('bgn.chat',id);$('conversat
 function showWelcome(){$('conversation').innerHTML='<div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:42px;height:42px">B</div><h1>What are we building?</h1><p>Choose a model and start a conversation with your Bridgena workspace.</p><div class="promptgrid"><button class="promptchip" onclick="usePrompt(\'Explain this code and identify reliability risks\')">Review code</button><button class="promptchip" onclick="usePrompt(\'Help me debug a failed API request\')">Debug a request</button></div></div></div>'}
 function usePrompt(text){$('input').value=text;$('input').dispatchEvent(new Event('input'));$('input').focus()}
 function newChat(){chatId=makeId();localStorage.setItem('bgn.chat',chatId);showWelcome();loadThreads();$('sidebar').classList.remove('open');$('input').focus()}
-async function sendMessage(){if(busy)return;const input=$('input'),text=input.value.trim();if(!text)return;busy=true;input.value='';input.style.height='44px';$('send').disabled=true;setStatus('Generating','busy');addMessage('user',text);saveLocalMessage('user',text);const out=addMessage('ai','Thinking…','thinking');let acc='';try{const history=((localChats()[chatId]||{}).messages||[]).slice(-16).map(m=>({role:m.role,content:m.content}));const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,messages:history.length?history:[{role:'user',content:text}],stream:true,chat_id:chatId})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let nl;while((nl=buf.indexOf('\n'))>=0){const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);if(!line.startsWith('data: '))continue;const p=line.slice(6);if(p==='[DONE]')continue;let j;try{j=JSON.parse(p)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta?.content;if(d){acc+=d;out.classList.remove('thinking');out.innerHTML=md(acc);$('scroll').scrollTop=$('scroll').scrollHeight}}}if(!acc)throw new Error('Arena returned an empty response');saveLocalMessage('assistant',acc);setStatus('Ready','ok')}catch(e){out.classList.remove('thinking');out.innerHTML='<div class="errorbox">'+escHtml(e.message||e)+'</div>';setStatus('Error','err')}finally{busy=false;$('send').disabled=false;loadThreads()}}
+async function sendMessage(){if(busy)return;const input=$('input'),text=input.value.trim();if(!text)return;busy=true;input.value='';input.style.height='44px';$('send').disabled=true;setStatus('Generating','busy');addMessage('user',text);saveLocalMessage('user',text);const out=addMessage('ai','Thinking…','thinking');let acc='';try{const history=((localChats()[chatId]||{}).messages||[]).slice(-16).map(m=>({role:m.role,content:m.content}));const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,messages:history.length?history:[{role:'user',content:text}],stream:true,chat_id:chatId})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let nl;while((nl=buf.indexOf('\n'))>=0){const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);if(!line.startsWith('data: '))continue;const p=line.slice(6);if(p==='[DONE]')continue;let j;try{j=JSON.parse(p)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta?.content;if(d){acc+=d;out.classList.remove('thinking');out.innerHTML=md(acc);$('scroll').scrollTop=$('scroll').scrollHeight}}}if(!acc)throw new Error('Arena returned an empty response');saveLocalMessage('assistant',acc);setStatus('Ready','ok')}catch(e){out.classList.remove('thinking');const err='<div class="errorbox">'+escHtml(e.message||e)+'</div>';out.innerHTML=acc?md(acc)+err:err;if(acc)saveLocalMessage('assistant',acc);setStatus('Error','err')}finally{busy=false;$('send').disabled=false;loadThreads()}}
 const input=$('input');input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px'});input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}});
 setInterval(()=>fetch('/debug-logs/data').then(r=>r.json()).then(d=>{$('signal').textContent=d.slice(-18).map(x=>x.line||x.m||'').join('\n')}).catch(()=>{}),3000);
 loadThreads();openChat(chatId);
@@ -8215,7 +8285,7 @@ def chat_page(models: list, default_model: str) -> str:
     template=r'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chat · Bridgena</title><style>
 :root{--bg:#09090b;--side:#0d0d0f;--soft:#18181b;--line:#27272a;--text:#fafafa;--muted:#a1a1aa;--dim:#71717a;--ok:#4ade80;--bad:#fb7185;--warn:#fbbf24}[data-theme=light]{--bg:#fff;--side:#fafafa;--soft:#f4f4f5;--line:#e4e4e7;--text:#09090b;--muted:#71717a;--dim:#a1a1aa;--ok:#16a34a;--bad:#e11d48;--warn:#b45309}*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font:14px/1.6 Inter,ui-sans-serif,system-ui,sans-serif}button,input,textarea{font:inherit}.app{height:100%;display:grid;grid-template-columns:260px minmax(0,1fr)}.side{display:flex;flex-direction:column;border-right:1px solid var(--line);background:var(--side);min-width:0}.sidehead{height:60px;display:flex;align-items:center;gap:10px;padding:0 14px}.logo{width:30px;height:30px;border-radius:9px;background:var(--text);color:var(--bg);display:grid;place-items:center;font-size:11px;font-weight:800}.sidebody{flex:1;overflow:auto;padding:8px}.new,.thread,.ghost,.modelbtn,.chipbtn{border:0;color:inherit;cursor:pointer}.new{width:100%;height:39px;border-radius:8px;text-align:left;padding:0 11px;background:transparent}.new:hover,.thread:hover,.ghost:hover,.modelbtn:hover,.chipbtn:hover{background:var(--soft)}.label{padding:22px 10px 8px;color:var(--dim);text-transform:uppercase;font-size:10px;font-weight:650;letter-spacing:.07em}.thread{width:100%;display:flex;background:transparent;border-radius:8px;padding:9px 10px;color:var(--muted);text-align:left}.thread span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.thread.on{background:var(--soft);color:var(--text)}.sidefoot{padding:9px;border-top:1px solid var(--line)}.sidefoot a{display:block;color:var(--muted);text-decoration:none;padding:9px 10px;border-radius:8px}.sidefoot a:hover{background:var(--soft);color:var(--text)}.main{min-width:0;min-height:0;display:flex;flex-direction:column}.top{height:60px;display:flex;align-items:center;gap:8px;padding:0 16px;border-bottom:1px solid var(--line)}.modelwrap{position:relative}.modelbtn{height:36px;max-width:min(480px,60vw);border-radius:8px;padding:0 10px;background:transparent;font-weight:620;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{margin-left:auto;display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px}.status i{width:7px;height:7px;border-radius:50%;background:var(--ok)}.ghost{width:35px;height:35px;border-radius:8px;background:transparent}.picker{display:none;position:absolute;top:42px;left:0;z-index:40;width:min(500px,calc(100vw - 30px));background:var(--bg);border:1px solid var(--line);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.35);overflow:hidden}.picker.open{display:block}.picker input{width:100%;height:42px;border:0;border-bottom:1px solid var(--line);outline:0;background:transparent;color:var(--text);padding:0 12px}.modellist{max-height:360px;overflow:auto;padding:5px}.modelopt{width:100%;border:0;border-radius:7px;background:transparent;color:var(--text);padding:9px 10px;text-align:left;cursor:pointer}.modelopt:hover,.modelopt.on{background:var(--soft)}.scroll{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}.conversation{width:min(900px,100%);margin:0 auto;padding:42px 24px 205px}.welcome{min-height:58vh;display:grid;place-items:center;text-align:center}.welcome h1{font-size:32px;letter-spacing:-.045em;margin:0 0 8px}.welcome p{margin:0;color:var(--muted)}.suggestions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:24px;width:min(580px,100%)}.chipbtn{padding:11px 13px;text-align:left;border:1px solid var(--line);border-radius:10px;background:transparent;color:var(--muted)}.msg{display:grid;grid-template-columns:32px minmax(0,1fr);gap:13px;margin-bottom:34px}.avatar{width:31px;height:31px;border-radius:9px;background:var(--soft);display:grid;place-items:center;font-size:10px;font-weight:800}.msg.user{display:flex;justify-content:flex-end;margin-left:18%}.msg.user .avatar,.msg.user .head{display:none}.msg.user .body{max-width:82%;padding:10px 14px;border-radius:17px;background:var(--soft)}.head{font-size:11px;color:var(--dim);margin-bottom:5px;font-weight:650}.body{font-size:15px;line-height:1.78;word-break:break-word}.body pre{overflow:auto;background:#050505;border:1px solid var(--line);border-radius:9px;padding:12px;font:12px/1.6 ui-monospace,monospace}.body code{font-family:ui-monospace,monospace;background:var(--soft);border-radius:5px;padding:1px 4px}.body pre code{background:none;padding:0}.reason{margin:0 0 12px;color:var(--muted);font-size:12px;border-left:2px solid var(--line);padding-left:10px;white-space:pre-wrap}.error{color:var(--bad)}.dock{position:fixed;left:260px;right:0;bottom:0;padding:54px 18px 18px;background:linear-gradient(transparent,var(--bg) 48%);pointer-events:none}.compose{pointer-events:auto;width:min(900px,100%);margin:0 auto;border:1px solid var(--line);border-radius:20px;background:var(--bg);padding:12px;box-shadow:0 10px 36px rgba(0,0,0,.2)}.compose textarea{width:100%;min-height:44px;max-height:190px;resize:none;border:0;outline:0;background:transparent;color:var(--text);padding:4px}.composefoot{display:flex;align-items:center;color:var(--dim);font-size:10px}.send{margin-left:auto;width:34px;height:34px;border:0;border-radius:50%;background:var(--text);color:var(--bg);cursor:pointer}.send.stop{background:var(--bad);color:#fff}.runtime{position:fixed;z-index:70;top:72px;right:14px;bottom:14px;width:min(520px,calc(100vw - 28px));background:var(--side);border:1px solid var(--line);border-radius:13px;box-shadow:0 24px 70px rgba(0,0,0,.4);padding:12px;display:none}.runtime.open{display:flex;flex-direction:column}.runtime pre{flex:1;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;color:var(--muted);white-space:pre-wrap;font:11px/1.5 ui-monospace,monospace}.mobile{display:none}@media(max-width:760px){.app{grid-template-columns:1fr}.side{position:fixed;inset:0 auto 0 0;width:260px;z-index:90;transform:translateX(-100%);transition:.18s}.side.open{transform:none}.mobile{display:block}.dock{left:0}.conversation{padding:28px 15px 190px}.suggestions{grid-template-columns:1fr}.msg.user{margin-left:5%}}
 </style></head><body><div class=app><aside class=side id=side><div class=sidehead><div class=logo>B</div><b>Bridgena</b></div><div class=sidebody><button class=new onclick="newChat()">＋ New chat</button><div class=label>Recent</div><div id=threads></div></div><div class=sidefoot><a href="/dashboard">← Control plane</a></div></aside><main class=main><header class=top><button class="ghost mobile" onclick="side.classList.toggle('open')">☰</button><div class=modelwrap><button class=modelbtn id=modelBtn onclick="togglePicker()">Model</button><div class=picker id=picker><input id=modelSearch placeholder="Search models"><div class=modellist id=modelList></div></div></div><div class=status><i id=statusDot></i><span id=statusText>Ready</span></div><button class=ghost onclick="toggleRuntime()">⌁</button><button class=ghost onclick="toggleTheme()">◐</button></header><div class=scroll id=scroll><div class=conversation id=conversation></div></div><div class=dock><div class=compose><textarea id=input placeholder="Message Bridgena"></textarea><div class=composefoot><span>Enter to send · Shift+Enter newline</span><button class=send id=send onclick="sendOrStop()">↑</button></div></div></div></main></div><aside class=runtime id=runtime><div style="display:flex;align-items:center"><b>Runtime signal</b><button class=ghost style="margin-left:auto" onclick="toggleRuntime()">×</button></div><pre id=signal>Waiting for activity…</pre></aside><script>
-const MODELS=__MODELS__,DEFAULT_MODEL=__DEFAULT__,$=id=>document.getElementById(id),side=$('side');let controller=null,busy=false,model=localStorage.getItem('bgn.v3.model')||DEFAULT_MODEL,chatId=localStorage.getItem('bgn.v3.chat')||newId();function newId(){return 'c-'+crypto.getRandomValues(new Uint32Array(2)).join('-')}function store(){try{return JSON.parse(localStorage.getItem('bgn.v3.chats')||'{}')}catch(e){return {}}}function saveStore(v){localStorage.setItem('bgn.v3.chats',JSON.stringify(v))}function current(){const s=store();return s[chatId]||{id:chatId,title:'New chat',messages:[],updated:Date.now()}}function saveCurrent(c){const s=store();s[chatId]=c;saveStore(s);localStorage.setItem('bgn.v3.chat',chatId);renderThreads()}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function md(s){let x=esc(s);x=x.replace(/```([\s\S]*?)```/g,(_,b)=>'<pre><code>'+b+'</code></pre>');x=x.replace(/`([^`]+)`/g,'<code>$1</code>');x=x.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');return x.replace(/\n/g,'<br>')}function renderThreads(){const s=store(),items=Object.values(s).sort((a,b)=>(b.updated||0)-(a.updated||0)).slice(0,60);$('threads').innerHTML=items.map(c=>'<button class="thread '+(c.id===chatId?'on':'')+'" onclick="openChat(\''+c.id.replace(/'/g,'')+'\')"><span>'+esc(c.title||'New chat')+'</span></button>').join('')}function openChat(id){chatId=id;localStorage.setItem('bgn.v3.chat',id);renderConversation();renderThreads();side.classList.remove('open')}function newChat(){chatId=newId();saveCurrent({id:chatId,title:'New chat',messages:[],updated:Date.now()});renderConversation()}function renderConversation(){const c=current(),root=$('conversation');root.innerHTML='';if(!c.messages.length){root.innerHTML='<div class=welcome><div><div class=logo style="margin:0 auto 16px;width:42px;height:42px">B</div><h1>How can I help?</h1><p>Chat through the same v3 compatibility surface your clients use.</p><div class=suggestions><button class=chipbtn onclick="usePrompt(\'Review this code and identify reliability risks\')">Review code</button><button class=chipbtn onclick="usePrompt(\'Help me diagnose a failed request\')">Diagnose a request</button></div></div></div>';return}c.messages.forEach(m=>appendRendered(m.role,m.content,m.reasoning||''));scrollBottom(false)}function appendRendered(role,content,reasoning=''){const root=$('conversation'),w=root.querySelector('.welcome');if(w)w.remove();const d=document.createElement('div');d.className='msg '+role;d.innerHTML='<div class=avatar>'+(role==='user'?'U':'B')+'</div><div><div class=head>'+(role==='user'?'You':'Bridgena')+'</div><div class=body>'+(reasoning?'<div class=reason>'+esc(reasoning)+'</div>':'')+md(content)+'</div></div>';root.appendChild(d);return d.querySelector('.body')}function setStatus(t,state='ok'){$('statusText').textContent=t;$('statusDot').style.background=state==='bad'?'var(--bad)':state==='busy'?'var(--warn)':'var(--ok)'}function scrollBottom(s=true){$('scroll').scrollTo({top:$('scroll').scrollHeight,behavior:s?'smooth':'auto'})}function toggleTheme(){const r=document.documentElement,n=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=n;localStorage.setItem('bgn.theme',n)}document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||'dark';function togglePicker(){$('picker').classList.toggle('open');if($('picker').classList.contains('open')){$('modelSearch').value='';renderModels('');$('modelSearch').focus()}}function renderModels(q=''){const x=q.toLowerCase(),arr=MODELS.filter(m=>m.toLowerCase().includes(x)).slice(0,250);$('modelList').innerHTML=arr.map(m=>'<button class="modelopt '+(m===model?'on':'')+'" data-m="'+esc(m)+'">'+esc(m)+'</button>').join('')||'<div style="padding:20px;color:var(--muted)">No matching models</div>';document.querySelectorAll('.modelopt').forEach(b=>b.onclick=()=>{model=b.dataset.m;localStorage.setItem('bgn.v3.model',model);$('modelBtn').textContent=model;$('picker').classList.remove('open')})}$('modelSearch').addEventListener('input',e=>renderModels(e.target.value));$('modelBtn').textContent=model;renderModels('');function usePrompt(s){$('input').value=s;$('input').focus();autoSize()}function autoSize(){const t=$('input');t.style.height='44px';t.style.height=Math.min(190,t.scrollHeight)+'px'}$('input').addEventListener('input',autoSize);$('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendOrStop()}});function toggleRuntime(){$('runtime').classList.toggle('open')}async function refreshSignal(){try{const r=await fetch('/debug-logs/data',{cache:'no-store'});if(!r.ok)return;const d=await r.json();$('signal').textContent=d.slice(-120).map(x=>x.line||x.message||'').join('\n')}catch(e){}}setInterval(refreshSignal,2500);function saveMsg(role,content,reasoning=''){const c=current();c.messages.push({role,content,reasoning,ts:Date.now()});if(c.title==='New chat'&&role==='user')c.title=content.replace(/\s+/g,' ').slice(0,48)||'New chat';c.updated=Date.now();saveCurrent(c)}function sendOrStop(){if(busy){controller?.abort();return}sendMessage()}async function sendMessage(){const input=$('input'),text=input.value.trim();if(!text)return;busy=true;controller=new AbortController();input.value='';autoSize();$('send').textContent='■';$('send').classList.add('stop');setStatus('Generating','busy');saveMsg('user',text);appendRendered('user',text);const body=appendRendered('assistant','');let acc='',reason='';scrollBottom();try{const c=current();const messages=c.messages.slice(-24).map(m=>({role:m.role==='assistant'?'assistant':'user',content:m.content}));const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({model,messages,stream:true,chat_id:chatId,stream_options:{include_usage:true}})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let cut;while((cut=buf.indexOf('\n'))>=0){const line=buf.slice(0,cut).trim();buf=buf.slice(cut+1);if(!line.startsWith('data: '))continue;const raw=line.slice(6);if(raw==='[DONE]')continue;let j;try{j=JSON.parse(raw)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta||{};if(d.reasoning_content)reason+=d.reasoning_content;if(d.content)acc+=d.content;body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc);scrollBottom(false)}}if(!acc)throw new Error('The upstream completed without assistant content.');saveMsg('assistant',acc,reason);setStatus('Ready')}catch(e){if(e.name==='AbortError'){body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc||'Generation stopped.');if(acc)saveMsg('assistant',acc,reason);setStatus('Stopped')}else{body.innerHTML='<div class=error>'+esc(e.message||e)+'</div>';setStatus('Error','bad')}}finally{busy=false;controller=null;$('send').textContent='↑';$('send').classList.remove('stop');renderThreads()}}renderThreads();renderConversation();refreshSignal();document.addEventListener('click',e=>{if(!$('picker').contains(e.target)&&e.target!==$('modelBtn'))$('picker').classList.remove('open')});
+const MODELS=__MODELS__,DEFAULT_MODEL=__DEFAULT__,$=id=>document.getElementById(id),side=$('side');let controller=null,busy=false,model=localStorage.getItem('bgn.v3.model')||DEFAULT_MODEL,chatId=localStorage.getItem('bgn.v3.chat')||newId();function newId(){return 'c-'+crypto.getRandomValues(new Uint32Array(2)).join('-')}function store(){try{return JSON.parse(localStorage.getItem('bgn.v3.chats')||'{}')}catch(e){return {}}}function saveStore(v){localStorage.setItem('bgn.v3.chats',JSON.stringify(v))}function current(){const s=store();return s[chatId]||{id:chatId,title:'New chat',messages:[],updated:Date.now()}}function saveCurrent(c){const s=store();s[chatId]=c;saveStore(s);localStorage.setItem('bgn.v3.chat',chatId);renderThreads()}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function md(s){let x=esc(s);x=x.replace(/```([\s\S]*?)```/g,(_,b)=>'<pre><code>'+b+'</code></pre>');x=x.replace(/`([^`]+)`/g,'<code>$1</code>');x=x.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');return x.replace(/\n/g,'<br>')}function renderThreads(){const s=store(),items=Object.values(s).sort((a,b)=>(b.updated||0)-(a.updated||0)).slice(0,60);$('threads').innerHTML=items.map(c=>'<button class="thread '+(c.id===chatId?'on':'')+'" onclick="openChat(\''+c.id.replace(/'/g,'')+'\')"><span>'+esc(c.title||'New chat')+'</span></button>').join('')}function openChat(id){chatId=id;localStorage.setItem('bgn.v3.chat',id);renderConversation();renderThreads();side.classList.remove('open')}function newChat(){chatId=newId();saveCurrent({id:chatId,title:'New chat',messages:[],updated:Date.now()});renderConversation()}function renderConversation(){const c=current(),root=$('conversation');root.innerHTML='';if(!c.messages.length){root.innerHTML='<div class=welcome><div><div class=logo style="margin:0 auto 16px;width:42px;height:42px">B</div><h1>How can I help?</h1><p>Chat through the same v3 compatibility surface your clients use.</p><div class=suggestions><button class=chipbtn onclick="usePrompt(\'Review this code and identify reliability risks\')">Review code</button><button class=chipbtn onclick="usePrompt(\'Help me diagnose a failed request\')">Diagnose a request</button></div></div></div>';return}c.messages.forEach(m=>appendRendered(m.role,m.content,m.reasoning||''));scrollBottom(false)}function appendRendered(role,content,reasoning=''){const root=$('conversation'),w=root.querySelector('.welcome');if(w)w.remove();const d=document.createElement('div');d.className='msg '+role;d.innerHTML='<div class=avatar>'+(role==='user'?'U':'B')+'</div><div><div class=head>'+(role==='user'?'You':'Bridgena')+'</div><div class=body>'+(reasoning?'<div class=reason>'+esc(reasoning)+'</div>':'')+md(content)+'</div></div>';root.appendChild(d);return d.querySelector('.body')}function setStatus(t,state='ok'){$('statusText').textContent=t;$('statusDot').style.background=state==='bad'?'var(--bad)':state==='busy'?'var(--warn)':'var(--ok)'}function scrollBottom(s=true){$('scroll').scrollTo({top:$('scroll').scrollHeight,behavior:s?'smooth':'auto'})}function toggleTheme(){const r=document.documentElement,n=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=n;localStorage.setItem('bgn.theme',n)}document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||'dark';function togglePicker(){$('picker').classList.toggle('open');if($('picker').classList.contains('open')){$('modelSearch').value='';renderModels('');$('modelSearch').focus()}}function renderModels(q=''){const x=q.toLowerCase(),arr=MODELS.filter(m=>m.toLowerCase().includes(x)).slice(0,250);$('modelList').innerHTML=arr.map(m=>'<button class="modelopt '+(m===model?'on':'')+'" data-m="'+esc(m)+'">'+esc(m)+'</button>').join('')||'<div style="padding:20px;color:var(--muted)">No matching models</div>';document.querySelectorAll('.modelopt').forEach(b=>b.onclick=()=>{model=b.dataset.m;localStorage.setItem('bgn.v3.model',model);$('modelBtn').textContent=model;$('picker').classList.remove('open')})}$('modelSearch').addEventListener('input',e=>renderModels(e.target.value));$('modelBtn').textContent=model;renderModels('');function usePrompt(s){$('input').value=s;$('input').focus();autoSize()}function autoSize(){const t=$('input');t.style.height='44px';t.style.height=Math.min(190,t.scrollHeight)+'px'}$('input').addEventListener('input',autoSize);$('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendOrStop()}});function toggleRuntime(){$('runtime').classList.toggle('open')}async function refreshSignal(){try{const r=await fetch('/debug-logs/data',{cache:'no-store'});if(!r.ok)return;const d=await r.json();$('signal').textContent=d.slice(-120).map(x=>x.line||x.message||'').join('\n')}catch(e){}}setInterval(refreshSignal,2500);function saveMsg(role,content,reasoning=''){const c=current();c.messages.push({role,content,reasoning,ts:Date.now()});if(c.title==='New chat'&&role==='user')c.title=content.replace(/\s+/g,' ').slice(0,48)||'New chat';c.updated=Date.now();saveCurrent(c)}function sendOrStop(){if(busy){controller?.abort();return}sendMessage()}async function sendMessage(){const input=$('input'),text=input.value.trim();if(!text)return;busy=true;controller=new AbortController();input.value='';autoSize();$('send').textContent='■';$('send').classList.add('stop');setStatus('Generating','busy');saveMsg('user',text);appendRendered('user',text);const body=appendRendered('assistant','');let acc='',reason='';scrollBottom();try{const c=current();const messages=c.messages.slice(-24).map(m=>({role:m.role==='assistant'?'assistant':'user',content:m.content}));const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({model,messages,stream:true,chat_id:chatId,stream_options:{include_usage:true}})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let cut;while((cut=buf.indexOf('\n'))>=0){const line=buf.slice(0,cut).trim();buf=buf.slice(cut+1);if(!line.startsWith('data: '))continue;const raw=line.slice(6);if(raw==='[DONE]')continue;let j;try{j=JSON.parse(raw)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta||{};if(d.reasoning_content)reason+=d.reasoning_content;if(d.content)acc+=d.content;body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc);scrollBottom(false)}}if(!acc)throw new Error('The upstream completed without assistant content.');saveMsg('assistant',acc,reason);setStatus('Ready')}catch(e){if(e.name==='AbortError'){body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc||'Generation stopped.');if(acc)saveMsg('assistant',acc,reason);setStatus('Stopped')}else{const err='<div class=error>'+esc(e.message||e)+'</div>';if(acc||reason){body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc)+err;if(acc)saveMsg('assistant',acc,reason)}else{body.innerHTML=err}setStatus('Error','bad')}}finally{busy=false;controller=null;$('send').textContent='↑';$('send').classList.remove('stop');renderThreads()}}renderThreads();renderConversation();refreshSignal();document.addEventListener('click',e=>{if(!$('picker').contains(e.target)&&e.target!==$('modelBtn'))$('picker').classList.remove('open')});
 </script></body></html>'''
     return template.replace('__MODELS__',mj).replace('__DEFAULT__',dj)
 
@@ -8835,12 +8905,16 @@ async def openai_stream(body: dict, keyinfo: dict):
                 elif kind == "reasoning":
                     yield chunk({"reasoning_content": payload})
                 elif kind == "error":
-                    outcome = "upstream-error"
-                    yield _sse({"error": {"message": payload}})
-                    # New API's OpenAI-stream translator does not consider a
-                    # top-level error plus [DONE] terminal by itself. Emit the
-                    # ordinary terminal choice as well so downstream Claude
-                    # clients always leave their generating state.
+                    outcome = "partial-upstream-error" if content_chunks > 0 else "upstream-error"
+                    yield _sse({"error": {
+                        "message": payload,
+                        "partial_response_preserved": bool(content_chunks > 0),
+                        "partial_chars": len(acc),
+                    }})
+                    # The partial assistant deltas (if any) have already been
+                    # emitted. Send a normal terminal choice after the error so
+                    # clients leave their generating state without discarding
+                    # those earlier deltas.
                     yield chunk({}, finish="stop")
                     yield "data: [DONE]\n\n"
                     terminal_sent = True
@@ -9371,7 +9445,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.4",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.5",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -10190,6 +10264,7 @@ async def _lifespan(app):
     log("INFO", f"Transport recovery · same-keeper restart ON · quarantine {TRANSPORT_FAILURE_QUARANTINE_SEC:.0f}s · bound wait {BOUND_KEEPER_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Pre-dispatch transport guard · HEAD probe every request {'ON' if TRANSPORT_PROBE_EVERY_REQUEST else 'OFF'} · timeout {TRANSPORT_PROBE_TIMEOUT_MS}ms · recovery wait {PREDISPATCH_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Account failover · max {ACCOUNT_FAILOVER_MAX} alternate keeper(s) · thread handoff ON for pre-generation account/session failures · 429+verification+partial-stream excluded")
+    log("INFO", f"Stream completion policy · first assistant output <= {FIRST_ASSISTANT_RESPONSE_SEC:.1f}s · provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} · partial UI preservation ON")
     log("INFO", f"Reliability SLO · rolling window {_reliability_window.maxlen} · target {_RELIABILITY_TARGET*100:.0f}%")
     log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
     log("INFO", "Stream decoder · Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini · snapshot de-dup ON")
