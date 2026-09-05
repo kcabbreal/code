@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.2-recover-then-salvage")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.3-confirmed-absence-retry")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1932,6 +1932,18 @@ ARENA_HISTORY_STABLE_POLLS = max(2, min(8, int(os.environ.get("BRIDGENA_ARENA_HI
 ARENA_SALVAGE_QUICK_SEC = max(1.0, min(8.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_QUICK_SEC", "3"))))
 ARENA_POST_RESTART_SALVAGE_SEC = max(5.0, min(45.0, float(os.environ.get("BRIDGENA_ARENA_POST_RESTART_SALVAGE_SEC", "22"))))
 ARENA_SALVAGE_RECOVERY_WAIT_SEC = max(5.0, min(40.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_RECOVERY_WAIT_SEC", "18"))))
+UNDELIVERED_ENVELOPE_RETRY_MAX = max(0, min(2, int(os.environ.get("BRIDGENA_UNDELIVERED_ENVELOPE_RETRY_MAX", "1"))))
+_undelivered_retry_stats = {"attempted": 0, "succeeded": 0, "suppressed_trace_found": 0, "exhausted": 0}
+_undelivered_retry_guard = threading.Lock()
+
+def _bump_undelivered_retry(key: str) -> None:
+    with _undelivered_retry_guard:
+        _undelivered_retry_stats[key] = int(_undelivered_retry_stats.get(key, 0)) + 1
+
+def _undelivered_retry_snapshot() -> dict:
+    with _undelivered_retry_guard:
+        return dict(_undelivered_retry_stats)
+
 ARENA_UI_RECOVERY_STABLE_SEC = max(0.8, min(6.0, float(os.environ.get("BRIDGENA_ARENA_UI_RECOVERY_STABLE_SEC", "1.8"))))
 _arena_ui_recovery_stats = {"attempted": 0, "recovered": 0, "history_api_recovered": 0, "history_api_match": 0, "history_index_waits": 0, "ui_recovered": 0, "post_restart_attempted": 0, "post_restart_recovered": 0, "recovery_wait_timeout": 0, "not_found": 0, "incomplete": 0, "navigation_failed": 0}
 _arena_ui_recovery_stats_guard = threading.Lock()
@@ -1998,7 +2010,8 @@ def _reliability_snapshot() -> dict:
             "failures_by_reason": failures,
             "transport_guard": _transport_guard_snapshot(),
             "account_failover": _account_failover_snapshot(),
-            "arena_ui_recovery": _arena_ui_recovery_snapshot()}
+            "arena_ui_recovery": _arena_ui_recovery_snapshot(),
+            "confirmed_absence_retry": _undelivered_retry_snapshot()}
 
 
 def _bootable_keeper_jars(jars: Optional[List[dict]] = None) -> List[dict]:
@@ -6963,6 +6976,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
             next_hint = jar_hint
             failovers = 0
             same_account_429_retries = 0
+            undelivered_envelope_retries = 0
+            retry_envelope_ids = None
             active_prompt = prompt
             active_system_prompt = system_prompt
             migrated_thread = False
@@ -6972,12 +6987,13 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     chat_id, active_prompt, model_name, attachments, next_hint,
                     system_prompt=active_system_prompt,
                     exclude_jars=excluded,
+                    retry_envelope_ids=retry_envelope_ids,
                 )
                 retry_info = None
                 emitted_user_output = False
                 try:
                     async for kind, payload in turn:
-                        if kind in ("retry-account", "retry-same-account"):
+                        if kind in ("retry-account", "retry-same-account", "retry-undelivered"):
                             retry_info = payload if isinstance(payload, dict) else {"reason": str(payload)}
                             retry_info["_kind"] = kind
                             break
@@ -6988,6 +7004,28 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
 
                 if not retry_info:
                     return
+
+                if retry_info.get("_kind") == "retry-undelivered":
+                    failed_id = str(retry_info.get("jar_id") or "")
+                    failed_name = str(retry_info.get("jar_name") or failed_id or "unknown")
+                    envelope = retry_info.get("envelope_ids") if isinstance(retry_info.get("envelope_ids"), dict) else None
+                    reason = str(retry_info.get("reason") or "delivery could not be confirmed")
+
+                    if undelivered_envelope_retries >= UNDELIVERED_ENVELOPE_RETRY_MAX or not envelope:
+                        _bump_undelivered_retry("exhausted")
+                        yield ("error", "502: The upstream delivery could not be confirmed after route recovery. "
+                                        "Bridgena did not keep resending the same turn.")
+                        return
+
+                    undelivered_envelope_retries += 1
+                    _bump_undelivered_retry("attempted")
+                    retry_envelope_ids = dict(envelope)
+                    next_hint = failed_id or next_hint
+
+                    log("WARN", f"[{failed_name}] confirmed-absence retry "
+                                f"{undelivered_envelope_retries}/{UNDELIVERED_ENVELOPE_RETRY_MAX} · "
+                                f"reusing exact message IDs · {reason}")
+                    continue
 
                 if retry_info.get("_kind") == "retry-same-account":
                     failed_id = str(retry_info.get("jar_id") or "")
@@ -7013,6 +7051,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     next_hint = failed_id or next_hint
                     continue
 
+                # A real account handoff must start with a fresh envelope.
+                retry_envelope_ids = None
                 failed_id = str(retry_info.get("jar_id") or "")
                 failed_name = str(retry_info.get("jar_name") or failed_id or "unknown")
                 reason = str(retry_info.get("reason") or "account unavailable")
@@ -7361,9 +7401,9 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
       assistant bubble to stop changing, then return only once the text is stable.
     """
     if not ARENA_UI_STREAM_RECOVERY:
-        return {"ok": False, "reason": "disabled"}
+        return {"ok": False, "reason": "disabled", "trace_found": None}
     if not session or not getattr(session, "context", None):
-        return {"ok": False, "reason": "no keeper context"}
+        return {"ok": False, "reason": "no keeper context", "trace_found": None}
 
     _bump_arena_ui_recovery("attempted")
     name = getattr(session, "name", "keeper")
@@ -7531,6 +7571,7 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                                 "url": best_route or page.url,
                                 "complete": True,
                                 "source": "history-api",
+                                "trace_found": True,
                             }
                 else:
                     _bump_arena_ui_recovery("history_index_waits")
@@ -7666,6 +7707,7 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                     return {
                         "ok": False,
                         "reason": "matching Arena chat did not become visible before recovery deadline",
+                        "trace_found": bool(history_match_logged),
                     }
 
                 try:
@@ -7692,6 +7734,7 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                         "reason": f"UI extraction failed: {type(exc).__name__}",
                         "text": best_text,
                         "url": best_url,
+                        "trace_found": bool(history_match_logged or best_text),
                     }
 
                 current = str((snap or {}).get("text") or "").strip()
@@ -7725,6 +7768,7 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                             "url": best_url,
                             "complete": True,
                             "source": "ui",
+                            "trace_found": True,
                         }
 
                 await asyncio.sleep(0.4)
@@ -7736,10 +7780,11 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                     "reason": "Arena response was found but did not reach a confirmed stable completed state",
                     "text": best_text,
                     "url": best_url,
+                    "trace_found": True,
                 }
 
             _bump_arena_ui_recovery("not_found")
-            return {"ok": False, "reason": "assistant response not visible in Arena history/UI"}
+            return {"ok": False, "reason": "assistant response not visible in Arena history/UI", "trace_found": bool(history_match_logged)}
 
         finally:
             if page is not None:
@@ -7903,7 +7948,8 @@ async def _ensure_predispatch_transport(jar: dict, *, wait_for_recovery: bool = 
 
 async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                    attachments: Optional[list] = None, jar_hint: Optional[str] = None,
-                   system_prompt: str = "", exclude_jars: Optional[set] = None):
+                   system_prompt: str = "", exclude_jars: Optional[set] = None,
+                   retry_envelope_ids: Optional[dict] = None):
     """Async generator yielding ('content'|'reasoning'|'error'|'done', text).
     One bounded attempt budget over the PROVEN exit pool; jars survive every
     failure class except true session death."""
@@ -8058,14 +8104,17 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             base = {
                 "id": mc["arena_id"],
                 "modelAId": model_id,
-                "userMessageId": str(uuid7()),
-                "modelAMessageId": str(uuid7()),
+                "userMessageId": str((retry_envelope_ids or {}).get("userMessageId") or uuid7()),
+                "modelAMessageId": str((retry_envelope_ids or {}).get("modelAMessageId") or uuid7()),
                 "modality": "chat",
             }
             follow_url = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/{mc['arena_id']}"
         else:
-            base.update({"id": str(uuid7()), "userMessageId": str(uuid7()),
-                         "modelAMessageId": str(uuid7())})
+            base.update({
+                "id": str((retry_envelope_ids or {}).get("id") or uuid7()),
+                "userMessageId": str((retry_envelope_ids or {}).get("userMessageId") or uuid7()),
+                "modelAMessageId": str((retry_envelope_ids or {}).get("modelAMessageId") or uuid7()),
+            })
         turn_content = prompt
         if not mc and system_prompt:
             turn_content = f"{system_prompt.strip()}\n\n{prompt}".strip()
@@ -8081,6 +8130,11 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         base["userMessage"] = user_message
         log("INFO", f"[{jar.get('name')}] outbound {'follow-up' if follow_url else 'create'} envelope · "
                     f"content string {len(content)} chars · attachments {len(attachments or [])}")
+        if retry_envelope_ids:
+            log("WARN", f"[{jar.get('name')}] outbound envelope is a confirmed-absence retry · "
+                        f"reusing id {str(base.get('id'))[:12]}… · "
+                        f"userMessageId {str(base.get('userMessageId'))[:12]}… · "
+                        f"modelMessageId {str(base.get('modelAMessageId'))[:12]}…")
 
         if pending_v2_token:
             _attach_v2(base, pending_v2_token)
@@ -8260,6 +8314,10 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             f"{len(response_text)} text chars · {_decoded_events} decoded events · "
                             f"{_unknown_frames} metadata/unknown frames")
                 _clear_model_rate_limit(model_name)
+                if retry_envelope_ids:
+                    _bump_undelivered_retry("succeeded")
+                    log("OK", f"[{jar.get('name')}] confirmed-absence retry succeeded · "
+                              f"{len(response_text)} chars")
                 yield ("done", response_text)
                 return
             except BridgeHTTPError as e:
@@ -8419,6 +8477,36 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         yield ("done", response_text)
                         return
 
+                    trace_found = salvage.get("trace_found")
+                    if trace_found is False and not response_text and not reasoning_text:
+                        # We now have the strongest safe-to-retry case available:
+                        #   - fetch produced no HTTP response,
+                        #   - zero stream content,
+                        #   - keeper route was repaired,
+                        #   - authenticated Arena history/UI found no trace of
+                        #     this exact evaluation/message/prompt.
+                        #
+                        # Reuse the SAME IDs rather than minting new message IDs.
+                        # If the original POST was accepted but indexing lagged,
+                        # duplicate IDs give the upstream the best chance to
+                        # deduplicate/reject instead of creating two turns.
+                        yield ("retry-undelivered", {
+                            "jar_id": jar.get("id"),
+                            "jar_name": jar.get("name"),
+                            "reason": "no Arena history trace after same-keeper route recovery",
+                            "envelope_ids": {
+                                "id": str(base.get("id") or ""),
+                                "userMessageId": str(base.get("userMessageId") or ""),
+                                "modelAMessageId": str(base.get("modelAMessageId") or ""),
+                            },
+                        })
+                        return
+
+                    if trace_found:
+                        _bump_undelivered_retry("suppressed_trace_found")
+                        log("WARN", f"[{jar.get('name')}] resend suppressed · Arena history/UI contains "
+                                    "evidence of the turn even though no completed answer was recovered")
+
                     # Keep the existing 5-second minimum for very fast failures;
                     # normally the foreground repair+salvage path is longer.
                     elapsed = time.monotonic() - _transport_t0
@@ -8427,8 +8515,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         await asyncio.sleep(remaining)
 
                     yield ("error", "502: The browser route failed before a response was observed. Bridgena "
-                                    "restarted the same bound keeper, verified its route, and checked Arena history "
-                                    "again, but no completed assistant response could be confirmed.")
+                                    "restarted the same bound keeper and checked Arena history, but delivery remained "
+                                    "ambiguous so the turn was not resent.")
                     return
                 else:
                     verdict = _classify(e.status, e.body)
@@ -11144,7 +11232,7 @@ async def healthz():
                                 for j in load_jars()))
     bootable_count = len(_bootable_keeper_jars())
     preferred_keepers, preferred_exits = _api_preferred_targets() if bootable_count else (0, 0)
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.2",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.3",
                          "models": len(get_models()),
                          "bootable_accounts": bootable_count,
                          "keeper_fleet_target": bootable_count,
@@ -12010,6 +12098,8 @@ async def _lifespan(app):
     log("INFO", f"Arena stream salvage · {'ON' if ARENA_UI_STREAM_RECOVERY else 'OFF'} · "
                 f"quick {ARENA_SALVAGE_QUICK_SEC:.0f}s current-context check → same-keeper route repair → "
                 f"{ARENA_POST_RESTART_SALVAGE_SEC:.0f}s post-restart history/UI salvage · no prompt replay")
+    log("INFO", f"Confirmed-absence resend · max {UNDELIVERED_ENVELOPE_RETRY_MAX} · "
+                "HTTP-0 + zero output + post-restart history trace absent only · exact message IDs reused")
     log("INFO", f"Customer error privacy · opaque friendly messages ON · private registry {_ERROR_EVENTS_FILE} · Errors tab enabled")
     log("INFO", f"Readiness leases · TTL {_API_VERIFICATION_TTL:.0f}s · staggered proactive renewal 55-72% · "
                 f"admission {_API_ADMISSION_MIN_KEEPERS} keeper/{_API_ADMISSION_MIN_EXITS} exit · "
