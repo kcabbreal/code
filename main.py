@@ -37,6 +37,8 @@ except ImportError:
 def _discover_verification_factory():
     """Resolve function-, class-, and singleton-based adapter packages."""
     import importlib
+    import importlib.util
+    import sys
     errors = []
     # Do not accept the package's legacy image/ONNX RecaptchaSolver here. It is
     # a different component and may construct to None; only the documented
@@ -55,6 +57,44 @@ def _discover_verification_factory():
             if instance is not None and callable(getattr(instance, "solve", None)):
                 return (lambda instance=instance: instance), name
         return None, None
+
+    # A sibling recaptcha_solver.py can coexist with a recaptcha_solver/
+    # package. Python normally imports the package first, which hid the
+    # documented adapter on deployed installations. Load explicit adapter
+    # files before package discovery so get_solver() wins deterministically.
+    sibling_dir = os.path.dirname(os.path.abspath(__file__))
+    configured_file = os.environ.get("BRIDGENA_VERIFICATION_ADAPTER_FILE", "").strip()
+    file_candidates = [
+        configured_file,
+        os.path.join(sibling_dir, "recaptcha_solver.py"),
+        os.path.join(sibling_dir, "authorized_verification_adapter.py"),
+    ]
+    seen_files = set()
+    for candidate_path in file_candidates:
+        if not candidate_path:
+            continue
+        candidate_path = os.path.abspath(candidate_path)
+        if candidate_path in seen_files or candidate_path == os.path.abspath(__file__):
+            continue
+        seen_files.add(candidate_path)
+        if not os.path.isfile(candidate_path):
+            continue
+        try:
+            module_name = "_bridgena_verification_adapter_" + hashlib.sha256(
+                candidate_path.encode("utf-8")
+            ).hexdigest()[:10]
+            spec = importlib.util.spec_from_file_location(module_name, candidate_path)
+            if spec is None or spec.loader is None:
+                raise ImportError("could not create module spec")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            factory, resolved_name = resolve(module)
+            if factory:
+                return factory, None, f"{candidate_path}:{resolved_name}"
+            errors.append(f"{candidate_path}=no compatible adapter factory")
+        except Exception as exc:
+            errors.append(f"{candidate_path}={type(exc).__name__}: {exc}")
 
     configured = os.environ.get("BRIDGENA_VERIFICATION_FACTORY", "").strip()
     candidates = ([configured] if configured else []) + [
@@ -165,7 +205,7 @@ KEEPER_REQUEST_READY_SEC = max(30, min(180, int(os.environ.get("BRIDGENA_KEEPER_
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.1-python310-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.2-adapter-keeper-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1725,6 +1765,15 @@ def jar_has_auth(jar: dict) -> bool:
 def jar_has_cf(jar: dict) -> bool:
     return bool(find_cookie(jar.get("cookies", []), "cf_clearance"))
 
+def keeper_session_ready(session, *, warmed: bool = True) -> bool:
+    """True only when a keeper is safe to receive API/token work."""
+    if not (session and session.running and getattr(session, "status", "") == "running"):
+        return False
+    page = getattr(session, "page", None)
+    if not page or page.is_closed():
+        return False
+    return not warmed or time.monotonic() >= getattr(session, "ready_at", 0.0)
+
 def jar_available(jar: dict, now: float = None) -> bool:
     """Usable if enabled and has auth cookies OR a live keeper session.
 
@@ -1737,7 +1786,7 @@ def jar_available(jar: dict, now: float = None) -> bool:
     if jar_has_auth(jar):
         return True
     s = keeper.sessions.get(jar.get("id"))
-    if s and s.running and getattr(s, "page", None) and not s.page.is_closed():
+    if keeper_session_ready(s):
         return True
     return False
 
@@ -2195,7 +2244,7 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
         """Higher is better. Returns a sort key (prefer higher)."""
         sid = j.get("id")
         s = keeper.sessions.get(sid) if sid else None
-        has_session = bool(s and s.running and getattr(s, "page", None) and not s.page.is_closed())
+        has_session = keeper_session_ready(s)
         is_live = has_session and (not getattr(s, "headless", True))
         healthy = bool(s and s.last_health_ok and (now - s.last_health_ok) < 900)
         available = jar_available(j, now)
@@ -2221,12 +2270,12 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
         # Only accept if it at least has auth or a live session
         sid = best.get("id")
         s = keeper.sessions.get(sid) if sid else None
-        has_session = bool(s and s.running)
+        has_session = keeper_session_ready(s)
         if not jar_has_auth(best) and not has_session:
             # Try to find any jar that has either auth cookies or a live session
             for j in candidates[1:]:
                 sj = keeper.sessions.get(j.get("id"))
-                if jar_has_auth(j) or (sj and sj.running):
+                if jar_has_auth(j) or keeper_session_ready(sj):
                     best = j
                     break
             else:
@@ -2657,6 +2706,7 @@ class KeeperSession:
         self.step_history = []
         self.last_activity = 0.0
         self.last_health_ok = 0.0
+        self.last_public_auth_check = 0.0
         self.last_nav = 0.0
         self.last_restart = 0.0
         self.ready_at = 0.0
@@ -3040,7 +3090,17 @@ class KeeperSession:
                 except Exception:
                     pass
 
-            # 2. If Login button is visible on page, we are NOT logged in
+            # 2. Prefer the authenticated history request over transient UI.
+            # During hydration the Log In control can briefly remain visible
+            # even after the session cookie has become valid.
+            status_code = await page.evaluate(
+                "async () => { try { const r = await fetch('/api/history/unified?limit=1', "
+                "{credentials:'include'}); return r.status; } catch(e) { return 0; } }"
+            )
+            if status_code == 200:
+                return True
+
+            # 3. If Login button is visible on page, we are NOT logged in
             login_btn = page.locator("button:has-text('Log In'), a:has-text('Log In'), button:has-text('Sign In'), a:has-text('Sign In'), button:has-text('Login'), a:has-text('Login')").first
             if await login_btn.count() > 0 and await login_btn.is_visible():
                 return False
@@ -3050,27 +3110,19 @@ class KeeperSession:
             if await modal_title.count() > 0 and await modal_title.is_visible():
                 return False
 
-            # 3. Check for typical auth cookies directly in the browser context
+            # 4. Check for typical auth cookies directly in the browser context
             cookies = await page.context.cookies([page.url])
             auth_cookie_names = ["arena-auth", "arena-auth-prod-v1.0", "arena-auth-prod-v1.1", "__session", "session", "authToken", "clerk-db-jwt"]
             has_auth = any(any(n in c["name"] for n in auth_cookie_names) for c in cookies)
             if has_auth:
                 return True
                 
-            # 4. Fallback: Check if the user profile avatar or settings button is present
+            # 5. Fallback: Check if the user profile avatar or settings button is present
             profile_btn = page.locator("button:has(svg), button[aria-label='User Profile'], button[aria-label='Settings']").last
             if await profile_btn.count() > 0 and any(
                     origin in (page.url or "") for origin in (ARENA_BASE, PUBLIC_AUTH_BASE)):
                 return True
 
-            # 5. Check actual unified history API status
-            status_code = await page.evaluate(
-                "async () => { try { const r = await fetch('/api/history/unified?limit=1', "
-                "{credentials:'include'}); return r.status; } catch(e) { return 0; } }"
-            )
-            if status_code == 200:
-                return True
-                    
         except Exception:
             pass
         await self._screenshot(page, "unverified_auth_state")
@@ -3509,6 +3561,10 @@ class KeeperSession:
         await self.page.wait_for_load_state("domcontentloaded")
         await self._ensure_sidebar_cookie()
         self.last_nav = time.time()
+        # Startup just verified the public session. Do not immediately run a
+        # second health check against the mirror page.
+        self.last_health_ok = time.time()
+        self.last_public_auth_check = time.time()
         return True
 
     # --- Activity & Health ---
@@ -3536,6 +3592,28 @@ class KeeperSession:
                 page = self.page
                 if not page or page.is_closed():
                     return False
+                # The mirror is the transport page, not the source of truth for
+                # public login state. Verify public auth in a short-lived tab so
+                # mirror UI state cannot trigger a false relogin or disturb an
+                # otherwise ready request page.
+                if LOCAL_UPSTREAM:
+                    probe = None
+                    try:
+                        probe = await self.context.new_page()
+                        await self._navigate_resilient(probe, PUBLIC_AUTH_URL, timeout=45000)
+                        await self._wait_cloudflare(probe)
+                        healthy = await self._verify_auth_state(probe)
+                        self.last_public_auth_check = time.time()
+                        if healthy:
+                            self.last_health_ok = time.time()
+                            await self._harvest_cookies()
+                        return healthy
+                    finally:
+                        if probe is not None:
+                            try:
+                                await probe.close()
+                            except Exception:
+                                pass
                 if ARENA_BASE not in (page.url or "") and self.active_requests == 0:
                     await self._ensure_sidebar_cookie()
                     await page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded")
@@ -3559,6 +3637,7 @@ class KeeperSession:
             return await asyncio.wait_for(self._relogin_impl(), timeout=KEEPER_RELOGIN_TIMEOUT)
         except asyncio.TimeoutError:
             self.error = f"Relogin timed out after {KEEPER_RELOGIN_TIMEOUT}s"
+            self.status = "degraded"
             self._set_step(f"[TIMEOUT] {self.error}")
             log("ERROR", f"[{self.name}] {self.error}")
             self._schedule_retry()
@@ -3594,6 +3673,7 @@ class KeeperSession:
                     self.status = "running"
                     self.fail_count = 0
                     self.next_retry = 0
+                    self.ready_at = time.monotonic() + KEEPER_WARMUP_SEC
                     log("OK", f"[{self.name}] ✓ Reconnected successfully via {self.login_method}")
                     return True
 
@@ -4011,6 +4091,7 @@ class KeeperSession:
             log("OK", f"[{self.name}] Keeper started ({'headless' if self.headless else 'LIVE WINDOW'})")
 
             if await self._verify_auth_state(self.page):
+                self.last_public_auth_check = time.time()
                 await self._harvest_cookies()
                 if not await self._activate_local_mirror():
                     log("WARN", f"[{self.name}] Public session valid but local cookie injection failed")
@@ -4018,8 +4099,11 @@ class KeeperSession:
                 log("WARN", f"[{self.name}] Initial health check negative — triggering relogin")
                 await self.relogin()
 
-            self.ready_at = time.monotonic() + KEEPER_WARMUP_SEC
-            if KEEPER_WARMUP_SEC:
+            if self.status == "running":
+                self.ready_at = time.monotonic() + KEEPER_WARMUP_SEC
+            else:
+                self.ready_at = float("inf")
+            if self.status == "running" and KEEPER_WARMUP_SEC:
                 log("INFO", f"[{self.name}] Keeper warm-up gate {KEEPER_WARMUP_SEC}s before API traffic")
 
             self._loop_task = asyncio.create_task(self._session_loop())
@@ -4409,6 +4493,20 @@ async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bo
             return await apick_live_proxy(jar, purpose=purpose or "last-resort", rotate=rotate,
                                           include_flagged=True, exclude=excluded)
         return None
+    if purpose == "keeper":
+        current_id = (jar or {}).get("id")
+        reserved = set()
+        for sid, session in keeper.sessions.items():
+            if sid == current_id:
+                continue
+            used_proxy = _normalize_proxy(getattr(session, "_used_proxy", "") or "")
+            if used_proxy:
+                reserved.add(used_proxy)
+        unreserved = [candidate for candidate in live if candidate not in reserved]
+        # Prefer one exit per keeper while capacity exists. If the pool is
+        # smaller than the fleet, sharing remains an explicit last resort.
+        if unreserved:
+            live = unreserved
     if assignment_mode and not rotate and jar is not None:
         pinned = _normalize_proxy(jar.get("proxy") or "") or None
         if pinned and pinned in live:
@@ -4904,9 +5002,9 @@ async def _solve_with_verification_adapter(challenge_type: str, session,
     global _verification_adapter_warned_at
     if get_verification_solver is None:
         now = time.time()
-        if now - _verification_adapter_warned_at > 30:
+        if now - _verification_adapter_warned_at > 300:
             _verification_adapter_warned_at = now
-            log("ERROR", "verification adapter import unavailable"
+            log("WARN", "optional verification adapter unavailable; using keeper-native verification"
                 + (f": {_VERIFICATION_IMPORT_ERROR}" if _VERIFICATION_IMPORT_ERROR else
                    ": recaptcha_solver.py was not found beside bridgena.py"))
         return None
@@ -4981,15 +5079,13 @@ def _find_session(jar_id=None):
         return None, None
     if jar_id:
         s = sessions.get(jar_id)
-        if (s and s.running and getattr(s, "page", None) and not s.page.is_closed()
-                and time.monotonic() >= getattr(s, "ready_at", 0.0)):
+        if keeper_session_ready(s):
             return jar_id, s
         # A token from some other account/browser/exit is not a fallback: it is
         # cryptographically and behaviorally the wrong identity for this jar.
         return None, None
     for sid, s in list(sessions.items()):
-        if (s and s.running and getattr(s, "page", None) and not s.page.is_closed()
-                and time.monotonic() >= getattr(s, "ready_at", 0.0)):
+        if keeper_session_ready(s):
             return sid, s
     return None, None
 
@@ -5040,7 +5136,7 @@ async def mint_v3(jar_id=None):
                 )
                 res = await s.page.evaluate(RC_MINT_JS, {
                     "fallbackSitekey": ARENA_RECAPTCHA_SITEKEY,
-                    "allowConfiguredFallback": True,
+                    "allowConfiguredFallback": ALLOW_CONFIGURED_RECAPTCHA_FALLBACK,
                     "action": RECAPTCHA_ACTION,
                 })
                 if isinstance(res, str) and len(res) > 20:
@@ -5608,7 +5704,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
         # identity and proxy exit that minted the token. curl remains a fallback
         # only for browser-evaluation failures.
         browser_session = keeper.sessions.get(jar.get("id"))
-        if browser_session and browser_session.running and browser_session.page:
+        if keeper_session_ready(browser_session):
             try:
                 log("INFO", f"[{jar.get('name')}] transport browser-origin")
                 async with browser_session._action_lock:
@@ -6607,7 +6703,7 @@ from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
 from fastapi.security import APIKeyHeader
 
-app = FastAPI(title="Bridgena", version="3.2.1")
+app = FastAPI(title="Bridgena", version="3.2.2")
 
 # ---------- v3 optional VNC integration ----------
 _V3_VNC_PROCS=[]
@@ -6830,7 +6926,8 @@ async def dashboard(request: Request):
     if g:
         return g
     jars = load_jars()
-    live = set(keeper.sessions.keys())
+    live = {sid for sid, session in keeper.sessions.items()
+            if keeper_session_ready(session)}
     rows = snapshot_rows()
     flags = _flagged_active()
     overview = {
@@ -6838,7 +6935,8 @@ async def dashboard(request: Request):
             "pool_total": len([l for l in _pool_lines() if l.strip() and not l.startswith("#")]),
             "alive": sum(1 for r in rows if r["verdict"] == "alive"),
             "flagged": len(flags),
-            "jars_total": len(jars), "jars_ok": sum(1 for j in jars if not j.get("expired")),
+            "jars_total": len(jars),
+            "jars_ok": sum(1 for j in jars if jar_has_auth(j) and not j.get("expired")),
             "keepers_live": len(live), "models": len(get_models()),
         },
         "pool": rows, "live_ids": live,
@@ -7427,10 +7525,11 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.1", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.2", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
-                         "keepers_live": sum(1 for session in keeper.sessions.values() if session.running),
+                         "keepers_live": sum(1 for session in keeper.sessions.values()
+                                             if keeper_session_ready(session)),
                          "verification_adapter": bool(get_verification_solver),
                          "vnc_enabled": _V3_VNC_ENABLED})
 
@@ -7438,7 +7537,7 @@ async def healthz():
 @app.get("/readyz")
 async def readyz():
     models_ready = bool(get_models())
-    keeper_ready = any(session.running and getattr(session, "page", None)
+    keeper_ready = any(keeper_session_ready(session)
                        for session in keeper.sessions.values())
     ready = models_ready and keeper_ready
     return JSONResponse({"ready": ready, "build": BUILD_STAMP,
@@ -7747,7 +7846,8 @@ async def _lifespan(app):
     if get_verification_solver:
         log("OK", f"Verification adapter factory loaded: {_VERIFICATION_FACTORY_SPEC}")
     else:
-        log("ERROR", f"Verification adapter factory unavailable: {_VERIFICATION_IMPORT_ERROR}")
+        log("WARN", "Optional verification adapter not installed; keeper-native verification remains active"
+            + (f": {_VERIFICATION_IMPORT_ERROR}" if _VERIFICATION_IMPORT_ERROR else ""))
     try:
         yield
     finally:
