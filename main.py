@@ -268,7 +268,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.5-stream-completeness-first-token-sla")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.7-private-errors-console")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1865,6 +1865,20 @@ PREDISPATCH_RECOVERY_WAIT_SEC = max(4.0, min(30.0, float(os.environ.get("BRIDGEN
 ACCOUNT_FAILOVER_MAX = max(0, min(6, int(os.environ.get("BRIDGENA_ACCOUNT_FAILOVER_MAX", "3"))))
 FIRST_ASSISTANT_RESPONSE_SEC = max(1.0, min(30.0, float(os.environ.get("BRIDGENA_FIRST_ASSISTANT_RESPONSE_SEC", "5"))))
 REQUIRE_PROVIDER_FINISH = os.environ.get("BRIDGENA_REQUIRE_PROVIDER_FINISH", "1").strip().lower() not in ("0", "false", "no", "off")
+ARENA_UI_STREAM_RECOVERY = os.environ.get("BRIDGENA_ARENA_UI_STREAM_RECOVERY", "1").strip().lower() not in ("0", "false", "no", "off")
+ARENA_UI_RECOVERY_TIMEOUT_SEC = max(5.0, min(45.0, float(os.environ.get("BRIDGENA_ARENA_UI_RECOVERY_TIMEOUT_SEC", "18"))))
+ARENA_UI_RECOVERY_STABLE_SEC = max(0.8, min(6.0, float(os.environ.get("BRIDGENA_ARENA_UI_RECOVERY_STABLE_SEC", "1.8"))))
+_arena_ui_recovery_stats = {"attempted": 0, "recovered": 0, "not_found": 0, "incomplete": 0, "navigation_failed": 0}
+_arena_ui_recovery_stats_guard = threading.Lock()
+
+def _bump_arena_ui_recovery(key: str) -> None:
+    with _arena_ui_recovery_stats_guard:
+        _arena_ui_recovery_stats[key] = int(_arena_ui_recovery_stats.get(key, 0)) + 1
+
+def _arena_ui_recovery_snapshot() -> dict:
+    with _arena_ui_recovery_stats_guard:
+        return dict(_arena_ui_recovery_stats)
+
 _account_failover_stats = {"attempted": 0, "successful_handoff": 0, "exhausted": 0, "session_401": 0, "predispatch": 0, "keeper_unready": 0}
 _account_failover_stats_lock = threading.Lock()
 
@@ -1918,7 +1932,8 @@ def _reliability_snapshot() -> dict:
             "target_met": (bool(rate is not None and rate >= _RELIABILITY_TARGET)),
             "failures_by_reason": failures,
             "transport_guard": _transport_guard_snapshot(),
-            "account_failover": _account_failover_snapshot()}
+            "account_failover": _account_failover_snapshot(),
+            "arena_ui_recovery": _arena_ui_recovery_snapshot()}
 
 
 def _api_keeper_verified(sid: Optional[str]) -> bool:
@@ -2390,6 +2405,29 @@ def save_conversation(key: str, conv: dict) -> None:
         mutate_state(fn)
     except Exception as e:
         log("WARN", f"Conversation save failed: {e}")
+
+def save_conversation_ui_url(key: str, model_name: str, ui_url: str) -> None:
+    """Cache a browser-visible Arena thread URL discovered during recovery."""
+    ui_url = str(ui_url or "").strip()
+    if not ui_url:
+        return
+    def fn(state: dict):
+        conv = state.get("conversations", {}).get(key)
+        if not isinstance(conv, dict):
+            return
+        arena = conv.get("arena")
+        if not isinstance(arena, dict):
+            return
+        model_state = arena.get(model_name)
+        if not isinstance(model_state, dict):
+            return
+        model_state["ui_url"] = ui_url[:1000]
+        conv["updated"] = time.time()
+    try:
+        mutate_state(fn)
+    except Exception as exc:
+        log("WARN", f"Conversation UI URL cache failed: {type(exc).__name__}: {exc}")
+
 
 def clear_conversation_model(key: str, model_name: str) -> None:
     """Remove only a stale upstream binding; never touch browser-local text."""
@@ -6806,6 +6844,373 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
 
 
 
+def _stream_recovery_suffix(partial: str, recovered: str) -> tuple:
+    """Return (safe_suffix, confidence).
+
+    Streaming clients cannot retract already-emitted text, so recovery only
+    appends text when the Arena UI copy is demonstrably the same answer.
+    """
+    partial = str(partial or "")
+    recovered = str(recovered or "")
+    if not recovered:
+        return "", 0.0
+    if not partial:
+        return recovered, 1.0
+    if recovered.startswith(partial):
+        return recovered[len(partial):], 1.0
+    if partial == recovered:
+        return "", 1.0
+
+    # Find the longest suffix(partial) == prefix(recovered). This handles a
+    # dropped/repeated transport frame near the break point.
+    max_overlap = min(len(partial), len(recovered))
+    for n in range(max_overlap, max(8, min(64, max_overlap // 4)) - 1, -1):
+        if partial[-n:] == recovered[:n]:
+            return recovered[n:], min(0.98, n / max(1, min(len(partial), 128)))
+
+    # A full UI answer can occasionally wrap the partial answer with a tiny
+    # prefix (e.g. a model label). Accept only a strong containment match.
+    idx = recovered.find(partial)
+    if 0 <= idx <= 80:
+        return recovered[idx + len(partial):], 0.94
+
+    return "", 0.0
+
+
+async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: str,
+                                   user_prompt: str, partial_text: str = "",
+                                   cached_url: str = "") -> dict:
+    """Recover a broken model stream from Arena's own chat UI.
+
+    Recovery never re-submits the user prompt. It opens a temporary page in the
+    SAME authenticated keeper context, navigates to Arena's chat history/search,
+    opens the matching conversation, waits for the assistant bubble to finish,
+    then returns the browser-visible final text.
+
+    Matching order:
+      1) cached thread URL;
+      2) href containing the evaluation/session id;
+      3) Arena history search using the exact user prompt and best matching item.
+    """
+    if not ARENA_UI_STREAM_RECOVERY:
+        return {"ok": False, "reason": "disabled"}
+    if not session or not getattr(session, "context", None):
+        return {"ok": False, "reason": "no keeper context"}
+
+    _bump_arena_ui_recovery("attempted")
+    name = getattr(session, "name", "keeper")
+    page = None
+    search_term = " ".join(str(user_prompt or "").split())[:160]
+    prompt_probe = search_term[:72]
+    partial_probe = str(partial_text or "")[:120]
+    deadline = time.monotonic() + ARENA_UI_RECOVERY_TIMEOUT_SEC
+
+    # Extract the smallest plausible assistant bubble. The strongest signal is
+    # the exact model message id; partial streamed text is second; semantic
+    # assistant/test-id attributes are third.
+    extract_js = r"""([messageId, promptProbe, partialProbe]) => {
+      const visible = el => {
+        if (!el || !(el instanceof Element)) return false;
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden';
+      };
+      const txt = el => (el && (el.innerText || el.textContent) || '').trim();
+      const clean = s => String(s || '').replace(/\s+/g, ' ').trim();
+      const all = [...document.querySelectorAll('body *')].filter(visible);
+      const candidates = [];
+
+      const push = (el, score) => {
+        const t = txt(el);
+        if (!t || t.length > 120000) return;
+        if (promptProbe && clean(t).includes(clean(promptProbe)) && t.length < Math.max(300, promptProbe.length * 3)) {
+          return; // almost certainly the user bubble
+        }
+        candidates.push({el, t, score});
+      };
+
+      if (messageId) {
+        for (const el of document.querySelectorAll(
+          `[data-message-id*="${CSS.escape(messageId)}"],[id*="${CSS.escape(messageId)}"],[data-id*="${CSS.escape(messageId)}"]`
+        )) push(el, 10000 - txt(el).length / 1000);
+      }
+
+      if (partialProbe) {
+        const needle = clean(partialProbe.slice(0, 90));
+        for (const el of all) {
+          const t = clean(txt(el));
+          if (needle && t.includes(needle) && t.length >= needle.length) {
+            // Prefer the smallest element containing the already-streamed text.
+            push(el, 8000 - Math.min(7000, t.length));
+          }
+        }
+      }
+
+      for (const el of all) {
+        const sig = clean([
+          el.getAttribute('data-message-author-role'),
+          el.getAttribute('data-role'),
+          el.getAttribute('data-testid'),
+          el.getAttribute('aria-label'),
+          el.className
+        ].join(' ')).toLowerCase();
+        if (/(assistant|model-message|modelresponse|model-response|response-message|chat-message-assistant)/.test(sig)) {
+          push(el, 5000 + Math.min(2000, txt(el).length / 10));
+        }
+      }
+
+      // Structural fallback: find the user prompt and inspect later message-like
+      // blocks in DOM order.
+      if (promptProbe) {
+        const needle = clean(promptProbe);
+        let userIndex = -1;
+        for (let i = 0; i < all.length; i++) {
+          const t = clean(txt(all[i]));
+          if (t === needle || (t.includes(needle) && t.length <= needle.length + 180)) {
+            userIndex = i;
+          }
+        }
+        if (userIndex >= 0) {
+          for (let i = userIndex + 1; i < all.length; i++) {
+            const el = all[i], t = txt(el);
+            if (!t || t.length < 2 || t.length > 60000) continue;
+            const sig = clean([el.tagName, el.getAttribute('role'), el.getAttribute('data-testid'), el.className].join(' ')).toLowerCase();
+            if (/(article|message|assistant|markdown|prose)/.test(sig)) {
+              push(el, 2500 + Math.min(1200, t.length / 20));
+            }
+          }
+        }
+      }
+
+      candidates.sort((a,b) => b.score - a.score || a.t.length - b.t.length);
+      let chosen = candidates[0] || null;
+
+      const generating = [...document.querySelectorAll('button,[role=button],[aria-label],[data-state]')]
+        .filter(visible)
+        .some(el => {
+          const s = clean([txt(el), el.getAttribute('aria-label'), el.getAttribute('data-state')].join(' ')).toLowerCase();
+          return /(stop generating|stop response|cancel generation|generating|streaming)/.test(s);
+        });
+
+      return {
+        text: chosen ? chosen.t : '',
+        generating,
+        url: location.href,
+        title: document.title,
+        candidateCount: candidates.length
+      };
+    }"""
+
+    async with session._action_lock:
+        try:
+            page = await session.context.new_page()
+
+            # Fast path: a previously discovered thread URL.
+            if cached_url:
+                try:
+                    await session._navigate_resilient(page, cached_url, timeout=12000)
+                    await asyncio.sleep(0.8)
+                except Exception:
+                    pass
+
+            # If the cached route didn't land on a useful chat, use Arena's
+            # built-in chat-history search. Arena exposes /history/search.
+            body_text = ""
+            try:
+                body_text = await page.locator("body").inner_text(timeout=1200)
+            except Exception:
+                pass
+            if not body_text or (prompt_probe and prompt_probe not in body_text):
+                history_url = f"{PUBLIC_AUTH_BASE.rstrip('/')}/history/search"
+                try:
+                    ok = await session._navigate_resilient(page, history_url, timeout=12000)
+                    if not ok:
+                        _bump_arena_ui_recovery("navigation_failed")
+                        return {"ok": False, "reason": "history navigation failed"}
+                except Exception as exc:
+                    _bump_arena_ui_recovery("navigation_failed")
+                    return {"ok": False, "reason": f"history navigation failed: {type(exc).__name__}"}
+
+                try:
+                    await session._dismiss_promos(page)
+                except Exception:
+                    pass
+
+                # Direct session/evaluation-id link wins if Arena renders one.
+                clicked = False
+                if arena_id:
+                    try:
+                        by_id = page.locator(f'a[href*="{arena_id}"],button[data-href*="{arena_id}"]').first
+                        if await by_id.count() > 0 and await by_id.is_visible():
+                            await by_id.click(timeout=2500)
+                            clicked = True
+                    except Exception:
+                        pass
+
+                if not clicked and search_term:
+                    # Search Arena's own history UI.
+                    try:
+                        search = page.locator(
+                            "input[placeholder*='Search your chats' i],"
+                            "input[placeholder*='Search' i],"
+                            "input[type='search']"
+                        ).first
+                        if await search.count() > 0:
+                            await search.fill(search_term)
+                            try:
+                                await search.press("Enter")
+                            except Exception:
+                                pass
+                            await asyncio.sleep(1.0)
+                    except Exception:
+                        pass
+
+                    # Score visible result links/buttons against the prompt and
+                    # evaluation id, then click the best match.
+                    try:
+                        result = await page.evaluate(r"""([arenaId, prompt]) => {
+                          const norm=s=>String(s||'').toLowerCase().replace(/\s+/g,' ').trim();
+                          const p=norm(prompt), words=p.split(' ').filter(w=>w.length>2).slice(0,12);
+                          let best=null;
+                          for(const el of document.querySelectorAll('a[href],button,[role=button]')){
+                            const r=el.getBoundingClientRect(), cs=getComputedStyle(el);
+                            if(r.width<2||r.height<2||cs.display==='none'||cs.visibility==='hidden') continue;
+                            const href=String(el.getAttribute('href')||el.getAttribute('data-href')||'');
+                            const t=norm(el.innerText||el.textContent||'');
+                            let score=0;
+                            if(arenaId && href.includes(arenaId)) score+=10000;
+                            if(p && t.includes(p)) score+=5000;
+                            for(const w of words) if(t.includes(w)) score+=120;
+                            if(/history|chat|conversation|evaluation/.test(href)) score+=80;
+                            if(!best || score>best.score) best={el,score,href,text:t};
+                          }
+                          if(best && best.score>=240){
+                            best.el.click();
+                            return {clicked:true,score:best.score,href:best.href,text:best.text};
+                          }
+                          return {clicked:false,score:best?best.score:0};
+                        }""", [arena_id, search_term])
+                        clicked = bool(result and result.get("clicked"))
+                    except Exception:
+                        clicked = False
+
+                if not clicked:
+                    _bump_arena_ui_recovery("not_found")
+                    return {"ok": False, "reason": "matching Arena history item not found"}
+
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.7)
+
+            best_text = ""
+            stable_since = 0.0
+            last_text = None
+            best_url = page.url
+
+            while time.monotonic() < deadline:
+                try:
+                    snap = await page.evaluate(
+                        extract_js,
+                        [str(model_message_id or ""), prompt_probe, partial_probe],
+                    )
+                except Exception as exc:
+                    return {"ok": False, "reason": f"UI extraction failed: {type(exc).__name__}"}
+
+                current = str((snap or {}).get("text") or "").strip()
+                generating = bool((snap or {}).get("generating"))
+                best_url = str((snap or {}).get("url") or page.url or best_url)
+
+                if current and len(current) >= len(best_text):
+                    best_text = current
+
+                if current and current == last_text:
+                    if not stable_since:
+                        stable_since = time.monotonic()
+                else:
+                    stable_since = time.monotonic()
+                    last_text = current
+
+                stable_for = time.monotonic() - stable_since if current else 0.0
+                suffix, confidence = _stream_recovery_suffix(partial_text, current)
+
+                # Accept only a stable, browser-visible answer that is not
+                # actively generating and that matches our partial stream when
+                # partial text exists.
+                if current and not generating and stable_for >= ARENA_UI_RECOVERY_STABLE_SEC:
+                    if not partial_text or confidence >= 0.90:
+                        _bump_arena_ui_recovery("recovered")
+                        log("OK", f"[{name}] Arena UI stream recovery · recovered {len(current)} chars · "
+                                  f"stable {stable_for:.1f}s · {best_url}")
+                        return {
+                            "ok": True, "text": current, "suffix": suffix,
+                            "confidence": confidence, "url": best_url,
+                            "complete": True,
+                        }
+
+                await asyncio.sleep(0.45)
+
+            if best_text:
+                _bump_arena_ui_recovery("incomplete")
+                return {
+                    "ok": False, "reason": "Arena UI answer did not reach a stable completed state",
+                    "text": best_text, "url": best_url,
+                }
+
+            _bump_arena_ui_recovery("not_found")
+            return {"ok": False, "reason": "assistant response not visible in Arena UI"}
+
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+
+async def _attempt_ui_stream_salvage(*, session, chat_id: str, model_name: str,
+                                     arena_id: str, model_message_id: str,
+                                     user_prompt: str, partial_text: str,
+                                     jar: dict, proxy: Optional[str],
+                                     cached_url: str = "") -> dict:
+    """Wrapper that persists recovered bindings/URLs but never replays a prompt."""
+    if not ARENA_UI_STREAM_RECOVERY:
+        return {"ok": False, "reason": "disabled"}
+
+    log("WARN", f"[{jar.get('name')}] stream interrupted · opening Arena history UI for recovery")
+    result = await _arena_ui_stream_recover(
+        session,
+        arena_id=arena_id,
+        model_message_id=model_message_id,
+        user_prompt=user_prompt,
+        partial_text=partial_text,
+        cached_url=cached_url,
+    )
+
+    if result.get("ok"):
+        # A create-evaluation may have succeeded upstream even though Bridgena
+        # lost the fetch response. Persist the thread binding once the Arena UI
+        # proves the conversation exists.
+        conv_now = get_conversation(chat_id) or {}
+        conv_now["model"] = model_name
+        conv_now["arena"] = dict(conv_now.get("arena") or {})
+        conv_now["arena"][model_name] = {
+            "arena_id": arena_id,
+            "mode": "direct",
+            "jar_id": jar.get("id"),
+            "proxy": proxy,
+            "ui_url": result.get("url") or cached_url or "",
+        }
+        save_conversation(chat_id, conv_now)
+        if result.get("url"):
+            save_conversation_ui_url(chat_id, model_name, result["url"])
+    else:
+        log("WARN", f"[{jar.get('name')}] Arena UI stream recovery failed · {result.get('reason') or 'unknown'}")
+
+    return result
+
+
 async def _ensure_predispatch_transport(jar: dict, *, wait_for_recovery: bool = True) -> bool:
     """Do not submit a model POST through a keeper whose browser route is dead.
 
@@ -7223,33 +7628,105 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         jar.get("id"), "browser-origin mid-stream network failure",
                         TRANSPORT_FAILURE_QUARANTINE_SEC,
                     )
+
+                    # The model may continue/finish on Arena even though our
+                    # streaming fetch died. Before showing an error, open Arena's
+                    # own history UI in this same authenticated keeper and recover
+                    # the completed assistant bubble. NO prompt replay occurs.
+                    salvage = await _attempt_ui_stream_salvage(
+                        session=browser_session,
+                        chat_id=chat_id,
+                        model_name=model_name,
+                        arena_id=str(base.get("id") or (mc or {}).get("arena_id") or ""),
+                        model_message_id=str(base.get("modelAMessageId") or ""),
+                        user_prompt=prompt,
+                        partial_text=response_text or "",
+                        jar=jar,
+                        proxy=proxy,
+                        cached_url=str((mc or {}).get("ui_url") or ""),
+                    )
+                    if salvage.get("ok"):
+                        final_text = str(salvage.get("text") or "")
+                        suffix = str(salvage.get("suffix") or "")
+                        if suffix:
+                            response_text += suffix
+                            yield ("content", suffix)
+                        elif not response_text and final_text:
+                            response_text = final_text
+                            yield ("content", final_text)
+                        else:
+                            response_text = final_text or response_text
+
+                        _schedule_transport_recovery(
+                            jar.get("id"), "post-salvage repair after mid-stream failure"
+                        )
+                        log("OK", f"[{jar.get('name')}] interrupted stream recovered from Arena UI · "
+                                  f"{len(response_text)} final chars · keeper remains quarantined until repair completes")
+                        yield ("done", response_text)
+                        return
+
                     _schedule_transport_recovery(jar.get("id"), "mid-stream browser transport failure")
                     if response_text or reasoning_text:
                         yield ("error", "502: Arena returned partial assistant output but never delivered a complete "
-                                        "provider finish event. The partial response was preserved above; the request was not replayed.")
+                                        "provider finish event. Bridgena checked the Arena chat UI but could not "
+                                        "confirm a completed answer; the partial response remains visible above.")
                     else:
-                        yield ("error", "502: Arena opened the response but the browser transport was interrupted before "
-                                        "a decodable answer arrived. The keeper is being recovered.")
+                        yield ("error", "502: Arena opened the response but the browser transport was interrupted. "
+                                        "Bridgena checked the Arena chat UI but could not recover a completed answer.")
                     return
                 if not e.status:
                     log("WARN", f"[{jar.get('name')}] browser transport failed before an HTTP response; "
-                                f"starting same-keeper recovery")
+                                f"checking Arena UI before declaring failure")
                     _quarantine_api_keeper(
                         jar.get("id"), "browser-origin network failure",
                         TRANSPORT_FAILURE_QUARANTINE_SEC,
                     )
+
+                    # `fetch()` can throw even after the POST reached Arena. The
+                    # history UI is our source of truth for whether a response
+                    # actually appeared; never replay the prompt just to find out.
+                    salvage = await _attempt_ui_stream_salvage(
+                        session=browser_session,
+                        chat_id=chat_id,
+                        model_name=model_name,
+                        arena_id=str(base.get("id") or (mc or {}).get("arena_id") or ""),
+                        model_message_id=str(base.get("modelAMessageId") or ""),
+                        user_prompt=prompt,
+                        partial_text=response_text or "",
+                        jar=jar,
+                        proxy=proxy,
+                        cached_url=str((mc or {}).get("ui_url") or ""),
+                    )
+                    if salvage.get("ok"):
+                        final_text = str(salvage.get("text") or "")
+                        suffix = str(salvage.get("suffix") or "")
+                        if suffix:
+                            response_text += suffix
+                            yield ("content", suffix)
+                        elif not response_text and final_text:
+                            response_text = final_text
+                            yield ("content", final_text)
+                        else:
+                            response_text = final_text or response_text
+
+                        _schedule_transport_recovery(
+                            jar.get("id"), "post-salvage repair after HTTP-0"
+                        )
+                        log("OK", f"[{jar.get('name')}] HTTP-0 request recovered from Arena UI · "
+                                  f"{len(response_text)} chars · keeper remains quarantined until repair completes")
+                        yield ("done", response_text)
+                        return
+
                     _schedule_transport_recovery(jar.get("id"), "pre-response browser transport failure")
 
-                    # An immediate browser-side Failed-to-fetch used to replace
-                    # the chat answer almost instantly. Hold the user-visible
-                    # failure until the configured first-response SLA expires.
+                    # Keep the existing 5-second user-facing minimum error window.
                     elapsed = time.monotonic() - _transport_t0
                     remaining = FIRST_ASSISTANT_RESPONSE_SEC - elapsed
                     if remaining > 0:
                         await asyncio.sleep(remaining)
 
-                    yield ("error", f"502: No assistant response began within "
-                                    f"{FIRST_ASSISTANT_RESPONSE_SEC:.0f}s because the browser route failed. "
+                    yield ("error", f"502: No completed assistant response could be recovered from Arena within "
+                                    f"{ARENA_UI_RECOVERY_TIMEOUT_SEC:.0f}s after the browser route failed. "
                                     "The same keeper is being recovered.")
                     return
                 else:
@@ -7810,7 +8287,8 @@ def page(title: str, body: str, active: str = "", *, raw_js: str = "", wide=Fals
         items = [("Dashboard", "/dashboard", "dash"), ("Proxy Pool", "/pool", "pool"),
                  ("Accounts", "/jars", "jars"), ("Models", "/models-page", "models"),
                  ("API Keys", "/api-keys", "keys"),
-                 ("Live Chat", "/chat", "chat"), ("Logs", "/logs", "logs")]
+                 ("Live Chat", "/chat", "chat"), ("Errors", "/errors", "errors"),
+                 ("Logs", "/logs", "logs")]
         nav = '<div class="rail">' + "".join(
             f'<a href="{href}" class="{"on" if k==active else ""}">{lbl}</a>' for lbl, href, k in items) + "</div>"
     main_open = '<div class="shell">' + nav + '<div class="main">' + body + "</div></div>"
@@ -8041,6 +8519,103 @@ function switchJarTab(name){
 
 
 
+
+def errors_page() -> str:
+    rows = _recent_private_errors(120)
+    body_rows = "".join(
+        "<tr data-error-id='" + esc(str(row.get("id") or "")) + "'>"
+        "<td><button class='btn sm ghost mono' type='button' onclick=\"lookupError('" +
+        esc(str(row.get("id") or "")) + "')\">" + esc(str(row.get("id") or "")) + "</button></td>"
+        "<td class='muted'>" + esc(str(row.get("time") or "")) + "</td>"
+        "<td><span class='pill " + ("bad" if int(row.get("status") or 500) >= 500 else "warn") + "'>" +
+        esc(str(row.get("status") or "")) + "</span></td>"
+        "<td>" + esc(str(row.get("source") or "")) + "</td>"
+        "<td class='mono muted'>" + esc(str(row.get("path") or "")) + "</td>"
+        "</tr>"
+        for row in rows
+    ) or "<tr><td colspan='5' class='empty'>No customer-facing errors recorded yet.</td></tr>"
+
+    return page("Errors", f"""
+<div class="pagehead">
+  <div>
+    <div class="eyebrow">Support diagnostics</div>
+    <h1>Error lookup</h1>
+    <p>Customers only see a friendly Error ID. The implementation details stay here.</p>
+  </div>
+  <div class="row">
+    <button class="btn ghost" onclick="location.reload()">Refresh</button>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <div class="row" style="align-items:end">
+    <label style="flex:1;max-width:620px">Error ID
+      <input id="errorLookup" class="mono" placeholder="ERR-185049-A1B2C3D4"
+             autocomplete="off" spellcheck="false">
+    </label>
+    <button class="btn primary" type="button" onclick="lookupError()">Look up</button>
+  </div>
+</div>
+
+<div id="errorDetail" class="card" style="display:none;margin-bottom:16px"></div>
+
+<div class="card">
+  <div class="row" style="margin-bottom:14px">
+    <div>
+      <div class="eyebrow">Recent</div>
+      <h3 style="margin:2px 0 0">Customer-facing errors</h3>
+    </div>
+    <span class="spacer"></span>
+    <span class="pill">{len(rows)} shown</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Error ID</th><th>Time</th><th>HTTP</th><th>Source</th><th>Path</th></tr></thead>
+      <tbody>{body_rows}</tbody>
+    </table>
+  </div>
+</div>
+""", active="errors", raw_js=r"""
+const eEsc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function lookupError(forced=''){
+  const input=document.getElementById('errorLookup'),id=(forced||input.value||'').trim();
+  if(!id){bgnToast('Enter an Error ID first','warn');return}
+  input.value=id;
+  const pending=bgnToast('Looking up '+id+'…','loading');
+  try{
+    const r=await fetch('/errors/api/'+encodeURIComponent(id),{cache:'no-store',credentials:'same-origin'});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.detail||'Error ID not found');
+    const box=document.getElementById('errorDetail'),x=d.error||{};
+    const ctx=x.context&&Object.keys(x.context).length
+      ?'<pre><code>'+eEsc(JSON.stringify(x.context,null,2))+'</code></pre>'
+      :'<div class="muted">No additional context captured.</div>';
+    box.innerHTML=
+      '<div class="row"><div><div class="eyebrow">Nerd details</div><h3 class="mono" style="margin:2px 0 6px">'+eEsc(x.id)+'</h3></div>'+
+      '<span class="spacer"></span><span class="pill '+((x.status||500)>=500?'bad':'warn')+'">HTTP '+eEsc(x.status)+'</span></div>'+
+      '<div class="kv"><span>Time</span><b>'+eEsc(x.time)+'</b></div>'+
+      '<div class="kv"><span>Source</span><b class="mono">'+eEsc(x.source)+'</b></div>'+
+      '<div class="kv"><span>Protocol</span><b>'+eEsc(x.protocol||'—')+'</b></div>'+
+      '<div class="kv"><span>Request</span><b class="mono">'+eEsc((x.method||'')+' '+(x.path||''))+'</b></div>'+
+      (x.exception_type?'<div class="kv"><span>Exception</span><b class="mono">'+eEsc(x.exception_type)+'</b></div>':'')+
+      '<div style="margin-top:16px"><div class="eyebrow">Internal detail</div><pre><code>'+eEsc(x.detail||'')+'</code></pre></div>'+
+      '<div style="margin-top:16px"><div class="eyebrow">Context</div>'+ctx+'</div>';
+    box.style.display='block';
+    box.scrollIntoView({behavior:'smooth',block:'start'});
+    bgnToastUpdate(pending,'Found '+id,'ok','Error found');
+  }catch(err){
+    bgnToastUpdate(pending,err.message||String(err),'error','Lookup failed');
+  }
+}
+document.getElementById('errorLookup').addEventListener('keydown',e=>{
+  if(e.key==='Enter'){e.preventDefault();lookupError()}
+});
+const q=new URLSearchParams(location.search).get('id');
+if(q){document.getElementById('errorLookup').value=q;lookupError(q)}
+""")
+
+
+
 def logs_page(tail: list) -> str:
     lines = "".join(f'<div class="{esc(x["lvl"])}">{esc(x["line"])}</div>' for x in tail)
     return page("Logs", f"""<div class="pagehead"><div><h1>System Log</h1><p>ring buffer · auto-scroll</p></div>
@@ -8258,7 +8833,7 @@ async function bgnJson(r){const ct=r.headers.get('content-type')||'';if(ct.inclu
 document.addEventListener('submit',async e=>{const f=e.target;if(!(f instanceof HTMLFormElement)||f.dataset.native==='1'||(f.method||'get').toLowerCase()==='get')return;if(!f.action.startsWith(location.origin))return;e.preventDefault();const submit=e.submitter;if(submit)submit.disabled=true;const pending=bgnToast('Sending request…','loading');try{const r=await fetch(f.action,{method:(f.method||'POST').toUpperCase(),body:new FormData(f),credentials:'same-origin'});if(!r.ok){const d=await bgnJson(r);throw new Error(bgnResultMessage(d,'HTTP '+r.status))}if(r.redirected){bgnToastUpdate(pending,'Changes saved','ok');bgnFlash('Changes saved','ok');setTimeout(()=>{location.href=r.url},900);return}const d=await bgnJson(r);bgnToastUpdate(pending,bgnResultMessage(d),'ok');if(f.dataset.reload!=='0')bgnReload(bgnResultMessage(d),'ok','',900)}catch(err){bgnToastUpdate(pending,err.message||String(err),'error')}finally{if(submit)submit.disabled=false}});window.addEventListener('unhandledrejection',e=>{if(e.reason&&e.reason.message)bgnToast(e.reason.message,'error')});'''
 
 def page(title: str, content: str, active: str = "", raw_js: str = "", wide: bool = False) -> str:
-    nav=[('dash','/dashboard','Overview'),('chat','/chat','Chat'),('browser','/browser-view','Browser'),('pool','/pool','Network'),('jars','/jars','Accounts'),('models','/models-page','Models'),('keys','/api-keys','API keys'),('logs','/logs','Logs')]
+    nav=[('dash','/dashboard','Overview'),('chat','/chat','Chat'),('browser','/browser-view','Browser'),('pool','/pool','Network'),('jars','/jars','Accounts'),('models','/models-page','Models'),('keys','/api-keys','API keys'),('errors','/errors','Errors'),('logs','/logs','Logs')]
     links=''.join(f'<a class="{"on" if active==k else ""}" href="{h}">{esc(l)}</a>' for k,h,l in nav)
     return f'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark light"><title>{esc(title)} · Bridgena</title><style>{V3_CSS}</style></head><body><header class="topbar"><a class="brand" href="/dashboard"><span class="dot"></span><span>Bridgena</span><small>{esc(BUILD_STAMP)}</small></a><div class="spacer"></div><div class="v3-health"><i></i><span>control plane online</span></div><button class="btn sm ghost" onclick="bgnToggleTheme()">◐</button><a class="btn sm ghost" href="/logout">Sign out</a></header><div class="shell"><aside class="rail"><div class="rail-label">Workspace</div>{links}</aside><main class="main">{content}</main></div><div id="toast-stack" class="toast-stack"></div><script>{V3_THEME_JS}{raw_js}</script></body></html>'''
 
@@ -8409,6 +8984,280 @@ _login_failures: dict = {}
 _login_failures_lock = threading.Lock()
 
 
+_ERROR_EVENTS_FILE = os.environ.get("BRIDGENA_ERROR_EVENTS_FILE", "errors.jsonl").strip() or "errors.jsonl"
+_ERROR_EVENTS_MAX = max(100, min(5000, int(os.environ.get("BRIDGENA_ERROR_EVENTS_MAX", "1000"))))
+_error_events = deque(maxlen=_ERROR_EVENTS_MAX)
+_error_events_lock = threading.Lock()
+
+_PUBLIC_ERROR_VARIANTS = {
+    "auth": (
+        "Your API key couldn't get past the bouncer. Error ID: {id}",
+        "The velvet rope said nope. Error ID: {id}",
+        "Our tiny security guard couldn't verify this request. Error ID: {id}",
+    ),
+    "rate": (
+        "The request queue is doing cardio right now. Error ID: {id}",
+        "The response hamsters need a tiny cooldown. Error ID: {id}",
+        "Too many pigeons arrived at once. Error ID: {id}",
+    ),
+    "request": (
+        "That request confused the carrier pigeon. Error ID: {id}",
+        "Our message sorter couldn't make sense of that envelope. Error ID: {id}",
+        "The request took a wrong turn at the post office. Error ID: {id}",
+    ),
+    "server": (
+        "The carrier pigeon streaming your response died! Error ID: {id}",
+        "A tiny internet gremlin dropped your response. Error ID: {id}",
+        "The response hamster tripped over a cable. Error ID: {id}",
+        "Our packet train missed its station. Error ID: {id}",
+        "One of the server goblins misplaced your message. Error ID: {id}",
+        "The response conveyor belt made an unexpected noise. Error ID: {id}",
+    ),
+}
+
+
+def _safe_internal_error_detail(value: Any) -> str:
+    """Keep useful operator diagnostics without persisting obvious secrets."""
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            raw = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            raw = str(value)
+    else:
+        raw = str(value or "")
+    raw = redact(raw)
+    # Second line of defense for credentials that may not match redact().
+    raw = re.sub(r'(?i)(authorization\s*[:=]\s*)(bearer\s+)?[^\s,;"]+', r'\1[redacted]', raw)
+    raw = re.sub(r'(?i)((?:api[_-]?key|password|passwd|secret|token)\s*[:=]\s*)[^\s,;"]+', r'\1[redacted]', raw)
+    raw = re.sub(r'(?i)(https?://[^:/\s]+:)[^@\s]+@', r'\1[redacted]@', raw)
+    return raw[:12000]
+
+
+def _new_error_id() -> str:
+    stamp = time.strftime("%H%M%S", time.localtime())
+    suffix = secrets.token_hex(4).upper()
+    return f"ERR-{stamp}-{suffix}"
+
+
+def _public_error_category(status_code: int) -> str:
+    status_code = int(status_code or 500)
+    if status_code in (401, 403):
+        return "auth"
+    if status_code == 429:
+        return "rate"
+    if 400 <= status_code < 500:
+        return "request"
+    return "server"
+
+
+def _public_error_phrase(error_id: str, status_code: int) -> str:
+    variants = _PUBLIC_ERROR_VARIANTS[_public_error_category(status_code)]
+    # Stable phrase for a given Error ID; screenshots and support chats match.
+    pick = int(hashlib.sha256(error_id.encode("utf-8")).hexdigest()[:8], 16) % len(variants)
+    return variants[pick].format(id=error_id)
+
+
+def _load_error_events() -> None:
+    if not os.path.isfile(_ERROR_EVENTS_FILE):
+        return
+    try:
+        with open(_ERROR_EVENTS_FILE, "r", encoding="utf-8") as fh:
+            rows = fh.readlines()[-_ERROR_EVENTS_MAX:]
+        with _error_events_lock:
+            for line in rows:
+                try:
+                    row = json.loads(line)
+                    if isinstance(row, dict) and row.get("id"):
+                        _error_events.append(row)
+                except Exception:
+                    continue
+    except Exception as exc:
+        log("WARN", f"Error registry load failed: {type(exc).__name__}: {exc}")
+
+
+def _persist_error_event(row: dict) -> None:
+    try:
+        parent = os.path.dirname(os.path.abspath(_ERROR_EVENTS_FILE))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(_ERROR_EVENTS_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        # Cheap bounded persistence: compact once the file grows much larger
+        # than the configured ring. Errors are infrequent, so no hot-path cost.
+        try:
+            if os.path.getsize(_ERROR_EVENTS_FILE) > 8 * 1024 * 1024:
+                with _error_events_lock:
+                    snapshot = list(_error_events)
+                tmp = _ERROR_EVENTS_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    for item in snapshot:
+                        fh.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
+                os.replace(tmp, _ERROR_EVENTS_FILE)
+        except Exception:
+            pass
+    except Exception as exc:
+        log("WARN", f"Error registry persist failed: {type(exc).__name__}: {exc}")
+
+
+def _register_private_error(*, status_code: int, detail: Any, source: str,
+                            path: str = "", method: str = "",
+                            protocol: str = "", context: Optional[dict] = None,
+                            exception_type: str = "") -> tuple:
+    error_id = _new_error_id()
+    safe_detail = _safe_internal_error_detail(detail)
+    safe_context = {}
+    for key, value in (context or {}).items():
+        # Never persist prompts, API keys, cookies, or full auth headers.
+        if str(key).lower() in {
+            "prompt", "messages", "cookies", "authorization", "api_key",
+            "password", "token", "recaptchav3token", "recaptchav2token",
+        }:
+            continue
+        safe_context[str(key)[:80]] = _safe_internal_error_detail(value)[:2000]
+
+    row = {
+        "id": error_id,
+        "ts": time.time(),
+        "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "status": int(status_code or 500),
+        "source": str(source or "api")[:120],
+        "protocol": str(protocol or "")[:80],
+        "method": str(method or "")[:16],
+        "path": str(path or "")[:500],
+        "exception_type": str(exception_type or "")[:160],
+        "detail": safe_detail,
+        "context": safe_context,
+    }
+    with _error_events_lock:
+        _error_events.append(row)
+    _persist_error_event(row)
+    log("WARN", f"Customer error {error_id} · HTTP {row['status']} · {row['source']} · "
+                f"{row['method']} {row['path']} · internal: {safe_detail[:260]}")
+    return error_id, _public_error_phrase(error_id, row["status"])
+
+
+def _find_private_error(error_id: str) -> Optional[dict]:
+    needle = str(error_id or "").strip().upper()
+    if not needle:
+        return None
+    with _error_events_lock:
+        for row in reversed(_error_events):
+            if str(row.get("id") or "").upper() == needle:
+                return dict(row)
+    return None
+
+
+def _recent_private_errors(limit: int = 100) -> list:
+    with _error_events_lock:
+        return [dict(x) for x in list(_error_events)[-max(1, min(500, limit)):]][::-1]
+
+
+def _status_from_internal_error(detail: Any, default: int = 502) -> int:
+    match = re.match(r"^\s*(\d{3})\s*:", str(detail or ""))
+    if match:
+        value = int(match.group(1))
+        if 400 <= value <= 599:
+            return value
+    return int(default)
+
+
+def _is_public_inference_path(path: str) -> bool:
+    path = str(path or "")
+    return (
+        path.startswith("/v1/")
+        or path in {"/chat/completions", "/messages", "/models"}
+        or path.startswith("/models/")
+    )
+
+
+def _openai_public_error(status_code: int, detail: Any, *, source: str,
+                         path: str = "/v1/chat/completions",
+                         context: Optional[dict] = None,
+                         exception_type: str = "") -> tuple:
+    error_id, message = _register_private_error(
+        status_code=status_code,
+        detail=detail,
+        source=source,
+        path=path,
+        method="POST",
+        protocol="openai",
+        context=context,
+        exception_type=exception_type,
+    )
+    return error_id, message
+
+
+def _anthropic_public_error(status_code: int, detail: Any, *, source: str,
+                            path: str = "/v1/messages",
+                            context: Optional[dict] = None,
+                            exception_type: str = "") -> tuple:
+    error_id, message = _register_private_error(
+        status_code=status_code,
+        detail=detail,
+        source=source,
+        path=path,
+        method="POST",
+        protocol="anthropic",
+        context=context,
+        exception_type=exception_type,
+    )
+    return error_id, message
+
+
+_load_error_events()
+
+
+@app.exception_handler(HTTPException)
+async def bridgena_http_exception_handler(request: Request, exc: HTTPException):
+    path = request.url.path
+    if _is_public_inference_path(path):
+        protocol = "anthropic" if path in {"/v1/messages", "/messages", "/v1/messages/count_tokens"} else "openai"
+        error_id, message = _register_private_error(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            source="http_exception",
+            path=path,
+            method=request.method,
+            protocol=protocol,
+            context={"retry_after": (exc.headers or {}).get("Retry-After", "")},
+            exception_type="HTTPException",
+        )
+        headers = dict(exc.headers or {})
+        headers["X-Bridgena-Error-ID"] = error_id
+        headers["Cache-Control"] = "no-store"
+
+        if protocol == "anthropic":
+            return JSONResponse(
+                {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": message},
+                    "error_id": error_id,
+                },
+                status_code=exc.status_code,
+                headers=headers,
+            )
+
+        return JSONResponse(
+            {
+                "error": {
+                    "message": message,
+                    "type": "api_error" if exc.status_code >= 500 else "invalid_request_error",
+                    "code": error_id,
+                },
+                "error_id": error_id,
+            },
+            status_code=exc.status_code,
+            headers=headers,
+        )
+
+    # Preserve detailed control-plane diagnostics for authenticated operators.
+    return JSONResponse(
+        {"detail": exc.detail},
+        status_code=exc.status_code,
+        headers=exc.headers,
+    )
+
+
 @app.middleware("http")
 async def bridgena_delivery_headers(request: Request, call_next):
     """Prevent stale UI assets and intermediary buffering of streamed deltas."""
@@ -8470,7 +9319,7 @@ async def _require_key(request: Request) -> Optional[dict]:
 
 
 # ---------- v3 control-plane security / telemetry ----------
-_V3_CONTROL_PREFIXES=('/proxies/api','/jars/','/keeper/','/models/block','/create-key','/delete-key','/clear-logs','/debug-logs/data','/debug/raw-models','/control/api','/screenshots','/browser-view','/vnc','/refresh-tokens','/oxalpha/')
+_V3_CONTROL_PREFIXES=('/proxies/api','/jars/','/keeper/','/models/block','/create-key','/delete-key','/clear-logs','/debug-logs/data','/errors','/debug/raw-models','/control/api','/screenshots','/browser-view','/vnc','/refresh-tokens','/oxalpha/')
 _V3_PUBLIC_PATHS={'/login','/logout','/healthz','/v1/models','/models','/v1/chat/completions','/chat/completions','/v1/messages','/messages'}
 @app.middleware('http')
 async def v3_control_plane_middleware(request: Request,call_next):
@@ -8582,6 +9431,34 @@ async def jars_upload_view(request: Request):
     if g:
         return g
     return jars_upload_page()
+
+
+@app.get("/errors", response_class=HTMLResponse)
+async def errors_view(request: Request):
+    g = await _page_guard(request)
+    if g:
+        return g
+    return errors_page()
+
+
+@app.get("/errors/api/{error_id}")
+async def errors_lookup_api(request: Request, error_id: str):
+    if not await _current_session(request):
+        raise HTTPException(status_code=401, detail="dashboard session required")
+    row = _find_private_error(error_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Error ID not found")
+    return JSONResponse({"ok": True, "error": row}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/errors/api")
+async def errors_recent_api(request: Request, limit: int = 100):
+    if not await _current_session(request):
+        raise HTTPException(status_code=401, detail="dashboard session required")
+    return JSONResponse(
+        {"ok": True, "errors": _recent_private_errors(limit)},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/logs", response_class=HTMLResponse)
@@ -8906,8 +9783,22 @@ async def openai_stream(body: dict, keyinfo: dict):
                     yield chunk({"reasoning_content": payload})
                 elif kind == "error":
                     outcome = "partial-upstream-error" if content_chunks > 0 else "upstream-error"
+                    status_code = _status_from_internal_error(payload, 502)
+                    error_id, public_message = _openai_public_error(
+                        status_code,
+                        payload,
+                        source="openai_stream",
+                        context={
+                            "model": model,
+                            "chat_id": str(chat_id)[:120],
+                            "partial_chars": len(acc),
+                            "content_chunks": content_chunks,
+                        },
+                    )
                     yield _sse({"error": {
-                        "message": payload,
+                        "message": public_message,
+                        "type": "api_error",
+                        "code": error_id,
                         "partial_response_preserved": bool(content_chunks > 0),
                         "partial_chars": len(acc),
                     }})
@@ -8944,7 +9835,23 @@ async def openai_stream(body: dict, keyinfo: dict):
             terminal_sent = True
         except Exception as e:
             outcome = "bridge-exception"
-            yield _sse({"error": {"message": f"{type(e).__name__}: {e}"}})
+            error_id, public_message = _openai_public_error(
+                500,
+                f"{type(e).__name__}: {e}",
+                source="openai_stream_exception",
+                context={
+                    "model": model,
+                    "chat_id": str(chat_id)[:120],
+                    "partial_chars": len(acc),
+                    "content_chunks": content_chunks,
+                },
+                exception_type=type(e).__name__,
+            )
+            yield _sse({"error": {
+                "message": public_message,
+                "type": "api_error",
+                "code": error_id,
+            }})
             yield chunk({}, finish="stop")
             yield "data: [DONE]\n\n"
             terminal_sent = True
@@ -9043,10 +9950,16 @@ async def chat_completions(request: Request):
     return await openai_stream(body, keyinfo)
 
 
-def _anthropic_error(status: int, message: str, error_type: str = "invalid_request_error"):
-    return JSONResponse({"type": "error", "error": {
-        "type": error_type, "message": message,
-    }}, status_code=status)
+def _anthropic_error(status: int, message: str, error_type: str = "invalid_request_error",
+                     *, source: str = "anthropic_local_error"):
+    error_id, public_message = _anthropic_public_error(
+        status, message, source=source
+    )
+    return JSONResponse({
+        "type": "error",
+        "error": {"type": error_type, "message": public_message},
+        "error_id": error_id,
+    }, status_code=status, headers={"X-Bridgena-Error-ID": error_id, "Cache-Control": "no-store"})
 
 
 async def _native_anthropic_request(request: Request, endpoint: str):
@@ -9057,11 +9970,11 @@ async def _native_anthropic_request(request: Request, endpoint: str):
     """
     provider_key = os.environ.get("BRIDGENA_ANTHROPIC_API_KEY", "").strip()
     if not provider_key:
-        return _anthropic_error(503, "Native Anthropic routing requires BRIDGENA_ANTHROPIC_API_KEY.", "api_error")
+        return _anthropic_error(503, "Native Anthropic routing requires BRIDGENA_ANTHROPIC_API_KEY.", "api_error", source="native_anthropic_config")
     try:
         import httpx
     except ImportError:
-        return _anthropic_error(503, "Native Anthropic routing requires the httpx package.", "api_error")
+        return _anthropic_error(503, "Native Anthropic routing requires the httpx package.", "api_error", source="native_anthropic_dependency")
     headers = {
         "x-api-key": provider_key,
         "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
@@ -9090,10 +10003,18 @@ async def _native_anthropic_request(request: Request, endpoint: str):
             try:
                 async for chunk in response.aiter_bytes():
                     yield chunk
-            except httpx.HTTPError:
-                yield _anthropic_sse("error", {"type": "error", "error": {
-                    "type": "api_error", "message": "Provider stream interrupted; no automatic replay attempted.",
-                }}).encode("utf-8")
+            except httpx.HTTPError as exc:
+                error_id, public_message = _anthropic_public_error(
+                    502,
+                    f"Provider stream interrupted: {type(exc).__name__}: {exc}",
+                    source="native_anthropic_stream",
+                    exception_type=type(exc).__name__,
+                )
+                yield _anthropic_sse("error", {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": public_message},
+                    "error_id": error_id,
+                }).encode("utf-8")
             finally:
                 await response.aclose()
                 await client.aclose()
@@ -9104,7 +10025,7 @@ async def _native_anthropic_request(request: Request, endpoint: str):
         handed_off = True
         return stream_response
     except httpx.HTTPError:
-        return _anthropic_error(502, "Provider connection failed; no automatic replay attempted.", "api_error")
+        return _anthropic_error(502, "Provider connection failed; no automatic replay attempted.", "api_error", source="native_anthropic_connection")
     finally:
         if not locals().get("handed_off", False):
             if response is not None:
@@ -9201,9 +10122,23 @@ async def anthropic_messages(request: Request):
                                                                   "delta": {"type": "text_delta", "text": payload}})
                 elif kind == "error":
                     outcome = "upstream-error"
-                    yield _anthropic_sse("error", {"type": "error", "error": {
-                        "type": "api_error", "message": payload,
-                    }})
+                    status_code = _status_from_internal_error(payload, 502)
+                    error_id, public_message = _anthropic_public_error(
+                        status_code,
+                        payload,
+                        source="anthropic_stream",
+                        context={
+                            "model": model,
+                            "chat_id": str(chat_id)[:120],
+                            "partial_chars": len(acc),
+                            "chunks": chunks,
+                        },
+                    )
+                    yield _anthropic_sse("error", {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": public_message},
+                        "error_id": error_id,
+                    })
                     # Some desktop clients wait for the ordinary terminal
                     # sequence even after receiving an error event.
                     yield _anthropic_sse("content_block_stop", {
@@ -9234,9 +10169,23 @@ async def anthropic_messages(request: Request):
             terminal_sent = True
         except Exception as e:
             outcome = "bridge-exception"
-            yield _anthropic_sse("error", {"type": "error", "error": {
-                "type": "api_error", "message": f"{type(e).__name__}: {e}",
-            }})
+            error_id, public_message = _anthropic_public_error(
+                500,
+                f"{type(e).__name__}: {e}",
+                source="anthropic_stream_exception",
+                context={
+                    "model": model,
+                    "chat_id": str(chat_id)[:120],
+                    "partial_chars": len(acc),
+                    "chunks": chunks,
+                },
+                exception_type=type(e).__name__,
+            )
+            yield _anthropic_sse("error", {
+                "type": "error",
+                "error": {"type": "api_error", "message": public_message},
+                "error_id": error_id,
+            })
         finally:
             _release_api_request(body, keyinfo, prompt)
             _record_reliability_outcome(
@@ -9445,7 +10394,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.5",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.7",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -10265,6 +11214,8 @@ async def _lifespan(app):
     log("INFO", f"Pre-dispatch transport guard · HEAD probe every request {'ON' if TRANSPORT_PROBE_EVERY_REQUEST else 'OFF'} · timeout {TRANSPORT_PROBE_TIMEOUT_MS}ms · recovery wait {PREDISPATCH_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Account failover · max {ACCOUNT_FAILOVER_MAX} alternate keeper(s) · thread handoff ON for pre-generation account/session failures · 429+verification+partial-stream excluded")
     log("INFO", f"Stream completion policy · first assistant output <= {FIRST_ASSISTANT_RESPONSE_SEC:.1f}s · provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} · partial UI preservation ON")
+    log("INFO", f"Arena UI stream recovery · {'ON' if ARENA_UI_STREAM_RECOVERY else 'OFF'} · history/search + session-id matching · timeout {ARENA_UI_RECOVERY_TIMEOUT_SEC:.0f}s · no prompt replay")
+    log("INFO", f"Customer error privacy · opaque friendly messages ON · private registry {_ERROR_EVENTS_FILE} · Errors tab enabled")
     log("INFO", f"Reliability SLO · rolling window {_reliability_window.maxlen} · target {_RELIABILITY_TARGET*100:.0f}%")
     log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
     log("INFO", "Stream decoder · Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini · snapshot de-dup ON")
