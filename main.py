@@ -263,7 +263,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.0-dashboard-proxy-toast-redesign")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.1-proxy-ingest-toast-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -4981,6 +4981,56 @@ def sweep_all() -> dict:
 
 
 # ---------- ingest / prune / revive ----------
+def _parse_proxy_line_loose(raw: str) -> Optional[str]:
+    """Parse one proxy line without requiring credentials.
+
+    Accepted unauthenticated forms include:
+      1.2.3.4:8080
+      example.net:3128
+      socks5://1.2.3.4:1080
+      socks4://1.2.3.4:1080
+      http://1.2.3.4:8080
+      1.2.3.4:1080:socks5
+      1.2.3.4 8080
+    Authenticated formats continue to be supported by _normalize_proxy().
+    """
+    if raw is None:
+        return None
+    line = str(raw).strip().lstrip("\ufeff").strip().strip('"\'')
+    if not line or line.startswith("#") or line.startswith("//"):
+        return None
+
+    # First use the canonical parser; it already handles full URLs,
+    # user:pass@host:port and host:port:user:pass.
+    normal = _normalize_proxy(line)
+    if normal:
+        return normal
+
+    # Whitespace-separated provider export: "host port [scheme]".
+    fields = line.split()
+    if len(fields) >= 2 and fields[1].isdigit():
+        host, port = fields[0], fields[1]
+        scheme = fields[2].lower() if len(fields) >= 3 else "http"
+        if scheme in ("socks5h", "socks5", "socks4", "socks4a", "http", "https"):
+            return _normalize_proxy(f"{scheme}://{host}:{port}")
+
+    # Unauthenticated "host:port:scheme".
+    parts = line.rsplit(":", 2)
+    if len(parts) == 3 and parts[1].isdigit() and parts[2].lower() in (
+        "socks5h", "socks5", "socks4", "socks4a", "http", "https"
+    ):
+        return _normalize_proxy(f"{parts[2].lower()}://{parts[0]}:{parts[1]}")
+
+    # Very explicit bare host:port fallback, including hostnames.
+    m = re.fullmatch(r"(\[[0-9a-fA-F:]+\]|[^:\s]+):(\d{1,5})", line)
+    if m:
+        host, port = m.group(1), int(m.group(2))
+        if 0 < port <= 65535:
+            return f"http://{host}:{port}"
+
+    return None
+
+
 def parse_upload(text: str) -> Tuple[List[str], int, int]:
     """Accepts plain lines AND headered CSV exports (R10 rules):
     'Host,Port,Username,Password[,Type]' rows become scheme://u:p@host:port."""
@@ -5008,7 +5058,7 @@ def parse_upload(text: str) -> Tuple[List[str], int, int]:
             pw = col("password", "pass", "proxy password")
             typ = (col("type", "scheme", "proxy type", default="http") or "http").lower()
             if not (host and str(port).isdigit()):
-                alt = _normalize_proxy(",".join(r)) if r and ":" in r[0] and not host else None
+                alt = _parse_proxy_line_loose(",".join(r)) if r and ":" in r[0] and not host else None
                 if alt:
                     out.append(alt); continue
                 skipped += 1; continue
@@ -5022,7 +5072,7 @@ def parse_upload(text: str) -> Tuple[List[str], int, int]:
             lines = [l for l in text.replace("\r", "").splitlines() if l.strip() and not l.strip().startswith("#")]
     for l in lines if not looks_csv or not out else []:
         raw = l.strip()
-        n = _normalize_proxy(raw)
+        n = _parse_proxy_line_loose(raw)
         if not n and "://" not in raw and raw.count(":") >= 3 and "@" not in raw:
             parts = raw.split(":")
             if len(parts) >= 4 and parts[1].isdigit():
@@ -5054,7 +5104,13 @@ def upload_pool(text: str) -> dict:
     merged = cur + add
     pool_save(merged)
     log("OK", f"proxy manager: +{len(add)} from upload/paste ({len(new)} parsed, {skipped} skipped, {hinted} with list hints)")
-    return {"added": len(add), "parsed": len(new), "skipped": skipped, "hinted": hinted}
+    return {
+        "added": len(add),
+        "parsed": len(new),
+        "skipped": skipped,
+        "duplicates": max(0, len(new) - len(add)),
+        "hinted": hinted,
+    }
 
 
 def prune_bad() -> int:
@@ -6956,8 +7012,8 @@ def api_key_created_page(name: str, raw_key: str) -> str:
 
 def pool_page(rows: list, stats: dict) -> str:
     body=''.join(f"<tr><td class='mono'>{esc(r['display'])}</td><td class='muted'>{esc(r.get('scheme',''))}</td><td>{_verdict_pill(r['verdict'])}</td><td class='muted' style='max-width:360px'>{esc(r['why']) or '—'}</td><td>{esc(r['latency']) if r['latency'] else '<span class=muted>—</span>'}{'ms' if r['latency'] else ''}</td><td><form method='post' action='/proxies/api/remove-one'><input type='hidden' name='key' value='{esc(r['key'])}'><button class='btn sm ghost'>Remove</button></form></td></tr>" for r in rows) or "<tr><td colspan='6' class='empty'>No proxies configured yet.</td></tr>"
-    content=f'''<div class="pagehead"><div><div class="eyebrow">Network</div><h1>Proxy pool</h1><p>Manage configured upstream routes and see current transport health.</p></div><div class="actionbar"><span class="badge-num">{stats['total']} configured</span><span class="pill ok">{stats['alive']} alive</span><span class="pill warn">{stats['flagged']} restricted</span><button class="btn" onclick="scan()">Scan pool</button></div></div><div class="proxy-add"><section class="card"><div class="row"><div><div class="eyebrow">Inventory</div><h3 style="margin:2px 0 14px">Configured exits</h3></div><span class="spacer"></span><input id="proxyFilter" placeholder="Filter exits…" style="width:220px" oninput="filterRows()"></div><div class="table-wrap"><table id="proxyTable"><thead><tr><th>Exit</th><th>Scheme</th><th>State</th><th>Diagnosis</th><th>RTT</th><th></th></tr></thead><tbody>{body}</tbody></table></div></section><aside class="card"><div class="eyebrow">Add capacity</div><h3 style="margin:2px 0 14px">Add proxies</h3><form id="proxyAddForm" data-native="1"><div class="dropbox"><label for="proxyText" style="margin-top:0">Paste proxies</label><textarea id="proxyText" name="text" placeholder="socks5://user:pass@host:port&#10;host:port:user:pass&#10;&#10;Or CSV: Host,Port,Username,Password,Type"></textarea><div class="helper">Accepts one proxy per line, provider host:port:user:pass exports, full URLs, or headered CSV.</div></div><label for="proxyFile">Or upload a text / CSV file</label><input id="proxyFile" type="file" accept=".txt,.csv,text/plain,text/csv"><div class="actionbar" style="margin-top:12px"><button class="btn primary" type="submit">Add proxies</button><button class="btn ghost" type="button" onclick="clearProxyForm()">Clear</button></div></form><div style="border-top:1px solid var(--line);margin:18px -17px 14px"></div><div class="eyebrow">Maintenance</div><h3 style="margin:2px 0 14px">Pool actions</h3><div class="actionbar"><button class="btn sm" onclick="poolAction('/proxies/api/prune','Pruning unhealthy exits…')">Prune dead</button><button class="btn sm ghost" onclick="poolAction('/proxies/api/revive','Reviving saved exits…')">Revive all</button><button class="btn sm danger" onclick="deleteAll()">Delete all</button></div></aside></div>'''
-    js=r'''function filterRows(){const q=document.getElementById('proxyFilter').value.toLowerCase();document.querySelectorAll('#proxyTable tbody tr').forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?'':'none')}function clearProxyForm(){document.getElementById('proxyText').value='';document.getElementById('proxyFile').value=''}document.getElementById('proxyAddForm').addEventListener('submit',async e=>{e.preventDefault();const text=document.getElementById('proxyText').value,file=document.getElementById('proxyFile').files[0];if(!text.trim()&&!file){bgnToast('Paste proxies or choose a file first','warn');return}const t=bgnToast('Parsing and merging proxies…','loading');try{const fd=new FormData();fd.append('text',text);if(file)fd.append('file',file);const r=await fetch('/proxies/api/upload',{method:'POST',body:fd,credentials:'same-origin'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Upload failed'));bgnToastUpdate(t,'Added '+d.added+' · parsed '+d.parsed+' · skipped '+d.skipped,d.added>0?'ok':'warn',d.added>0?'Proxies added':'Nothing new added');if(d.added>0)setTimeout(()=>location.reload(),650)}catch(err){bgnToastUpdate(t,err.message||String(err),'error')}});async function scan(){const t=bgnToast('Scanning the proxy pool…','loading');try{const r=await fetch('/proxies/api/check',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Scan failed'));if(d.running){bgnToastUpdate(t,'A scan is already running','warn');return}bgnToastUpdate(t,d.alive+' of '+d.total+' exits are healthy','ok','Scan complete');setTimeout(()=>location.reload(),650)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function poolAction(url,msg){const t=bgnToast(msg,'loading');try{const r=await fetch(url,{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Action failed'));bgnToastUpdate(t,bgnResultMessage(d),'ok');setTimeout(()=>location.reload(),650)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function deleteAll(){if(!confirm('Delete every active proxy? A recovery snapshot will be retained.'))return;const t=bgnToast('Deleting active proxies…','loading');try{const r=await fetch('/proxies/api/delete-all',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Delete failed'));bgnToastUpdate(t,'Deleted '+d.removed+' proxies','ok');setTimeout(()=>location.reload(),650)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}'''
+    content=f'''<div class="pagehead"><div><div class="eyebrow">Network</div><h1>Proxy pool</h1><p>Manage configured upstream routes and see current transport health.</p></div><div class="actionbar"><span class="badge-num">{stats['total']} configured</span><span class="pill ok">{stats['alive']} alive</span><span class="pill warn">{stats['flagged']} restricted</span><button class="btn" onclick="scan()">Scan pool</button></div></div><div class="proxy-add"><section class="card"><div class="row"><div><div class="eyebrow">Inventory</div><h3 style="margin:2px 0 14px">Configured exits</h3></div><span class="spacer"></span><input id="proxyFilter" placeholder="Filter exits…" style="width:220px" oninput="filterRows()"></div><div class="table-wrap"><table id="proxyTable"><thead><tr><th>Exit</th><th>Scheme</th><th>State</th><th>Diagnosis</th><th>RTT</th><th></th></tr></thead><tbody>{body}</tbody></table></div></section><aside class="card"><div class="eyebrow">Add capacity</div><h3 style="margin:2px 0 14px">Add proxies</h3><form id="proxyAddForm" data-native="1"><div class="dropbox"><label for="proxyText" style="margin-top:0">Paste proxies</label><textarea id="proxyText" name="text" placeholder="1.2.3.4:8080&#10;socks5://1.2.3.4:1080&#10;host:port:user:pass&#10;&#10;Or CSV: Host,Port,Username,Password,Type"></textarea><div class="helper">Credentials are optional. Accepts host:port, scheme://host:port, host:port:user:pass, full URLs, whitespace exports, or headered CSV.</div></div><label for="proxyFile">Or upload a text / CSV file</label><input id="proxyFile" type="file" accept=".txt,.csv,text/plain,text/csv"><div class="actionbar" style="margin-top:12px"><button class="btn primary" type="submit">Add proxies</button><button class="btn ghost" type="button" onclick="clearProxyForm()">Clear</button></div></form><div style="border-top:1px solid var(--line);margin:18px -17px 14px"></div><div class="eyebrow">Maintenance</div><h3 style="margin:2px 0 14px">Pool actions</h3><div class="actionbar"><button class="btn sm" onclick="poolAction('/proxies/api/prune','Pruning unhealthy exits…')">Prune dead</button><button class="btn sm ghost" onclick="poolAction('/proxies/api/revive','Reviving saved exits…')">Revive all</button><button class="btn sm danger" onclick="deleteAll()">Delete all</button></div></aside></div>'''
+    js=r'''function filterRows(){const q=document.getElementById('proxyFilter').value.toLowerCase();document.querySelectorAll('#proxyTable tbody tr').forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?'':'none')}function clearProxyForm(){document.getElementById('proxyText').value='';document.getElementById('proxyFile').value=''}document.getElementById('proxyAddForm').addEventListener('submit',async e=>{e.preventDefault();const text=document.getElementById('proxyText').value,file=document.getElementById('proxyFile').files[0];if(!text.trim()&&!file){bgnToast('Paste proxies or choose a file first','warn');return}const t=bgnToast('Parsing and merging proxies…','loading');try{const fd=new FormData();fd.append('text',text);if(file)fd.append('file',file);const r=await fetch('/proxies/api/upload',{method:'POST',body:fd,credentials:'same-origin'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Upload failed'));bgnToastUpdate(t,'Added '+d.added+' · parsed '+d.parsed+' · skipped '+d.skipped,d.added>0?'ok':'warn',d.added>0?'Proxies added':'Nothing new added');if(d.added>0)bgnReload(message,'ok','Proxies added',1200)}catch(err){bgnToastUpdate(t,err.message||String(err),'error')}});async function scan(){const t=bgnToast('Scanning the proxy pool…','loading');try{const r=await fetch('/proxies/api/check',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Scan failed'));if(d.running){bgnToastUpdate(t,'A scan is already running','warn');return}bgnToastUpdate(t,d.alive+' of '+d.total+' exits are healthy','ok','Scan complete');bgnReload(d.alive+' of '+d.total+' exits are healthy','ok','Scan complete',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function poolAction(url,msg){const t=bgnToast(msg,'loading');try{const r=await fetch(url,{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Action failed'));bgnToastUpdate(t,bgnResultMessage(d),'ok');bgnReload(bgnResultMessage(d),'ok','Done',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function deleteAll(){if(!confirm('Delete every active proxy? A recovery snapshot will be retained.'))return;const t=bgnToast('Deleting active proxies…','loading');try{const r=await fetch('/proxies/api/delete-all',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Delete failed'));bgnToastUpdate(t,'Deleted '+d.removed+' proxies','ok');bgnReload('Deleted '+d.removed+' proxies','ok','Pool cleared',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}'''
     return page('Network', content, 'pool', js)
 
 def jars_page(jars: list) -> str:
@@ -7184,10 +7240,13 @@ V3_CSS = r'''
 .toast-stack{position:fixed;z-index:5000;right:20px;bottom:20px;display:flex;flex-direction:column;gap:10px;width:min(390px,calc(100vw - 28px));pointer-events:none}.toast-stack .toast{position:relative;left:auto;bottom:auto;transform:translateY(10px) scale(.985);opacity:0;pointer-events:auto;background:color-mix(in srgb,var(--surface) 96%,transparent);color:var(--text);border:1px solid var(--line2);border-radius:12px;padding:12px 14px;box-shadow:0 18px 50px rgba(0,0,0,.28);font-size:12.5px;transition:.2s;display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:10px;align-items:start;backdrop-filter:blur(18px)}.toast-stack .toast.show{opacity:1;transform:none}.toast-dot{width:8px;height:8px;border-radius:50%;margin-top:5px;background:var(--info)}.toast.ok .toast-dot{background:var(--ok)}.toast.warn .toast-dot{background:var(--warn)}.toast.error .toast-dot{background:var(--bad)}.toast.loading .toast-dot{animation:bgnpulse .8s infinite alternate}@keyframes bgnpulse{to{opacity:.25;transform:scale(.75)}}.toast-title{font-weight:650;line-height:1.25}.toast-msg{color:var(--muted);margin-top:2px;line-height:1.4;word-break:break-word}.toast-close{border:0;background:transparent;color:var(--dim);cursor:pointer;padding:0 2px;font-size:15px}.eyebrow{font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:var(--dim);font-weight:700}.hero{border:1px solid var(--line);border-radius:16px;padding:24px;background:linear-gradient(145deg,color-mix(in srgb,var(--surface2) 92%,transparent),var(--surface));position:relative;overflow:hidden}.hero:after{content:"";position:absolute;width:360px;height:360px;border-radius:50%;right:-180px;top:-220px;background:radial-gradient(circle,color-mix(in srgb,var(--info) 13%,transparent),transparent 68%);pointer-events:none}.hero h1{font-size:32px;letter-spacing:-.05em;margin:3px 0 8px;line-height:1.05}.hero p{max-width:700px;color:var(--muted);margin:0}.hero-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:20px}.status-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:12px}.status-card{border:1px solid var(--line);background:var(--surface);border-radius:12px;padding:14px}.status-card .label{font-size:11px;color:var(--muted);display:flex;justify-content:space-between;gap:12px}.status-card .num{font-size:27px;font-weight:700;letter-spacing:-.04em;margin-top:8px}.status-card .meta{font-size:10.5px;color:var(--dim);margin-top:4px}.section-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(300px,.55fr);gap:12px;margin-top:12px}.quick-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.quick{display:block;border:1px solid var(--line);border-radius:10px;padding:13px;background:var(--surface2);transition:.16s}.quick:hover{border-color:var(--line2);background:var(--surface3);transform:translateY(-1px)}.quick b{display:block;font-size:12px}.quick span{display:block;color:var(--dim);font-size:10.5px;margin-top:3px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px}.table-wrap table{min-width:680px}.empty{padding:30px;text-align:center;color:var(--muted)}.proxy-add{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:12px}.dropbox{border:1px dashed var(--line2);border-radius:12px;padding:14px;background:var(--surface2)}.dropbox textarea{min-height:220px;background:var(--surface)}.helper{font-size:10.5px;color:var(--dim);margin-top:7px}.actionbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.badge-num{font:650 10px var(--mono);padding:3px 7px;border-radius:999px;background:var(--surface3);color:var(--muted)}@media(max-width:1000px){.status-strip{grid-template-columns:repeat(2,1fr)}.section-grid,.proxy-add{grid-template-columns:1fr}}@media(max-width:640px){.status-strip{grid-template-columns:1fr}.hero{padding:19px}.hero h1{font-size:27px}.quick-grid{grid-template-columns:1fr}.toast-stack{right:14px;bottom:14px}}
 '''
 V3_THEME_JS = r'''function bgnToggleTheme(){const r=document.documentElement,n=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=n;localStorage.setItem('bgn.theme',n)}document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||'dark';
-function bgnToast(message,type='ok',title=''){const stack=document.getElementById('toast-stack')||(()=>{const s=document.createElement('div');s.id='toast-stack';s.className='toast-stack';document.body.appendChild(s);return s})();const t=document.createElement('div'),msg=String(message??'').trim()||'Done',label=title||({ok:'Done',error:'Something went wrong',warn:'Notice',loading:'Working…'}[type]||'Notice');t.className='toast '+type;t.innerHTML='<i class="toast-dot"></i><div><div class="toast-title"></div><div class="toast-msg"></div></div><button class="toast-close" aria-label="Dismiss">×</button>';t.querySelector('.toast-title').textContent=label;t.querySelector('.toast-msg').textContent=msg;t.querySelector('.toast-close').onclick=()=>{t.classList.remove('show');setTimeout(()=>t.remove(),180)};stack.appendChild(t);requestAnimationFrame(()=>t.classList.add('show'));if(type!=='loading')setTimeout(()=>{if(t.isConnected){t.classList.remove('show');setTimeout(()=>t.remove(),180)}},3600);return t}
-function toast(m,type='ok'){return bgnToast(m,type)}function bgnToastUpdate(t,message,type='ok',title=''){if(!t||!t.isConnected)return bgnToast(message,type,title);t.className='toast '+type;t.querySelector('.toast-title').textContent=title||({ok:'Done',error:'Something went wrong',warn:'Notice'}[type]||'Done');t.querySelector('.toast-msg').textContent=String(message||'Done');if(type!=='loading')setTimeout(()=>{if(t.isConnected){t.classList.remove('show');setTimeout(()=>t.remove(),180)}},3000);return t}
+function bgnToast(message,type='ok',title=''){const stack=document.getElementById('toast-stack')||(()=>{const s=document.createElement('div');s.id='toast-stack';s.className='toast-stack';document.body.appendChild(s);return s})();const t=document.createElement('div'),msg=String(message??'').trim()||'Done',label=title||({ok:'Done',error:'Something went wrong',warn:'Notice',loading:'Working…'}[type]||'Notice');t.className='toast '+type;t.innerHTML='<i class="toast-dot"></i><div><div class="toast-title"></div><div class="toast-msg"></div></div><button class="toast-close" aria-label="Dismiss">×</button>';t.querySelector('.toast-title').textContent=label;t.querySelector('.toast-msg').textContent=msg;t.querySelector('.toast-close').onclick=()=>{t.classList.remove('show');setTimeout(()=>t.remove(),180)};stack.appendChild(t);requestAnimationFrame(()=>t.classList.add('show'));if(type!=='loading'){const ttl=type==='error'?10000:type==='warn'?8500:7000;setTimeout(()=>{if(t.isConnected){t.classList.remove('show');setTimeout(()=>t.remove(),180)}},ttl)}return t}
+function toast(m,type='ok'){return bgnToast(m,type)}function bgnToastUpdate(t,message,type='ok',title=''){if(!t||!t.isConnected)return bgnToast(message,type,title);t.className='toast '+type;t.querySelector('.toast-title').textContent=title||({ok:'Done',error:'Something went wrong',warn:'Notice'}[type]||'Done');t.querySelector('.toast-msg').textContent=String(message||'Done');if(type!=='loading'){const ttl=type==='error'?10000:type==='warn'?8500:7000;setTimeout(()=>{if(t.isConnected){t.classList.remove('show');setTimeout(()=>t.remove(),180)}},ttl)}return t}
+function bgnFlash(message,type='ok',title=''){try{sessionStorage.setItem('bgn.flash',JSON.stringify({message:String(message||''),type,title,at:Date.now()}))}catch(e){}}
+function bgnReload(message,type='ok',title='',delay=900){bgnFlash(message,type,title);setTimeout(()=>location.reload(),delay)}
+document.addEventListener('DOMContentLoaded',()=>{try{const raw=sessionStorage.getItem('bgn.flash');if(!raw)return;sessionStorage.removeItem('bgn.flash');const f=JSON.parse(raw);if(Date.now()-(f.at||0)<15000)bgnToast(f.message,f.type||'ok',f.title||'')}catch(e){}});
 async function bgnJson(r){const ct=r.headers.get('content-type')||'';if(ct.includes('application/json'))return await r.json();return {message:(await r.text()).trim()}}function bgnResultMessage(d,fallback='Saved'){if(!d)return fallback;if(d.detail)return typeof d.detail==='string'?d.detail:JSON.stringify(d.detail);if(d.message)return d.message;const parts=[];for(const [k,v] of Object.entries(d)){if(v===null||v===undefined||typeof v==='object')continue;parts.push(k.replaceAll('_',' ')+' '+v)}return parts.join(' · ')||fallback}
-document.addEventListener('submit',async e=>{const f=e.target;if(!(f instanceof HTMLFormElement)||f.dataset.native==='1'||(f.method||'get').toLowerCase()==='get')return;if(!f.action.startsWith(location.origin))return;e.preventDefault();const submit=e.submitter;if(submit)submit.disabled=true;const pending=bgnToast('Sending request…','loading');try{const r=await fetch(f.action,{method:(f.method||'POST').toUpperCase(),body:new FormData(f),credentials:'same-origin'});if(!r.ok){const d=await bgnJson(r);throw new Error(bgnResultMessage(d,'HTTP '+r.status))}if(r.redirected){bgnToastUpdate(pending,'Changes saved','ok');setTimeout(()=>{location.href=r.url},450);return}const d=await bgnJson(r);bgnToastUpdate(pending,bgnResultMessage(d),'ok');if(f.dataset.reload!=='0')setTimeout(()=>location.reload(),650)}catch(err){bgnToastUpdate(pending,err.message||String(err),'error')}finally{if(submit)submit.disabled=false}});window.addEventListener('unhandledrejection',e=>{if(e.reason&&e.reason.message)bgnToast(e.reason.message,'error')});'''
+document.addEventListener('submit',async e=>{const f=e.target;if(!(f instanceof HTMLFormElement)||f.dataset.native==='1'||(f.method||'get').toLowerCase()==='get')return;if(!f.action.startsWith(location.origin))return;e.preventDefault();const submit=e.submitter;if(submit)submit.disabled=true;const pending=bgnToast('Sending request…','loading');try{const r=await fetch(f.action,{method:(f.method||'POST').toUpperCase(),body:new FormData(f),credentials:'same-origin'});if(!r.ok){const d=await bgnJson(r);throw new Error(bgnResultMessage(d,'HTTP '+r.status))}if(r.redirected){bgnToastUpdate(pending,'Changes saved','ok');bgnFlash('Changes saved','ok');setTimeout(()=>{location.href=r.url},900);return}const d=await bgnJson(r);bgnToastUpdate(pending,bgnResultMessage(d),'ok');if(f.dataset.reload!=='0')bgnReload(bgnResultMessage(d),'ok','',900)}catch(err){bgnToastUpdate(pending,err.message||String(err),'error')}finally{if(submit)submit.disabled=false}});window.addEventListener('unhandledrejection',e=>{if(e.reason&&e.reason.message)bgnToast(e.reason.message,'error')});'''
 
 def page(title: str, content: str, active: str = "", raw_js: str = "", wide: bool = False) -> str:
     nav=[('dash','/dashboard','Overview'),('chat','/chat','Chat'),('browser','/browser-view','Browser'),('pool','/pool','Network'),('jars','/jars','Accounts'),('models','/models-page','Models'),('keys','/api-keys','API keys'),('logs','/logs','Logs')]
@@ -8173,7 +8232,7 @@ async def proxies_upload(request: Request):
     result = upload_pool(payload)
     result["total"] = len(_pool_lines())
     if result["parsed"] == 0:
-        raise HTTPException(status_code=400, detail="No valid proxies were parsed. Use URL, host:port, host:port:user:pass, or headered CSV format.")
+        raise HTTPException(status_code=400, detail="No valid proxies were parsed. Credentials are optional: use host:port, scheme://host:port, host:port:user:pass, or headered CSV.")
     return JSONResponse(result)
 
 @app.post("/proxies/api/prune")
@@ -8286,7 +8345,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.0",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.1",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
