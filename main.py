@@ -7,6 +7,7 @@
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote, urlparse, quote, quote_plus
 from io import BytesIO
@@ -267,7 +268,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.0-keeper-recovery-jars-upload")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.1-reliability-slo-transport-recovery")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1851,6 +1852,35 @@ _keeper_recovery_attempts: Dict[str, int] = {}
 _keeper_recovery_restart_after = max(2, min(6, int(os.environ.get("BRIDGENA_KEEPER_RECOVERY_RESTART_AFTER", "2"))))
 _keeper_recovery_retry_sec = max(2.0, min(30.0, float(os.environ.get("BRIDGENA_KEEPER_RECOVERY_RETRY_SEC", "5"))))
 _keeper_recovery_gate = asyncio.Semaphore(max(1, min(4, int(os.environ.get("BRIDGENA_KEEPER_RECOVERY_PARALLEL", "3")))))
+TRANSPORT_FAILURE_QUARANTINE_SEC = max(8.0, min(120.0, float(os.environ.get("BRIDGENA_TRANSPORT_FAILURE_QUARANTINE_SEC", "30"))))
+BOUND_KEEPER_RECOVERY_WAIT_SEC = max(2.0, min(30.0, float(os.environ.get("BRIDGENA_BOUND_KEEPER_RECOVERY_WAIT_SEC", "14"))))
+_transport_recovery_tasks: Dict[str, asyncio.Task] = {}
+_reliability_window = deque(maxlen=max(20, min(500, int(os.environ.get("BRIDGENA_RELIABILITY_WINDOW", "100")))))
+_reliability_guard = threading.Lock()
+_RELIABILITY_TARGET = max(0.1, min(1.0, float(os.environ.get("BRIDGENA_RELIABILITY_TARGET", "0.70"))))
+
+def _record_reliability_outcome(success: bool, reason: str = "") -> dict:
+    with _reliability_guard:
+        _reliability_window.append((bool(success), str(reason or "")))
+        total = len(_reliability_window)
+        passed = sum(1 for ok, _ in _reliability_window if ok)
+    rate = (passed / total) if total else 0.0
+    if total >= 5:
+        level = "OK" if rate >= _RELIABILITY_TARGET else "WARN"
+        log(level, f"Reliability SLO · last {total} request(s) · success {rate*100:.1f}% · "
+                   f"target {_RELIABILITY_TARGET*100:.0f}% · {'PASS' if rate >= _RELIABILITY_TARGET else 'BELOW TARGET'}")
+    return {"sample": total, "successes": passed, "success_rate": round(rate, 4), "target": _RELIABILITY_TARGET}
+
+def _reliability_snapshot() -> dict:
+    with _reliability_guard:
+        total = len(_reliability_window)
+        passed = sum(1 for ok, _ in _reliability_window if ok)
+    rate = (passed / total) if total else None
+    return {"sample": total, "successes": passed,
+            "success_rate": (round(rate, 4) if rate is not None else None),
+            "target": _RELIABILITY_TARGET,
+            "target_met": (bool(rate is not None and rate >= _RELIABILITY_TARGET))}
+
 
 def _api_keeper_verified(sid: Optional[str]) -> bool:
     if not sid:
@@ -3085,9 +3115,17 @@ async def refresh_model_catalog() -> dict:
     return {"ok": False, "models": get_models(), "reason": reason}
 
 class BridgeHTTPError(Exception):
-    def __init__(self, status: int, body: str):
-        self.status, self.body = status, body
-        super().__init__(f"HTTP {status}: {body[:200]}")
+    def __init__(self, status: int, body: str, *, frame_count: int = 0,
+                 response_started: bool = False, stream_error: bool = False,
+                 finish_seen: bool = False, stop_reason: str = ""):
+        self.status = int(status or 0)
+        self.body = str(body or "")
+        self.frame_count = int(frame_count or 0)
+        self.response_started = bool(response_started)
+        self.stream_error = bool(stream_error)
+        self.finish_seen = bool(finish_seen)
+        self.stop_reason = str(stop_reason or "")
+        super().__init__(f"HTTP {self.status}: {self.body[:200]}")
 
 class ConversationLost(Exception):
     pass
@@ -4258,6 +4296,10 @@ class KeeperSession:
             script = """async ([url, payload, rid, action, tailGraceMs]) => {
                 const P = s => console.log('__NX' + rid + s);
                 const captured = [];
+                let responseStatus = 0;
+                let responseStarted = false;
+                let protocolFinished = false;
+                let stopReason = 'not-started';
                 const emit = line => {
                     const i = captured.length;
                     captured.push(line);
@@ -4271,17 +4313,20 @@ class KeeperSession:
                         },
                         body: JSON.stringify(payload)
                     });
+                    responseStarted = true;
+                    responseStatus = r.status;
+                    stopReason = 'eof';
                     P('S' + r.status);
                     if (!r.ok) {
                         const error = (await r.text()).slice(0, 400);
                         P('E' + error); P('Dnull');
-                        return {status: r.status, error, lines: captured};
+                        return {status: r.status, error, lines: captured,
+                                responseStarted: true, streamError: false,
+                                finishSeen: false, stopReason: 'http-error'};
                     }
                     const reader = r.body.getReader();
                     const dec = new TextDecoder();
                     let buffer = '';
-                    let protocolFinished = false;
-                    let stopReason = 'eof';
                     const readWithGrace = () => new Promise((resolve, reject) => {
                         // Some providers emit their final text delta after the
                         // finish metadata. Drain for a real quiet window so a
@@ -4319,10 +4364,15 @@ class KeeperSession:
                     if (buffer.trim()) emit(buffer);
                     P('D' + JSON.stringify(null));
                     return {status: r.status, error: '', lines: captured,
+                            responseStarted: true, streamError: false,
                             finishSeen: protocolFinished, stopReason};
                 } catch(e) {
-                    P('S0'); P('E' + e.message); P('Dnull');
-                    return {status: 0, error: String(e.message || e), lines: captured};
+                    const message = String((e && e.message) || e || 'browser transport error');
+                    P('S' + responseStatus); P('E' + message); P('Dnull');
+                    return {status: responseStatus, error: message, lines: captured,
+                            responseStarted, streamError: responseStarted,
+                            finishSeen: protocolFinished,
+                            stopReason: responseStarted ? 'stream-error' : 'fetch-error'};
                 }
             }"""
             eval_task = asyncio.create_task(asyncio.wait_for(page.evaluate(
@@ -4366,13 +4416,42 @@ class KeeperSession:
             error_body = (result.get("error") if isinstance(result, dict) else None) or meta.get("error", "")
             if isinstance(result, dict):
                 frame_count = len(result.get("lines") or [])
-                if status_code == 200:
+                response_started = bool(result.get("responseStarted"))
+                stream_error = bool(result.get("streamError"))
+                finish_seen = bool(result.get("finishSeen"))
+                stop_reason = str(result.get("stopReason") or "unknown")
+
+                if status_code == 200 and stream_error and finish_seen:
+                    # The provider already emitted its semantic terminal frame.
+                    # A TCP/browser error while draining the post-finish quiet
+                    # window must not turn a completed answer into a 502.
+                    log("WARN", f"[{self.name}] stream audit · HTTP 200 · frames {frame_count} · "
+                                f"finish yes · transport dropped after protocol finish · accepting completed stream")
+                elif status_code == 200 and stream_error:
+                    log("WARN", f"[{self.name}] stream audit · HTTP 200 · frames {frame_count} · "
+                                f"finish no · stream interrupted: {error_body[:220]}")
+                elif status_code == 200:
                     log("INFO", f"[{self.name}] stream audit · HTTP 200 · frames {frame_count} · "
-                                f"finish {'yes' if result.get('finishSeen') else 'no'} · "
-                                f"stop {result.get('stopReason') or 'unknown'}")
+                                f"finish {'yes' if finish_seen else 'no'} · stop {stop_reason}")
                 else:
-                    log("WARN", f"[{self.name}] stream audit · HTTP {status_code or 0} rejected before stream · frames {frame_count} · body: {error_body[:300]}")
-            if status_code != 200:
+                    phase = "after response" if response_started else "before response"
+                    log("WARN", f"[{self.name}] stream audit · HTTP {status_code or 0} · {phase} · "
+                                f"frames {frame_count} · body: {error_body[:300]}")
+
+                if status_code == 200 and stream_error and not finish_seen:
+                    raise BridgeHTTPError(
+                        200, error_body or "browser response stream interrupted",
+                        frame_count=frame_count, response_started=True,
+                        stream_error=True, finish_seen=False, stop_reason=stop_reason,
+                    )
+                if status_code != 200:
+                    raise BridgeHTTPError(
+                        status_code, error_body,
+                        frame_count=frame_count, response_started=response_started,
+                        stream_error=stream_error, finish_seen=finish_seen,
+                        stop_reason=stop_reason,
+                    )
+            elif status_code != 200:
                 raise BridgeHTTPError(status_code, error_body)
         finally:
             if 'eval_task' in locals():
@@ -5576,6 +5655,7 @@ def _externally_reachable_proxy(session) -> Optional[str]:
 
 _verification_adapter_bad_shapes = 0
 _verification_adapter_disabled_until = 0.0
+VERIFICATION_ADAPTER_BAD_SHAPE_LIMIT = max(1, min(5, int(os.environ.get("BRIDGENA_VERIFICATION_ADAPTER_BAD_SHAPE_LIMIT", "1"))))
 
 async def _solve_with_verification_adapter(challenge_type: str, session,
                                             site_key: str, action: Optional[str] = None):
@@ -5660,9 +5740,9 @@ async def _solve_with_verification_adapter(challenge_type: str, session,
             _verification_adapter_bad_shapes += 1
             log("WARN", "verification adapter returned an invalid token shape"
                 + f" ({len(token)} chars; minimum {VERIFICATION_MIN_TOKEN_LEN})")
-            if _verification_adapter_bad_shapes >= 2:
+            if _verification_adapter_bad_shapes >= VERIFICATION_ADAPTER_BAD_SHAPE_LIMIT:
                 _verification_adapter_disabled_until = time.monotonic() + 300.0
-                log("WARN", "verification adapter circuit-open for 300s after repeated invalid token shapes; "
+                log("WARN", f"verification adapter circuit-open for 300s after {_verification_adapter_bad_shapes} invalid token shape(s); "
                             "keeper-native verification will be used")
             return None
         error = result.get("error") if isinstance(result, dict) else "invalid adapter response"
@@ -6549,6 +6629,32 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         return
     tried.add(jar["id"])
 
+    # Existing Arena conversations must stay on their original authenticated
+    # keeper/route. If that keeper is quarantined, actively repair it and wait
+    # briefly instead of knowingly sending another request through the same
+    # broken browser transport.
+    if bound_jar_id:
+        sid = str(jar.get("id") or "")
+        quarantine_until = _api_keeper_quarantine_until.get(sid, 0.0)
+        if sid and time.monotonic() < quarantine_until:
+            _schedule_transport_recovery(sid, "bound conversation requested during quarantine")
+            deadline = time.monotonic() + BOUND_KEEPER_RECOVERY_WAIT_SEC
+            log("INFO", f"[{jar.get('name')}] bound conversation waiting up to "
+                        f"{BOUND_KEEPER_RECOVERY_WAIT_SEC:.0f}s for same-keeper recovery")
+            while time.monotonic() < deadline:
+                if (_api_keeper_verified(sid)
+                        and keeper_session_ready(keeper.sessions.get(sid))):
+                    break
+                await asyncio.sleep(0.5)
+            if not (_api_keeper_verified(sid)
+                    and keeper_session_ready(keeper.sessions.get(sid))):
+                retry_after = max(2, int(max(
+                    2.0, _api_keeper_quarantine_until.get(sid, 0.0) - time.monotonic()
+                )))
+                yield ("error", f"503: This conversation's keeper is recovering from a browser transport failure. "
+                                f"Retry in about {retry_after}s; Bridgena will not move the Arena thread to another account.")
+                return
+
     # Startup used to race chat: requests reached Arena with `token no` while
     # all keepers were still launching, producing opaque 500s. Trigger sync and
     # wait briefly for this exact jar's page instead of sending invalid traffic.
@@ -6747,10 +6853,31 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                 yield ("done", response_text)
                 return
             except BridgeHTTPError as e:
+                if e.stream_error and e.response_started:
+                    log("WARN", f"[{jar.get('name')}] browser response stream interrupted after "
+                                f"{e.frame_count} frame(s) · finish {'yes' if e.finish_seen else 'no'}")
+                    _quarantine_api_keeper(
+                        jar.get("id"), "browser-origin mid-stream network failure",
+                        TRANSPORT_FAILURE_QUARANTINE_SEC,
+                    )
+                    _schedule_transport_recovery(jar.get("id"), "mid-stream browser transport failure")
+                    if response_text or reasoning_text:
+                        yield ("error", "502: Arena started responding, but the browser transport was interrupted before "
+                                        "the provider's finish event. Partial output was preserved; the request was not replayed.")
+                    else:
+                        yield ("error", "502: Arena opened the response but the browser transport was interrupted before "
+                                        "a decodable answer arrived. The keeper is being recovered.")
+                    return
                 if not e.status:
-                    log("WARN", f"[{jar.get('name')}] browser transport failed before an HTTP response; request ended as transient network failure")
-                    _quarantine_api_keeper(jar.get("id"), "browser-origin network failure", 90.0)
-                    yield ("error", "502: Browser transport lost the route before an HTTP response. Retry the request; no cross-transport replay was attempted.")
+                    log("WARN", f"[{jar.get('name')}] browser transport failed before an HTTP response; "
+                                f"starting same-keeper recovery")
+                    _quarantine_api_keeper(
+                        jar.get("id"), "browser-origin network failure",
+                        TRANSPORT_FAILURE_QUARANTINE_SEC,
+                    )
+                    _schedule_transport_recovery(jar.get("id"), "pre-response browser transport failure")
+                    yield ("error", "502: Browser transport lost the route before an HTTP response. "
+                                    "The same keeper is being recovered; no cross-account replay was attempted.")
                     return
                 else:
                     verdict = _classify(e.status, e.body)
@@ -8400,6 +8527,10 @@ async def openai_stream(body: dict, keyinfo: dict):
             return
         finally:
             _release_api_request(body, keyinfo, prompt)
+            _record_reliability_outcome(
+                bool(outcome == "complete" and terminal_sent and content_chunks > 0),
+                outcome,
+            )
             if terminal_sent:
                 log("INFO", f"OpenAI stream {rid[-8:]} delivered · outcome {outcome} · "
                             f"content {content_chunks} chunks/{len(acc)} chars · terminal yes")
@@ -8681,6 +8812,10 @@ async def anthropic_messages(request: Request):
             }})
         finally:
             _release_api_request(body, keyinfo, prompt)
+            _record_reliability_outcome(
+                bool(outcome == "complete" and terminal_sent and chunks > 0),
+                outcome,
+            )
             level = "INFO" if terminal_sent or outcome == "upstream-error" else "WARN"
             log(level, f"Anthropic stream {message_id[-8:]} delivered · outcome {outcome} · "
                        f"content {chunks} chunks/{len(acc)} chars · terminal {'yes' if terminal_sent else 'no'}")
@@ -8883,7 +9018,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.0",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.1",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -8904,6 +9039,7 @@ async def healthz():
                                  for s in keeper.sessions.values()
                                  if keeper_session_ready(s)),
                          "verification_adapter": bool(get_verification_solver),
+                         "reliability": _reliability_snapshot(),
                          "vnc_enabled": _V3_VNC_ENABLED})
 
 
@@ -9407,6 +9543,65 @@ async def _preflight_one_keeper(sid: str, session, jar: dict) -> tuple:
         return sid, False
 
 
+def _schedule_transport_recovery(sid: Optional[str], reason: str) -> None:
+    sid = str(sid or "")
+    if not sid:
+        return
+    existing = _transport_recovery_tasks.get(sid)
+    if existing and not existing.done():
+        return
+
+    async def worker():
+        try:
+            session = keeper.sessions.get(sid)
+            if not session:
+                await keeper.sync()
+                session = keeper.sessions.get(sid)
+            if not session:
+                log("WARN", f"[{sid}] transport recovery · keeper session unavailable")
+                return
+
+            log("INFO", f"[{getattr(session, 'name', sid)}] transport recovery · restarting same keeper · {reason}")
+            async with _keeper_recovery_gate:
+                _mark_api_keeper_unready(sid, "transport recovery")
+                await session.restart()
+
+            # Wait for the restarted page + warmup, then re-run the normal
+            # browser-client readiness check. No user prompt is replayed.
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                if keeper_session_ready(session):
+                    break
+                await asyncio.sleep(0.5)
+
+            jar = next((j for j in load_jars() if str(j.get("id")) == sid), None)
+            if jar and keeper_session_ready(session):
+                _, ok = await _preflight_one_keeper(sid, session, jar)
+                if ok:
+                    _api_keeper_quarantine_until.pop(sid, None)
+                    _refresh_api_ready_event()
+                    log("OK", f"[{getattr(session, 'name', sid)}] transport recovery complete · keeper readmitted")
+                    return
+
+            log("WARN", f"[{getattr(session, 'name', sid)}] transport recovery incomplete · "
+                        "readiness loop will continue repairing it")
+            _verification_preflight_retry_after[sid] = time.monotonic() + 3.0
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log("WARN", f"[{sid}] transport recovery failed · "
+                        f"{type(exc).__name__}: {redact(str(exc))[:180]}")
+            _verification_preflight_retry_after[sid] = time.monotonic() + 5.0
+        finally:
+            _transport_recovery_tasks.pop(sid, None)
+
+    _transport_recovery_tasks[sid] = asyncio.create_task(
+        worker(), name=f"transport-recovery-{sid[:8]}"
+    )
+
+
+
 async def _recover_unready_keeper(sid: str, session, jar: dict) -> bool:
     """Actively recover a keeper whose verification client did not become ready.
 
@@ -9625,6 +9820,8 @@ async def _lifespan(app):
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
     log("INFO", f"Keeper startup · parallel starts {KEEPER_START_CONCURRENCY} · parallel logins {KEEPER_LOGIN_CONCURRENCY} · warm-up {KEEPER_WARMUP_SEC}s · cohort readiness barrier ON")
     log("INFO", f"Keeper recovery · soft refresh then restart after {_keeper_recovery_restart_after} failed readiness checks · parallel {_keeper_recovery_gate._value}")
+    log("INFO", f"Transport recovery · same-keeper restart ON · quarantine {TRANSPORT_FAILURE_QUARANTINE_SEC:.0f}s · bound wait {BOUND_KEEPER_RECOVERY_WAIT_SEC:.0f}s")
+    log("INFO", f"Reliability SLO · rolling window {_reliability_window.maxlen} · target {_RELIABILITY_TARGET*100:.0f}%")
     log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
     log("INFO", "Stream decoder · Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini · snapshot de-dup ON")
     log("INFO", f"Upstream 429 policy · model cooldown {UPSTREAM_429_COOLDOWN_SEC:.0f}s · Retry-After enforced · no retry storm")
