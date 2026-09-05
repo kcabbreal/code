@@ -267,7 +267,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.9-ratelimit-cooldown-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.0-keeper-recovery-jars-upload")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1847,6 +1847,10 @@ _api_ready_event = asyncio.Event()
 _initial_verification_sweep_done = asyncio.Event()
 _keeper_fleet_launch_event = asyncio.Event()
 _verification_preflight_retry_after: Dict[str, float] = {}
+_keeper_recovery_attempts: Dict[str, int] = {}
+_keeper_recovery_restart_after = max(2, min(6, int(os.environ.get("BRIDGENA_KEEPER_RECOVERY_RESTART_AFTER", "2"))))
+_keeper_recovery_retry_sec = max(2.0, min(30.0, float(os.environ.get("BRIDGENA_KEEPER_RECOVERY_RETRY_SEC", "5"))))
+_keeper_recovery_gate = asyncio.Semaphore(max(1, min(4, int(os.environ.get("BRIDGENA_KEEPER_RECOVERY_PARALLEL", "3")))))
 
 def _api_keeper_verified(sid: Optional[str]) -> bool:
     if not sid:
@@ -2490,8 +2494,7 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None) -> d
         j for j in jars
         if j.get("enabled", True)
         and j.get("keeper_enabled", True)
-        and j.get("email")
-        and j.get("password")
+        and ((j.get("email") and j.get("password")) or jar_has_auth(j))
     ]
 
     raw_pool = get_proxy_pool()
@@ -2702,22 +2705,25 @@ async def rebind_keeper_fleet_to_proxy_pool(reason: str = "proxy pool changed") 
 
 
 async def auto_login_on_boot():
-    """Auto-start keeper sessions for all accounts with email+password on boot.
-    Checks if already authenticated first to avoid unnecessary login.
-    Works headless (no display required)."""
+    """Auto-start keepers for enabled credential accounts OR authenticated cookie jars."""
     await asyncio.sleep(1)  # Minimal app bootstrap; keeper startup is intentionally parallel
     jars = load_jars()
-    accounts_with_creds = [j for j in jars if j.get("email") and j.get("password") and j.get("enabled", True)]
-    if not accounts_with_creds:
-        log("INFO", "Auto-login: No accounts with credentials found, skipping")
+    bootable = [
+        j for j in jars
+        if j.get("enabled", True)
+        and ((j.get("email") and j.get("password")) or jar_has_auth(j))
+    ]
+    if not bootable:
+        log("INFO", "Auto-login: No bootable account sessions found, skipping")
         return
 
-    log("INFO", f"Auto-login: Starting keeper sessions for {len(accounts_with_creds)} account(s)...")
+    log("INFO", f"Auto-login: Starting keeper sessions for {len(bootable)} account(s)...")
 
-    # Enable keeper for all accounts with credentials.
+    # Cookie imports are authenticated sessions too; keep them alive after reboot.
+    bootable_ids = {j.get("id") for j in bootable}
     def enable_keepers(jars_list):
         for j in jars_list:
-            if j.get("email") and j.get("password") and j.get("enabled", True):
+            if j.get("id") in bootable_ids:
                 j["keeper_enabled"] = True
     mutate_jars(enable_keepers)
 
@@ -2729,7 +2735,7 @@ async def auto_login_on_boot():
     # session immediately; sync() starts browsers as background tasks.
     await keeper.sync()
     _keeper_fleet_launch_event.set()
-    log("INFO", f"Auto-login: {len(accounts_with_creds)} keeper session(s) launched · startup verification barrier released")
+    log("INFO", f"Auto-login: {len(bootable)} keeper session(s) launched · startup verification barrier released")
 
 def uuid7() -> str:
     ts = int(time.time() * 1000)
@@ -7441,8 +7447,88 @@ def jars_page(jars: list) -> str:
 <form method=post action=/jars/toggle style=margin:0><input type=hidden name=jar_id value="{esc(j['id'])}"><button class="btn sm ghost">{'Disable' if j.get('enabled', True) else 'Enable'}</button></form>
 <form method=post action=/jars/persona style=margin:0><input type=hidden name=jar_id value="{esc(j['id'])}"><select name=key style="width:auto;padding:5px 8px;font-size:12px">{''.join(f'<option value="{esc(k)}" ' + ('selected' if j.get('persona')==k else '') + f'>{esc(l)}</option>' for k,l in j.get('_personas'))}</select><button class="btn sm ghost">bind</button></form></div></div>"""
     return page("Accounts", f"""<div class="pagehead"><div><h1>Accounts</h1><p>one device persona per account — headers, keeper and token minting stay coherent</p></div>
-<div class="row"><a class="btn" href="/jars/upload">＋ Add cookies</a></div></div>
+<div class="row"><a class="btn" href="/jars/upload">＋ Add account</a></div></div>
 <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(340px,1fr))">{cards or '<div class="card muted">No jars yet.</div>'}</div>""", active="jars")
+
+
+
+def jars_upload_page() -> str:
+    return page("Add account", r"""
+<div class="pagehead">
+  <div>
+    <div class="eyebrow">Accounts</div>
+    <h1>Add account</h1>
+    <p>Import an authenticated Arena cookie export, or add an account with email/password credentials.</p>
+  </div>
+  <div class="row"><a class="btn ghost" href="/jars">← Accounts</a></div>
+</div>
+
+<div class="tabbar" style="margin-bottom:18px">
+  <button class="tab on" type="button" data-jtab="cookies" onclick="switchJarTab('cookies')">Cookie JSON</button>
+  <button class="tab" type="button" data-jtab="credentials" onclick="switchJarTab('credentials')">Email : password</button>
+</div>
+
+<div data-jpanel="cookies">
+  <div class="card" style="max-width:760px">
+    <div class="eyebrow">Authenticated cookie import</div>
+    <h3 style="margin:4px 0 8px">Upload a .txt / .json cookie export</h3>
+    <p class="muted" style="margin-top:0">
+      The file may contain a JSON cookie array, <code>{"cookies":[...]}</code>, Netscape cookie text,
+      or a pasted cookie JSON payload.
+    </p>
+
+    <form method="post" action="/jars/add" enctype="multipart/form-data" class="stack" style="gap:14px">
+      <label>Account name <span class="muted">(optional)</span>
+        <input name="name" placeholder="e.g. Arena account 8">
+      </label>
+      <label>Cookie file
+        <input name="cookie_file" type="file" accept=".txt,.json,application/json,text/plain" required>
+      </label>
+      <button class="btn primary" type="submit">Import cookies and start keeper</button>
+    </form>
+
+    <div class="divider" style="margin:22px 0"></div>
+
+    <form method="post" action="/jars/add-text" class="stack" style="gap:14px">
+      <label>Account name <span class="muted">(optional)</span>
+        <input name="name" placeholder="e.g. Arena account 8">
+      </label>
+      <label>Paste cookie JSON
+        <textarea name="cookie_json" rows="10" spellcheck="false"
+          placeholder='[{"name":"...","value":"...","domain":".arena.ai","path":"/"}]' required></textarea>
+      </label>
+      <button class="btn" type="submit">Import pasted cookies and start keeper</button>
+    </form>
+  </div>
+</div>
+
+<div data-jpanel="credentials" hidden>
+  <div class="card" style="max-width:760px">
+    <div class="eyebrow">Credential account</div>
+    <h3 style="margin:4px 0 8px">Add email:password credentials</h3>
+    <p class="muted" style="margin-top:0">
+      One account per line. The first <code>:</code> separates the email from the password,
+      so passwords may contain additional colons. Passwords are never written to the runtime log.
+    </p>
+    <form method="post" action="/jars/add-credentials" class="stack" style="gap:14px">
+      <label>Display name <span class="muted">(optional; used only for a single line)</span>
+        <input name="name" placeholder="e.g. Main Arena account">
+      </label>
+      <label>Credentials
+        <textarea name="credentials" rows="8" spellcheck="false"
+          placeholder="email@example.com:password" required></textarea>
+      </label>
+      <button class="btn primary" type="submit">Add account and start keeper</button>
+    </form>
+  </div>
+</div>
+""", active="jars", raw_js=r"""
+function switchJarTab(name){
+  document.querySelectorAll('[data-jtab]').forEach(b=>b.classList.toggle('on',b.dataset.jtab===name));
+  document.querySelectorAll('[data-jpanel]').forEach(p=>p.hidden=p.dataset.jpanel!==name);
+}
+""")
+
 
 
 def logs_page(tail: list) -> str:
@@ -7967,7 +8053,6 @@ async def pool_view(request: Request):
 
 
 @app.get("/jars", response_class=HTMLResponse)
-@app.get("/jars/upload", response_class=HTMLResponse)
 async def jars_view(request: Request):
     g = await _page_guard(request)
     if g:
@@ -7979,6 +8064,14 @@ async def jars_view(request: Request):
              "last_used_str": time.strftime("%Y-%m-%d %H:%M", time.localtime(j["last_used"])) if j.get("last_used") else None,
              "_personas": personas} for j in load_jars()]
     return jars_page(jars)
+
+
+@app.get("/jars/upload", response_class=HTMLResponse)
+async def jars_upload_view(request: Request):
+    g = await _page_guard(request)
+    if g:
+        return g
+    return jars_upload_page()
 
 
 @app.get("/logs", response_class=HTMLResponse)
@@ -8790,7 +8883,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.9",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.0",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -8967,18 +9060,38 @@ async def delete_key(request: Request, key_id: str = Form(...)):
     return RedirectResponse(url="/api-keys", status_code=status.HTTP_303_SEE_OTHER)
 
 
-# ---------- jars add (cookie file / paste) ----------
+# ---------- jars add (cookie file / paste / credentials) ----------
+async def _activate_new_keeper(jar_id: str) -> None:
+    """Allocate a stable route and register a newly-added account immediately."""
+    try:
+        await allocate_unique_keeper_proxies(load_jars())
+        await keeper.sync()
+        _keeper_fleet_launch_event.set()
+        _verification_preflight_retry_after.pop(str(jar_id), None)
+        _keeper_recovery_attempts.pop(str(jar_id), None)
+        log("INFO", f"[{jar_id}] account queued for keeper startup + readiness recovery")
+    except Exception as exc:
+        log("WARN", f"[{jar_id}] account saved but keeper activation failed: "
+                    f"{type(exc).__name__}: {redact(str(exc))[:160]}")
+
+
 @app.post("/jars/add")
 async def jars_add(request: Request, name: str = Form(""), cookie_file: UploadFile = File(...)):
     g = await _page_guard(request)
     if g:
         return g
     try:
-        cookies = _validate_cookies((await cookie_file.read()).decode("utf-8"))
-        jar, found = _new_jar(name.strip(), cookies)
-        log("OK", f"Account '{jar['name']}' added ({len(cookies)} cookies, keys: {sorted(found) or 'NONE'})")
+        raw = (await cookie_file.read()).decode("utf-8-sig")
+        cookies = _validate_cookies(raw)
+        if not cookies:
+            raise ValueError("No valid cookies were found in the uploaded file")
+        jar, found = _new_jar(name.strip(), cookies, keeper_enabled=True)
+        log("OK", f"Account '{jar['name']}' imported ({len(cookies)} cookies; "
+                  f"auth markers {len(found)})")
+        await _activate_new_keeper(jar["id"])
     except Exception as e:
-        log("ERROR", f"Jar upload failed: {type(e).__name__}: {e}")
+        log("ERROR", f"Jar upload failed: {type(e).__name__}: {redact(str(e))[:180]}")
+        return RedirectResponse(url="/jars/upload", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/jars", status_code=status.HTTP_303_SEE_OTHER)
 
 
@@ -8988,10 +9101,71 @@ async def jars_add_text(request: Request, name: str = Form(""), cookie_json: str
     if g:
         return g
     try:
-        jar, found = _new_jar(name.strip(), _validate_cookies(cookie_json.strip()))
-        log("OK", f"Account '{jar['name']}' added ({sorted(found) or 'NONE'})")
+        cookies = _validate_cookies(cookie_json.strip())
+        if not cookies:
+            raise ValueError("No valid cookies were found in the pasted payload")
+        jar, found = _new_jar(name.strip(), cookies, keeper_enabled=True)
+        log("OK", f"Account '{jar['name']}' imported from pasted cookies "
+                  f"({len(cookies)} cookies; auth markers {len(found)})")
+        await _activate_new_keeper(jar["id"])
     except Exception as e:
-        log("ERROR", f"Jar paste failed: {type(e).__name__}: {e}")
+        log("ERROR", f"Jar paste failed: {type(e).__name__}: {redact(str(e))[:180]}")
+        return RedirectResponse(url="/jars/upload", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(url="/jars", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/jars/add-credentials")
+async def jars_add_credentials(request: Request, name: str = Form(""), credentials: str = Form(...)):
+    g = await _page_guard(request)
+    if g:
+        return g
+
+    parsed = []
+    for lineno, raw_line in enumerate(credentials.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            log("WARN", f"Credential import skipped line {lineno}: expected email:password")
+            continue
+        email, password = line.split(":", 1)
+        email, password = email.strip(), password.strip()
+        if not email or not password or "@" not in email:
+            log("WARN", f"Credential import skipped line {lineno}: invalid email/password shape")
+            continue
+        parsed.append((email, password))
+
+    if not parsed:
+        log("ERROR", "Credential import failed: no valid email:password entries")
+        return RedirectResponse(url="/jars/upload", status_code=status.HTTP_303_SEE_OTHER)
+
+    created = []
+    for idx, (email, password) in enumerate(parsed):
+        display = name.strip() if len(parsed) == 1 and name.strip() else email.split("@", 1)[0]
+        jar, _ = _new_jar(
+            display,
+            [],
+            email=email,
+            password=password,
+            login_method="email",
+            keeper_enabled=True,
+        )
+        created.append(jar["id"])
+        log("OK", f"Credential account '{jar['name']}' added · email {redact(email)} · keeper enabled")
+
+    # One allocation/sync pass for the whole imported batch.
+    try:
+        await allocate_unique_keeper_proxies(load_jars())
+        await keeper.sync()
+        _keeper_fleet_launch_event.set()
+        for jar_id in created:
+            _verification_preflight_retry_after.pop(jar_id, None)
+            _keeper_recovery_attempts.pop(jar_id, None)
+        log("OK", f"Credential import complete · {len(created)} keeper(s) queued")
+    except Exception as exc:
+        log("WARN", f"Credential accounts saved but keeper activation failed: "
+                    f"{type(exc).__name__}: {redact(str(exc))[:160]}")
+
     return RedirectResponse(url="/jars", status_code=status.HTTP_303_SEE_OTHER)
 
 
@@ -9216,6 +9390,7 @@ async def _preflight_one_keeper(sid: str, session, jar: dict) -> tuple:
         if ok:
             _api_verified_keepers[sid] = time.monotonic()
             _api_keeper_quarantine_until.pop(sid, None)
+            _keeper_recovery_attempts.pop(sid, None)
             log("OK", f"[{name}] verification client ready · Enterprise execute available")
             return sid, True
 
@@ -9230,6 +9405,76 @@ async def _preflight_one_keeper(sid: str, session, jar: dict) -> tuple:
         log("WARN", f"[{name}] verification client readiness failed · "
                     f"{type(exc).__name__}: {redact(str(exc))[:160]}")
         return sid, False
+
+
+async def _recover_unready_keeper(sid: str, session, jar: dict) -> bool:
+    """Actively recover a keeper whose verification client did not become ready.
+
+    Recovery is intentionally local to this authenticated browser:
+      1) refresh/re-enter the official Arena page and re-check auth;
+      2) after repeated failed warmups, restart that keeper on its sticky route.
+    It does not generate a prompt or solve an interactive challenge.
+    """
+    sid = str(sid)
+    name = getattr(session, "name", sid)
+    attempt = int(_keeper_recovery_attempts.get(sid, 0)) + 1
+    _keeper_recovery_attempts[sid] = attempt
+
+    async with _keeper_recovery_gate:
+        try:
+            if not keeper_session_ready(session, warmed=False):
+                log("WARN", f"[{name}] readiness recovery · browser not healthy enough; restarting keeper")
+                _mark_api_keeper_unready(sid, "recovery restart")
+                await session.restart()
+                _verification_preflight_retry_after[sid] = time.monotonic() + KEEPER_WARMUP_SEC + 2.0
+                _keeper_recovery_attempts[sid] = 0
+                return True
+
+            if attempt < _keeper_recovery_restart_after:
+                log("INFO", f"[{name}] readiness recovery · soft refresh {attempt}/{_keeper_recovery_restart_after - 1}")
+                async with session._action_lock:
+                    page = session.page
+                    if not page or page.is_closed():
+                        raise RuntimeError("keeper page is closed")
+                    # Re-enter the normal authenticated Arena origin. Using the
+                    # session helper preserves its existing route/persona state.
+                    await session._navigate_resilient(page, PUBLIC_AUTH_URL, timeout=15000)
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
+                    auth_ok = await session._verify_auth_state(page)
+                    if auth_ok:
+                        session.last_public_auth_check = time.time()
+                        try:
+                            await session._harvest_cookies()
+                        except Exception:
+                            pass
+                    else:
+                        log("WARN", f"[{name}] readiness recovery · auth check failed; scheduling relogin")
+                        session.next_retry = 0
+                if not auth_ok:
+                    await session.relogin()
+                _verification_preflight_retry_after[sid] = time.monotonic() + _keeper_recovery_retry_sec
+                return True
+
+            # Passive checks + a soft refresh both failed: rebuild the browser
+            # context. restart() retains the jar's sticky proxy assignment.
+            log("WARN", f"[{name}] readiness recovery · still unready after {attempt} checks · restarting keeper")
+            _mark_api_keeper_unready(sid, "verification client recovery")
+            _verification_preflight_retry_after[sid] = time.monotonic() + KEEPER_WARMUP_SEC + 3.0
+            _keeper_recovery_attempts[sid] = 0
+            await session.restart()
+            return True
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log("WARN", f"[{name}] readiness recovery failed · "
+                        f"{type(exc).__name__}: {redact(str(exc))[:180]}")
+            _verification_preflight_retry_after[sid] = time.monotonic() + max(8.0, _keeper_recovery_retry_sec)
+            return False
+
 
 
 async def _api_verification_readiness_loop():
@@ -9290,13 +9535,26 @@ async def _api_verification_readiness_loop():
                     return_exceptions=False,
                 )
                 passed = 0
+                failed = []
+                eligible_by_sid = {sid: (session, jar) for sid, session, jar in eligible}
                 for sid, ok in results:
                     if ok:
                         passed += 1
                         _verification_preflight_retry_after.pop(sid, None)
                     else:
-                        _verification_preflight_retry_after[sid] = time.monotonic() + 12.0
+                        session, jar = eligible_by_sid[sid]
+                        failed.append((sid, session, jar))
+
                 log("INFO", f"Verification startup cohort · pass {passed}/{len(results)}")
+
+                if failed:
+                    names = ", ".join(getattr(session, "name", sid) for sid, session, _ in failed)
+                    log("WARN", f"Verification recovery · actively recovering {len(failed)} keeper(s) · {names}")
+                    await asyncio.gather(
+                        *(_recover_unready_keeper(sid, session, jar)
+                          for sid, session, jar in failed),
+                        return_exceptions=False,
+                    )
 
             _refresh_api_ready_event()
 
@@ -9319,7 +9577,10 @@ async def _api_verification_readiness_loop():
             else:
                 announced_ready = False
 
-            await asyncio.sleep(8.0 if verified >= max(1, ready_count) else 2.0)
+            # A partially-ready fleet is a recovery condition, not a steady state.
+            # Keep repairing laggards promptly; back off only once the ready fleet is complete.
+            target_count = len(jars_by_id)
+            await asyncio.sleep(8.0 if target_count and verified >= target_count else 2.0)
 
         except asyncio.CancelledError:
             raise
@@ -9332,7 +9593,13 @@ async def _api_verification_readiness_loop():
             await asyncio.sleep(2.0)
 
 def jars_have_creds() -> bool:
-    return any(j.get("email") and j.get("password") and j.get("enabled", True) for j in load_jars())
+    # Kept under the historical name because lifespan already calls it.
+    # Cookie-authenticated imports are bootable keeper accounts as well.
+    return any(
+        j.get("enabled", True)
+        and ((j.get("email") and j.get("password")) or jar_has_auth(j))
+        for j in load_jars()
+    )
 @asynccontextmanager
 async def _lifespan(app):
     await _v3_vnc_start()
@@ -9357,6 +9624,7 @@ async def _lifespan(app):
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
     log("INFO", f"Keeper startup · parallel starts {KEEPER_START_CONCURRENCY} · parallel logins {KEEPER_LOGIN_CONCURRENCY} · warm-up {KEEPER_WARMUP_SEC}s · cohort readiness barrier ON")
+    log("INFO", f"Keeper recovery · soft refresh then restart after {_keeper_recovery_restart_after} failed readiness checks · parallel {_keeper_recovery_gate._value}")
     log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
     log("INFO", "Stream decoder · Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini · snapshot de-dup ON")
     log("INFO", f"Upstream 429 policy · model cooldown {UPSTREAM_429_COOLDOWN_SEC:.0f}s · Retry-After enforced · no retry storm")
