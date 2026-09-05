@@ -263,7 +263,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.3-local-shim-proxy-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.4-live-proxy-rebind-stable-lane")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2632,6 +2632,68 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None) -> d
     return stats
 
 
+async def rebind_keeper_fleet_to_proxy_pool(reason: str = "proxy pool changed") -> dict:
+    """Allocate current live proxies, then restart only keepers whose route changed.
+
+    Chromium's proxy is fixed at browser-context launch. Updating jar["proxy"]
+    alone does not move an already-running keeper, so a route change has to be
+    applied with a controlled browser restart.
+    """
+    stats = await allocate_unique_keeper_proxies(load_jars())
+
+    jars = {j.get("id"): j for j in load_jars()}
+    changed = []
+    unchanged = []
+
+    for jid, session in list(keeper.sessions.items()):
+        jar = jars.get(jid) or {}
+        desired = _normalize_proxy(jar.get("proxy") or jar.get("_last_proxy") or "") or ""
+        current = _normalize_proxy(getattr(session, "_used_proxy", "") or "") or ""
+
+        if desired and desired != current:
+            changed.append((jid, session, current, desired))
+        else:
+            unchanged.append(jid)
+
+    if not changed:
+        log("INFO", f"Proxy rebind · {reason} · no keeper restart required · "
+                    f"distinct assigned {stats.get('distinct_assigned', 0)}")
+        stats["keepers_restarting"] = 0
+        stats["keepers_unchanged"] = len(unchanged)
+        return stats
+
+    log("INFO", f"Proxy rebind · {reason} · applying {len(changed)} changed keeper route(s)")
+
+    # Restarts are intentionally bounded. Persistent Chromium startup is heavy
+    # and restarting the whole fleet in one burst makes auth hydration flaky.
+    restart_gate = asyncio.Semaphore(2)
+
+    async def _apply(item):
+        jid, session, current, desired = item
+        async with restart_gate:
+            try:
+                session._tried_proxies.clear()
+                session._direct_tried = False
+                log("INFO", f"[{session.name}] proxy route changed · "
+                            f"{_proxy_hkey(current) if current else 'direct'} → {_proxy_hkey(desired)} · restarting keeper")
+                await session.restart()
+                return True
+            except Exception as exc:
+                log("ERROR", f"[{session.name}] proxy rebind restart failed: {type(exc).__name__}: {exc}")
+                return False
+
+    results = await asyncio.gather(*(_apply(item) for item in changed), return_exceptions=False)
+    applied = sum(1 for ok in results if ok)
+
+    stats["keepers_restarting"] = len(changed)
+    stats["keepers_rebound"] = applied
+    stats["keepers_unchanged"] = len(unchanged)
+
+    log("OK", f"Proxy rebind complete · {applied}/{len(changed)} keeper route changes applied · "
+              f"distinct assigned {stats.get('distinct_assigned', 0)}")
+    return stats
+
+
 async def auto_login_on_boot():
     """Auto-start keeper sessions for all accounts with email+password on boot.
     Checks if already authenticated first to avoid unnecessary login.
@@ -3073,6 +3135,10 @@ class KeeperSession:
         # Page pool for concurrent requests
         self._page_pool: list = []  # list of extra pages
         self._page_pool_lock = asyncio.Lock()
+        # The warmed main page is a single transport lane. With extra tabs
+        # disabled, concurrent callers must queue here rather than all sharing
+        # one page/console/fetch context simultaneously.
+        self._main_page_lane = asyncio.Lock()
         # Serialize through the keeper page unless an operator explicitly opts
         # into extra tabs after validating upstream capacity.
         self._max_pool_pages = max(0, min(4, int(os.environ.get("BRIDGENA_KEEPER_EXTRA_PAGES", "0"))))
@@ -4113,16 +4179,21 @@ class KeeperSession:
                     return new_page, idx
                 except Exception as e:
                     log("WARN", f"[{self.name}] Failed to create extra tab: {e}")
-            # Fallback: use main page (will still work, just shares console)
+            # Stable main-page lane. Never hand the same browser page to two
+            # simultaneous bridge_fetch calls: doing that mixes console events,
+            # fetch state and navigation/session activity.
+            await self._main_page_lane.acquire()
             return self.page, -1
 
     async def _release_page(self, idx):
-        """Mark a pooled page as idle."""
+        """Mark a pooled page as idle, or release the warmed main-page lane."""
         if idx >= 0:
             async with self._page_pool_lock:
                 if idx < len(self._page_pool):
                     pg, _ = self._page_pool[idx]
                     self._page_pool[idx] = (pg, False)
+        elif self._main_page_lane.locked():
+            self._main_page_lane.release()
 
     async def _cleanup_pool(self):
         """Close all idle pool pages (called when no active requests)."""
@@ -7018,7 +7089,7 @@ def api_key_created_page(name: str, raw_key: str) -> str:
 def pool_page(rows: list, stats: dict) -> str:
     body=''.join(f"<tr><td class='mono'>{esc(r['display'])}</td><td class='muted'>{esc(r.get('scheme',''))}</td><td>{_verdict_pill(r['verdict'])}</td><td class='muted' style='max-width:360px'>{esc(r['why']) or '—'}</td><td>{esc(r['latency']) if r['latency'] else '<span class=muted>—</span>'}{'ms' if r['latency'] else ''}</td><td><form method='post' action='/proxies/api/remove-one'><input type='hidden' name='key' value='{esc(r['key'])}'><button class='btn sm ghost'>Remove</button></form></td></tr>" for r in rows) or "<tr><td colspan='6' class='empty'>No proxies configured yet.</td></tr>"
     content=f'''<div class="pagehead"><div><div class="eyebrow">Network</div><h1>Proxy pool</h1><p>Manage configured upstream routes and see current transport health.</p></div><div class="actionbar"><span class="badge-num">{stats['total']} configured</span><span class="pill ok">{stats['alive']} alive</span><span class="pill warn">{stats['flagged']} restricted</span><button class="btn" onclick="scan()">Scan pool</button></div></div><div class="proxy-add"><section class="card"><div class="row"><div><div class="eyebrow">Inventory</div><h3 style="margin:2px 0 14px">Configured exits</h3></div><span class="spacer"></span><input id="proxyFilter" placeholder="Filter exits…" style="width:220px" oninput="filterRows()"></div><div class="table-wrap"><table id="proxyTable"><thead><tr><th>Exit</th><th>Scheme</th><th>State</th><th>Diagnosis</th><th>RTT</th><th></th></tr></thead><tbody>{body}</tbody></table></div></section><aside class="card"><div class="tabs" role="tablist"><button class="tab on" type="button" data-tab="add" onclick="switchProxyTab('add')">Add</button><button class="tab" type="button" data-tab="formats" onclick="switchProxyTab('formats')">Formats</button><button class="tab" type="button" data-tab="maint" onclick="switchProxyTab('maint')">Maintenance</button></div><div class="tab-panel" data-panel="add"><div class="eyebrow" style="margin-top:18px">Add capacity</div><h3 style="margin:2px 0 14px">Add proxies</h3><form id="proxyAddForm" data-native="1"><div class="dropbox"><label for="proxyText" style="margin-top:0">Paste proxies</label><textarea id="proxyText" name="text" placeholder="1.2.3.4:8080&#10;socks5://1.2.3.4:1080&#10;host:port:user:pass&#10;&#10;Or CSV: Host,Port,Username,Password,Type"></textarea><div class="helper">Credentials are optional. Accepts host:port, scheme://host:port, host:port:user:pass, full URLs, whitespace exports, or headered CSV.</div></div><label for="proxyFile">Or upload a text / CSV file</label><input id="proxyFile" type="file" accept=".txt,.csv,text/plain,text/csv"><div class="actionbar" style="margin-top:12px"><button class="btn primary" type="submit">Add proxies</button><button class="btn ghost" type="button" onclick="clearProxyForm()">Clear</button></div></form></div><div class="tab-panel" data-panel="formats" hidden><div class="eyebrow" style="margin-top:18px">Accepted input</div><h3 style="margin:2px 0 12px">Flexible parser</h3><div class="console" style="height:auto;max-height:none;padding:12px">1.2.3.4:8080<br>socks5://1.2.3.4:1080<br>SOCKS5 1.2.3.4 1080<br>1.2.3.4 1080 SOCKS5<br>1.2.3.4,1080,SOCKS5</div></div><div class="tab-panel" data-panel="maint" hidden><div class="eyebrow" style="margin-top:18px">Maintenance</div><h3 style="margin:2px 0 14px">Pool actions</h3><div class="actionbar"><button class="btn sm" onclick="poolAction('/proxies/api/prune','Pruning unhealthy exits…')">Prune dead</button><button class="btn sm ghost" onclick="poolAction('/proxies/api/revive','Reviving saved exits…')">Revive all</button><button class="btn sm danger" onclick="deleteAll()">Delete all</button></div></div></aside></div>'''
-    js=r'''function switchProxyTab(name){document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('on',b.dataset.tab===name));document.querySelectorAll('[data-panel]').forEach(p=>p.hidden=p.dataset.panel!==name)}function filterRows(){const q=document.getElementById('proxyFilter').value.toLowerCase();document.querySelectorAll('#proxyTable tbody tr').forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?'':'none')}function clearProxyForm(){document.getElementById('proxyText').value='';document.getElementById('proxyFile').value=''}document.getElementById('proxyAddForm').addEventListener('submit',async e=>{e.preventDefault();const text=document.getElementById('proxyText').value,file=document.getElementById('proxyFile').files[0];if(!text.trim()&&!file){bgnToast('Paste proxies or choose a file first','warn');return}const t=bgnToast('Parsing and merging proxies…','loading');try{const fd=new FormData();fd.append('text',text);if(file)fd.append('file',file);const r=await fetch('/proxies/api/upload',{method:'POST',body:fd,credentials:'same-origin'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Upload failed'));const message='Added '+d.added+' · parsed '+d.parsed+' · local shims '+(d.local_shims||0)+' · duplicates '+(d.duplicates||0)+' · skipped '+d.skipped;bgnToastUpdate(t,message,d.added>0?'ok':'warn',d.added>0?'Proxies added':'Nothing new added');if(d.added>0)bgnReload(message,'ok','Proxies added',1800)}catch(err){bgnToastUpdate(t,err.message||String(err),'error')}});async function scan(){const t=bgnToast('Scanning the proxy pool…','loading');try{const r=await fetch('/proxies/api/check',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Scan failed'));if(d.running){bgnToastUpdate(t,'A scan is already running','warn');return}bgnToastUpdate(t,d.alive+' of '+d.total+' exits are healthy','ok','Scan complete');bgnReload(d.alive+' of '+d.total+' exits are healthy','ok','Scan complete',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function poolAction(url,msg){const t=bgnToast(msg,'loading');try{const r=await fetch(url,{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Action failed'));bgnToastUpdate(t,bgnResultMessage(d),'ok');bgnReload(bgnResultMessage(d),'ok','Done',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function deleteAll(){if(!confirm('Delete every active proxy? A recovery snapshot will be retained.'))return;const t=bgnToast('Deleting active proxies…','loading');try{const r=await fetch('/proxies/api/delete-all',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Delete failed'));bgnToastUpdate(t,'Deleted '+d.removed+' proxies','ok');bgnReload('Deleted '+d.removed+' proxies','ok','Pool cleared',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}'''
+    js=r'''function switchProxyTab(name){document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('on',b.dataset.tab===name));document.querySelectorAll('[data-panel]').forEach(p=>p.hidden=p.dataset.panel!==name)}function filterRows(){const q=document.getElementById('proxyFilter').value.toLowerCase();document.querySelectorAll('#proxyTable tbody tr').forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?'':'none')}function clearProxyForm(){document.getElementById('proxyText').value='';document.getElementById('proxyFile').value=''}document.getElementById('proxyAddForm').addEventListener('submit',async e=>{e.preventDefault();const text=document.getElementById('proxyText').value,file=document.getElementById('proxyFile').files[0];if(!text.trim()&&!file){bgnToast('Paste proxies or choose a file first','warn');return}const t=bgnToast('Parsing and merging proxies…','loading');try{const fd=new FormData();fd.append('text',text);if(file)fd.append('file',file);const r=await fetch('/proxies/api/upload',{method:'POST',body:fd,credentials:'same-origin'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Upload failed'));const message='Added '+d.added+' · parsed '+d.parsed+' · local shims '+(d.local_shims||0)+' · distinct assigned '+(d.distinct_assigned||0)+' · keepers rebound '+(d.keepers_rebound||0)+' · skipped '+d.skipped;bgnToastUpdate(t,message,d.added>0?'ok':'warn',d.added>0?'Proxies added':'Nothing new added');if(d.added>0)bgnReload(message,'ok','Proxies added',1800)}catch(err){bgnToastUpdate(t,err.message||String(err),'error')}});async function scan(){const t=bgnToast('Scanning the proxy pool…','loading');try{const r=await fetch('/proxies/api/check',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Scan failed'));if(d.running){bgnToastUpdate(t,'A scan is already running','warn');return}bgnToastUpdate(t,d.alive+' of '+d.total+' exits are healthy','ok','Scan complete');bgnReload(d.alive+' of '+d.total+' exits are healthy','ok','Scan complete',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function poolAction(url,msg){const t=bgnToast(msg,'loading');try{const r=await fetch(url,{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Action failed'));bgnToastUpdate(t,bgnResultMessage(d),'ok');bgnReload(bgnResultMessage(d),'ok','Done',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function deleteAll(){if(!confirm('Delete every active proxy? A recovery snapshot will be retained.'))return;const t=bgnToast('Deleting active proxies…','loading');try{const r=await fetch('/proxies/api/delete-all',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Delete failed'));bgnToastUpdate(t,'Deleted '+d.removed+' proxies','ok');bgnReload('Deleted '+d.removed+' proxies','ok','Pool cleared',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}'''
     return page('Network', content, 'pool', js)
 
 def jars_page(jars: list) -> str:
@@ -8217,6 +8288,13 @@ async def proxies_snapshot():
 async def proxies_check():
     loop = asyncio.get_running_loop()
     stats = await loop.run_in_executor(None, sweep_all)
+    try:
+        rebind = await rebind_keeper_fleet_to_proxy_pool("proxy sweep")
+        stats["distinct_assigned"] = rebind.get("distinct_assigned", 0)
+        stats["keepers_rebound"] = rebind.get("keepers_rebound", 0)
+    except Exception as exc:
+        log("ERROR", f"Proxy sweep succeeded, but keeper rebind failed: {type(exc).__name__}: {exc}")
+        stats["rebind_error"] = f"{type(exc).__name__}: {exc}"
     return JSONResponse(stats)
 
 
@@ -8242,6 +8320,20 @@ async def proxies_upload(request: Request):
     result["total"] = len(_pool_lines())
     if result["parsed"] == 0:
         raise HTTPException(status_code=400, detail="No valid proxies were parsed. Credentials are optional: use host:port, scheme://host:port, host:port:user:pass, or headered CSV.")
+
+    # If capacity changed while Bridgena is already running, merely saving the
+    # list is not enough: existing Chromium contexts keep their launch-time
+    # proxy forever. Allocate the new pool and rebind the running keeper fleet.
+    if result.get("added", 0) > 0:
+        try:
+            rebind = await rebind_keeper_fleet_to_proxy_pool("proxy upload")
+            result["live"] = rebind.get("live", 0)
+            result["distinct_assigned"] = rebind.get("distinct_assigned", 0)
+            result["keepers_rebound"] = rebind.get("keepers_rebound", 0)
+        except Exception as exc:
+            log("ERROR", f"Proxy upload saved, but live keeper rebind failed: {type(exc).__name__}: {exc}")
+            result["rebind_error"] = f"{type(exc).__name__}: {exc}"
+
     return JSONResponse(result)
 
 @app.post("/proxies/api/prune")
@@ -8354,7 +8446,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.3",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.4",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -8828,7 +8920,7 @@ async def _lifespan(app):
     log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
-    log("INFO", "Capacity target · ~20 simultaneous users · stable keeper lanes enabled")
+    log("INFO", "Capacity target · queued multi-user admission · one stable browser transport lane per keeper")
     log("INFO", "Proxy allocator · full-pool startup scan + distinct keeper assignment enabled")
     if get_verification_solver:
         log("OK", f"Verification adapter factory loaded: {_VERIFICATION_FACTORY_SPEC}")
