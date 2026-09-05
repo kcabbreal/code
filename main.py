@@ -252,6 +252,10 @@ API_PACE_INTERVAL_SEC = max(0.0, min(5.0, float(os.environ.get("BRIDGENA_API_PAC
 API_PACE_MAX_WAIT_SEC = max(1.0, min(30.0, float(os.environ.get("BRIDGENA_API_PACE_MAX_WAIT_SEC", "8"))))
 CONVERSATION_MIN_GAP_SEC = max(0.0, min(5.0, float(os.environ.get("BRIDGENA_CONVERSATION_MIN_GAP_SEC", "0.9"))))
 UPSTREAM_429_COOLDOWN_SEC = max(5.0, min(300.0, float(os.environ.get("BRIDGENA_UPSTREAM_429_COOLDOWN_SEC", "45"))))
+UPSTREAM_429_FIRST_BACKOFF_SEC = max(1.0, min(30.0, float(os.environ.get("BRIDGENA_UPSTREAM_429_FIRST_BACKOFF_SEC", "5"))))
+UPSTREAM_429_INLINE_WAIT_MAX_SEC = max(1.0, min(60.0, float(os.environ.get("BRIDGENA_UPSTREAM_429_INLINE_WAIT_MAX_SEC", "12"))))
+UPSTREAM_429_SAME_ACCOUNT_RETRIES = max(0, min(3, int(os.environ.get("BRIDGENA_UPSTREAM_429_SAME_ACCOUNT_RETRIES", "1"))))
+UPSTREAM_429_STRIKE_RESET_SEC = max(15.0, min(900.0, float(os.environ.get("BRIDGENA_UPSTREAM_429_STRIKE_RESET_SEC", "120"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 VERIFICATION_MIN_TOKEN_LEN = max(
     32, min(512, int(os.environ.get("BRIDGENA_VERIFICATION_MIN_TOKEN_LEN", "80")))
@@ -308,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.0-history-api-stream-salvage")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.1-adaptive-429-recovery")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -3340,7 +3344,8 @@ async def refresh_model_catalog() -> dict:
 class BridgeHTTPError(Exception):
     def __init__(self, status: int, body: str, *, frame_count: int = 0,
                  response_started: bool = False, stream_error: bool = False,
-                 finish_seen: bool = False, stop_reason: str = ""):
+                 finish_seen: bool = False, stop_reason: str = "",
+                 retry_after: str = ""):
         self.status = int(status or 0)
         self.body = str(body or "")
         self.frame_count = int(frame_count or 0)
@@ -3348,6 +3353,7 @@ class BridgeHTTPError(Exception):
         self.stream_error = bool(stream_error)
         self.finish_seen = bool(finish_seen)
         self.stop_reason = str(stop_reason or "")
+        self.retry_after = str(retry_after or "")
         super().__init__(f"HTTP {self.status}: {self.body[:200]}")
 
 class ConversationLost(Exception):
@@ -4616,7 +4622,8 @@ class KeeperSession:
                         P('E' + error); P('Dnull');
                         return {status: r.status, error, lines: captured,
                                 responseStarted: true, streamError: false,
-                                finishSeen: false, stopReason: 'http-error'};
+                                finishSeen: false, stopReason: 'http-error',
+                                retryAfter: r.headers.get('retry-after') || ''};
                     }
                     const reader = r.body.getReader();
                     const dec = new TextDecoder();
@@ -4659,7 +4666,8 @@ class KeeperSession:
                     P('D' + JSON.stringify(null));
                     return {status: r.status, error: '', lines: captured,
                             responseStarted: true, streamError: false,
-                            finishSeen: protocolFinished, stopReason};
+                            finishSeen: protocolFinished, stopReason,
+                            retryAfter: r.headers.get('retry-after') || ''};
                 } catch(e) {
                     const message = String((e && e.message) || e || 'browser transport error');
                     P('S' + responseStatus); P('E' + message); P('Dnull');
@@ -4711,6 +4719,7 @@ class KeeperSession:
             if isinstance(result, dict):
                 frame_count = len(result.get("lines") or [])
                 response_started = bool(result.get("responseStarted"))
+                retry_after = str(result.get("retryAfter") or "")
                 if response_started and status_code:
                     self.last_transport_ok = time.monotonic()
                     self.transport_fail_streak = 0
@@ -4743,6 +4752,7 @@ class KeeperSession:
                         200, error_body or "browser response stream interrupted",
                         frame_count=frame_count, response_started=True,
                         stream_error=True, finish_seen=False, stop_reason=stop_reason,
+                        retry_after=retry_after,
                     )
                 if status_code == 200 and REQUIRE_PROVIDER_FINISH and not finish_seen:
                     log("WARN", f"[{self.name}] stream audit · HTTP 200 ended without provider finish · "
@@ -4752,13 +4762,14 @@ class KeeperSession:
                         frame_count=frame_count, response_started=True,
                         stream_error=True, finish_seen=False,
                         stop_reason=(stop_reason or "eof-without-finish"),
+                        retry_after=retry_after,
                     )
                 if status_code != 200:
                     raise BridgeHTTPError(
                         status_code, error_body,
                         frame_count=frame_count, response_started=response_started,
                         stream_error=stream_error, finish_seen=finish_seen,
-                        stop_reason=stop_reason,
+                        stop_reason=stop_reason, retry_after=retry_after,
                     )
             elif status_code != 200:
                 raise BridgeHTTPError(status_code, error_body)
@@ -6800,6 +6811,7 @@ _tenant_pace_next: Dict[str, float] = {}
 _tenant_pace_guard = threading.Lock()
 _conversation_next_start: Dict[str, float] = {}
 _model_rate_limit_until: Dict[str, float] = {}
+_model_rate_limit_state: Dict[str, dict] = {}
 _model_rate_limit_guard = threading.Lock()
 
 def _model_rate_limit_remaining(model_name: str) -> float:
@@ -6808,11 +6820,40 @@ def _model_rate_limit_remaining(model_name: str) -> float:
         until = _model_rate_limit_until.get(key, 0.0)
     return max(0.0, until - time.monotonic())
 
+def _parse_retry_after_seconds(value: str) -> Optional[float]:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except Exception:
+        return None
+
 def _mark_model_rate_limited(model_name: str, seconds: float = None) -> float:
+    """Adaptive throttle lease.
+
+    A single transient 429 gets a short pause. Repeated 429s back off
+    exponentially up to the historical configured ceiling. If Arena supplies
+    Retry-After, that value wins.
+    """
     key = str(model_name or "auto").strip().lower()
-    duration = float(seconds if seconds is not None else UPSTREAM_429_COOLDOWN_SEC)
-    until = time.monotonic() + max(1.0, duration)
+    now = time.monotonic()
     with _model_rate_limit_guard:
+        state = dict(_model_rate_limit_state.get(key) or {})
+        last = float(state.get("last", 0.0) or 0.0)
+        strikes = int(state.get("strikes", 0) or 0)
+        if not last or now - last > UPSTREAM_429_STRIKE_RESET_SEC:
+            strikes = 0
+        strikes += 1
+        if seconds is None:
+            duration = min(
+                UPSTREAM_429_COOLDOWN_SEC,
+                UPSTREAM_429_FIRST_BACKOFF_SEC * (2 ** max(0, strikes - 1)),
+            )
+        else:
+            duration = max(1.0, min(float(seconds), 300.0))
+        until = now + max(1.0, duration)
+        _model_rate_limit_state[key] = {"strikes": strikes, "last": now}
         _model_rate_limit_until[key] = max(_model_rate_limit_until.get(key, 0.0), until)
     return max(0.0, until - time.monotonic())
 
@@ -6820,10 +6861,18 @@ def _clear_model_rate_limit(model_name: str):
     key = str(model_name or "auto").strip().lower()
     with _model_rate_limit_guard:
         _model_rate_limit_until.pop(key, None)
+        _model_rate_limit_state.pop(key, None)
 
-def _raise_if_model_rate_limited(model_name: str):
+async def _wait_if_model_rate_limited(model_name: str):
+    """Absorb short upstream cooldowns inside the request instead of making the
+    customer manually retry. Long cooldowns still return 429 promptly.
+    """
     remaining = _model_rate_limit_remaining(model_name)
     if remaining <= 0:
+        return
+    if remaining <= UPSTREAM_429_INLINE_WAIT_MAX_SEC:
+        log("INFO", f"Model throttle wait · {model_name} · sleeping {remaining:.1f}s before dispatch")
+        await asyncio.sleep(remaining + 0.05)
         return
     retry_after = max(1, int(remaining + 0.999))
     raise HTTPException(
@@ -6910,6 +6959,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
             excluded = set()
             next_hint = jar_hint
             failovers = 0
+            same_account_429_retries = 0
             active_prompt = prompt
             active_system_prompt = system_prompt
             migrated_thread = False
@@ -6924,8 +6974,9 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 emitted_user_output = False
                 try:
                     async for kind, payload in turn:
-                        if kind == "retry-account":
+                        if kind in ("retry-account", "retry-same-account"):
                             retry_info = payload if isinstance(payload, dict) else {"reason": str(payload)}
+                            retry_info["_kind"] = kind
                             break
                         emitted_user_output = True
                         yield kind, payload
@@ -6934,6 +6985,30 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
 
                 if not retry_info:
                     return
+
+                if retry_info.get("_kind") == "retry-same-account":
+                    failed_id = str(retry_info.get("jar_id") or "")
+                    failed_name = str(retry_info.get("jar_name") or failed_id or "unknown")
+                    delay = max(0.0, float(retry_info.get("delay") or 0.0))
+                    reason = str(retry_info.get("reason") or "upstream throttle")
+                    if same_account_429_retries >= UPSTREAM_429_SAME_ACCOUNT_RETRIES:
+                        retry_after = max(1, int(delay + 0.999))
+                        yield ("error", f"429: Arena is still throttling model '{model_name}'. "
+                                        f"Retry in about {retry_after}s.")
+                        return
+                    if delay > UPSTREAM_429_INLINE_WAIT_MAX_SEC:
+                        retry_after = max(1, int(delay + 0.999))
+                        yield ("error", f"429: Arena is rate-limiting model '{model_name}'. "
+                                        f"Retry in about {retry_after}s.")
+                        return
+                    same_account_429_retries += 1
+                    log("WARN", f"[{failed_name}] same-account throttle recovery "
+                                f"{same_account_429_retries}/{UPSTREAM_429_SAME_ACCOUNT_RETRIES} · "
+                                f"waiting {delay:.1f}s · {reason}")
+                    if delay > 0:
+                        await asyncio.sleep(delay + 0.05)
+                    next_hint = failed_id or next_hint
+                    continue
 
                 failed_id = str(retry_info.get("jar_id") or "")
                 failed_name = str(retry_info.get("jar_name") or failed_id or "unknown")
@@ -8266,12 +8341,22 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         return
 
                     if verdict == "RATELIMIT":
-                        cooldown = _mark_model_rate_limited(model_name)
+                        explicit_retry = _parse_retry_after_seconds(getattr(e, "retry_after", ""))
+                        cooldown = _mark_model_rate_limited(model_name, explicit_retry)
                         retry_after = max(1, int(cooldown + 0.999))
                         log("WARN", f"[{jar.get('name')}] upstream throttle (HTTP {e.status}) · "
-                                    f"model cooldown {retry_after}s · request stopped; no retry storm")
+                                    f"cooldown {cooldown:.1f}s · retry-after "
+                                    f"{getattr(e, 'retry_after', '') or 'adaptive'} · same-account only")
+                        if int(getattr(e, "frame_count", 0) or 0) == 0:
+                            yield ("retry-same-account", {
+                                "jar_id": jar.get("id"),
+                                "jar_name": jar.get("name"),
+                                "delay": cooldown,
+                                "reason": "definitive zero-frame HTTP 429",
+                            })
+                            return
                         yield ("error", f"429: Arena returned Too Many Requests for model '{model_name}'. "
-                                        f"Bridgena will not send another upstream request for this model for about {retry_after}s.")
+                                        f"Retry in about {retry_after}s.")
                         return
 
                     if verdict == "UPSTREAM":
@@ -8438,12 +8523,20 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         return
 
                     if verdict == "RATELIMIT":
-                        cooldown = _mark_model_rate_limited(model_name)
+                        explicit_retry = _parse_retry_after_seconds(
+                            (resp.headers or {}).get("retry-after", "")
+                            if getattr(resp, "headers", None) is not None else ""
+                        )
+                        cooldown = _mark_model_rate_limited(model_name, explicit_retry)
                         retry_after = max(1, int(cooldown + 0.999))
                         log("WARN", f"[{jar.get('name')}] upstream prompt throttle · "
-                                    f"model cooldown {retry_after}s · request stopped")
-                        yield ("error", f"429: Arena throttled model '{model_name}'. "
-                                        f"Bridgena is applying a local cooldown for about {retry_after}s.")
+                                    f"cooldown {cooldown:.1f}s · same-account only")
+                        yield ("retry-same-account", {
+                            "jar_id": jar.get("id"),
+                            "jar_name": jar.get("name"),
+                            "delay": cooldown,
+                            "reason": "definitive HTTP 429 from curl transport",
+                        })
                         return
 
                     if verdict == "UPSTREAM":
@@ -10444,7 +10537,7 @@ async def chat_completions(request: Request):
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
     messages = body.get("messages") or []
-    _raise_if_model_rate_limited(body.get("model", "auto"))
+    await _wait_if_model_rate_limited(body.get("model", "auto"))
     log("INFO", f"OpenAI request · model {str(body.get('model') or 'auto')[:80]} · "
                 f"messages {len(messages) if isinstance(messages, list) else 0} · "
                 f"tools {len(body.get('tools') or []) if isinstance(body.get('tools') or [], list) else 0} · "
@@ -10591,7 +10684,7 @@ async def anthropic_messages(request: Request):
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
     model = body.get("model", "auto")
-    _raise_if_model_rate_limited(model)
+    await _wait_if_model_rate_limited(model)
     await _pace_api_request(_tenant_identity(keyinfo))
     reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
     if not reserved:
@@ -10926,7 +11019,7 @@ async def healthz():
                                 for j in load_jars()))
     bootable_count = len(_bootable_keeper_jars())
     preferred_keepers, preferred_exits = _api_preferred_targets() if bootable_count else (0, 0)
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.0",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.1",
                          "models": len(get_models()),
                          "bootable_accounts": bootable_count,
                          "keeper_fleet_target": bootable_count,
@@ -11799,7 +11892,9 @@ async def _lifespan(app):
     log("INFO", f"Reliability SLO · rolling window {_reliability_window.maxlen} · target {_RELIABILITY_TARGET*100:.0f}%")
     log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
     log("INFO", "Stream decoder · Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini · snapshot de-dup ON")
-    log("INFO", f"Upstream 429 policy · model cooldown {UPSTREAM_429_COOLDOWN_SEC:.0f}s · Retry-After enforced · no retry storm")
+    log("INFO", f"Upstream 429 policy · adaptive backoff {UPSTREAM_429_FIRST_BACKOFF_SEC:.0f}s→"
+                f"{UPSTREAM_429_COOLDOWN_SEC:.0f}s · inline wait <= {UPSTREAM_429_INLINE_WAIT_MAX_SEC:.0f}s · "
+                f"same-account retries {UPSTREAM_429_SAME_ACCOUNT_RETRIES} · Retry-After honored · no route/account rotation")
     log("INFO", "Capacity target · queued multi-user admission · one stable browser transport lane per keeper")
     log("INFO", "Proxy allocator · full-pool startup scan + distinct keeper assignment enabled")
     if get_verification_solver:
