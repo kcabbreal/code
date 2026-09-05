@@ -180,10 +180,10 @@ def _validated_public_url(value):
     return value.rstrip("/")
 
 PUBLIC_APP_URL = _validated_public_url(os.environ.get(
-    "BRIDGENA_PUBLIC_URL", "https://arena.itio.dpdns.org"
+    "BRIDGENA_PUBLIC_URL", "https://arena.ai"
 ))
 ARENA_BASE = _validated_public_url(os.environ.get(
-    "BRIDGENA_ARENA_BASE", "https://arena.itio.dpdns.org"
+    "BRIDGENA_ARENA_BASE", "https://arena.ai"
 ))
 _ARENA_PARSED = urlparse(ARENA_BASE)
 LOCAL_UPSTREAM = (_ARENA_PARSED.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
@@ -6042,7 +6042,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                 verdict = _classify(resp.status_code, "")
                 if resp.status_code != 200:
                     raw = b""
-                    async for chunk in resp.itio.dpdns.orgter_content():
+                    async for chunk in resp.aiter_content():
                         raw += chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8", "ignore")
                         if len(raw) > 40000:
                             break
@@ -6165,7 +6165,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         _proxy_health_record(proxy, True, ms, source="stream")
                     _flagged_exits.pop(_proxy_hkey(proxy), None)
                 buffer = b""
-                async for chunk in resp.itio.dpdns.orgter_content():
+                async for chunk in resp.aiter_content():
                     if not chunk:
                         continue
                     if isinstance(chunk, str):
@@ -6353,8 +6353,8 @@ td .mono,.mono{font-family:var(--mono);font-size:12.5px}
 .transcript{flex:1;overflow:auto;padding:26px 8%;display:flex;flex-direction:column;gap:16px}
 .bubble{max-width:78%;padding:12px 16px;border-radius:14px;font-size:15px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word}
 .bubble.user{align-self:flex-end;background:color-mix(in srgb,var(--amber) 14%,var(--panel));border:1px solid color-mix(in srgb,var(--amber) 26%,transparent);border-bottom-right-radius:4px}
-.bubble.itio.dpdns.org{align-self:flex-start;background:var(--panel);border:1px solid var(--hair);border-bottom-left-radius:4px}
-.bubble.itio.dpdns.org .who,.bubble.user .who{display:block;font:600 10px var(--mono);letter-spacing:1.2px;text-transform:uppercase;color:var(--ink3);margin-bottom:6px}
+.bubble.ai{align-self:flex-start;background:var(--panel);border:1px solid var(--hair);border-bottom-left-radius:4px}
+.bubble.ai .who,.bubble.user .who{display:block;font:600 10px var(--mono);letter-spacing:1.2px;text-transform:uppercase;color:var(--ink3);margin-bottom:6px}
 .bubble pre{background:#07090E;border:1px solid var(--hair);border-radius:8px;padding:10px 12px;overflow:auto;font:400 12.5px/1.6 var(--mono)}
 .bubble pre code{background:transparent;padding:0;color:inherit}
 .bubble code{background:var(--panel2);border:1px solid var(--hair);border-radius:4px;padding:1px 5px;font:400 13px var(--mono)}
@@ -7535,7 +7535,7 @@ async def _native_anthropic_request(request: Request, endpoint: str):
 
         async def forward():
             try:
-                async for chunk in response.itio.dpdns.orgter_bytes():
+                async for chunk in response.aiter_bytes():
                     yield chunk
             except httpx.HTTPError:
                 yield _anthropic_sse("error", {"type": "error", "error": {
