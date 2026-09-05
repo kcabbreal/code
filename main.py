@@ -165,7 +165,26 @@ import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)) or "."
 PORT = int(os.environ.get("BRIDGENA_PORT", "8000"))
-ARENA_BASE = os.environ.get("BRIDGENA_ARENA_BASE", "http://localhost:6767")
+# Advertised application origin only; never used for upstream traffic or binds.
+def _validated_public_url(value):
+    value = value.strip()
+    parsed = urlparse(value)
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment
+            or any(ch.isspace() or ord(ch) < 32 for ch in value)
+            or "\\" in value or "?" in value or "#" in value):
+        raise ValueError("BRIDGENA_PUBLIC_URL must be an HTTP(S) origin without credentials, path, query, or fragment")
+    if parsed.port is not None and not 1 <= parsed.port <= 65535:
+        raise ValueError("BRIDGENA_PUBLIC_URL has an invalid port")
+    return value.rstrip("/")
+
+PUBLIC_APP_URL = _validated_public_url(os.environ.get(
+    "BRIDGENA_PUBLIC_URL", "https://arena.ai"
+))
+ARENA_BASE = _validated_public_url(os.environ.get(
+    "BRIDGENA_ARENA_BASE", "https://arena.ai"
+))
 _ARENA_PARSED = urlparse(ARENA_BASE)
 LOCAL_UPSTREAM = (_ARENA_PARSED.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
 LOCAL_VERIFICATION_ENHANCED = LOCAL_UPSTREAM and os.environ.get(
@@ -177,7 +196,9 @@ LOCAL_VERIFICATION_MAX_ROUNDS = max(
 LOCAL_VERIFICATION_POLL_MS = max(
     100, min(2000, int(os.environ.get("BRIDGENA_LOCAL_VERIFICATION_POLL_MS", "300")))
 )
-PUBLIC_AUTH_BASE = os.environ.get("BRIDGENA_PUBLIC_AUTH_BASE", "https://arena.ai").rstrip("/")
+PUBLIC_AUTH_BASE = _validated_public_url(os.environ.get(
+    "BRIDGENA_PUBLIC_AUTH_BASE", ARENA_BASE
+))
 PUBLIC_AUTH_URL = os.environ.get("BRIDGENA_PUBLIC_AUTH_URL", f"{PUBLIC_AUTH_BASE}/?mode=direct")
 ARENA_MODES = ["direct-battle", "direct"]
 MAX_PROMPT = 50000
@@ -220,7 +241,7 @@ KEEPER_LOGIN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.4-readiness-diagnostics")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.6-unified-base")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -7661,7 +7682,7 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.4", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.6", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
@@ -8070,9 +8091,10 @@ def _cli():
     print("=" * 62)
     print("  BRIDGENA v3 — Arena Bridge (" + BUILD_STAMP + ")")
     print("=" * 62)
-    print(f"  * Live Chat   : http://localhost:{args.port}/chat")
-    print(f"  * Dashboard   : http://localhost:{args.port}/dashboard")
-    print(f"  * OpenAI Base : http://localhost:{args.port}/v1")
+    print(f"  * Live Chat   : {PUBLIC_APP_URL}/chat")
+    print(f"  * Dashboard   : {PUBLIC_APP_URL}/dashboard")
+    print(f"  * OpenAI Base : {PUBLIC_APP_URL}/v1")
+    print(f"  * Local port  : {args.port} (public URL requires reverse proxy/TLS)")
     print(f"  * Workers     : {args.workers} (healthy accounts: {jars_count})")
     print(f"  * Exits       : {len([l for l in _pool_lines() if l.strip()])} in proxies.txt")
     if args.workers > 1:
