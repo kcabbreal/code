@@ -250,6 +250,7 @@ API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE
 API_PACE_INTERVAL_SEC = max(0.0, min(5.0, float(os.environ.get("BRIDGENA_API_PACE_INTERVAL_SEC", "0.75"))))
 API_PACE_MAX_WAIT_SEC = max(1.0, min(30.0, float(os.environ.get("BRIDGENA_API_PACE_MAX_WAIT_SEC", "8"))))
 CONVERSATION_MIN_GAP_SEC = max(0.0, min(5.0, float(os.environ.get("BRIDGENA_CONVERSATION_MIN_GAP_SEC", "0.9"))))
+UPSTREAM_429_COOLDOWN_SEC = max(5.0, min(300.0, float(os.environ.get("BRIDGENA_UPSTREAM_429_COOLDOWN_SEC", "45"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 VERIFICATION_MIN_TOKEN_LEN = max(
     32, min(512, int(os.environ.get("BRIDGENA_VERIFICATION_MIN_TOKEN_LEN", "80")))
@@ -266,7 +267,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.8-universal-stream-decoder")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.9-ratelimit-cooldown-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -6403,6 +6404,39 @@ _tenant_pace_locks: Dict[str, asyncio.Lock] = {}
 _tenant_pace_next: Dict[str, float] = {}
 _tenant_pace_guard = threading.Lock()
 _conversation_next_start: Dict[str, float] = {}
+_model_rate_limit_until: Dict[str, float] = {}
+_model_rate_limit_guard = threading.Lock()
+
+def _model_rate_limit_remaining(model_name: str) -> float:
+    key = str(model_name or "auto").strip().lower()
+    with _model_rate_limit_guard:
+        until = _model_rate_limit_until.get(key, 0.0)
+    return max(0.0, until - time.monotonic())
+
+def _mark_model_rate_limited(model_name: str, seconds: float = None) -> float:
+    key = str(model_name or "auto").strip().lower()
+    duration = float(seconds if seconds is not None else UPSTREAM_429_COOLDOWN_SEC)
+    until = time.monotonic() + max(1.0, duration)
+    with _model_rate_limit_guard:
+        _model_rate_limit_until[key] = max(_model_rate_limit_until.get(key, 0.0), until)
+    return max(0.0, until - time.monotonic())
+
+def _clear_model_rate_limit(model_name: str):
+    key = str(model_name or "auto").strip().lower()
+    with _model_rate_limit_guard:
+        _model_rate_limit_until.pop(key, None)
+
+def _raise_if_model_rate_limited(model_name: str):
+    remaining = _model_rate_limit_remaining(model_name)
+    if remaining <= 0:
+        return
+    retry_after = max(1, int(remaining + 0.999))
+    raise HTTPException(
+        status_code=429,
+        detail=f"Model '{model_name}' is temporarily rate-limited upstream. Retry in about {retry_after}s.",
+        headers={"Retry-After": str(retry_after)},
+    )
+
 
 def _tenant_pace_lock(tenant_id: str) -> asyncio.Lock:
     key = str(tenant_id or "anonymous")
@@ -6703,6 +6737,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             f"{(time.monotonic() - _transport_t0):.2f}s transport total · "
                             f"{len(response_text)} text chars · {_decoded_events} decoded events · "
                             f"{_unknown_frames} metadata/unknown frames")
+                _clear_model_rate_limit(model_name)
                 yield ("done", response_text)
                 return
             except BridgeHTTPError as e:
@@ -6731,8 +6766,12 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         return
 
                     if verdict == "RATELIMIT":
-                        log("WARN", f"[{jar.get('name')}] upstream throttle (HTTP {e.status}) — request stopped; no retry storm")
-                        yield ("error", f"429: Arena returned Too Many Requests for model '{model_name}'. This model is currently rate-limited upstream on Arena; wait 30-60s or select another model in your chat.")
+                        cooldown = _mark_model_rate_limited(model_name)
+                        retry_after = max(1, int(cooldown + 0.999))
+                        log("WARN", f"[{jar.get('name')}] upstream throttle (HTTP {e.status}) · "
+                                    f"model cooldown {retry_after}s · request stopped; no retry storm")
+                        yield ("error", f"429: Arena returned Too Many Requests for model '{model_name}'. "
+                                        f"Bridgena will not send another upstream request for this model for about {retry_after}s.")
                         return
 
                     if verdict == "UPSTREAM":
@@ -6905,8 +6944,12 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         return
 
                     if verdict == "RATELIMIT":
-                        log("WARN", f"[{jar.get('name')}] upstream prompt throttle — request stopped; no account rotation")
-                        yield ("error", "429: Arena throttled or rejected this prompt. No account rotation was attempted; wait 30-60 seconds, then retry or start a new chat.")
+                        cooldown = _mark_model_rate_limited(model_name)
+                        retry_after = max(1, int(cooldown + 0.999))
+                        log("WARN", f"[{jar.get('name')}] upstream prompt throttle · "
+                                    f"model cooldown {retry_after}s · request stopped")
+                        yield ("error", f"429: Arena throttled model '{model_name}'. "
+                                        f"Bridgena is applying a local cooldown for about {retry_after}s.")
                         return
 
                     if verdict == "UPSTREAM":
@@ -8316,6 +8359,7 @@ async def chat_completions(request: Request):
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
     messages = body.get("messages") or []
+    _raise_if_model_rate_limited(body.get("model", "auto"))
     log("INFO", f"OpenAI request · model {str(body.get('model') or 'auto')[:80]} · "
                 f"messages {len(messages) if isinstance(messages, list) else 0} · "
                 f"tools {len(body.get('tools') or []) if isinstance(body.get('tools') or [], list) else 0} · "
@@ -8446,7 +8490,9 @@ async def anthropic_messages(request: Request):
     prompt = _anthropic_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
-    reserved, duplicate_count = await _pace_api_request(_tenant_identity(keyinfo))
+    model = body.get("model", "auto")
+    _raise_if_model_rate_limited(model)
+    await _pace_api_request(_tenant_identity(keyinfo))
     reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
     if not reserved:
         if duplicate_count == 1:
@@ -8454,7 +8500,6 @@ async def anthropic_messages(request: Request):
                         f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
         raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
 
-    model = body.get("model", "auto")
     chat_id = _logical_chat_id(body, keyinfo, "anthropic")
     tenant_id = _tenant_identity(keyinfo)
     system_prompt = _anthropic_system_context(body)
@@ -8745,7 +8790,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.8",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.9",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -9314,6 +9359,7 @@ async def _lifespan(app):
     log("INFO", f"Keeper startup · parallel starts {KEEPER_START_CONCURRENCY} · parallel logins {KEEPER_LOGIN_CONCURRENCY} · warm-up {KEEPER_WARMUP_SEC}s · cohort readiness barrier ON")
     log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
     log("INFO", "Stream decoder · Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini · snapshot de-dup ON")
+    log("INFO", f"Upstream 429 policy · model cooldown {UPSTREAM_429_COOLDOWN_SEC:.0f}s · Retry-After enforced · no retry storm")
     log("INFO", "Capacity target · queued multi-user admission · one stable browser transport lane per keeper")
     log("INFO", "Proxy allocator · full-pool startup scan + distinct keeper assignment enabled")
     if get_verification_solver:
