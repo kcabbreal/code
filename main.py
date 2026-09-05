@@ -165,7 +165,7 @@ KEEPER_REQUEST_READY_SEC = max(30, min(180, int(os.environ.get("BRIDGENA_KEEPER_
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2-stable-control-plane")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.1-python310-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -6564,7 +6564,17 @@ def login_page(err: str = "") -> str:
 def dashboard_page(overview: dict) -> str:
     m=overview['metrics']
     rows_pool=''.join(f"<tr><td class=mono>{esc(r['display'])}</td><td>{_verdict_pill(r['verdict'])}</td><td class=muted>{esc(r.get('why') or '—')}</td><td>{esc(r.get('latency') or '—')}{' ms' if r.get('latency') else ''}</td></tr>" for r in overview['pool'][:8]) or '<tr><td colspan=4 class=muted>No network entries yet.</td></tr>'
-    jrows=''.join(f"<tr><td><b>{esc(j['name'])}</b></td><td class=mono>{esc(j.get('persona','—'))}</td><td>{'<span class=\"pill ok\">live</span>' if j['id'] in overview['live_ids'] else '<span class=\"pill idle\">offline</span>'}</td><td>{_verdict_pill('alive' if j.get('ok') else ('arena-blocked' if j.get('limited') else 'unknown'))}</td></tr>" for j in overview['jars']) or '<tr><td colspan=4 class=muted>No accounts configured.</td></tr>'
+    jrow_parts=[]
+    for j in overview['jars']:
+        browser_pill = ('<span class="pill ok">live</span>' if j['id'] in overview['live_ids']
+                        else '<span class="pill idle">offline</span>')
+        health = 'alive' if j.get('ok') else ('arena-blocked' if j.get('limited') else 'unknown')
+        jrow_parts.append(
+            f"<tr><td><b>{esc(j['name'])}</b></td>"
+            f"<td class=mono>{esc(j.get('persona','—'))}</td>"
+            f"<td>{browser_pill}</td><td>{_verdict_pill(health)}</td></tr>"
+        )
+    jrows=''.join(jrow_parts) or '<tr><td colspan=4 class=muted>No accounts configured.</td></tr>'
     logl=''.join(f'<div class="{esc(x["lvl"])}">{esc(x["line"])}</div>' for x in overview['logtail'])
     return page('Overview',f'''<div class="pagehead"><div><h1>Control plane</h1><p>Request engine, browser keepers, network health, model catalog and API compatibility from one workspace.</p></div><div class="row"><a class="btn" href="/browser-view">Open browser observer</a><a class="btn primary" href="/chat">New chat</a></div></div><div class="grid metrics"><div class="card metric"><div class="k">Healthy exits</div><div class="v">{m['alive']}<span class="muted" style="font-size:17px">/{m['pool_total']}</span></div><div class="s">Current network pool</div></div><div class="card metric"><div class="k">Restricted</div><div class="v">{m['flagged']}</div><div class="s">Temporarily excluded by existing policy</div></div><div class="card metric"><div class="k">Keepers</div><div class="v">{m['keepers_live']}</div><div class="s">{m['jars_ok']} healthy of {m['jars_total']} accounts</div></div><div class="card metric"><div class="k">Models</div><div class="v">{m['models']}</div><div class="s">Published by the compatibility API</div></div></div><div class="split" style="margin-top:12px"><section class="card"><h3>Network snapshot <span class=spacer></span><a class=muted href="/pool">View network →</a></h3><div style="overflow:auto"><table><thead><tr><th>Exit</th><th>State</th><th>Diagnosis</th><th>RTT</th></tr></thead><tbody>{rows_pool}</tbody></table></div></section><section class="card"><h3>Keeper fleet <span class=spacer></span><a class=muted href="/browser-view">Watch →</a></h3><div style="overflow:auto"><table><thead><tr><th>Account</th><th>Persona</th><th>Browser</th><th>Health</th></tr></thead><tbody>{jrows}</tbody></table></div></section></div><section class="card" style="margin-top:12px"><h3>Runtime activity <span class=spacer></span><span class="muted small">auto-refresh</span></h3><div class="console" id="cons">{logl}</div></section>''','dash',r'''async function consRefresh(){try{const r=await fetch('/debug-logs/data',{cache:'no-store'});if(!r.ok)return;const d=await r.json(),c=document.getElementById('cons');c.innerHTML=d.map(x=>'<div class="'+(x.lvl||'INFO')+'">'+String(x.line||x.message||'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))+'</div>').join('');c.scrollTop=c.scrollHeight}catch(e){}}setInterval(consRefresh,3000);''')
 
@@ -6597,7 +6607,7 @@ from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
 from fastapi.security import APIKeyHeader
 
-app = FastAPI(title="Bridgena", version="3.2")
+app = FastAPI(title="Bridgena", version="3.2.1")
 
 # ---------- v3 optional VNC integration ----------
 _V3_VNC_PROCS=[]
@@ -7417,7 +7427,7 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.1", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values() if session.running),
