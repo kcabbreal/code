@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.1-adaptive-429-recovery")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.2-recover-then-salvage")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1929,8 +1929,11 @@ ARENA_UI_RECOVERY_TIMEOUT_SEC = max(5.0, min(60.0, float(os.environ.get("BRIDGEN
 ARENA_HISTORY_RECOVERY_LIMIT = max(5, min(200, int(os.environ.get("BRIDGENA_ARENA_HISTORY_RECOVERY_LIMIT", "60"))))
 ARENA_HISTORY_POLL_SEC = max(0.25, min(3.0, float(os.environ.get("BRIDGENA_ARENA_HISTORY_POLL_SEC", "0.65"))))
 ARENA_HISTORY_STABLE_POLLS = max(2, min(8, int(os.environ.get("BRIDGENA_ARENA_HISTORY_STABLE_POLLS", "3"))))
+ARENA_SALVAGE_QUICK_SEC = max(1.0, min(8.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_QUICK_SEC", "3"))))
+ARENA_POST_RESTART_SALVAGE_SEC = max(5.0, min(45.0, float(os.environ.get("BRIDGENA_ARENA_POST_RESTART_SALVAGE_SEC", "22"))))
+ARENA_SALVAGE_RECOVERY_WAIT_SEC = max(5.0, min(40.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_RECOVERY_WAIT_SEC", "18"))))
 ARENA_UI_RECOVERY_STABLE_SEC = max(0.8, min(6.0, float(os.environ.get("BRIDGENA_ARENA_UI_RECOVERY_STABLE_SEC", "1.8"))))
-_arena_ui_recovery_stats = {"attempted": 0, "recovered": 0, "history_api_recovered": 0, "history_api_match": 0, "history_index_waits": 0, "ui_recovered": 0, "not_found": 0, "incomplete": 0, "navigation_failed": 0}
+_arena_ui_recovery_stats = {"attempted": 0, "recovered": 0, "history_api_recovered": 0, "history_api_match": 0, "history_index_waits": 0, "ui_recovered": 0, "post_restart_attempted": 0, "post_restart_recovered": 0, "recovery_wait_timeout": 0, "not_found": 0, "incomplete": 0, "navigation_failed": 0}
 _arena_ui_recovery_stats_guard = threading.Lock()
 
 def _bump_arena_ui_recovery(key: str) -> None:
@@ -7341,7 +7344,8 @@ async def _arena_history_probe(page, *, arena_id: str, model_message_id: str,
 
 async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: str,
                                    user_prompt: str, partial_text: str = "",
-                                   cached_url: str = "") -> dict:
+                                   cached_url: str = "",
+                                   timeout_sec: Optional[float] = None) -> dict:
     """Recover a broken stream from Arena history/UI without replaying the prompt.
 
     Recovery is intentionally patient. Arena can persist/index a just-created
@@ -7367,7 +7371,11 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
     search_term = " ".join(str(user_prompt or "").split())[:240]
     prompt_probe = search_term[:96]
     partial_probe = str(partial_text or "")[:180]
-    deadline = time.monotonic() + ARENA_UI_RECOVERY_TIMEOUT_SEC
+    effective_timeout = max(
+        1.0,
+        min(60.0, float(timeout_sec if timeout_sec is not None else ARENA_UI_RECOVERY_TIMEOUT_SEC))
+    )
+    deadline = time.monotonic() + effective_timeout
 
     extract_js = r"""([messageId, promptProbe, partialProbe]) => {
       const visible = el => {
@@ -7475,7 +7483,7 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
             history_match_logged = False
             history_phase_deadline = min(
                 deadline,
-                time.monotonic() + max(8.0, ARENA_UI_RECOVERY_TIMEOUT_SEC * 0.62)
+                time.monotonic() + max(1.0, effective_timeout * 0.62)
             )
 
             while time.monotonic() < history_phase_deadline:
@@ -7745,12 +7753,15 @@ async def _attempt_ui_stream_salvage(*, session, chat_id: str, model_name: str,
                                      arena_id: str, model_message_id: str,
                                      user_prompt: str, partial_text: str,
                                      jar: dict, proxy: Optional[str],
-                                     cached_url: str = "") -> dict:
+                                     cached_url: str = "",
+                                     timeout_sec: Optional[float] = None,
+                                     stage: str = "initial") -> dict:
     """Wrapper that persists recovered bindings/URLs but never replays a prompt."""
     if not ARENA_UI_STREAM_RECOVERY:
         return {"ok": False, "reason": "disabled"}
 
-    log("WARN", f"[{jar.get('name')}] stream interrupted · opening Arena history UI for recovery")
+    log("WARN", f"[{jar.get('name')}] stream salvage · stage {stage} · "
+                f"history/UI timeout {float(timeout_sec if timeout_sec is not None else ARENA_UI_RECOVERY_TIMEOUT_SEC):.1f}s")
     result = await _arena_ui_stream_recover(
         session,
         arena_id=arena_id,
@@ -7758,6 +7769,7 @@ async def _attempt_ui_stream_salvage(*, session, chat_id: str, model_name: str,
         user_prompt=user_prompt,
         partial_text=partial_text,
         cached_url=cached_url,
+        timeout_sec=timeout_sec,
     )
 
     if result.get("ok"):
@@ -7784,6 +7796,61 @@ async def _attempt_ui_stream_salvage(*, session, chat_id: str, model_name: str,
                     f"url {str(result.get('url') or '')[:180]}")
 
     return result
+
+
+async def _recover_keeper_before_salvage(sid: str, *, reason: str,
+                                         timeout_sec: float = None) -> bool:
+    """Repair a dead keeper route before trying Arena history again.
+
+    The prior implementation spent the entire history-recovery window using the
+    browser context whose route had just failed, then restarted it only after
+    salvage gave up. That made HTTP-0 recovery structurally unlikely to work.
+
+    This helper reuses the existing same-account/same-route recovery worker,
+    waits for the replacement browser to become verified and route-healthy,
+    then returns so salvage can run in that NEW authenticated context.
+    """
+    sid = str(sid or "")
+    if not sid:
+        return False
+
+    wait_for = max(
+        3.0,
+        min(45.0, float(timeout_sec if timeout_sec is not None else ARENA_SALVAGE_RECOVERY_WAIT_SEC))
+    )
+    _schedule_transport_recovery(sid, reason)
+
+    task = _transport_recovery_tasks.get(sid)
+    if task:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=wait_for)
+        except asyncio.TimeoutError:
+            _bump_arena_ui_recovery("recovery_wait_timeout")
+            log("WARN", f"[{sid}] salvage recovery wait timed out after {wait_for:.1f}s")
+        except Exception as exc:
+            log("WARN", f"[{sid}] salvage recovery task failed · "
+                        f"{type(exc).__name__}: {redact(str(exc))[:180]}")
+
+    session = keeper.sessions.get(sid)
+    if not keeper_session_ready(session):
+        return False
+
+    # The recovery worker normally verifies this already. Probe once more here
+    # because this request is about to depend on the recovered browser.
+    try:
+        route_ok, route_status, route_detail = await session.probe_transport(force=True)
+    except Exception as exc:
+        log("WARN", f"[{getattr(session, 'name', sid)}] post-restart salvage probe failed · "
+                    f"{type(exc).__name__}: {redact(str(exc))[:160]}")
+        return False
+
+    if not route_ok:
+        log("WARN", f"[{getattr(session, 'name', sid)}] post-restart salvage route still unhealthy · "
+                    f"{redact(route_detail)[:160]}")
+        return False
+
+    log("OK", f"[{getattr(session, 'name', sid)}] salvage browser recovered · route HTTP {route_status}")
+    return True
 
 
 async def _ensure_predispatch_transport(jar: dict, *, wait_for_recovery: bool = True) -> bool:
@@ -8219,7 +8286,39 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         jar=jar,
                         proxy=proxy,
                         cached_url=str((mc or {}).get("ui_url") or ""),
+                        timeout_sec=ARENA_SALVAGE_QUICK_SEC,
+                        stage="quick-current-context",
                     )
+
+                    # If the route itself died, history navigation in the same
+                    # context is often doomed too. Repair FIRST, then retry
+                    # salvage in the freshly-started browser context.
+                    if not salvage.get("ok"):
+                        _bump_arena_ui_recovery("post_restart_attempted")
+                        recovered_browser = await _recover_keeper_before_salvage(
+                            str(jar.get("id") or ""),
+                            reason="mid-stream failure before second-stage salvage",
+                            timeout_sec=ARENA_SALVAGE_RECOVERY_WAIT_SEC,
+                        )
+                        if recovered_browser:
+                            browser_session = keeper.sessions.get(jar.get("id"))
+                            salvage = await _attempt_ui_stream_salvage(
+                                session=browser_session,
+                                chat_id=chat_id,
+                                model_name=model_name,
+                                arena_id=str(base.get("id") or (mc or {}).get("arena_id") or ""),
+                                model_message_id=str(base.get("modelAMessageId") or ""),
+                                user_prompt=prompt,
+                                partial_text=response_text or "",
+                                jar=jar,
+                                proxy=proxy,
+                                cached_url=str((mc or {}).get("ui_url") or ""),
+                                timeout_sec=ARENA_POST_RESTART_SALVAGE_SEC,
+                                stage="post-restart",
+                            )
+                            if salvage.get("ok"):
+                                _bump_arena_ui_recovery("post_restart_recovered")
+
                     if salvage.get("ok"):
                         final_text = str(salvage.get("text") or "")
                         suffix = str(salvage.get("suffix") or "")
@@ -8232,23 +8331,21 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         else:
                             response_text = final_text or response_text
 
-                        _schedule_transport_recovery(
-                            jar.get("id"), "post-salvage repair after mid-stream failure"
-                        )
-                        log("OK", f"[{jar.get('name')}] interrupted stream recovered from Arena UI · "
-                                  f"{len(response_text)} final chars · keeper remains quarantined until repair completes")
+                        log("OK", f"[{jar.get('name')}] interrupted stream recovered after "
+                                  f"{salvage.get('source') or 'history/UI'} salvage · "
+                                  f"{len(response_text)} final chars")
                         yield ("done", response_text)
                         return
 
-                    _schedule_transport_recovery(jar.get("id"), "mid-stream browser transport failure")
                     if response_text or reasoning_text:
                         yield ("error", "502: Arena returned partial assistant output but never delivered a complete "
-                                        "provider finish event. Bridgena polled the authenticated Arena history and "
-                                        "chat UI but could not confirm a completed answer; the partial response remains visible above.")
+                                        "provider finish event. Bridgena tried history recovery, repaired the bound "
+                                        "browser route, then checked history again; no completed answer could be confirmed. "
+                                        "The partial response remains visible above.")
                     else:
                         yield ("error", "502: Arena opened the response but the browser transport was interrupted. "
-                                        "Bridgena polled authenticated history and the chat UI but could not recover "
-                                        "a completed answer.")
+                                        "Bridgena repaired the bound browser route and checked Arena history again, "
+                                        "but no completed answer could be confirmed.")
                     return
                 if not e.status:
                     log("WARN", f"[{jar.get('name')}] browser transport failed before an HTTP response; "
@@ -8261,6 +8358,9 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     # `fetch()` can throw even after the POST reached Arena. The
                     # history UI is our source of truth for whether a response
                     # actually appeared; never replay the prompt just to find out.
+                    # Give a still-responsive context a tiny chance to show
+                    # the history row, but do NOT burn the whole salvage timeout
+                    # through a route that just returned HTTP-0.
                     salvage = await _attempt_ui_stream_salvage(
                         session=browser_session,
                         chat_id=chat_id,
@@ -8272,7 +8372,36 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         jar=jar,
                         proxy=proxy,
                         cached_url=str((mc or {}).get("ui_url") or ""),
+                        timeout_sec=ARENA_SALVAGE_QUICK_SEC,
+                        stage="quick-http0",
                     )
+
+                    if not salvage.get("ok"):
+                        _bump_arena_ui_recovery("post_restart_attempted")
+                        recovered_browser = await _recover_keeper_before_salvage(
+                            str(jar.get("id") or ""),
+                            reason="HTTP-0 before history salvage",
+                            timeout_sec=ARENA_SALVAGE_RECOVERY_WAIT_SEC,
+                        )
+                        if recovered_browser:
+                            browser_session = keeper.sessions.get(jar.get("id"))
+                            salvage = await _attempt_ui_stream_salvage(
+                                session=browser_session,
+                                chat_id=chat_id,
+                                model_name=model_name,
+                                arena_id=str(base.get("id") or (mc or {}).get("arena_id") or ""),
+                                model_message_id=str(base.get("modelAMessageId") or ""),
+                                user_prompt=prompt,
+                                partial_text=response_text or "",
+                                jar=jar,
+                                proxy=proxy,
+                                cached_url=str((mc or {}).get("ui_url") or ""),
+                                timeout_sec=ARENA_POST_RESTART_SALVAGE_SEC,
+                                stage="post-restart-http0",
+                            )
+                            if salvage.get("ok"):
+                                _bump_arena_ui_recovery("post_restart_recovered")
+
                     if salvage.get("ok"):
                         final_text = str(salvage.get("text") or "")
                         suffix = str(salvage.get("suffix") or "")
@@ -8285,25 +8414,21 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         else:
                             response_text = final_text or response_text
 
-                        _schedule_transport_recovery(
-                            jar.get("id"), "post-salvage repair after HTTP-0"
-                        )
-                        log("OK", f"[{jar.get('name')}] HTTP-0 request recovered from Arena UI · "
-                                  f"{len(response_text)} chars · keeper remains quarantined until repair completes")
+                        log("OK", f"[{jar.get('name')}] HTTP-0 request recovered after route repair · "
+                                  f"{len(response_text)} chars · source {salvage.get('source') or 'history/UI'}")
                         yield ("done", response_text)
                         return
 
-                    _schedule_transport_recovery(jar.get("id"), "pre-response browser transport failure")
-
-                    # Keep the existing 5-second user-facing minimum error window.
+                    # Keep the existing 5-second minimum for very fast failures;
+                    # normally the foreground repair+salvage path is longer.
                     elapsed = time.monotonic() - _transport_t0
                     remaining = FIRST_ASSISTANT_RESPONSE_SEC - elapsed
                     if remaining > 0:
                         await asyncio.sleep(remaining)
 
-                    yield ("error", f"502: No completed assistant response could be recovered from Arena within "
-                                    f"{ARENA_UI_RECOVERY_TIMEOUT_SEC:.0f}s after the browser route failed. "
-                                    "The same keeper is being recovered.")
+                    yield ("error", "502: The browser route failed before a response was observed. Bridgena "
+                                    "restarted the same bound keeper, verified its route, and checked Arena history "
+                                    "again, but no completed assistant response could be confirmed.")
                     return
                 else:
                     verdict = _classify(e.status, e.body)
@@ -11019,7 +11144,7 @@ async def healthz():
                                 for j in load_jars()))
     bootable_count = len(_bootable_keeper_jars())
     preferred_keepers, preferred_exits = _api_preferred_targets() if bootable_count else (0, 0)
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.1",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.2",
                          "models": len(get_models()),
                          "bootable_accounts": bootable_count,
                          "keeper_fleet_target": bootable_count,
@@ -11883,8 +12008,8 @@ async def _lifespan(app):
     log("INFO", f"Account failover · max {ACCOUNT_FAILOVER_MAX} alternate keeper(s) · thread handoff ON for pre-generation account/session failures · 429+verification+partial-stream excluded")
     log("INFO", f"Stream completion policy · first assistant output <= {FIRST_ASSISTANT_RESPONSE_SEC:.1f}s · provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} · partial UI preservation ON")
     log("INFO", f"Arena stream salvage · {'ON' if ARENA_UI_STREAM_RECOVERY else 'OFF'} · "
-                f"authenticated /api/history/unified polling + Search Chats UI · "
-                f"limit {ARENA_HISTORY_RECOVERY_LIMIT} · timeout {ARENA_UI_RECOVERY_TIMEOUT_SEC:.0f}s · no prompt replay")
+                f"quick {ARENA_SALVAGE_QUICK_SEC:.0f}s current-context check → same-keeper route repair → "
+                f"{ARENA_POST_RESTART_SALVAGE_SEC:.0f}s post-restart history/UI salvage · no prompt replay")
     log("INFO", f"Customer error privacy · opaque friendly messages ON · private registry {_ERROR_EVENTS_FILE} · Errors tab enabled")
     log("INFO", f"Readiness leases · TTL {_API_VERIFICATION_TTL:.0f}s · staggered proactive renewal 55-72% · "
                 f"admission {_API_ADMISSION_MIN_KEEPERS} keeper/{_API_ADMISSION_MIN_EXITS} exit · "
