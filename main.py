@@ -242,10 +242,10 @@ ARENA_DIRECT_URL = os.environ.get("BRIDGENA_ARENA_DIRECT_URL", f"{ARENA_BASE}/?m
 ALLOW_CONFIGURED_RECAPTCHA_FALLBACK = os.environ.get(
     "BRIDGENA_ALLOW_RECAPTCHA_FALLBACK", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
-REQUEST_MAX_ATTEMPTS = max(1, min(5, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "3"))))
+REQUEST_MAX_ATTEMPTS = max(1, min(3, int(os.environ.get("BRIDGENA_REQUEST_MAX_ATTEMPTS", "1"))))
 STREAM_TAIL_GRACE_MS = max(250, min(10000, int(os.environ.get("BRIDGENA_STREAM_TAIL_GRACE_MS", "1500"))))
 KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SEC", "15"))))
-KEEPER_REQUEST_READY_SEC = max(30, min(180, int(os.environ.get("BRIDGENA_KEEPER_REQUEST_READY_SEC", "100"))))
+KEEPER_REQUEST_READY_SEC = max(2, min(20, int(os.environ.get("BRIDGENA_KEEPER_REQUEST_READY_SEC", "6"))))
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
 VERIFICATION_MIN_TOKEN_LEN = max(
@@ -258,12 +258,12 @@ KEEPER_LOGIN_CONCURRENCY = max(
     1, min(4, int(os.environ.get("BRIDGENA_KEEPER_LOGIN_CONCURRENCY", "2")))
 )
 API_TURN_CONCURRENCY = max(
-    1, min(8, int(os.environ.get("BRIDGENA_API_TURN_CONCURRENCY", "3")))
+    1, min(128, int(os.environ.get("BRIDGENA_API_TURN_CONCURRENCY", "32")))
 )
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.3.3-startup-readiness-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.4.1-20user-unlimited-api-concurrency")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1827,15 +1827,38 @@ def jar_has_cf(jar: dict) -> bool:
 # A keeper must have passed an authenticated Enterprise-V3 preflight before
 # external API traffic can be assigned to it.
 _API_VERIFICATION_TTL = max(60.0, float(os.environ.get("BRIDGENA_VERIFICATION_READY_TTL", "600")))
-_API_MIN_VERIFIED_KEEPERS = max(1, min(7, int(os.environ.get("BRIDGENA_MIN_VERIFIED_KEEPERS", "1"))))
+_API_MIN_VERIFIED_KEEPERS = max(1, min(7, int(os.environ.get("BRIDGENA_MIN_VERIFIED_KEEPERS", "2"))))
+_API_MIN_VERIFIED_EXITS = max(1, min(7, int(os.environ.get("BRIDGENA_MIN_VERIFIED_EXITS", "2"))))
+_API_FAILURE_QUARANTINE_S = max(15.0, float(os.environ.get("BRIDGENA_FAILURE_QUARANTINE_S", "90")))
 _api_verified_keepers: Dict[str, float] = {}
+_api_keeper_quarantine_until: Dict[str, float] = {}
 _api_ready_event = asyncio.Event()
 
 def _api_keeper_verified(sid: Optional[str]) -> bool:
     if not sid:
         return False
-    ts = _api_verified_keepers.get(str(sid), 0.0)
+    sid = str(sid)
+    if time.monotonic() < _api_keeper_quarantine_until.get(sid, 0.0):
+        return False
+    ts = _api_verified_keepers.get(sid, 0.0)
     return bool(ts and (time.monotonic() - ts) <= _API_VERIFICATION_TTL)
+
+def _api_keeper_exit_key(sid: str) -> str:
+    s = keeper.sessions.get(str(sid))
+    raw = getattr(s, "_used_proxy", "") if s else ""
+    return _proxy_hkey(raw) if raw else f"direct:{sid}"
+
+def _verified_exit_count() -> int:
+    return len({_api_keeper_exit_key(sid) for sid in _api_verified_keepers if _api_keeper_verified(sid)})
+
+def _quarantine_api_keeper(sid: Optional[str], reason: str, seconds: Optional[float] = None) -> None:
+    if not sid:
+        return
+    sid = str(sid)
+    _api_verified_keepers.pop(sid, None)
+    _api_keeper_quarantine_until[sid] = time.monotonic() + float(seconds or _API_FAILURE_QUARANTINE_S)
+    _refresh_api_ready_event()
+    log("WARN", f"[{sid}] API keeper quarantined · {reason} · {int(seconds or _API_FAILURE_QUARANTINE_S)}s")
 
 def _verified_keeper_count() -> int:
     now = time.monotonic()
@@ -1846,7 +1869,9 @@ def _verified_keeper_count() -> int:
     return sum(1 for sid in _api_verified_keepers if keeper_session_ready(keeper.sessions.get(sid)))
 
 def _refresh_api_ready_event() -> None:
-    if bool(get_models()) and _verified_keeper_count() >= _API_MIN_VERIFIED_KEEPERS:
+    enough_keepers = _verified_keeper_count() >= _API_MIN_VERIFIED_KEEPERS
+    enough_exits = _verified_exit_count() >= _API_MIN_VERIFIED_EXITS
+    if bool(get_models()) and enough_keepers and enough_exits:
         _api_ready_event.set()
     else:
         _api_ready_event.clear()
@@ -2344,6 +2369,8 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
         captcha_clean = 1 if (now - _captcha_failed_jars.get(sid, 0.0) > 300) else 0
         api_verified = 1 if _api_keeper_verified(sid) else 0
         idle = 1 if (not s or not getattr(s, "_action_lock", None) or not s._action_lock.locked()) else 0
+        active = int(getattr(s, "active_requests", 0) or 0) if s else 0
+        load_score = -active
         # last_used is inverted so older = higher priority
         recency = -float(j.get("last_used", 0) or 0)
         return (
@@ -2354,6 +2381,7 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
             1 if (prefer_live and has_session and healthy) else 0,
             1 if available else 0,
             1 if has_session else 0,
+            load_score,
             recency,
         )
 
@@ -2371,7 +2399,9 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
         if _api_ready_event.is_set() and not _api_keeper_verified(sid):
             verified = [j for j in candidates
                         if _api_keeper_verified(j.get("id"))
-                        and keeper_session_ready(keeper.sessions.get(j.get("id")))]
+                        and keeper_session_ready(keeper.sessions.get(j.get("id")))
+                        and not (getattr(keeper.sessions.get(j.get("id")), "_action_lock", None)
+                                 and keeper.sessions.get(j.get("id"))._action_lock.locked())]
             if verified:
                 best = sorted(verified, key=_score, reverse=True)[0]
                 sid = best.get("id")
@@ -2406,6 +2436,8 @@ def acquire_ready_jar(exclude: Optional[set] = None) -> Optional[dict]:
         session = keeper.sessions.get(sid)
         if not keeper_session_ready(session):
             continue
+        if getattr(session, "_action_lock", None) and session._action_lock.locked():
+            continue
         if _api_ready_event.is_set() and not _api_keeper_verified(sid):
             continue
         candidates.append(jar)
@@ -2413,6 +2445,7 @@ def acquire_ready_jar(exclude: Optional[set] = None) -> Optional[dict]:
         return None
     candidates.sort(key=lambda jar: (
         0 if now - _captcha_failed_jars.get(jar.get("id"), 0.0) > 300 else 1,
+        int(getattr(keeper.sessions.get(jar.get("id")), "active_requests", 0) or 0),
         float(jar.get("last_used", 0) or 0),
     ))
     selected = candidates[0]
@@ -2865,7 +2898,7 @@ class KeeperSession:
         self._page_pool_lock = asyncio.Lock()
         # Serialize through the keeper page unless an operator explicitly opts
         # into extra tabs after validating upstream capacity.
-        self._max_pool_pages = max(0, min(2, int(os.environ.get("BRIDGENA_KEEPER_EXTRA_PAGES", "0"))))
+        self._max_pool_pages = max(0, min(4, int(os.environ.get("BRIDGENA_KEEPER_EXTRA_PAGES", "2"))))
 
     def _set_step(self, step_text: str):
         """Record and broadcast a detailed login/keeper progress step."""
@@ -5823,35 +5856,42 @@ def _parse_stream_line(line: str):
 
 
 _browser_turn_gate = asyncio.Semaphore(API_TURN_CONCURRENCY)
-_model_cooldown_until: Dict[str, float] = {}
+_conversation_turn_locks: Dict[str, asyncio.Lock] = {}
+_conversation_turn_locks_guard = threading.Lock()
+
+def _conversation_gate(chat_id: str) -> asyncio.Lock:
+    """Serialize only writes to one exact stateful Arena conversation."""
+    key = str(chat_id or "anonymous")
+    with _conversation_turn_locks_guard:
+        lock = _conversation_turn_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _conversation_turn_locks[key] = lock
+        return lock
 
 
 async def run_turn(chat_id: str, prompt: str, model_name: str,
-                   attachments: Optional[list] = None, jar_hint: Optional[str] = None):
-    """Bound concurrent work across independent keepers.
+                   attachments: Optional[list] = None, jar_hint: Optional[str] = None,
+                   system_prompt: str = "", tenant_id: str = "anonymous"):
+    """Unlimited concurrency per API key, bounded only by service capacity.
 
-    Upstream throttling is model-scoped instead of process-wide, so a 429 for one
-    model does not stall unrelated models or every account.
+    Different chats from the same API key run in parallel. Concurrent writes to
+    the exact same Arena conversation are ordered to preserve transcript state.
     """
-    cooldown_key = _model_key(model_name or "auto")
-    remaining = _model_cooldown_until.get(cooldown_key, 0.0) - time.monotonic()
-    if remaining > 0:
-        yield ("error", "429: This model is cooling down; retry after %d seconds." % math.ceil(remaining))
-        return
-
-    async with _browser_turn_gate:
-        turn = _run_turn_impl(chat_id, prompt, model_name, attachments, jar_hint)
-        try:
-            async for kind, payload in turn:
-                if kind == "error" and str(payload).startswith("429:"):
-                    _model_cooldown_until[cooldown_key] = time.monotonic() + 30.0
-                yield kind, payload
-        finally:
-            await turn.aclose()
+    async with _conversation_gate(chat_id):
+        async with _browser_turn_gate:
+            turn = _run_turn_impl(chat_id, prompt, model_name, attachments, jar_hint,
+                                  system_prompt=system_prompt)
+            try:
+                async for kind, payload in turn:
+                    yield kind, payload
+            finally:
+                await turn.aclose()
 
 
 async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
-                   attachments: Optional[list] = None, jar_hint: Optional[str] = None):
+                   attachments: Optional[list] = None, jar_hint: Optional[str] = None,
+                   system_prompt: str = ""):
     """Async generator yielding ('content'|'reasoning'|'error'|'done', text).
     One bounded attempt budget over the PROVEN exit pool; jars survive every
     failure class except true session death."""
@@ -5936,7 +5976,10 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         else:
             base.update({"id": str(uuid7()), "userMessageId": str(uuid7()),
                          "modelAMessageId": str(uuid7())})
-        content = prompt if len(prompt) <= MAX_PROMPT else prompt[:MAX_PROMPT]
+        turn_content = prompt
+        if not mc and system_prompt:
+            turn_content = f"{system_prompt.strip()}\n\n{prompt}".strip()
+        content = turn_content if len(turn_content) <= MAX_PROMPT else turn_content[:MAX_PROMPT]
         # These apparently optional fields are always emitted by Arena's live
         # client. Its follow-up validator returns a generic 500 when they are
         # absent, so preserve the exact captured envelope even when both empty.
@@ -6037,6 +6080,9 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     _proxy_health_record(proxy, True, 0, source="browser-stream")
                     _flagged_exits.pop(_proxy_hkey(proxy), None)
                 _captcha_failed_jars.pop(jar.get("id"), None)
+                _api_keeper_quarantine_until.pop(str(jar.get("id")), None)
+                _api_verified_keepers[str(jar.get("id"))] = time.monotonic()
+                _refresh_api_ready_event()
                 if not response_text and reasoning_text:
                     response_text = reasoning_text
                     yield ("content", reasoning_text)
@@ -6061,7 +6107,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             except BridgeHTTPError as e:
                 if not e.status:
                     log("WARN", f"[{jar.get('name')}] browser transport failed before an HTTP response; request ended as transient network failure")
-                    _mark_api_keeper_unready(jar.get("id"), "browser-origin network failure; keeper must re-pass preflight")
+                    _quarantine_api_keeper(jar.get("id"), "browser-origin network failure", 90.0)
                     yield ("error", "502: Browser transport lost the route before an HTTP response. Retry the request; no cross-transport replay was attempted.")
                     return
                 else:
@@ -6071,7 +6117,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     # A failed POST may already have been processed. Do not turn
                     # it into a new conversation or replay it automatically.
                     if verdict == "SESSION":
-                        _mark_api_keeper_unready(jar.get("id"), "upstream session/login gate")
+                        _quarantine_api_keeper(jar.get("id"), "upstream session/login gate", 180.0)
                         browser_session.status = "degraded"
                         browser_session.ready_at = float("inf")
                         browser_session.error = "Upstream rejected authentication; sign in again"
@@ -6095,6 +6141,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     if verdict == "RECAPTCHA":
                         failed_jar_id = jar.get("id")
                         _captcha_failed_jars[failed_jar_id] = time.time()
+                        _quarantine_api_keeper(failed_jar_id, "upstream verification challenge/rejection", 45.0)
                         if rc_attempts.get(failed_jar_id, 0) < 1:
                             rc_attempts[failed_jar_id] = rc_attempts.get(failed_jar_id, 0) + 1
                             reason = ("server requested V2 escalation"
@@ -6109,20 +6156,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                     continue
                         if mc:
                             clear_conversation_model(chat_id, model_name)
-                            mc = None
-                            conv = {}
-                            response_text = ""
-                            reasoning_text = ""
-                        if attempt + 1 < max_attempts:
-                            next_jar = acquire_ready_jar(exclude=tried)
-                            if next_jar:
-                                tried.add(next_jar["id"])
-                                pending_v2_token = None
-                                log("WARN", f"[{next_jar.get('name')}] Rotating to a ready account after verification rejection on {jar.get('name')}")
-                                jar = next_jar
-                                continue
-                        log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation failed")
-                        yield ("error", "403: Arena rejected this session's verification token. The request was stopped without repeated retries; wait briefly and try a new chat.")
+                        log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation did not complete; failing fast")
+                        yield ("error", "503: Verification is not ready on the selected keeper. Bridgena quarantined it instead of retrying the same prompt across accounts; retry after readiness returns.")
                         return
 
                     if e.status == 400 and "user message is invalid" in (e.body or "").lower():
@@ -7412,51 +7447,86 @@ def _last_openai_user_prompt(body: dict) -> str:
     prompts = [_openai_text_content(message.get("content", ""))
                for message in messages
                if isinstance(message, dict) and message.get("role") == "user"]
-    return prompts[-1] if prompts else ""
+    return prompts[-1].strip() if prompts else ""
+
+
+def _openai_system_context(body: dict) -> str:
+    parts = []
+    direct = _openai_text_content(body.get("system", "")).strip()
+    if direct:
+        parts.append(direct)
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        value = _openai_text_content(message.get("content", "")).strip()
+        if value and value not in parts:
+            parts.append(value)
+    return "\n\n".join(parts)
 
 
 def _format_conversation_prompt(body: dict) -> str:
-    """Format conversation messages into a coherent prompt with full dialogue history."""
-    messages = body.get("messages") or []
-    if not messages:
-        return _last_openai_user_prompt(body)
-    if len(messages) == 1 and isinstance(messages[0], dict) and messages[0].get("role") == "user":
-        return _openai_text_content(messages[0].get("content", ""))
-    lines = []
-    system = _openai_text_content(body.get("system", ""))
-    if system:
-        lines.append("System:\n" + system)
-    for m in messages:
-        if not isinstance(m, dict):
-            continue
-        role = (m.get("role") or "").lower()
-        text = _openai_text_content(m.get("content", "")).strip()
-        if not text:
-            continue
-        if role == "system":
-            lines.append(f"System:\n{text}")
-        elif role == "assistant":
-            lines.append(f"Assistant:\n{text}")
-        else:
-            lines.append(f"User:\n{text}")
-    return "\n\n".join(lines) if lines else _last_openai_user_prompt(body)
+    """Return only the newest user turn.
+
+    Arena owns the persistent transcript after create-evaluation. Replaying the
+    full OpenAI/Claude history into post-to-evaluation duplicates context and
+    caused very large envelopes plus incorrect follow-up behavior.
+    """
+    return _last_openai_user_prompt(body)
 
 
 def _anthropic_prompt(body: dict) -> str:
-    """Flatten Anthropic message blocks into one stateless Arena turn."""
-    lines = []
-    system = _openai_text_content(body.get("system", ""))
-    if system:
-        lines.append("System:\n" + system)
-    for message in body.get("messages") or []:
-        if not isinstance(message, dict):
+    """Return only the newest Anthropic user turn."""
+    messages = body.get("messages") or []
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
             continue
-        text = _openai_text_content(message.get("content", ""))
-        if text:
-            role = "Assistant" if message.get("role") == "assistant" else "User"
-            lines.append(f"{role}:\n{text}")
-    return "\n\n".join(lines)
+        value = _openai_text_content(message.get("content", "")).strip()
+        if value:
+            return value
+    return ""
 
+
+def _anthropic_system_context(body: dict) -> str:
+    return _openai_text_content(body.get("system", "")).strip()
+
+
+def _tenant_identity(keyinfo: Optional[dict]) -> str:
+    """Opaque tenant identity; never use the plaintext API key."""
+    k = keyinfo or {}
+    raw = str(k.get("id") or k.get("key_hash") or k.get("name") or "anonymous")
+    return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()[:20]
+
+
+def _first_user_text(body: dict) -> str:
+    for message in body.get("messages") or []:
+        if isinstance(message, dict) and message.get("role") == "user":
+            value = _openai_text_content(message.get("content", "")).strip()
+            if value:
+                return value
+    return ""
+
+
+def _logical_chat_id(body: dict, keyinfo: Optional[dict], prefix: str = "api") -> str:
+    """Stable, tenant-scoped conversation identity for clients without chat_id.
+
+    Explicit client thread identifiers win. Otherwise derive an opaque stable id
+    from tenant + model + initial system/user context, mirroring the behavior of
+    the older working bridge while preventing cross-user collisions.
+    """
+    tenant = _tenant_identity(keyinfo)
+    explicit = body.get("chat_id") or body.get("conversation_id") or body.get("thread_id")
+    metadata = body.get("metadata")
+    if not explicit and isinstance(metadata, dict):
+        explicit = metadata.get("thread_id") or metadata.get("conversation_id") or metadata.get("session_id")
+    if explicit:
+        seed = f"{tenant}\\0explicit\\0{explicit}"
+    else:
+        model = str(body.get("model") or "auto")
+        system = _openai_system_context(body) or _anthropic_system_context(body)
+        first_user = _first_user_text(body)
+        seed = f"{tenant}\\0{model}\\0{system}\\0{first_user}"
+    digest = hashlib.sha256(seed.encode("utf-8", "ignore")).hexdigest()[:32]
+    return f"{prefix}-{digest}"
 
 def _anthropic_sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -7531,7 +7601,9 @@ async def openai_stream(body: dict, keyinfo: dict):
     model = body.get("model", "auto")
     # A caller-supplied opaque thread id preserves Arena context without storing
     # prompt or response content. One-off API calls receive a random id.
-    chat_id = body.get("chat_id") or ("api-" + uuid7())
+    chat_id = _logical_chat_id(body, keyinfo, "api")
+    tenant_id = _tenant_identity(keyinfo)
+    system_prompt = _openai_system_context(body)
 
     created = int(time.time())
     rid = "chatcmpl-" + uuid7()[:23]
@@ -7553,7 +7625,9 @@ async def openai_stream(body: dict, keyinfo: dict):
         try:
             yield chunk({"role": "assistant"})
             async for kind, payload in run_turn(chat_id, prompt, model,
-                                                attachments=body.get("attachments")):
+                                                attachments=body.get("attachments"),
+                                                system_prompt=system_prompt,
+                                                tenant_id=tenant_id):
                 if kind == "content":
                     acc += payload
                     content_chunks += 1
@@ -7621,13 +7695,22 @@ async def openai_stream(body: dict, keyinfo: dict):
 
 
 async def _require_api_ready():
-    _refresh_api_ready_event()
-    if not _api_ready_event.is_set():
-        verified = _verified_keeper_count()
-        raise HTTPException(
-            status_code=503,
-            detail=f"Bridgena is starting verification preflight ({verified}/{_API_MIN_VERIFIED_KEEPERS} verified keepers). Retry shortly."
-        )
+    models_ready = bool(get_models())
+    ready_jars = []
+    for jar in load_jars():
+        if not jar.get("enabled", True) or not jar_has_auth(jar):
+            continue
+        session = keeper.sessions.get(jar.get("id"))
+        if keeper_session_ready(session):
+            ready_jars.append(jar)
+    if models_ready and ready_jars:
+        return
+    raise HTTPException(
+        status_code=503,
+        detail=(f"Bridgena is starting: models={'ready' if models_ready else 'loading'}, "
+                f"authenticated keepers={len(ready_jars)}. Retry shortly."),
+        headers={"Retry-After": "2"},
+    )
 
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
@@ -7655,8 +7738,12 @@ async def chat_completions(request: Request):
                "model": body.get("model", "auto"), "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]}
         acc = ""
         try:
-            async for kind, payload in run_turn(body.get("chat_id") or ("api-" + uuid7()), prompt,
-                                                body.get("model", "auto"), attachments=body.get("attachments")):
+            chat_id = _logical_chat_id(body, keyinfo, "api")
+            async for kind, payload in run_turn(chat_id, prompt,
+                                                body.get("model", "auto"),
+                                                attachments=body.get("attachments"),
+                                                system_prompt=_openai_system_context(body),
+                                                tenant_id=_tenant_identity(keyinfo)):
                 if kind == "content":
                     acc += payload
                 elif kind == "error":
@@ -7772,7 +7859,9 @@ async def anthropic_messages(request: Request):
         raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
 
     model = body.get("model", "auto")
-    chat_id = body.get("chat_id") or ("anthropic-" + uuid7())
+    chat_id = _logical_chat_id(body, keyinfo, "anthropic")
+    tenant_id = _tenant_identity(keyinfo)
+    system_prompt = _anthropic_system_context(body)
     message_id = "msg_" + uuid7().replace("-", "")
     input_tokens = _rough_tokens(prompt)
 
@@ -7780,7 +7869,9 @@ async def anthropic_messages(request: Request):
         acc = ""
         try:
             async for kind, payload in run_turn(chat_id, prompt, model,
-                                                attachments=body.get("attachments")):
+                                                attachments=body.get("attachments"),
+                                                system_prompt=system_prompt,
+                                                tenant_id=tenant_id):
                 if kind in ("content", "reasoning") and isinstance(payload, str):
                     acc += payload
                 elif kind == "error":
@@ -7808,7 +7899,9 @@ async def anthropic_messages(request: Request):
             yield _anthropic_sse("content_block_start", {"type": "content_block_start", "index": 0,
                                                           "content_block": {"type": "text", "text": ""}})
             async for kind, payload in run_turn(chat_id, prompt, model,
-                                                attachments=body.get("attachments")):
+                                                attachments=body.get("attachments"),
+                                                system_prompt=system_prompt,
+                                                tenant_id=tenant_id):
                 if kind in ("content", "reasoning") and isinstance(payload, str):
                     acc += payload
                     chunks += 1
@@ -8014,13 +8107,24 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.3.3", "models": len(get_models()),
+    ready_keepers = sum(1 for sid, session in keeper.sessions.items()
+                        if keeper_session_ready(session)
+                        and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
+                                for j in load_jars()))
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.4.1",
+                         "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
                                              if keeper_session_ready(session)),
-                         "api_ready": _api_ready_event.is_set(),
-                         "verified_keepers": _verified_keeper_count(),
+                         "api_ready": bool(get_models()) and ready_keepers > 0,
+                         "ready_authenticated_keepers": ready_keepers,
+                         "global_concurrency": API_TURN_CONCURRENCY,
+                         "per_api_concurrency": "unlimited",
+                         "estimated_browser_lanes":
+                             sum(1 + int(getattr(s, "_max_pool_pages", 0) or 0)
+                                 for s in keeper.sessions.values()
+                                 if keeper_session_ready(s)),
                          "verification_adapter": bool(get_verification_solver),
                          "vnc_enabled": _V3_VNC_ENABLED})
 
@@ -8085,19 +8189,24 @@ async def keeper_diagnostics(request: Request):
 
 @app.get("/readyz")
 async def readyz():
-    _refresh_api_ready_event()
     models_ready = bool(get_models())
-    keeper_ready = any(keeper_session_ready(session)
-                       for session in keeper.sessions.values())
-    verified = _verified_keeper_count()
-    ready = _api_ready_event.is_set()
+    jars = load_jars()
+    ready_ids = []
+    for jar in jars:
+        sid = jar.get("id")
+        if jar.get("enabled", True) and jar_has_auth(jar) and keeper_session_ready(keeper.sessions.get(sid)):
+            ready_ids.append(sid)
+    ready = models_ready and bool(ready_ids)
     return JSONResponse({"ready": ready, "build": BUILD_STAMP,
                          "checks": {"models": models_ready,
-                                    "keeper": keeper_ready,
-                                    "verification_preflight": verified >= _API_MIN_VERIFIED_KEEPERS,
-                                    "verified_keepers": verified,
-                                    "required_verified_keepers": _API_MIN_VERIFIED_KEEPERS,
-                                    "verification_adapter": bool(get_verification_solver)}},
+                                    "authenticated_keeper": bool(ready_ids),
+                                    "ready_authenticated_keepers": len(ready_ids),
+                                    "global_concurrency": API_TURN_CONCURRENCY,
+                                    "per_api_concurrency": "unlimited",
+                                    "estimated_browser_lanes":
+                                        sum(1 + int(getattr(s, "_max_pool_pages", 0) or 0)
+                                            for s in keeper.sessions.values()
+                                            if keeper_session_ready(s))}},
                         status_code=200 if ready else 503)
 
 
@@ -8394,8 +8503,9 @@ async def _api_verification_readiness_loop():
                              for sid in _api_verified_keepers
                              if _api_keeper_verified(sid)
                              and keeper_session_ready(keeper.sessions.get(sid))]
-                    log("OK", "API READY · verification preflight passed"
+                    log("OK", "API READY · auth + V3 capability quorum passed"
                         + f" · verified keepers {len(names)}"
+                        + f" · verified exits {_verified_exit_count()}"
                         + (f" · {', '.join(names[:4])}" if names else ""))
                     announced_ready = True
                     announced_wait = False
@@ -8404,13 +8514,15 @@ async def _api_verification_readiness_loop():
 
             announced_ready = False
             if not announced_wait:
-                log("INFO", "API NOT READY · waiting for authenticated keeper + Enterprise V3 preflight; "
+                log("INFO", "API NOT READY · waiting for authenticated keeper quorum + Enterprise V3 capability; "
                             "chat requests will receive 503 until verification is ready")
                 announced_wait = True
 
             for jar in load_jars():
                 sid = str(jar.get("id") or "")
                 if not sid or _api_keeper_verified(sid) or not jar.get("enabled", True):
+                    continue
+                if time.monotonic() < _api_keeper_quarantine_until.get(sid, 0.0):
                     continue
                 session = keeper.sessions.get(sid)
                 if not keeper_session_ready(session) or not jar_has_auth(jar):
@@ -8429,7 +8541,8 @@ async def _api_verification_readiness_loop():
                     log("OK", f"[{getattr(session, 'name', sid)}] verification preflight passed · "
                               f"Enterprise V3 ready · token shape {len(token)} chars")
                     _refresh_api_ready_event()
-                    if _api_ready_event.is_set():
+                    if (_verified_keeper_count() >= _API_MIN_VERIFIED_KEEPERS
+                            and _verified_exit_count() >= _API_MIN_VERIFIED_EXITS):
                         break
                 except Exception as exc:
                     log("WARN", f"[{getattr(session, 'name', sid)}] verification preflight failed · "
@@ -8458,13 +8571,15 @@ async def _lifespan(app):
     mutate_jars(_normalize_personas)
     tasks = [asyncio.create_task(keeper_election_loop(), name="keeper-election"),
              asyncio.create_task(periodic_model_refresher(), name="model-refresher"),
-             asyncio.create_task(get_initial_data(), name="initial-catalog"),
-             asyncio.create_task(_api_verification_readiness_loop(), name="api-verification-readiness")]
+             asyncio.create_task(get_initial_data(), name="initial-catalog")]
     if jars_have_creds():
         tasks.append(asyncio.create_task(auto_login_on_boot(), name="auto-login"))
     app.state.background_tasks = tasks
     app.state.ready_at = time.time()
     log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
+    log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
+                f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
+    log("INFO", "Capacity target · ~20 simultaneous users · keeper browser pooling enabled")
     if get_verification_solver:
         log("OK", f"Verification adapter factory loaded: {_VERIFICATION_FACTORY_SPEC}")
     else:
