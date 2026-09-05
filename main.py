@@ -308,7 +308,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.9-dynamic-account-fleet")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.0-history-api-stream-salvage")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1921,9 +1921,12 @@ ACCOUNT_FAILOVER_MAX = max(0, min(6, int(os.environ.get("BRIDGENA_ACCOUNT_FAILOV
 FIRST_ASSISTANT_RESPONSE_SEC = max(1.0, min(30.0, float(os.environ.get("BRIDGENA_FIRST_ASSISTANT_RESPONSE_SEC", "5"))))
 REQUIRE_PROVIDER_FINISH = os.environ.get("BRIDGENA_REQUIRE_PROVIDER_FINISH", "1").strip().lower() not in ("0", "false", "no", "off")
 ARENA_UI_STREAM_RECOVERY = os.environ.get("BRIDGENA_ARENA_UI_STREAM_RECOVERY", "1").strip().lower() not in ("0", "false", "no", "off")
-ARENA_UI_RECOVERY_TIMEOUT_SEC = max(5.0, min(45.0, float(os.environ.get("BRIDGENA_ARENA_UI_RECOVERY_TIMEOUT_SEC", "18"))))
+ARENA_UI_RECOVERY_TIMEOUT_SEC = max(5.0, min(60.0, float(os.environ.get("BRIDGENA_ARENA_UI_RECOVERY_TIMEOUT_SEC", "30"))))
+ARENA_HISTORY_RECOVERY_LIMIT = max(5, min(200, int(os.environ.get("BRIDGENA_ARENA_HISTORY_RECOVERY_LIMIT", "60"))))
+ARENA_HISTORY_POLL_SEC = max(0.25, min(3.0, float(os.environ.get("BRIDGENA_ARENA_HISTORY_POLL_SEC", "0.65"))))
+ARENA_HISTORY_STABLE_POLLS = max(2, min(8, int(os.environ.get("BRIDGENA_ARENA_HISTORY_STABLE_POLLS", "3"))))
 ARENA_UI_RECOVERY_STABLE_SEC = max(0.8, min(6.0, float(os.environ.get("BRIDGENA_ARENA_UI_RECOVERY_STABLE_SEC", "1.8"))))
-_arena_ui_recovery_stats = {"attempted": 0, "recovered": 0, "not_found": 0, "incomplete": 0, "navigation_failed": 0}
+_arena_ui_recovery_stats = {"attempted": 0, "recovered": 0, "history_api_recovered": 0, "history_api_match": 0, "history_index_waits": 0, "ui_recovered": 0, "not_found": 0, "incomplete": 0, "navigation_failed": 0}
 _arena_ui_recovery_stats_guard = threading.Lock()
 
 def _bump_arena_ui_recovery(key: str) -> None:
@@ -7018,20 +7021,265 @@ def _stream_recovery_suffix(partial: str, recovered: str) -> tuple:
     return "", 0.0
 
 
+async def _arena_history_probe(page, *, arena_id: str, model_message_id: str,
+                               user_prompt: str, partial_text: str) -> dict:
+    """Inspect Arena's authenticated unified history without resubmitting anything.
+
+    The response shape has changed over time, so matching intentionally walks the
+    JSON generically instead of hard-coding one schema. We score nested objects by:
+      - exact evaluation/session id
+      - exact model message id
+      - the user's prompt
+      - the already-streamed assistant prefix
+
+    If the history payload contains assistant text directly, return it. Otherwise
+    return the best chat URL/id so UI recovery can open the exact conversation.
+    """
+    try:
+        return await page.evaluate(
+            r"""async ([limit, arenaId, messageId, prompt, partial]) => {
+              const norm = s => String(s ?? '').replace(/\s+/g, ' ').trim();
+              const low = s => norm(s).toLowerCase();
+              const promptN = norm(prompt).slice(0, 240);
+              const partialN = norm(partial).slice(0, 240);
+              const promptL = promptN.toLowerCase();
+              const partialL = partialN.toLowerCase();
+              const arenaL = String(arenaId || '').toLowerCase();
+              const messageL = String(messageId || '').toLowerCase();
+
+              let r;
+              try {
+                r = await fetch('/api/history/unified?limit=' + encodeURIComponent(limit), {
+                  credentials: 'include',
+                  cache: 'no-store',
+                  headers: {'Accept': 'application/json'}
+                });
+              } catch (e) {
+                return {ok:false,status:0,error:String(e && e.message || e)};
+              }
+              if (!r.ok) {
+                return {ok:false,status:r.status,error:(await r.text()).slice(0,500)};
+              }
+
+              let data;
+              try { data = await r.json(); }
+              catch(e) { return {ok:false,status:r.status,error:'history JSON parse failed'}; }
+
+              const roots = [];
+              const seen = new WeakSet();
+
+              function scalarText(v) {
+                if (typeof v === 'string') return norm(v);
+                if (Array.isArray(v)) {
+                  return v.map(x => {
+                    if (typeof x === 'string') return x;
+                    if (x && typeof x === 'object') {
+                      return x.text || x.content || x.value || '';
+                    }
+                    return '';
+                  }).filter(Boolean).join('');
+                }
+                if (v && typeof v === 'object') {
+                  return norm(v.text || v.content || v.value || '');
+                }
+                return '';
+              }
+
+              function roleOf(o) {
+                if (!o || typeof o !== 'object') return '';
+                return low(
+                  o.role || o.author || o.sender || o.type || o.message_type ||
+                  o.messageType || o.source || o.owner || ''
+                );
+              }
+
+              function collectAssistant(o, depth=0, out=[]) {
+                if (!o || depth > 9) return out;
+                if (Array.isArray(o)) {
+                  for (const x of o) collectAssistant(x, depth+1, out);
+                  return out;
+                }
+                if (typeof o !== 'object') return out;
+
+                const role = roleOf(o);
+                if (/(assistant|model|bot)/.test(role) && !/(user|human)/.test(role)) {
+                  for (const k of ['content','text','response','answer','output','markdown','message']) {
+                    const t = scalarText(o[k]);
+                    if (t && t.length >= 2) out.push(t);
+                  }
+                }
+
+                for (const [k,v] of Object.entries(o)) {
+                  if (['cookies','token','password','authorization'].includes(String(k).toLowerCase())) continue;
+                  if (v && typeof v === 'object') collectAssistant(v, depth+1, out);
+                }
+                return out;
+              }
+
+              function findRoute(o, depth=0) {
+                if (!o || depth > 6) return '';
+                if (Array.isArray(o)) {
+                  for (const x of o) {
+                    const q = findRoute(x, depth+1);
+                    if (q) return q;
+                  }
+                  return '';
+                }
+                if (typeof o !== 'object') return '';
+
+                const directKeys = [
+                  'url','href','path','chat_url','chatUrl','conversation_url',
+                  'conversationUrl','route','pathname'
+                ];
+                for (const k of directKeys) {
+                  const v = o[k];
+                  if (typeof v === 'string' && v.trim()) {
+                    const s = v.trim();
+                    if (s.startsWith('/') || /^https?:\/\//i.test(s)) return s;
+                  }
+                }
+                for (const v of Object.values(o)) {
+                  if (v && typeof v === 'object') {
+                    const q = findRoute(v, depth+1);
+                    if (q) return q;
+                  }
+                }
+                return '';
+              }
+
+              function explicitComplete(o) {
+                let complete = null;
+                function walk(v, depth=0) {
+                  if (!v || depth > 6 || complete !== null) return;
+                  if (Array.isArray(v)) {
+                    for (const x of v) walk(x, depth+1);
+                    return;
+                  }
+                  if (typeof v !== 'object') return;
+                  for (const [k,val] of Object.entries(v)) {
+                    const kl = String(k).toLowerCase();
+                    if (['isgenerating','generating','streaming','is_streaming','inprogress','in_progress'].includes(kl)) {
+                      if (val === false || val === 0) complete = true;
+                      if (val === true || val === 1) complete = false;
+                    }
+                    if (['complete','completed','finished','done','iscomplete','is_complete'].includes(kl)) {
+                      if (val === true || val === 1) complete = true;
+                    }
+                    if (['status','state'].includes(kl) && typeof val === 'string') {
+                      const s = val.toLowerCase();
+                      if (/(complete|completed|finished|done|success|succeeded)/.test(s)) complete = true;
+                      if (/(generating|streaming|pending|running|in.progress)/.test(s)) complete = false;
+                    }
+                    if (val && typeof val === 'object') walk(val, depth+1);
+                  }
+                }
+                walk(o);
+                return complete;
+              }
+
+              function scoreObject(o) {
+                let blob = '';
+                try { blob = JSON.stringify(o).slice(0, 180000).toLowerCase(); }
+                catch(e) { return 0; }
+
+                let score = 0;
+                if (arenaL && blob.includes(arenaL)) score += 12000;
+                if (messageL && blob.includes(messageL)) score += 15000;
+                if (promptL && blob.includes(promptL)) score += 6500;
+                if (partialL && blob.includes(partialL)) score += 9000;
+
+                if (promptL) {
+                  const words = promptL.split(/\s+/).filter(x => x.length >= 4).slice(0,16);
+                  for (const w of words) if (blob.includes(w)) score += 90;
+                }
+                return score;
+              }
+
+              function walk(v, path=[], depth=0) {
+                if (!v || depth > 10) return;
+                if (Array.isArray(v)) {
+                  for (let i=0;i<v.length;i++) walk(v[i], path.concat(i), depth+1);
+                  return;
+                }
+                if (typeof v !== 'object') return;
+                if (seen.has(v)) return;
+                seen.add(v);
+
+                const score = scoreObject(v);
+                if (score > 0) {
+                  const assistants = collectAssistant(v);
+                  let bestText = '';
+                  for (const t of assistants) {
+                    const tn = norm(t);
+                    let local = 0;
+                    if (partialL && tn.toLowerCase().includes(partialL)) local += 10000;
+                    if (tn.length > bestText.length) local += Math.min(4000, tn.length);
+                    const oldLocal = bestText ? Math.min(4000, bestText.length) : 0;
+                    if (!bestText || local > oldLocal) bestText = tn;
+                  }
+                  roots.push({
+                    score,
+                    path: path.join('.'),
+                    text: bestText,
+                    route: findRoute(v),
+                    complete: explicitComplete(v)
+                  });
+                }
+
+                for (const [k,val] of Object.entries(v)) {
+                  if (val && typeof val === 'object') walk(val, path.concat(k), depth+1);
+                }
+              }
+
+              walk(data);
+              roots.sort((a,b) => {
+                const ax = a.score + (a.text ? Math.min(6000,a.text.length) : 0) + (a.route ? 500 : 0);
+                const bx = b.score + (b.text ? Math.min(6000,b.text.length) : 0) + (b.route ? 500 : 0);
+                return bx - ax;
+              });
+
+              const best = roots[0] || null;
+              return {
+                ok:true,
+                status:r.status,
+                matched:!!best,
+                score:best ? best.score : 0,
+                text:best ? best.text : '',
+                route:best ? best.route : '',
+                complete:best ? best.complete : null,
+                path:best ? best.path : '',
+                candidateCount:roots.length
+              };
+            }""",
+            [
+                ARENA_HISTORY_RECOVERY_LIMIT,
+                str(arena_id or ""),
+                str(model_message_id or ""),
+                str(user_prompt or ""),
+                str(partial_text or ""),
+            ],
+        )
+    except Exception as exc:
+        return {"ok": False, "status": 0,
+                "error": f"{type(exc).__name__}: {redact(str(exc))[:200]}"}
+
+
 async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: str,
                                    user_prompt: str, partial_text: str = "",
                                    cached_url: str = "") -> dict:
-    """Recover a broken model stream from Arena's own chat UI.
+    """Recover a broken stream from Arena history/UI without replaying the prompt.
 
-    Recovery never re-submits the user prompt. It opens a temporary page in the
-    SAME authenticated keeper context, navigates to Arena's chat history/search,
-    opens the matching conversation, waits for the assistant bubble to finish,
-    then returns the browser-visible final text.
+    Recovery is intentionally patient. Arena can persist/index a just-created
+    conversation a few seconds after the streaming fetch breaks. Previous builds
+    checked history once and immediately failed if the row was not visible yet.
 
-    Matching order:
-      1) cached thread URL;
-      2) href containing the evaluation/session id;
-      3) Arena history search using the exact user prompt and best matching item.
+    Stage 1:
+      Poll authenticated /api/history/unified for the exact evaluation/message/
+      prompt. If history already contains the final assistant text, return it.
+
+    Stage 2:
+      Open the best matching chat route (or Search Chats), wait for the matching
+      assistant bubble to stop changing, then return only once the text is stable.
     """
     if not ARENA_UI_STREAM_RECOVERY:
         return {"ok": False, "reason": "disabled"}
@@ -7041,14 +7289,11 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
     _bump_arena_ui_recovery("attempted")
     name = getattr(session, "name", "keeper")
     page = None
-    search_term = " ".join(str(user_prompt or "").split())[:160]
-    prompt_probe = search_term[:72]
-    partial_probe = str(partial_text or "")[:120]
+    search_term = " ".join(str(user_prompt or "").split())[:240]
+    prompt_probe = search_term[:96]
+    partial_probe = str(partial_text or "")[:180]
     deadline = time.monotonic() + ARENA_UI_RECOVERY_TIMEOUT_SEC
 
-    # Extract the smallest plausible assistant bubble. The strongest signal is
-    # the exact model message id; partial streamed text is second; semantic
-    # assistant/test-id attributes are third.
     extract_js = r"""([messageId, promptProbe, partialProbe]) => {
       const visible = el => {
         if (!el || !(el instanceof Element)) return false;
@@ -7064,26 +7309,24 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
       const push = (el, score) => {
         const t = txt(el);
         if (!t || t.length > 120000) return;
-        if (promptProbe && clean(t).includes(clean(promptProbe)) && t.length < Math.max(300, promptProbe.length * 3)) {
-          return; // almost certainly the user bubble
-        }
-        candidates.push({el, t, score});
+        if (promptProbe && clean(t).includes(clean(promptProbe)) &&
+            t.length < Math.max(320, promptProbe.length * 3)) return;
+        candidates.push({el,t,score});
       };
 
       if (messageId) {
+        const safe = CSS.escape(messageId);
         for (const el of document.querySelectorAll(
-          `[data-message-id*="${CSS.escape(messageId)}"],[id*="${CSS.escape(messageId)}"],[data-id*="${CSS.escape(messageId)}"]`
-        )) push(el, 10000 - txt(el).length / 1000);
+          `[data-message-id*="${safe}"],[id*="${safe}"],[data-id*="${safe}"]`
+        )) push(el, 15000 - txt(el).length / 1000);
       }
 
       if (partialProbe) {
-        const needle = clean(partialProbe.slice(0, 90));
+        const needle = clean(partialProbe.slice(0, 120));
         for (const el of all) {
           const t = clean(txt(el));
-          if (needle && t.includes(needle) && t.length >= needle.length) {
-            // Prefer the smallest element containing the already-streamed text.
-            push(el, 8000 - Math.min(7000, t.length));
-          }
+          if (needle && t.includes(needle) && t.length >= needle.length)
+            push(el, 12000 - Math.min(9000, t.length));
         }
       }
 
@@ -7095,50 +7338,44 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
           el.getAttribute('aria-label'),
           el.className
         ].join(' ')).toLowerCase();
-        if (/(assistant|model-message|modelresponse|model-response|response-message|chat-message-assistant)/.test(sig)) {
-          push(el, 5000 + Math.min(2000, txt(el).length / 10));
-        }
+        if (/(assistant|model-message|modelresponse|model-response|response-message|chat-message-assistant)/.test(sig))
+          push(el, 7000 + Math.min(2500, txt(el).length / 10));
       }
 
-      // Structural fallback: find the user prompt and inspect later message-like
-      // blocks in DOM order.
       if (promptProbe) {
         const needle = clean(promptProbe);
         let userIndex = -1;
-        for (let i = 0; i < all.length; i++) {
+        for (let i=0;i<all.length;i++) {
           const t = clean(txt(all[i]));
-          if (t === needle || (t.includes(needle) && t.length <= needle.length + 180)) {
+          if (t === needle || (t.includes(needle) && t.length <= needle.length + 220))
             userIndex = i;
-          }
         }
         if (userIndex >= 0) {
-          for (let i = userIndex + 1; i < all.length; i++) {
-            const el = all[i], t = txt(el);
+          for (let i=userIndex+1;i<all.length;i++) {
+            const el=all[i], t=txt(el);
             if (!t || t.length < 2 || t.length > 60000) continue;
-            const sig = clean([el.tagName, el.getAttribute('role'), el.getAttribute('data-testid'), el.className].join(' ')).toLowerCase();
-            if (/(article|message|assistant|markdown|prose)/.test(sig)) {
-              push(el, 2500 + Math.min(1200, t.length / 20));
-            }
+            const sig=clean([el.tagName,el.getAttribute('role'),el.getAttribute('data-testid'),el.className].join(' ')).toLowerCase();
+            if (/(article|message|assistant|markdown|prose)/.test(sig))
+              push(el, 3500 + Math.min(1400,t.length/20));
           }
         }
       }
 
-      candidates.sort((a,b) => b.score - a.score || a.t.length - b.t.length);
-      let chosen = candidates[0] || null;
+      candidates.sort((a,b)=>b.score-a.score || a.t.length-b.t.length);
+      const chosen=candidates[0]||null;
 
-      const generating = [...document.querySelectorAll('button,[role=button],[aria-label],[data-state]')]
-        .filter(visible)
-        .some(el => {
-          const s = clean([txt(el), el.getAttribute('aria-label'), el.getAttribute('data-state')].join(' ')).toLowerCase();
+      const generating=[...document.querySelectorAll('button,[role=button],[aria-label],[data-state]')]
+        .filter(visible).some(el=>{
+          const s=clean([txt(el),el.getAttribute('aria-label'),el.getAttribute('data-state')].join(' ')).toLowerCase();
           return /(stop generating|stop response|cancel generation|generating|streaming)/.test(s);
         });
 
       return {
-        text: chosen ? chosen.t : '',
+        text:chosen?chosen.t:'',
         generating,
-        url: location.href,
-        title: document.title,
-        candidateCount: candidates.length
+        url:location.href,
+        title:document.title,
+        candidateCount:candidates.length
       };
     }"""
 
@@ -7146,106 +7383,216 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
         try:
             page = await session.context.new_page()
 
-            # Fast path: a previously discovered thread URL.
-            if cached_url:
+            # Establish authenticated Arena origin before calling relative APIs.
+            initial = cached_url or f"{PUBLIC_AUTH_BASE.rstrip('/')}/"
+            try:
+                await session._navigate_resilient(page, initial, timeout=12000)
+            except Exception:
                 try:
-                    await session._navigate_resilient(page, cached_url, timeout=12000)
+                    await page.goto(initial, wait_until="commit", timeout=12000)
+                except Exception:
+                    pass
+
+            # ---------- Stage 1: authenticated history API ----------
+            hist_last_text = ""
+            hist_stable_polls = 0
+            best_route = cached_url or ""
+            history_match_logged = False
+            history_phase_deadline = min(
+                deadline,
+                time.monotonic() + max(8.0, ARENA_UI_RECOVERY_TIMEOUT_SEC * 0.62)
+            )
+
+            while time.monotonic() < history_phase_deadline:
+                probe = await _arena_history_probe(
+                    page,
+                    arena_id=arena_id,
+                    model_message_id=model_message_id,
+                    user_prompt=user_prompt,
+                    partial_text=partial_text,
+                )
+
+                if probe.get("matched"):
+                    if not history_match_logged:
+                        history_match_logged = True
+                        _bump_arena_ui_recovery("history_api_match")
+                        log("INFO", f"[{name}] Arena history recovery · matching chat appeared · "
+                                    f"score {probe.get('score')} · candidates {probe.get('candidateCount')}")
+                    route = str(probe.get("route") or "")
+                    if route:
+                        best_route = route
+
+                    current = str(probe.get("text") or "").strip()
+                    suffix, confidence = _stream_recovery_suffix(partial_text, current)
+
+                    if current:
+                        if current == hist_last_text:
+                            hist_stable_polls += 1
+                        else:
+                            hist_last_text = current
+                            hist_stable_polls = 1
+
+                        explicit_complete = probe.get("complete") is True
+                        stable_complete = hist_stable_polls >= ARENA_HISTORY_STABLE_POLLS
+
+                        if (not partial_text or confidence >= 0.90) and (explicit_complete or stable_complete):
+                            _bump_arena_ui_recovery("recovered")
+                            _bump_arena_ui_recovery("history_api_recovered")
+                            log("OK", f"[{name}] Arena history API recovery · recovered {len(current)} chars · "
+                                      f"stable polls {hist_stable_polls} · explicit complete {explicit_complete}")
+                            return {
+                                "ok": True,
+                                "text": current,
+                                "suffix": suffix,
+                                "confidence": confidence,
+                                "url": best_route or page.url,
+                                "complete": True,
+                                "source": "history-api",
+                            }
+                else:
+                    _bump_arena_ui_recovery("history_index_waits")
+
+                await asyncio.sleep(ARENA_HISTORY_POLL_SEC)
+
+            # ---------- Stage 2: exact route or Search Chats UI ----------
+            def absolute_route(route: str) -> str:
+                route = str(route or "").strip()
+                if not route:
+                    return ""
+                if route.startswith("http://") or route.startswith("https://"):
+                    return route
+                if route.startswith("/"):
+                    return PUBLIC_AUTH_BASE.rstrip("/") + route
+                return ""
+
+            direct_url = absolute_route(best_route)
+            if direct_url:
+                try:
+                    await session._navigate_resilient(page, direct_url, timeout=12000)
                     await asyncio.sleep(0.8)
                 except Exception:
                     pass
 
-            # If the cached route didn't land on a useful chat, use Arena's
-            # built-in chat-history search. Arena exposes /history/search.
+            # If the direct route did not expose our prompt/partial, use Arena's
+            # Search Chats page. Crucially, do NOT fail on the first empty result:
+            # keep polling because fresh conversations can appear after indexing.
             body_text = ""
             try:
                 body_text = await page.locator("body").inner_text(timeout=1200)
             except Exception:
                 pass
-            if not body_text or (prompt_probe and prompt_probe not in body_text):
+
+            if not body_text or (
+                prompt_probe and prompt_probe not in body_text and
+                partial_probe and partial_probe not in body_text
+            ):
                 history_url = f"{PUBLIC_AUTH_BASE.rstrip('/')}/history/search"
                 try:
                     ok = await session._navigate_resilient(page, history_url, timeout=12000)
                     if not ok:
                         _bump_arena_ui_recovery("navigation_failed")
-                        return {"ok": False, "reason": "history navigation failed"}
-                except Exception as exc:
+                except Exception:
                     _bump_arena_ui_recovery("navigation_failed")
-                    return {"ok": False, "reason": f"history navigation failed: {type(exc).__name__}"}
 
                 try:
                     await session._dismiss_promos(page)
                 except Exception:
                     pass
 
-                # Direct session/evaluation-id link wins if Arena renders one.
                 clicked = False
-                if arena_id:
-                    try:
-                        by_id = page.locator(f'a[href*="{arena_id}"],button[data-href*="{arena_id}"]').first
-                        if await by_id.count() > 0 and await by_id.is_visible():
-                            await by_id.click(timeout=2500)
-                            clicked = True
-                    except Exception:
-                        pass
+                search_attempt = 0
 
-                if not clicked and search_term:
-                    # Search Arena's own history UI.
-                    try:
-                        search = page.locator(
-                            "input[placeholder*='Search your chats' i],"
-                            "input[placeholder*='Search' i],"
-                            "input[type='search']"
-                        ).first
-                        if await search.count() > 0:
-                            await search.fill(search_term)
-                            try:
-                                await search.press("Enter")
-                            except Exception:
-                                pass
-                            await asyncio.sleep(1.0)
-                    except Exception:
-                        pass
+                while time.monotonic() < deadline and not clicked:
+                    search_attempt += 1
 
-                    # Score visible result links/buttons against the prompt and
-                    # evaluation id, then click the best match.
+                    # Direct evaluation/session id link if rendered.
+                    if arena_id:
+                        try:
+                            by_id = page.locator(
+                                f'a[href*="{arena_id}"],button[data-href*="{arena_id}"],'
+                                f'[data-id*="{arena_id}"]'
+                            ).first
+                            if await by_id.count() > 0 and await by_id.is_visible():
+                                await by_id.click(timeout=2500)
+                                clicked = True
+                                break
+                        except Exception:
+                            pass
+
+                    if search_term:
+                        try:
+                            search = page.locator(
+                                "input[placeholder*='Search your chats' i],"
+                                "input[placeholder*='Search' i],"
+                                "input[type='search']"
+                            ).first
+                            if await search.count() > 0:
+                                # Re-fill periodically because the app can replace
+                                # the search input during hydration.
+                                await search.fill(search_term)
+                                try:
+                                    await search.press("Enter")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                    await asyncio.sleep(min(0.9, ARENA_HISTORY_POLL_SEC + 0.2))
+
                     try:
-                        result = await page.evaluate(r"""([arenaId, prompt]) => {
+                        result = await page.evaluate(r"""([arenaId,prompt,partial])=>{
                           const norm=s=>String(s||'').toLowerCase().replace(/\s+/g,' ').trim();
-                          const p=norm(prompt), words=p.split(' ').filter(w=>w.length>2).slice(0,12);
+                          const p=norm(prompt), q=norm(partial);
+                          const words=p.split(' ').filter(w=>w.length>2).slice(0,16);
                           let best=null;
-                          for(const el of document.querySelectorAll('a[href],button,[role=button]')){
-                            const r=el.getBoundingClientRect(), cs=getComputedStyle(el);
-                            if(r.width<2||r.height<2||cs.display==='none'||cs.visibility==='hidden') continue;
+                          for(const el of document.querySelectorAll('a[href],button,[role=button],[data-id]')){
+                            const r=el.getBoundingClientRect(),cs=getComputedStyle(el);
+                            if(r.width<2||r.height<2||cs.display==='none'||cs.visibility==='hidden')continue;
                             const href=String(el.getAttribute('href')||el.getAttribute('data-href')||'');
+                            const id=String(el.getAttribute('data-id')||'');
                             const t=norm(el.innerText||el.textContent||'');
                             let score=0;
-                            if(arenaId && href.includes(arenaId)) score+=10000;
-                            if(p && t.includes(p)) score+=5000;
-                            for(const w of words) if(t.includes(w)) score+=120;
-                            if(/history|chat|conversation|evaluation/.test(href)) score+=80;
-                            if(!best || score>best.score) best={el,score,href,text:t};
+                            if(arenaId&&(href.includes(arenaId)||id.includes(arenaId)))score+=20000;
+                            if(p&&t.includes(p))score+=7000;
+                            if(q&&t.includes(q))score+=8000;
+                            for(const w of words)if(t.includes(w))score+=130;
+                            if(/history|chat|conversation|evaluation/.test(href))score+=100;
+                            if(!best||score>best.score)best={el,score,href,text:t};
                           }
-                          if(best && best.score>=240){
+                          if(best&&best.score>=260){
                             best.el.click();
                             return {clicked:true,score:best.score,href:best.href,text:best.text};
                           }
                           return {clicked:false,score:best?best.score:0};
-                        }""", [arena_id, search_term])
+                        }""", [arena_id, search_term, partial_probe])
                         clicked = bool(result and result.get("clicked"))
                     except Exception:
                         clicked = False
 
+                    if not clicked and search_attempt % 4 == 0:
+                        # Give the Search page a chance to refresh its indexed
+                        # results without losing the authenticated context.
+                        try:
+                            await page.reload(wait_until="commit", timeout=7000)
+                            await asyncio.sleep(0.45)
+                        except Exception:
+                            pass
+
                 if not clicked:
                     _bump_arena_ui_recovery("not_found")
-                    return {"ok": False, "reason": "matching Arena history item not found"}
+                    return {
+                        "ok": False,
+                        "reason": "matching Arena chat did not become visible before recovery deadline",
+                    }
 
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=5000)
                 except Exception:
                     pass
-                await asyncio.sleep(0.7)
+                await asyncio.sleep(0.55)
 
-            best_text = ""
+            # ---------- Stage 3: wait for the assistant bubble to stabilize ----------
+            best_text = hist_last_text or ""
             stable_since = 0.0
             last_text = None
             best_url = page.url
@@ -7257,7 +7604,12 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                         [str(model_message_id or ""), prompt_probe, partial_probe],
                     )
                 except Exception as exc:
-                    return {"ok": False, "reason": f"UI extraction failed: {type(exc).__name__}"}
+                    return {
+                        "ok": False,
+                        "reason": f"UI extraction failed: {type(exc).__name__}",
+                        "text": best_text,
+                        "url": best_url,
+                    }
 
                 current = str((snap or {}).get("text") or "").strip()
                 generating = bool((snap or {}).get("generating"))
@@ -7276,31 +7628,35 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                 stable_for = time.monotonic() - stable_since if current else 0.0
                 suffix, confidence = _stream_recovery_suffix(partial_text, current)
 
-                # Accept only a stable, browser-visible answer that is not
-                # actively generating and that matches our partial stream when
-                # partial text exists.
                 if current and not generating and stable_for >= ARENA_UI_RECOVERY_STABLE_SEC:
                     if not partial_text or confidence >= 0.90:
                         _bump_arena_ui_recovery("recovered")
+                        _bump_arena_ui_recovery("ui_recovered")
                         log("OK", f"[{name}] Arena UI stream recovery · recovered {len(current)} chars · "
                                   f"stable {stable_for:.1f}s · {best_url}")
                         return {
-                            "ok": True, "text": current, "suffix": suffix,
-                            "confidence": confidence, "url": best_url,
+                            "ok": True,
+                            "text": current,
+                            "suffix": suffix,
+                            "confidence": confidence,
+                            "url": best_url,
                             "complete": True,
+                            "source": "ui",
                         }
 
-                await asyncio.sleep(0.45)
+                await asyncio.sleep(0.4)
 
             if best_text:
                 _bump_arena_ui_recovery("incomplete")
                 return {
-                    "ok": False, "reason": "Arena UI answer did not reach a stable completed state",
-                    "text": best_text, "url": best_url,
+                    "ok": False,
+                    "reason": "Arena response was found but did not reach a confirmed stable completed state",
+                    "text": best_text,
+                    "url": best_url,
                 }
 
             _bump_arena_ui_recovery("not_found")
-            return {"ok": False, "reason": "assistant response not visible in Arena UI"}
+            return {"ok": False, "reason": "assistant response not visible in Arena history/UI"}
 
         finally:
             if page is not None:
@@ -7347,7 +7703,10 @@ async def _attempt_ui_stream_salvage(*, session, chat_id: str, model_name: str,
         if result.get("url"):
             save_conversation_ui_url(chat_id, model_name, result["url"])
     else:
-        log("WARN", f"[{jar.get('name')}] Arena UI stream recovery failed · {result.get('reason') or 'unknown'}")
+        log("WARN", f"[{jar.get('name')}] Arena stream salvage failed · "
+                    f"{result.get('reason') or 'unknown'} · "
+                    f"best chars {len(str(result.get('text') or ''))} · "
+                    f"url {str(result.get('url') or '')[:180]}")
 
     return result
 
@@ -7809,11 +8168,12 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     _schedule_transport_recovery(jar.get("id"), "mid-stream browser transport failure")
                     if response_text or reasoning_text:
                         yield ("error", "502: Arena returned partial assistant output but never delivered a complete "
-                                        "provider finish event. Bridgena checked the Arena chat UI but could not "
-                                        "confirm a completed answer; the partial response remains visible above.")
+                                        "provider finish event. Bridgena polled the authenticated Arena history and "
+                                        "chat UI but could not confirm a completed answer; the partial response remains visible above.")
                     else:
                         yield ("error", "502: Arena opened the response but the browser transport was interrupted. "
-                                        "Bridgena checked the Arena chat UI but could not recover a completed answer.")
+                                        "Bridgena polled authenticated history and the chat UI but could not recover "
+                                        "a completed answer.")
                     return
                 if not e.status:
                     log("WARN", f"[{jar.get('name')}] browser transport failed before an HTTP response; "
@@ -10566,7 +10926,7 @@ async def healthz():
                                 for j in load_jars()))
     bootable_count = len(_bootable_keeper_jars())
     preferred_keepers, preferred_exits = _api_preferred_targets() if bootable_count else (0, 0)
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.9",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.0",
                          "models": len(get_models()),
                          "bootable_accounts": bootable_count,
                          "keeper_fleet_target": bootable_count,
@@ -11429,7 +11789,9 @@ async def _lifespan(app):
     log("INFO", f"Pre-dispatch transport guard · HEAD probe every request {'ON' if TRANSPORT_PROBE_EVERY_REQUEST else 'OFF'} · timeout {TRANSPORT_PROBE_TIMEOUT_MS}ms · recovery wait {PREDISPATCH_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Account failover · max {ACCOUNT_FAILOVER_MAX} alternate keeper(s) · thread handoff ON for pre-generation account/session failures · 429+verification+partial-stream excluded")
     log("INFO", f"Stream completion policy · first assistant output <= {FIRST_ASSISTANT_RESPONSE_SEC:.1f}s · provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} · partial UI preservation ON")
-    log("INFO", f"Arena UI stream recovery · {'ON' if ARENA_UI_STREAM_RECOVERY else 'OFF'} · history/search + session-id matching · timeout {ARENA_UI_RECOVERY_TIMEOUT_SEC:.0f}s · no prompt replay")
+    log("INFO", f"Arena stream salvage · {'ON' if ARENA_UI_STREAM_RECOVERY else 'OFF'} · "
+                f"authenticated /api/history/unified polling + Search Chats UI · "
+                f"limit {ARENA_HISTORY_RECOVERY_LIMIT} · timeout {ARENA_UI_RECOVERY_TIMEOUT_SEC:.0f}s · no prompt replay")
     log("INFO", f"Customer error privacy · opaque friendly messages ON · private registry {_ERROR_EVENTS_FILE} · Errors tab enabled")
     log("INFO", f"Readiness leases · TTL {_API_VERIFICATION_TTL:.0f}s · staggered proactive renewal 55-72% · "
                 f"admission {_API_ADMISSION_MIN_KEEPERS} keeper/{_API_ADMISSION_MIN_EXITS} exit · "
