@@ -12,6 +12,25 @@ from urllib.parse import unquote, urlparse, quote, quote_plus
 from io import BytesIO
 import shutil
 
+def _load_app_env():
+    """Load the script-adjacent .env before adapters or settings are initialized."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(env_path):
+        return
+    try:
+        from dotenv import load_dotenv
+    except ImportError as exc:
+        raise RuntimeError(
+            "Found .env but python-dotenv is missing. Install it with: "
+            "python3 -m pip install python-dotenv"
+        ) from exc
+    # Preserve literal secret values, and let process/service settings win.
+    load_dotenv(dotenv_path=env_path, override=False, interpolate=False,
+                encoding="utf-8-sig")
+
+
+_load_app_env()
+
 try:
     from playwright.async_api import async_playwright
 except ImportError:
@@ -180,10 +199,10 @@ def _validated_public_url(value):
     return value.rstrip("/")
 
 PUBLIC_APP_URL = _validated_public_url(os.environ.get(
-    "BRIDGENA_PUBLIC_URL", "https://arena.ai"
+    "BRIDGENA_PUBLIC_URL", "https://arena.itio.dpdns.org"
 ))
 ARENA_BASE = _validated_public_url(os.environ.get(
-    "BRIDGENA_ARENA_BASE", "https://arena.ai"
+    "BRIDGENA_ARENA_BASE", "https://arena.itio.dpdns.org"
 ))
 _ARENA_PARSED = urlparse(ARENA_BASE)
 LOCAL_UPSTREAM = (_ARENA_PARSED.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
@@ -241,7 +260,7 @@ KEEPER_LOGIN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.7-admission-native-messages")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.8-dotenv")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -7811,7 +7830,7 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.7", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.8", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
