@@ -143,6 +143,10 @@ def _discover_verification_factory():
 
 
 get_verification_solver, _VERIFICATION_IMPORT_ERROR, _VERIFICATION_FACTORY_SPEC = _discover_verification_factory()
+if os.environ.get("BRIDGENA_VERIFICATION_ADAPTER_ENABLED", "1").lower() in {"0", "false", "no", "off"}:
+    get_verification_solver = None
+    _VERIFICATION_IMPORT_ERROR = "Adapter explicitly disabled by operator"
+    _VERIFICATION_FACTORY_SPEC = None
 
 # legacy global keeper UA: chrome131 on Windows — matches curl_cffi impersonate
 # default so cf_clearance (UA+IP-bound) stays coherent for persona-less jars.
@@ -216,7 +220,7 @@ KEEPER_LOGIN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.3-fleet-verification-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.4-readiness-diagnostics")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2753,7 +2757,7 @@ class KeeperSession:
         self.last_public_auth_check = 0.0
         self.last_nav = 0.0
         self.last_restart = 0.0
-        self.ready_at = 0.0
+        self.ready_at = float("inf")
         self.fail_count = 0
         self.next_retry = 0.0
         self.relogin_count = 0
@@ -3699,6 +3703,7 @@ class KeeperSession:
                 return await self._relogin_once()
 
     async def _relogin_once(self) -> bool:
+        self.ready_at = float("inf")
         self.status = "reconnecting"
         self.error = None
         self._set_step("Starting re-login sequence...")
@@ -3988,6 +3993,7 @@ class KeeperSession:
         if self.running:
             return True
             
+        self.ready_at = float("inf")
         self.status = "starting"
         self.error = None
         self._set_step("Initializing stealth browser engine...")
@@ -4162,7 +4168,7 @@ class KeeperSession:
             self._tried_proxies = set()
             self._direct_tried = False
             self.last_health_ok = 0
-            self.status = "running"
+            self.status = "authenticating"
             self._set_step("Keeper session active")
             log("OK", f"[{self.name}] Keeper started ({'headless' if self.headless else 'LIVE WINDOW'})")
 
@@ -4170,14 +4176,16 @@ class KeeperSession:
                 self.last_public_auth_check = time.time()
                 await self._harvest_cookies()
                 if not await self._activate_local_mirror():
+                    self.status = "degraded"
                     log("WARN", f"[{self.name}] Public session valid but local cookie injection failed")
+                else:
+                    self.ready_at = time.monotonic() + KEEPER_WARMUP_SEC
+                    self.status = "running"
             else:
                 log("WARN", f"[{self.name}] Initial health check negative — triggering relogin")
                 await self.relogin()
 
-            if self.status == "running":
-                self.ready_at = time.monotonic() + KEEPER_WARMUP_SEC
-            else:
+            if self.status != "running":
                 self.ready_at = float("inf")
             if self.status == "running" and KEEPER_WARMUP_SEC:
                 log("INFO", f"[{self.name}] Keeper warm-up gate {KEEPER_WARMUP_SEC}s before API traffic")
@@ -4240,6 +4248,7 @@ class KeeperSession:
 
     async def stop(self):
         self.running = False
+        self.ready_at = float("inf")
         if self._loop_task:
             try: self._loop_task.cancel()
             except Exception: pass
@@ -4345,6 +4354,7 @@ class SessionKeeper:
         return [
             {
                 "jar_id": s.jar_id, "name": s.name, "status": s.status,
+                "ready": keeper_session_ready(s),
                 "error": s.error, "method": s.login_method,
                 "current_step": s.current_step,
                 "step_history": s.step_history,
@@ -6829,7 +6839,7 @@ from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
 from fastapi.security import APIKeyHeader
 
-app = FastAPI(title="Bridgena", version="3.2.3")
+app = FastAPI(title="Bridgena", version="3.2.4")
 
 # ---------- v3 optional VNC integration ----------
 _V3_VNC_PROCS=[]
@@ -7651,13 +7661,71 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.3", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.4", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
                                              if keeper_session_ready(session)),
                          "verification_adapter": bool(get_verification_solver),
                          "vnc_enabled": _V3_VNC_ENABLED})
+
+
+@app.get("/control/api/keeper-diagnostics")
+async def keeper_diagnostics(request: Request):
+    """Operator-only, bounded, read-only diagnostics with no secret values."""
+    if not await _current_session(request):
+        raise HTTPException(status_code=401, detail="dashboard session required")
+    script = """() => {
+        const api = window.grecaptcha && window.grecaptcha.enterprise;
+        return {
+            document_complete: document.readyState === 'complete',
+            enterprise_present: !!api,
+            ready_function: typeof api?.ready === 'function',
+            execute_function: typeof api?.execute === 'function',
+            render_function: typeof api?.render === 'function',
+            site_key_elements: document.querySelectorAll('[data-sitekey]').length,
+            response_fields: document.querySelectorAll('[name="g-recaptcha-response"]').length
+        };
+    }"""
+    gate = asyncio.Semaphore(3)
+    async def inspect_session(sid, session):
+        row = {"keeper_id": sid, "state": session.status,
+               "ready": keeper_session_ready(session)}
+        deadline = getattr(session, "ready_at", float("inf"))
+        row["warmup_remaining_seconds"] = (
+            max(0, math.ceil(deadline - time.monotonic())) if math.isfinite(deadline) else None)
+        if not keeper_session_ready(session, warmed=False):
+            row["inspection"] = "not_initialized"
+            return row
+        if session.active_requests or session._action_lock.locked():
+            row["inspection"] = "busy"
+            return row
+        async with gate:
+            try:
+                await asyncio.wait_for(session._action_lock.acquire(), timeout=0.1)
+            except asyncio.TimeoutError:
+                row["inspection"] = "busy"
+                return row
+            try:
+                data = await asyncio.wait_for(session.page.evaluate(script), timeout=3)
+                # Never trust arbitrary page-returned values in a diagnostic export.
+                row["browser"] = {
+                    key: data[key] for key in (
+                        "document_complete", "enterprise_present", "ready_function",
+                        "execute_function", "render_function", "site_key_elements",
+                        "response_fields"
+                    ) if isinstance(data, dict) and type(data.get(key)) in (bool, int)
+                }
+                row["inspection"] = "complete"
+            except Exception as exc:
+                row["inspection"] = type(exc).__name__
+            finally:
+                session._action_lock.release()
+        return row
+    rows = await asyncio.gather(*(inspect_session(sid, session)
+                                  for sid, session in list(keeper.sessions.items())))
+    return JSONResponse({"build": BUILD_STAMP, "keepers": rows},
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/readyz")
