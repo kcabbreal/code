@@ -263,7 +263,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.3.2-verification-protocol-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.3.3-startup-readiness-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1823,6 +1823,41 @@ def jar_has_auth(jar: dict) -> bool:
 def jar_has_cf(jar: dict) -> bool:
     return bool(find_cookie(jar.get("cookies", []), "cf_clearance"))
 
+# API admission readiness is stronger than "browser process exists".
+# A keeper must have passed an authenticated Enterprise-V3 preflight before
+# external API traffic can be assigned to it.
+_API_VERIFICATION_TTL = max(60.0, float(os.environ.get("BRIDGENA_VERIFICATION_READY_TTL", "600")))
+_API_MIN_VERIFIED_KEEPERS = max(1, min(7, int(os.environ.get("BRIDGENA_MIN_VERIFIED_KEEPERS", "1"))))
+_api_verified_keepers: Dict[str, float] = {}
+_api_ready_event = asyncio.Event()
+
+def _api_keeper_verified(sid: Optional[str]) -> bool:
+    if not sid:
+        return False
+    ts = _api_verified_keepers.get(str(sid), 0.0)
+    return bool(ts and (time.monotonic() - ts) <= _API_VERIFICATION_TTL)
+
+def _verified_keeper_count() -> int:
+    now = time.monotonic()
+    stale = [sid for sid, ts in _api_verified_keepers.items()
+             if not ts or (now - ts) > _API_VERIFICATION_TTL]
+    for sid in stale:
+        _api_verified_keepers.pop(sid, None)
+    return sum(1 for sid in _api_verified_keepers if keeper_session_ready(keeper.sessions.get(sid)))
+
+def _refresh_api_ready_event() -> None:
+    if bool(get_models()) and _verified_keeper_count() >= _API_MIN_VERIFIED_KEEPERS:
+        _api_ready_event.set()
+    else:
+        _api_ready_event.clear()
+
+def _mark_api_keeper_unready(sid: Optional[str], reason: str = "") -> None:
+    if sid:
+        _api_verified_keepers.pop(str(sid), None)
+    _refresh_api_ready_event()
+    if reason and sid:
+        log("WARN", f"[{sid}] API readiness revoked · {reason}")
+
 def keeper_session_ready(session, *, warmed: bool = True) -> bool:
     """True only when a keeper is safe to receive API/token work."""
     if not (session and session.running and getattr(session, "status", "") == "running"):
@@ -2307,10 +2342,12 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
         healthy = bool(s and s.last_health_ok and (now - s.last_health_ok) < 900)
         available = jar_available(j, now)
         captcha_clean = 1 if (now - _captcha_failed_jars.get(sid, 0.0) > 300) else 0
+        api_verified = 1 if _api_keeper_verified(sid) else 0
         idle = 1 if (not s or not getattr(s, "_action_lock", None) or not s._action_lock.locked()) else 0
         # last_used is inverted so older = higher priority
         recency = -float(j.get("last_used", 0) or 0)
         return (
+            api_verified,
             captcha_clean,
             idle,
             1 if (prefer_live and is_live and healthy) else 0,
@@ -2331,6 +2368,15 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
         sid = best.get("id")
         s = keeper.sessions.get(sid) if sid else None
         has_session = keeper_session_ready(s)
+        if _api_ready_event.is_set() and not _api_keeper_verified(sid):
+            verified = [j for j in candidates
+                        if _api_keeper_verified(j.get("id"))
+                        and keeper_session_ready(keeper.sessions.get(j.get("id")))]
+            if verified:
+                best = sorted(verified, key=_score, reverse=True)[0]
+                sid = best.get("id")
+                s = keeper.sessions.get(sid) if sid else None
+                has_session = keeper_session_ready(s)
         if not jar_has_auth(best) and not has_session:
             # Try to find any jar that has either auth cookies or a live session
             for j in candidates[1:]:
@@ -2359,6 +2405,8 @@ def acquire_ready_jar(exclude: Optional[set] = None) -> Optional[dict]:
             continue
         session = keeper.sessions.get(sid)
         if not keeper_session_ready(session):
+            continue
+        if _api_ready_event.is_set() and not _api_keeper_verified(sid):
             continue
         candidates.append(jar)
     if not candidates:
@@ -6013,6 +6061,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             except BridgeHTTPError as e:
                 if not e.status:
                     log("WARN", f"[{jar.get('name')}] browser transport failed before an HTTP response; request ended as transient network failure")
+                    _mark_api_keeper_unready(jar.get("id"), "browser-origin network failure; keeper must re-pass preflight")
                     yield ("error", "502: Browser transport lost the route before an HTTP response. Retry the request; no cross-transport replay was attempted.")
                     return
                 else:
@@ -6022,6 +6071,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     # A failed POST may already have been processed. Do not turn
                     # it into a new conversation or replay it automatically.
                     if verdict == "SESSION":
+                        _mark_api_keeper_unready(jar.get("id"), "upstream session/login gate")
                         browser_session.status = "degraded"
                         browser_session.ready_at = float("inf")
                         browser_session.error = "Upstream rejected authentication; sign in again"
@@ -7570,9 +7620,19 @@ async def openai_stream(body: dict, keyinfo: dict):
     )
 
 
+async def _require_api_ready():
+    _refresh_api_ready_event()
+    if not _api_ready_event.is_set():
+        verified = _verified_keeper_count()
+        raise HTTPException(
+            status_code=503,
+            detail=f"Bridgena is starting verification preflight ({verified}/{_API_MIN_VERIFIED_KEEPERS} verified keepers). Retry shortly."
+        )
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_completions(request: Request):
+    await _require_api_ready()
     keyinfo = await _require_key(request)
     body = await request.json()
     prompt = _format_conversation_prompt(body)
@@ -7686,6 +7746,7 @@ async def anthropic_count_tokens(request: Request):
 @app.post("/v1/messages")
 @app.post("/messages")
 async def anthropic_messages(request: Request):
+    await _require_api_ready()
     """Native Anthropic Messages surface for clients that should not traverse
     an OpenAI-to-Anthropic stream converter."""
     keyinfo = await _require_key(request)
@@ -7953,11 +8014,13 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.3.2", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.3.3", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
                                              if keeper_session_ready(session)),
+                         "api_ready": _api_ready_event.is_set(),
+                         "verified_keepers": _verified_keeper_count(),
                          "verification_adapter": bool(get_verification_solver),
                          "vnc_enabled": _V3_VNC_ENABLED})
 
@@ -8022,12 +8085,18 @@ async def keeper_diagnostics(request: Request):
 
 @app.get("/readyz")
 async def readyz():
+    _refresh_api_ready_event()
     models_ready = bool(get_models())
     keeper_ready = any(keeper_session_ready(session)
                        for session in keeper.sessions.values())
-    ready = models_ready and keeper_ready
+    verified = _verified_keeper_count()
+    ready = _api_ready_event.is_set()
     return JSONResponse({"ready": ready, "build": BUILD_STAMP,
-                         "checks": {"models": models_ready, "keeper": keeper_ready,
+                         "checks": {"models": models_ready,
+                                    "keeper": keeper_ready,
+                                    "verification_preflight": verified >= _API_MIN_VERIFIED_KEEPERS,
+                                    "verified_keepers": verified,
+                                    "required_verified_keepers": _API_MIN_VERIFIED_KEEPERS,
                                     "verification_adapter": bool(get_verification_solver)}},
                         status_code=200 if ready else 503)
 
@@ -8307,6 +8376,72 @@ except Exception as _v3_static_exc:
     log('WARN',f'noVNC static mount unavailable: {type(_v3_static_exc).__name__}')
 
 # ---------- startup ----------
+async def _api_verification_readiness_loop():
+    """Keep external API admission closed until a keeper proves auth + V3 capability.
+
+    The preflight is browser-local: it does not create an Arena evaluation or
+    consume a user message. Runtime network/session failures revoke the keeper
+    and require it to pass this preflight again before selection.
+    """
+    announced_wait = False
+    announced_ready = False
+    while True:
+        try:
+            _refresh_api_ready_event()
+            if _api_ready_event.is_set():
+                if not announced_ready:
+                    names = [getattr(keeper.sessions.get(sid), "name", sid)
+                             for sid in _api_verified_keepers
+                             if _api_keeper_verified(sid)
+                             and keeper_session_ready(keeper.sessions.get(sid))]
+                    log("OK", "API READY · verification preflight passed"
+                        + f" · verified keepers {len(names)}"
+                        + (f" · {', '.join(names[:4])}" if names else ""))
+                    announced_ready = True
+                    announced_wait = False
+                await asyncio.sleep(10.0)
+                continue
+
+            announced_ready = False
+            if not announced_wait:
+                log("INFO", "API NOT READY · waiting for authenticated keeper + Enterprise V3 preflight; "
+                            "chat requests will receive 503 until verification is ready")
+                announced_wait = True
+
+            for jar in load_jars():
+                sid = str(jar.get("id") or "")
+                if not sid or _api_keeper_verified(sid) or not jar.get("enabled", True):
+                    continue
+                session = keeper.sessions.get(sid)
+                if not keeper_session_ready(session) or not jar_has_auth(jar):
+                    continue
+                if session.active_requests or session._action_lock.locked():
+                    continue
+                try:
+                    healthy = await asyncio.wait_for(session.check_health(), timeout=8.0)
+                    if not healthy:
+                        continue
+                    token = await asyncio.wait_for(mint_v3(sid), timeout=15.0)
+                    if not _verification_token_ok(token):
+                        log("WARN", f"[{getattr(session, 'name', sid)}] verification preflight failed · no valid V3 token")
+                        continue
+                    _api_verified_keepers[sid] = time.monotonic()
+                    log("OK", f"[{getattr(session, 'name', sid)}] verification preflight passed · "
+                              f"Enterprise V3 ready · token shape {len(token)} chars")
+                    _refresh_api_ready_event()
+                    if _api_ready_event.is_set():
+                        break
+                except Exception as exc:
+                    log("WARN", f"[{getattr(session, 'name', sid)}] verification preflight failed · "
+                                f"{type(exc).__name__}: {redact(str(exc))[:160]}")
+            _refresh_api_ready_event()
+            await asyncio.sleep(2.0 if not _api_ready_event.is_set() else 10.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log("WARN", f"API verification readiness loop recovered from {type(exc).__name__}: {redact(str(exc))[:160]}")
+            await asyncio.sleep(3.0)
+
 def jars_have_creds() -> bool:
     return any(j.get("email") and j.get("password") and j.get("enabled", True) for j in load_jars())
 @asynccontextmanager
@@ -8323,7 +8458,8 @@ async def _lifespan(app):
     mutate_jars(_normalize_personas)
     tasks = [asyncio.create_task(keeper_election_loop(), name="keeper-election"),
              asyncio.create_task(periodic_model_refresher(), name="model-refresher"),
-             asyncio.create_task(get_initial_data(), name="initial-catalog")]
+             asyncio.create_task(get_initial_data(), name="initial-catalog"),
+             asyncio.create_task(_api_verification_readiness_loop(), name="api-verification-readiness")]
     if jars_have_creds():
         tasks.append(asyncio.create_task(auto_login_on_boot(), name="auto-login"))
     app.state.background_tasks = tasks
