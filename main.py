@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.3-confirmed-absence-retry")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.4-context-capsule-thread-rehome")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1933,6 +1933,19 @@ ARENA_SALVAGE_QUICK_SEC = max(1.0, min(8.0, float(os.environ.get("BRIDGENA_ARENA
 ARENA_POST_RESTART_SALVAGE_SEC = max(5.0, min(45.0, float(os.environ.get("BRIDGENA_ARENA_POST_RESTART_SALVAGE_SEC", "22"))))
 ARENA_SALVAGE_RECOVERY_WAIT_SEC = max(5.0, min(40.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_RECOVERY_WAIT_SEC", "18"))))
 UNDELIVERED_ENVELOPE_RETRY_MAX = max(0, min(2, int(os.environ.get("BRIDGENA_UNDELIVERED_ENVELOPE_RETRY_MAX", "1"))))
+THROTTLE_THREAD_REHOME = os.environ.get("BRIDGENA_THROTTLE_THREAD_REHOME", "1").strip().lower() not in ("0", "false", "no", "off")
+CONTEXT_CAPSULE_MAX_CHARS = max(4000, min(MAX_PROMPT, int(os.environ.get("BRIDGENA_CONTEXT_CAPSULE_MAX_CHARS", str(min(MAX_PROMPT, 60000))))))
+_thread_rehome_stats = {"armed": 0, "activated": 0, "inline": 0, "completed": 0, "missing_context": 0}
+_thread_rehome_guard = threading.Lock()
+
+def _bump_thread_rehome(key: str) -> None:
+    with _thread_rehome_guard:
+        _thread_rehome_stats[key] = int(_thread_rehome_stats.get(key, 0)) + 1
+
+def _thread_rehome_snapshot() -> dict:
+    with _thread_rehome_guard:
+        return dict(_thread_rehome_stats)
+
 _undelivered_retry_stats = {"attempted": 0, "succeeded": 0, "suppressed_trace_found": 0, "exhausted": 0}
 _undelivered_retry_guard = threading.Lock()
 
@@ -2011,7 +2024,8 @@ def _reliability_snapshot() -> dict:
             "transport_guard": _transport_guard_snapshot(),
             "account_failover": _account_failover_snapshot(),
             "arena_ui_recovery": _arena_ui_recovery_snapshot(),
-            "confirmed_absence_retry": _undelivered_retry_snapshot()}
+            "confirmed_absence_retry": _undelivered_retry_snapshot(),
+            "thread_rehome": _thread_rehome_snapshot()}
 
 
 def _bootable_keeper_jars(jars: Optional[List[dict]] = None) -> List[dict]:
@@ -2592,6 +2606,124 @@ def save_conversation_ui_url(key: str, model_name: str, ui_url: str) -> None:
         mutate_state(fn)
     except Exception as exc:
         log("WARN", f"Conversation UI URL cache failed: {type(exc).__name__}: {exc}")
+
+
+def _trim_context_capsule(value: str) -> str:
+    value = str(value or "").strip()
+    if len(value) <= CONTEXT_CAPSULE_MAX_CHARS:
+        return value
+    tail = value[-CONTEXT_CAPSULE_MAX_CHARS:]
+    cut = tail.find("\n\n")
+    return tail[cut + 2:] if cut >= 0 else tail
+
+
+def save_context_capsule(chat_id: str, model_name: str, transcript: str,
+                         *, source: str = "client-transcript") -> None:
+    """Persist private continuity context for upstream thread replacement.
+
+    This is server-side state only. Nothing is appended to the assistant's
+    visible stream, so there are no magic <context> tags that can leak into the
+    customer's answer or confuse tool/JSON output.
+    """
+    transcript = _trim_context_capsule(transcript)
+    if not transcript:
+        return
+
+    def fn(state: dict):
+        convs = state.setdefault("conversations", {})
+        conv = convs.setdefault(chat_id, {"arena": {}, "updated": time.time()})
+        capsules = conv.setdefault("context_capsules", {})
+        capsules[model_name] = {
+            "text": transcript,
+            "source": str(source or "unknown")[:80],
+            "updated": time.time(),
+        }
+        conv["updated"] = time.time()
+
+    try:
+        mutate_state(fn)
+    except Exception as exc:
+        log("WARN", f"Context capsule save failed: {type(exc).__name__}: {exc}")
+
+
+def load_context_capsule(chat_id: str, model_name: str) -> str:
+    conv = get_conversation(chat_id) or {}
+    row = (conv.get("context_capsules") or {}).get(model_name) or {}
+    return _trim_context_capsule(row.get("text") or "")
+
+
+def append_context_capsule_answer(chat_id: str, model_name: str,
+                                  base_transcript: str, answer: str) -> None:
+    answer = str(answer or "").strip()
+    if not answer:
+        return
+    base = str(base_transcript or load_context_capsule(chat_id, model_name) or "").strip()
+    rendered = (base + "\n\nAssistant: " + answer).strip() if base else ("Assistant: " + answer)
+    save_context_capsule(chat_id, model_name, rendered, source="completed-turn")
+
+
+def arm_throttle_thread_rehome(chat_id: str, model_name: str, jar_id: str,
+                               delay_sec: float, context_text: str) -> bool:
+    """Mark the bound upstream conversation for replacement AFTER cooldown.
+
+    We preserve the same model and same configured account. This does not use a
+    fresh thread to bypass an active throttle: the rehome becomes eligible only
+    after the upstream cooldown/Retry-After has elapsed.
+    """
+    context_text = _trim_context_capsule(context_text or load_context_capsule(chat_id, model_name))
+    if not context_text:
+        _bump_thread_rehome("missing_context")
+        return False
+
+    save_context_capsule(chat_id, model_name, context_text, source="throttle-rehome")
+    not_before = time.time() + max(0.0, float(delay_sec or 0.0))
+
+    def fn(state: dict):
+        conv = state.setdefault("conversations", {}).setdefault(
+            chat_id, {"arena": {}, "updated": time.time()}
+        )
+        old = ((conv.get("arena") or {}).get(model_name) or {})
+        rehomes = conv.setdefault("thread_rehome", {})
+        rehomes[model_name] = {
+            "reason": "upstream-rate-limit",
+            "jar_id": str(jar_id or old.get("jar_id") or ""),
+            "old_arena_id": str(old.get("arena_id") or ""),
+            "not_before": not_before,
+            "armed": time.time(),
+            "model": model_name,
+        }
+        conv["updated"] = time.time()
+
+    try:
+        mutate_state(fn)
+        _bump_thread_rehome("armed")
+        log("WARN", f"Thread rehome armed · {str(chat_id)[:10]}… · model {model_name} · "
+                    f"same account {str(jar_id)[:10]}… · eligible in {max(0.0, delay_sec):.1f}s")
+        return True
+    except Exception as exc:
+        log("WARN", f"Thread rehome arm failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def get_throttle_thread_rehome(chat_id: str, model_name: str) -> Optional[dict]:
+    conv = get_conversation(chat_id) or {}
+    row = (conv.get("thread_rehome") or {}).get(model_name)
+    return dict(row) if isinstance(row, dict) else None
+
+
+def clear_throttle_thread_rehome(chat_id: str, model_name: str) -> None:
+    def fn(state: dict):
+        conv = state.get("conversations", {}).get(chat_id)
+        if not isinstance(conv, dict):
+            return
+        rehomes = conv.get("thread_rehome")
+        if isinstance(rehomes, dict):
+            rehomes.pop(model_name, None)
+        conv["updated"] = time.time()
+    try:
+        mutate_state(fn)
+    except Exception:
+        pass
 
 
 def clear_conversation_model(key: str, model_name: str) -> None:
@@ -6961,6 +7093,12 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
     different healthy configured account using the client-provided transcript.
     It never performs this handoff after partial model output has started.
     """
+    # Keep a private continuity capsule up to date from the transcript the
+    # client already supplied. This is more reliable than asking the model to
+    # emit hidden context markers after every response.
+    if handoff_prompt:
+        save_context_capsule(chat_id, model_name, handoff_prompt, source="client-transcript")
+
     async with _conversation_gate(chat_id):
         if CONVERSATION_MIN_GAP_SEC > 0:
             now = time.monotonic()
@@ -6981,6 +7119,25 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
             active_prompt = prompt
             active_system_prompt = system_prompt
             migrated_thread = False
+            throttle_rehome_active = False
+            continuity_context = handoff_prompt or load_context_capsule(chat_id, model_name)
+
+            pending_rehome = get_throttle_thread_rehome(chat_id, model_name)
+            if THROTTLE_THREAD_REHOME and pending_rehome:
+                not_before = float(pending_rehome.get("not_before") or 0.0)
+                if time.time() >= not_before:
+                    continuity_context = handoff_prompt or load_context_capsule(chat_id, model_name)
+                    if continuity_context:
+                        clear_conversation_model(chat_id, model_name)
+                        active_prompt = continuity_context
+                        next_hint = str(pending_rehome.get("jar_id") or jar_hint or "") or None
+                        migrated_thread = True
+                        throttle_rehome_active = True
+                        _bump_thread_rehome("activated")
+                        log("WARN", f"Thread rehome activated · rebuilding {str(chat_id)[:10]}… "
+                                    f"as a fresh Arena chat · same model {model_name} · same account")
+                    else:
+                        _bump_thread_rehome("missing_context")
 
             while True:
                 turn = _run_turn_impl(
@@ -6991,6 +7148,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 )
                 retry_info = None
                 emitted_user_output = False
+                attempt_answer = ""
+                saw_done = False
                 try:
                     async for kind, payload in turn:
                         if kind in ("retry-account", "retry-same-account", "retry-undelivered"):
@@ -6998,11 +7157,26 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                             retry_info["_kind"] = kind
                             break
                         emitted_user_output = True
+                        if kind == "content" and isinstance(payload, str):
+                            attempt_answer += payload
+                        elif kind == "done":
+                            saw_done = True
                         yield kind, payload
                 finally:
                     await turn.aclose()
 
                 if not retry_info:
+                    if saw_done and attempt_answer:
+                        append_context_capsule_answer(
+                            chat_id, model_name,
+                            continuity_context or handoff_prompt,
+                            attempt_answer,
+                        )
+                    if throttle_rehome_active and saw_done:
+                        clear_throttle_thread_rehome(chat_id, model_name)
+                        _bump_thread_rehome("completed")
+                        log("OK", f"Thread rehome completed · {str(chat_id)[:10]}… · "
+                                  f"same model {model_name}")
                     return
 
                 if retry_info.get("_kind") == "retry-undelivered":
@@ -7039,16 +7213,41 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         return
                     if delay > UPSTREAM_429_INLINE_WAIT_MAX_SEC:
                         retry_after = max(1, int(delay + 0.999))
-                        yield ("error", f"429: Arena is rate-limiting model '{model_name}'. "
-                                        f"Retry in about {retry_after}s.")
+                        if bool(retry_info.get("rehome_thread")) and THROTTLE_THREAD_REHOME:
+                            continuity_context = handoff_prompt or load_context_capsule(chat_id, model_name)
+                            arm_throttle_thread_rehome(
+                                chat_id, model_name, failed_id, delay, continuity_context,
+                            )
+                            yield ("error", f"429: Arena is rate-limiting model '{model_name}'. "
+                                            f"Retry in about {retry_after}s. A fresh same-model thread with preserved "
+                                            "context is armed for the next eligible attempt.")
+                        else:
+                            yield ("error", f"429: Arena is rate-limiting model '{model_name}'. "
+                                            f"Retry in about {retry_after}s.")
                         return
                     same_account_429_retries += 1
+                    rehome_thread = bool(retry_info.get("rehome_thread"))
                     log("WARN", f"[{failed_name}] same-account throttle recovery "
                                 f"{same_account_429_retries}/{UPSTREAM_429_SAME_ACCOUNT_RETRIES} · "
-                                f"waiting {delay:.1f}s · {reason}")
+                                f"waiting {delay:.1f}s · {'new thread after cooldown · ' if rehome_thread else ''}{reason}")
                     if delay > 0:
                         await asyncio.sleep(delay + 0.05)
+
                     next_hint = failed_id or next_hint
+                    if rehome_thread and THROTTLE_THREAD_REHOME:
+                        continuity_context = handoff_prompt or load_context_capsule(chat_id, model_name)
+                        if continuity_context:
+                            clear_conversation_model(chat_id, model_name)
+                            active_prompt = continuity_context
+                            active_system_prompt = system_prompt
+                            migrated_thread = True
+                            throttle_rehome_active = True
+                            clear_throttle_thread_rehome(chat_id, model_name)
+                            _bump_thread_rehome("inline")
+                            log("WARN", f"[{failed_name}] throttle cooldown elapsed · "
+                                        f"starting fresh Arena chat with preserved context · same model {model_name}")
+                        else:
+                            _bump_thread_rehome("missing_context")
                     continue
 
                 # A real account handoff must start with a fresh envelope.
@@ -8561,11 +8760,17 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                     f"cooldown {cooldown:.1f}s · retry-after "
                                     f"{getattr(e, 'retry_after', '') or 'adaptive'} · same-account only")
                         if int(getattr(e, "frame_count", 0) or 0) == 0:
+                            continuity = load_context_capsule(chat_id, model_name)
+                            arm_throttle_thread_rehome(
+                                chat_id, model_name, str(jar.get("id") or ""),
+                                cooldown, continuity,
+                            )
                             yield ("retry-same-account", {
                                 "jar_id": jar.get("id"),
                                 "jar_name": jar.get("name"),
                                 "delay": cooldown,
                                 "reason": "definitive zero-frame HTTP 429",
+                                "rehome_thread": True,
                             })
                             return
                         yield ("error", f"429: Arena returned Too Many Requests for model '{model_name}'. "
@@ -8744,11 +8949,17 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         retry_after = max(1, int(cooldown + 0.999))
                         log("WARN", f"[{jar.get('name')}] upstream prompt throttle · "
                                     f"cooldown {cooldown:.1f}s · same-account only")
+                        continuity = load_context_capsule(chat_id, model_name)
+                        arm_throttle_thread_rehome(
+                            chat_id, model_name, str(jar.get("id") or ""),
+                            cooldown, continuity,
+                        )
                         yield ("retry-same-account", {
                             "jar_id": jar.get("id"),
                             "jar_name": jar.get("name"),
                             "delay": cooldown,
                             "reason": "definitive HTTP 429 from curl transport",
+                            "rehome_thread": True,
                         })
                         return
 
@@ -9959,6 +10170,16 @@ def _recent_private_errors(limit: int = 100) -> list:
         return [dict(x) for x in list(_error_events)[-max(1, min(500, limit)):]][::-1]
 
 
+def _retry_after_from_internal_error(detail: Any) -> Optional[int]:
+    m = re.search(r"(?i)retry\s+in\s+(?:about\s+)?(\d+)s", str(detail or ""))
+    if not m:
+        return None
+    try:
+        return max(1, min(3600, int(m.group(1))))
+    except Exception:
+        return None
+
+
 def _status_from_internal_error(detail: Any, default: int = 502) -> int:
     match = re.match(r"^\s*(\d{3})\s*:", str(detail or ""))
     if match:
@@ -10602,13 +10823,18 @@ async def openai_stream(body: dict, keyinfo: dict):
                             "content_chunks": content_chunks,
                         },
                     )
-                    yield _sse({"error": {
+                    public_error = {
                         "message": public_message,
                         "type": "api_error",
                         "code": error_id,
                         "partial_response_preserved": bool(content_chunks > 0),
                         "partial_chars": len(acc),
-                    }})
+                    }
+                    retry_after = _retry_after_from_internal_error(payload)
+                    if retry_after:
+                        public_error["retry_after"] = retry_after
+                        public_error["retryable"] = True
+                    yield _sse({"error": public_error})
                     # The partial assistant deltas (if any) have already been
                     # emitted. Send a normal terminal choice after the error so
                     # clients leave their generating state without discarding
@@ -10970,11 +11196,16 @@ async def anthropic_messages(request: Request):
                             "chunks": chunks,
                         },
                     )
-                    yield _anthropic_sse("error", {
+                    anth_error = {
                         "type": "error",
                         "error": {"type": "api_error", "message": public_message},
                         "error_id": error_id,
-                    })
+                    }
+                    retry_after = _retry_after_from_internal_error(payload)
+                    if retry_after:
+                        anth_error["retry_after"] = retry_after
+                        anth_error["retryable"] = True
+                    yield _anthropic_sse("error", anth_error)
                     # Some desktop clients wait for the ordinary terminal
                     # sequence even after receiving an error event.
                     yield _anthropic_sse("content_block_stop", {
@@ -11232,7 +11463,7 @@ async def healthz():
                                 for j in load_jars()))
     bootable_count = len(_bootable_keeper_jars())
     preferred_keepers, preferred_exits = _api_preferred_targets() if bootable_count else (0, 0)
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.3",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.4",
                          "models": len(get_models()),
                          "bootable_accounts": bootable_count,
                          "keeper_fleet_target": bootable_count,
@@ -12100,6 +12331,9 @@ async def _lifespan(app):
                 f"{ARENA_POST_RESTART_SALVAGE_SEC:.0f}s post-restart history/UI salvage · no prompt replay")
     log("INFO", f"Confirmed-absence resend · max {UNDELIVERED_ENVELOPE_RETRY_MAX} · "
                 "HTTP-0 + zero output + post-restart history trace absent only · exact message IDs reused")
+    log("INFO", f"Throttle thread rehome · {'ON' if THROTTLE_THREAD_REHOME else 'OFF'} · "
+                f"same model/account · server-side context capsule <= {CONTEXT_CAPSULE_MAX_CHARS} chars · "
+                "upstream Retry-After is always respected")
     log("INFO", f"Customer error privacy · opaque friendly messages ON · private registry {_ERROR_EVENTS_FILE} · Errors tab enabled")
     log("INFO", f"Readiness leases · TTL {_API_VERIFICATION_TTL:.0f}s · staggered proactive renewal 55-72% · "
                 f"admission {_API_ADMISSION_MIN_KEEPERS} keeper/{_API_ADMISSION_MIN_EXITS} exit · "
