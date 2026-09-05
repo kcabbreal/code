@@ -266,7 +266,7 @@ API_TURN_CONCURRENCY = max(
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.7-cohort-readiness-startup-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.5.8-universal-stream-decoder")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -4300,7 +4300,11 @@ class KeeperSession:
                         for (const line of parts) {
                             if (line.trim()) {
                                 emit(line);
-                                if (/^(ad|d|e):/.test(line.trim())) protocolFinished = true;
+                                const t = line.trim();
+                                if (/^(ad|b|c|d|e):/.test(t) ||
+                                    /^data:\\s*\\{.*\\"type\\"\\s*:\\s*\\"(?:finish|finish-step|finish-message|message-stop|done)\\"/.test(t)) {
+                                    protocolFinished = true;
+                                }
                             }
                         }
                         if (done) break;
@@ -6093,10 +6097,41 @@ def _events_from_stream_data(data) -> list:
     delta = data.get("delta")
     if isinstance(delta, dict):
         delta_kind = str(delta.get("type") or kind).lower().replace("_", "-")
-        value = delta.get("text") or delta.get("content")
+        value = delta.get("text")
+        if not isinstance(value, str):
+            value = delta.get("content")
+        if not isinstance(value, str):
+            value = delta.get("value")
         if isinstance(value, str) and value:
             out.append(("reasoning" if "thinking" in delta_kind or "reasoning" in delta_kind else "content", value))
-            return out
+            # Do not return here: some providers place text + metadata/data in
+            # the same envelope and both need to be inspected.
+
+    # AI SDK UIMessageStream parts and provider wrappers.
+    parts = data.get("parts")
+    if isinstance(parts, list):
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            pkind = str(part.get("type") or "").lower().replace("_", "-")
+            ptext = part.get("text")
+            if not isinstance(ptext, str):
+                ptext = part.get("content")
+            if isinstance(ptext, str) and ptext:
+                out.append(("reasoning" if "reasoning" in pkind or "thinking" in pkind else "content", ptext))
+
+    message = data.get("message")
+    if isinstance(message, dict):
+        mcontent = message.get("content")
+        if isinstance(mcontent, str) and mcontent:
+            out.append(("content", mcontent))
+        elif isinstance(mcontent, list):
+            for item in mcontent:
+                if isinstance(item, dict):
+                    itype = str(item.get("type") or "").lower()
+                    itext = item.get("text")
+                    if isinstance(itext, str) and itext:
+                        out.append(("reasoning" if "thinking" in itype else "content", itext))
 
     value = delta if isinstance(delta, str) else data.get("text")
     if not isinstance(value, str):
@@ -6110,6 +6145,186 @@ def _events_from_stream_data(data) -> list:
     elif isinstance(data.get("data"), (dict, list)):
         out.extend(_events_from_stream_data(data["data"]))
     return out
+
+
+def _stream_scalar_text(value):
+    """Extract text from common provider payload fragments without flattening metadata."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        chunks = []
+        for item in value:
+            if isinstance(item, str):
+                chunks.append(item)
+            elif isinstance(item, dict):
+                t = item.get("text")
+                if isinstance(t, str):
+                    chunks.append(t)
+        return "".join(chunks)
+    if isinstance(value, dict):
+        for key in ("text", "value", "content"):
+            v = value.get(key)
+            if isinstance(v, str):
+                return v
+    return ""
+
+
+def _stream_events_from_prefixed(prefix: str, payload):
+    """Decode Vercel AI SDK / Arena prefixed data-stream frames.
+
+    Supports both the classic numeric protocol and Arena's `a*` variants.
+    Unknown metadata/tool frames are deliberately ignored rather than treated
+    as malformed text.
+    """
+    p = str(prefix or "").strip().lower()
+    events = []
+
+    # Arena/Vercel text and reasoning delta frames.
+    if p in ("0", "a0"):
+        if isinstance(payload, str):
+            return [("content", payload)]
+        return _events_from_stream_data(payload)
+
+    if p in ("g", "ag"):
+        if isinstance(payload, str):
+            return [("reasoning", payload)]
+        return _events_from_stream_data(payload)
+
+    # Structured data frames can themselves contain provider-native deltas.
+    if p in ("2", "a2"):
+        return _events_from_stream_data(payload)
+
+    # Classic data-stream error frame.
+    if p in ("3", "error"):
+        if isinstance(payload, dict):
+            msg = payload.get("message") or payload.get("error") or payload.get("detail")
+        else:
+            msg = payload
+        return [("error", str(msg or "Provider stream error"))]
+
+    # Finish-message / finish-step variants. Some adapters attach final text.
+    if p in ("b", "c", "d", "e", "ad"):
+        nested = _events_from_stream_data(payload)
+        contentish = [ev for ev in nested if ev[0] in ("content", "reasoning", "error")]
+        if contentish:
+            events.extend(contentish)
+        if not any(ev[0] == "error" for ev in events):
+            events.append(("done", p))
+        return events
+
+    # AI SDK metadata/tool frames: 8=data annotation, 9=tool call,
+    # a=tool result. They are not assistant text and should not poison parsing.
+    if p in ("8", "9", "a"):
+        return _events_from_stream_data(payload)
+
+    # A few provider adapters use named prefixes.
+    if p in ("text", "text-delta", "content", "content-delta"):
+        t = _stream_scalar_text(payload)
+        return [("content", t)] if t else _events_from_stream_data(payload)
+
+    if p in ("reasoning", "reasoning-delta", "thinking", "thinking-delta"):
+        t = _stream_scalar_text(payload)
+        return [("reasoning", t)] if t else _events_from_stream_data(payload)
+
+    return _events_from_stream_data(payload)
+
+
+def _parse_stream_events(line: str):
+    """Return *all* semantic events encoded by one upstream line.
+
+    The previous decoder collapsed each frame to a single event. Models that
+    package reasoning + text, or several deltas in one JSON envelope, therefore
+    lost content. This decoder preserves ordering and all deltas.
+    """
+    raw = str(line or "").strip()
+    if not raw or raw.startswith(":"):
+        return []
+
+    # SSE event-name lines carry no payload themselves.
+    if raw.startswith("event:"):
+        return []
+
+    if raw.startswith("data:"):
+        raw = raw[5:].strip()
+
+    if not raw:
+        return []
+    if raw == "[DONE]":
+        return [("done", "stop")]
+
+    # Normal JSON SSE used by OpenAI/Anthropic/Gemini/AI SDK UI streams.
+    if raw[:1] in ("{", "["):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        return _events_from_stream_data(parsed)
+
+    colon = raw.find(":")
+    if colon < 0:
+        return []
+
+    prefix, payload_raw = raw[:colon], raw[colon + 1:]
+    try:
+        payload = json.loads(payload_raw)
+    except json.JSONDecodeError:
+        payload = payload_raw
+
+    return _stream_events_from_prefixed(prefix, payload)
+
+
+class _StreamDeltaNormalizer:
+    """Normalize delta-style and snapshot-style provider streams.
+
+    Some models emit true deltas ("Hel" + "lo"), while others repeatedly emit
+    the entire accumulated text ("Hel", "Hello", "Hello world"). This class
+    converts both into monotonic deltas so OpenAI/Anthropic clients never see
+    duplicated growing snapshots.
+    """
+    def __init__(self):
+        self.content_seen = ""
+        self.reasoning_seen = ""
+
+    @staticmethod
+    def _delta(previous: str, incoming: str):
+        if not incoming:
+            return ""
+        if not previous:
+            return incoming
+
+        # Snapshot grows from the previous value.
+        if incoming.startswith(previous):
+            return incoming[len(previous):]
+
+        # Exact replay/duplicate frame.
+        if incoming == previous or previous.endswith(incoming):
+            return ""
+
+        # Find the largest suffix/prefix overlap to suppress retransmitted tails.
+        max_overlap = min(len(previous), len(incoming), 4096)
+        for n in range(max_overlap, 0, -1):
+            if previous[-n:] == incoming[:n]:
+                return incoming[n:]
+
+        return incoming
+
+    def normalize(self, kind: str, value):
+        if kind not in ("content", "reasoning"):
+            return kind, value
+        incoming = str(value or "")
+        if kind == "content":
+            delta = self._delta(self.content_seen, incoming)
+            if incoming.startswith(self.content_seen):
+                self.content_seen = incoming
+            else:
+                self.content_seen += delta
+            return kind, delta
+        delta = self._delta(self.reasoning_seen, incoming)
+        if incoming.startswith(self.reasoning_seen):
+            self.reasoning_seen = incoming
+        else:
+            self.reasoning_seen += delta
+        return kind, delta
 
 
 def _collapse_stream_events(events: list):
@@ -6429,26 +6644,34 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                 log("INFO", f"[{jar.get('name')}] transport browser-origin")
                 _transport_t0 = time.monotonic()
                 _first_stream_frame_at = None
+                _stream_norm = _StreamDeltaNormalizer()
+                _decoded_events = 0
+                _unknown_frames = 0
                 async with browser_session._action_lock:
                     async for line in browser_session.bridge_fetch(url, base):
                         if _first_stream_frame_at is None:
                             _first_stream_frame_at = time.monotonic()
                             log("INFO", f"[{jar.get('name')}] first upstream stream frame · "
                                         f"{(_first_stream_frame_at - _transport_t0):.2f}s after POST")
-                        ev = _parse_stream_line(str(line).strip())
-                        if not ev:
+                        events = _parse_stream_events(str(line).strip())
+                        if not events:
+                            _unknown_frames += 1
                             continue
-                        kind, payload = ev
-                        if kind == "content" and isinstance(payload, str):
-                            response_text += payload
-                            yield ("content", payload)
-                        elif kind == "reasoning":
-                            reasoning_chunk = payload if isinstance(payload, str) else json.dumps(payload)
-                            reasoning_text += reasoning_chunk
-                            yield ("reasoning", reasoning_chunk)
-                        elif kind == "error":
-                            yield ("error", str(payload))
-                            return
+                        for kind, payload in events:
+                            kind, payload = _stream_norm.normalize(kind, payload)
+                            if kind in ("content", "reasoning") and not payload:
+                                continue
+                            _decoded_events += 1
+                            if kind == "content" and isinstance(payload, str):
+                                response_text += payload
+                                yield ("content", payload)
+                            elif kind == "reasoning":
+                                reasoning_chunk = payload if isinstance(payload, str) else json.dumps(payload)
+                                reasoning_text += reasoning_chunk
+                                yield ("reasoning", reasoning_chunk)
+                            elif kind == "error":
+                                yield ("error", str(payload))
+                                return
                 if proxy:
                     _proxy_health_record(proxy, True, 0, source="browser-stream")
                     _flagged_exits.pop(_proxy_hkey(proxy), None)
@@ -6457,8 +6680,12 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                 _api_verified_keepers[str(jar.get("id"))] = time.monotonic()
                 _refresh_api_ready_event()
                 if not response_text and reasoning_text:
+                    # Some reasoning-only Arena adapters never emit a separate
+                    # final text part. Preserve compatibility by mirroring the
+                    # completed reasoning once into assistant content.
                     response_text = reasoning_text
                     yield ("content", reasoning_text)
+                    log("INFO", f"[{jar.get('name')}] stream compatibility · reasoning-only model mirrored to final content")
                 if not response_text:
                     log("WARN", f"[{jar.get('name')}] Arena returned HTTP 200 but no decodable text frames for {model_name}")
                     yield ("error", "502: Arena completed the stream without a text response. The model may be unavailable or using an unsupported event format.")
@@ -6474,7 +6701,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     save_conversation(chat_id, conv2)
                 log("INFO", f"[{jar.get('name')}] browser stream complete · "
                             f"{(time.monotonic() - _transport_t0):.2f}s transport total · "
-                            f"{len(response_text)} text chars")
+                            f"{len(response_text)} text chars · {_decoded_events} decoded events · "
+                            f"{_unknown_frames} metadata/unknown frames")
                 yield ("done", response_text)
                 return
             except BridgeHTTPError as e:
@@ -8517,7 +8745,7 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.7",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.5.8",
                          "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
@@ -9085,6 +9313,7 @@ async def _lifespan(app):
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
     log("INFO", f"Keeper startup · parallel starts {KEEPER_START_CONCURRENCY} · parallel logins {KEEPER_LOGIN_CONCURRENCY} · warm-up {KEEPER_WARMUP_SEC}s · cohort readiness barrier ON")
     log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
+    log("INFO", "Stream decoder · Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini · snapshot de-dup ON")
     log("INFO", "Capacity target · queued multi-user admission · one stable browser transport lane per keeper")
     log("INFO", "Proxy allocator · full-pool startup scan + distinct keeper assignment enabled")
     if get_verification_solver:
