@@ -256,19 +256,59 @@ VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICA
 VERIFICATION_MIN_TOKEN_LEN = max(
     32, min(512, int(os.environ.get("BRIDGENA_VERIFICATION_MIN_TOKEN_LEN", "80")))
 )
-KEEPER_START_CONCURRENCY = max(
-    1, min(16, int(os.environ.get("BRIDGENA_KEEPER_START_CONCURRENCY", "7")))
+KEEPER_CONCURRENCY_HARD_CAP = max(
+    1, min(128, int(os.environ.get("BRIDGENA_KEEPER_CONCURRENCY_HARD_CAP", "64")))
 )
-KEEPER_LOGIN_CONCURRENCY = max(
-    1, min(16, int(os.environ.get("BRIDGENA_KEEPER_LOGIN_CONCURRENCY", "7")))
-)
+_KEEPER_START_CONCURRENCY_CONFIG = os.environ.get(
+    "BRIDGENA_KEEPER_START_CONCURRENCY", "auto"
+).strip().lower()
+_KEEPER_LOGIN_CONCURRENCY_CONFIG = os.environ.get(
+    "BRIDGENA_KEEPER_LOGIN_CONCURRENCY", "auto"
+).strip().lower()
+
+# Resolved against the live bootable-account count before keeper.sync().
+KEEPER_START_CONCURRENCY = 1
+KEEPER_LOGIN_CONCURRENCY = 1
+
 API_TURN_CONCURRENCY = max(
     1, min(128, int(os.environ.get("BRIDGENA_API_TURN_CONCURRENCY", "32")))
 )
 _keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
 _keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.7-private-errors-console")
+
+def _resolve_keeper_concurrency(raw: str, account_count: int) -> int:
+    account_count = max(1, int(account_count or 1))
+    raw = str(raw or "auto").strip().lower()
+    if raw in {"", "auto", "dynamic", "accounts", "0"}:
+        requested = account_count
+    else:
+        try:
+            requested = max(1, int(raw))
+        except Exception:
+            requested = account_count
+    return max(1, min(account_count, requested, KEEPER_CONCURRENCY_HARD_CAP))
+
+
+def _configure_keeper_concurrency(account_count: int) -> tuple:
+    """Match keeper startup/login concurrency to the current account fleet."""
+    global KEEPER_START_CONCURRENCY, KEEPER_LOGIN_CONCURRENCY
+    global _keeper_start_gate, _keeper_login_gate
+
+    count = max(1, int(account_count or 1))
+    starts = _resolve_keeper_concurrency(_KEEPER_START_CONCURRENCY_CONFIG, count)
+    logins = _resolve_keeper_concurrency(_KEEPER_LOGIN_CONCURRENCY_CONFIG, count)
+
+    if starts != KEEPER_START_CONCURRENCY:
+        KEEPER_START_CONCURRENCY = starts
+        _keeper_start_gate = asyncio.Semaphore(starts)
+    if logins != KEEPER_LOGIN_CONCURRENCY:
+        KEEPER_LOGIN_CONCURRENCY = logins
+        _keeper_login_gate = asyncio.Semaphore(logins)
+
+    return starts, logins
+
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.6.9-dynamic-account-fleet")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1838,13 +1878,28 @@ def jar_has_cf(jar: dict) -> bool:
 # API admission readiness is stronger than "browser process exists".
 # A keeper must have passed an authenticated Enterprise-V3 preflight before
 # external API traffic can be assigned to it.
-_API_VERIFICATION_TTL = max(60.0, float(os.environ.get("BRIDGENA_VERIFICATION_READY_TTL", "600")))
-_API_MIN_VERIFIED_KEEPERS = max(1, min(7, int(os.environ.get("BRIDGENA_MIN_VERIFIED_KEEPERS", "2"))))
-_API_MIN_VERIFIED_EXITS = max(1, min(7, int(os.environ.get("BRIDGENA_MIN_VERIFIED_EXITS", "2"))))
+# This is a browser-client readiness LEASE, not a reCAPTCHA token lifetime.
+# A 10-minute all-at-once expiry caused healthy fleets to collapse to 0/2
+# between scheduler sweeps, so the default is longer and renewals are staggered.
+_API_VERIFICATION_TTL = max(180.0, float(os.environ.get("BRIDGENA_VERIFICATION_READY_TTL", "1800")))
+_API_PREFERRED_KEEPERS_CONFIG = os.environ.get(
+    "BRIDGENA_MIN_VERIFIED_KEEPERS", "auto"
+).strip().lower()
+_API_PREFERRED_EXITS_CONFIG = os.environ.get(
+    "BRIDGENA_MIN_VERIFIED_EXITS", "auto"
+).strip().lower()
+
+# Runtime admission remains degraded-capacity tolerant. Preferred capacity now
+# follows the actual account fleet; one healthy keeper/exit can still serve.
+_API_ADMISSION_MIN_KEEPERS = max(1, min(2, int(os.environ.get("BRIDGENA_ADMISSION_MIN_KEEPERS", "1"))))
+_API_ADMISSION_MIN_EXITS = max(1, min(2, int(os.environ.get("BRIDGENA_ADMISSION_MIN_EXITS", "1"))))
+_API_READY_RECOVERY_WAIT_SEC = max(1.0, min(20.0, float(os.environ.get("BRIDGENA_API_READY_RECOVERY_WAIT_SEC", "7"))))
+
 _API_FAILURE_QUARANTINE_S = max(15.0, float(os.environ.get("BRIDGENA_FAILURE_QUARANTINE_S", "90")))
 _api_verified_keepers: Dict[str, float] = {}
 _api_keeper_quarantine_until: Dict[str, float] = {}
 _api_ready_event = asyncio.Event()
+_verification_wakeup_event = asyncio.Event()
 _initial_verification_sweep_done = asyncio.Event()
 _keeper_fleet_launch_event = asyncio.Event()
 _verification_preflight_retry_after: Dict[str, float] = {}
@@ -1936,6 +1991,89 @@ def _reliability_snapshot() -> dict:
             "arena_ui_recovery": _arena_ui_recovery_snapshot()}
 
 
+def _bootable_keeper_jars(jars: Optional[List[dict]] = None) -> List[dict]:
+    rows = list(jars if jars is not None else load_jars())
+    return [
+        j for j in rows
+        if j.get("enabled", True)
+        and ((j.get("email") and j.get("password")) or jar_has_auth(j))
+    ]
+
+
+def _configured_distinct_proxy_count() -> int:
+    seen = set()
+    try:
+        for raw in get_proxy_pool():
+            proxy = _normalize_proxy(raw)
+            if not proxy:
+                continue
+            key = _proxy_hkey(proxy)
+            if key:
+                seen.add(key)
+    except Exception:
+        return 0
+    return len(seen)
+
+
+def _resolve_preferred_target(raw: str, auto_value: int) -> int:
+    auto_value = max(1, int(auto_value or 1))
+    raw = str(raw or "auto").strip().lower()
+    if raw in {"", "auto", "dynamic", "accounts", "0"}:
+        return auto_value
+    try:
+        return max(1, min(int(raw), auto_value))
+    except Exception:
+        return auto_value
+
+
+def _api_preferred_targets() -> tuple:
+    bootable = len(_bootable_keeper_jars())
+    keeper_target = _resolve_preferred_target(
+        _API_PREFERRED_KEEPERS_CONFIG, max(1, bootable)
+    )
+    proxy_count = _configured_distinct_proxy_count()
+    auto_exit_target = 1 if proxy_count <= 0 else min(max(1, bootable), proxy_count)
+    exit_target = _resolve_preferred_target(
+        _API_PREFERRED_EXITS_CONFIG, max(1, auto_exit_target)
+    )
+    return keeper_target, exit_target
+
+
+def _verification_refresh_age(sid: str) -> float:
+    """Deterministically stagger lease refresh across the keeper fleet.
+
+    Each keeper renews around 55-72% through its lease, preventing the whole
+    fleet from expiring/rechecking in one synchronized wave.
+    """
+    sid = str(sid or "")
+    digest = hashlib.sha256(sid.encode("utf-8")).digest()
+    frac = int.from_bytes(digest[:2], "big") / 65535.0
+    return _API_VERIFICATION_TTL * (0.55 + 0.17 * frac)
+
+
+def _api_keeper_lease_age(sid: Optional[str]) -> float:
+    if not sid:
+        return float("inf")
+    ts = _api_verified_keepers.get(str(sid), 0.0)
+    if not ts:
+        return float("inf")
+    return max(0.0, time.monotonic() - ts)
+
+
+def _api_keeper_needs_refresh(sid: Optional[str]) -> bool:
+    if not sid:
+        return True
+    sid = str(sid)
+    return _api_keeper_lease_age(sid) >= _verification_refresh_age(sid)
+
+
+def _wake_verification_scheduler() -> None:
+    try:
+        _verification_wakeup_event.set()
+    except Exception:
+        pass
+
+
 def _api_keeper_verified(sid: Optional[str]) -> bool:
     if not sid:
         return False
@@ -1960,6 +2098,7 @@ def _quarantine_api_keeper(sid: Optional[str], reason: str, seconds: Optional[fl
     _api_verified_keepers.pop(sid, None)
     _api_keeper_quarantine_until[sid] = time.monotonic() + float(seconds or _API_FAILURE_QUARANTINE_S)
     _refresh_api_ready_event()
+    _wake_verification_scheduler()
     log("WARN", f"[{sid}] API keeper quarantined · {reason} · {int(seconds or _API_FAILURE_QUARANTINE_S)}s")
 
 def _verified_keeper_count() -> int:
@@ -1971,8 +2110,10 @@ def _verified_keeper_count() -> int:
     return sum(1 for sid in _api_verified_keepers if keeper_session_ready(keeper.sessions.get(sid)))
 
 def _refresh_api_ready_event() -> None:
-    enough_keepers = _verified_keeper_count() >= _API_MIN_VERIFIED_KEEPERS
-    enough_exits = _verified_exit_count() >= _API_MIN_VERIFIED_EXITS
+    verified = _verified_keeper_count()
+    exits = _verified_exit_count()
+    enough_keepers = verified >= _API_ADMISSION_MIN_KEEPERS
+    enough_exits = exits >= _API_ADMISSION_MIN_EXITS
     if bool(get_models()) and enough_keepers and enough_exits:
         _api_ready_event.set()
     else:
@@ -1982,6 +2123,7 @@ def _mark_api_keeper_unready(sid: Optional[str], reason: str = "") -> None:
     if sid:
         _api_verified_keepers.pop(str(sid), None)
     _refresh_api_ready_event()
+    _wake_verification_scheduler()
     if reason and sid:
         log("WARN", f"[{sid}] API readiness revoked · {reason}")
 
@@ -2814,19 +2956,18 @@ async def rebind_keeper_fleet_to_proxy_pool(reason: str = "proxy pool changed") 
 
 
 async def auto_login_on_boot():
-    """Auto-start keepers for enabled credential accounts OR authenticated cookie jars."""
-    await asyncio.sleep(1)  # Minimal app bootstrap; keeper startup is intentionally parallel
+    """Auto-start exactly one keeper for every enabled bootable account."""
+    await asyncio.sleep(1)
     jars = load_jars()
-    bootable = [
-        j for j in jars
-        if j.get("enabled", True)
-        and ((j.get("email") and j.get("password")) or jar_has_auth(j))
-    ]
+    bootable = _bootable_keeper_jars(jars)
     if not bootable:
         log("INFO", "Auto-login: No bootable account sessions found, skipping")
         return
 
-    log("INFO", f"Auto-login: Starting keeper sessions for {len(bootable)} account(s)...")
+    starts, logins = _configure_keeper_concurrency(len(bootable))
+    log("INFO", f"Auto-login: fleet target {len(bootable)} keeper(s) from "
+                f"{len(bootable)} bootable account(s) · parallel starts {starts} · "
+                f"parallel logins {logins}")
 
     # Cookie imports are authenticated sessions too; keep them alive after reboot.
     bootable_ids = {j.get("id") for j in bootable}
@@ -9882,25 +10023,54 @@ async def openai_stream(body: dict, keyinfo: dict):
 async def _require_api_ready():
     models_ready = bool(get_models())
 
-    # Do not let early chat traffic compete with the startup verification cohort.
+    # During cold startup, briefly wait for the first usable keeper instead of
+    # making the customer manually retry while the parallel cohort is already
+    # coming online.
     if not _initial_verification_sweep_done.is_set():
-        raise HTTPException(
-            status_code=503,
-            detail="Bridgena is warming the keeper fleet and verification clients in parallel. Retry in a moment.",
-            headers={"Retry-After": "2"},
-        )
+        _wake_verification_scheduler()
+        try:
+            await asyncio.wait_for(
+                _initial_verification_sweep_done.wait(),
+                timeout=min(_API_READY_RECOVERY_WAIT_SEC, 7.0),
+            )
+        except asyncio.TimeoutError:
+            pass
 
     _refresh_api_ready_event()
     if models_ready and _api_ready_event.is_set():
         return
 
+    # A zero-ready transition can happen while leases are being refreshed or a
+    # keeper is restarting. Wake the cohort immediately and hold admission for
+    # a few seconds; most recoveries are faster than a customer retry roundtrip.
+    _wake_verification_scheduler()
+    deadline = time.monotonic() + _API_READY_RECOVERY_WAIT_SEC
+    last_verified = -1
+    while time.monotonic() < deadline:
+        _refresh_api_ready_event()
+        if bool(get_models()) and _api_ready_event.is_set():
+            verified = _verified_keeper_count()
+            exits = _verified_exit_count()
+            log("OK", f"API admission recovered inline · verified keepers {verified} · exits {exits}")
+            return
+
+        verified = _verified_keeper_count()
+        if verified != last_verified:
+            preferred_keepers, preferred_exits = _api_preferred_targets()
+            log("INFO", f"API admission waiting for keeper recovery · verified {verified} · "
+                        f"target {_API_ADMISSION_MIN_KEEPERS} · preferred {preferred_keepers}")
+            last_verified = verified
+        await asyncio.sleep(0.25)
+
     verified = _verified_keeper_count()
     exits = _verified_exit_count()
+    preferred_keepers, preferred_exits = _api_preferred_targets()
     raise HTTPException(
         status_code=503,
-        detail=(f"Bridgena verification capacity is recovering: "
-                f"verified keepers={verified}/{_API_MIN_VERIFIED_KEEPERS}, "
-                f"verified exits={exits}/{_API_MIN_VERIFIED_EXITS}. Retry shortly."),
+        detail=(f"Bridgena runtime capacity is temporarily unavailable after "
+                f"{_API_READY_RECOVERY_WAIT_SEC:.0f}s recovery wait: "
+                f"usable keepers={verified}, usable exits={exits}, "
+                f"preferred capacity={preferred_keepers}/{preferred_exits}."),
         headers={"Retry-After": "2"},
     )
 
@@ -10394,8 +10564,17 @@ async def healthz():
                         if keeper_session_ready(session)
                         and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
                                 for j in load_jars()))
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.7",
+    bootable_count = len(_bootable_keeper_jars())
+    preferred_keepers, preferred_exits = _api_preferred_targets() if bootable_count else (0, 0)
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.6.9",
                          "models": len(get_models()),
+                         "bootable_accounts": bootable_count,
+                         "keeper_fleet_target": bootable_count,
+                         "keeper_sessions_registered": len(keeper.sessions),
+                         "keeper_start_concurrency": KEEPER_START_CONCURRENCY,
+                         "keeper_login_concurrency": KEEPER_LOGIN_CONCURRENCY,
+                         "preferred_verified_keepers": preferred_keepers,
+                         "preferred_distinct_exits": preferred_exits,
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
@@ -10576,6 +10755,7 @@ async def delete_key(request: Request, key_id: str = Form(...)):
 async def _activate_new_keeper(jar_id: str) -> None:
     """Allocate a stable route and register a newly-added account immediately."""
     try:
+        _configure_keeper_concurrency(len(_bootable_keeper_jars()))
         await allocate_unique_keeper_proxies(load_jars())
         await keeper.sync()
         _keeper_fleet_launch_event.set()
@@ -10667,6 +10847,7 @@ async def jars_add_credentials(request: Request, name: str = Form(""), credentia
 
     # One allocation/sync pass for the whole imported batch.
     try:
+        _configure_keeper_concurrency(len(_bootable_keeper_jars()))
         await allocate_unique_keeper_proxies(load_jars())
         await keeper.sync()
         _keeper_fleet_launch_event.set()
@@ -11098,7 +11279,9 @@ async def _api_verification_readiness_loop():
             now = time.monotonic()
             eligible = []
             for sid, jar in jars_by_id.items():
-                if _api_keeper_verified(sid):
+                currently_verified = _api_keeper_verified(sid)
+                needs_refresh = _api_keeper_needs_refresh(sid)
+                if currently_verified and not needs_refresh:
                     continue
                 if now < _api_keeper_quarantine_until.get(sid, 0.0):
                     continue
@@ -11109,28 +11292,51 @@ async def _api_verification_readiness_loop():
                     continue
                 if session.active_requests:
                     continue
-                eligible.append((sid, session, jar))
+                # Carry whether the old lease is still valid. A proactive
+                # renewal miss should not disrupt a working keeper.
+                eligible.append((sid, session, jar, currently_verified))
 
             if eligible:
-                names = ", ".join(getattr(sess, "name", sid) for sid, sess, _ in eligible)
-                log("INFO", f"Verification startup cohort · checking {len(eligible)} keeper(s) concurrently · {names}")
+                names = ", ".join(getattr(sess, "name", sid) for sid, sess, _, _ in eligible)
+                refreshes = sum(1 for _, _, _, was_valid in eligible if was_valid)
+                log("INFO", f"Verification cohort · checking {len(eligible)} keeper(s) concurrently · "
+                            f"{refreshes} proactive refresh(es) · {names}")
                 results = await asyncio.gather(
                     *(_preflight_one_keeper(sid, session, jar)
-                      for sid, session, jar in eligible),
+                      for sid, session, jar, _ in eligible),
                     return_exceptions=False,
                 )
                 passed = 0
                 failed = []
-                eligible_by_sid = {sid: (session, jar) for sid, session, jar in eligible}
+                soft_refresh_failed = []
+                eligible_by_sid = {
+                    sid: (session, jar, was_valid)
+                    for sid, session, jar, was_valid in eligible
+                }
                 for sid, ok in results:
                     if ok:
                         passed += 1
                         _verification_preflight_retry_after.pop(sid, None)
                     else:
-                        session, jar = eligible_by_sid[sid]
-                        failed.append((sid, session, jar))
+                        session, jar, was_valid = eligible_by_sid[sid]
+                        if was_valid and _api_keeper_verified(sid):
+                            # The old lease is still valid. Do not restart a
+                            # working browser just because one proactive probe
+                            # missed; retry the renewal shortly.
+                            soft_refresh_failed.append((sid, session, jar))
+                            _verification_preflight_retry_after[sid] = time.monotonic() + 8.0
+                        else:
+                            failed.append((sid, session, jar))
 
-                log("INFO", f"Verification startup cohort · pass {passed}/{len(results)}")
+                log("INFO", f"Verification cohort · pass {passed}/{len(results)}"
+                            + (f" · soft-renewal misses {len(soft_refresh_failed)}"
+                               if soft_refresh_failed else ""))
+
+                if soft_refresh_failed:
+                    names = ", ".join(getattr(session, "name", sid)
+                                      for sid, session, _ in soft_refresh_failed)
+                    log("WARN", f"Verification lease refresh missed on still-valid keeper(s) · "
+                                f"retrying without restart · {names}")
 
                 if failed:
                     names = ", ".join(getattr(session, "name", sid) for sid, session, _ in failed)
@@ -11162,10 +11368,17 @@ async def _api_verification_readiness_loop():
             else:
                 announced_ready = False
 
-            # A partially-ready fleet is a recovery condition, not a steady state.
-            # Keep repairing laggards promptly; back off only once the ready fleet is complete.
+            # A partially-ready fleet is a recovery condition, not a steady
+            # state. Also wake instantly when request admission detects 0 ready
+            # capacity rather than sleeping through a customer request.
             target_count = len(jars_by_id)
-            await asyncio.sleep(8.0 if target_count and verified >= target_count else 2.0)
+            sleep_for = 8.0 if target_count and verified >= target_count else 2.0
+            try:
+                await asyncio.wait_for(_verification_wakeup_event.wait(), timeout=sleep_for)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                _verification_wakeup_event.clear()
 
         except asyncio.CancelledError:
             raise
@@ -11178,13 +11391,8 @@ async def _api_verification_readiness_loop():
             await asyncio.sleep(2.0)
 
 def jars_have_creds() -> bool:
-    # Kept under the historical name because lifespan already calls it.
-    # Cookie-authenticated imports are bootable keeper accounts as well.
-    return any(
-        j.get("enabled", True)
-        and ((j.get("email") and j.get("password")) or jar_has_auth(j))
-        for j in load_jars()
-    )
+    # Historical function name retained for lifespan compatibility.
+    return bool(_bootable_keeper_jars())
 @asynccontextmanager
 async def _lifespan(app):
     await _v3_vnc_start()
@@ -11197,6 +11405,9 @@ async def _lifespan(app):
                 jar["persona"] = "ubuntu"
                 jar["user_agent"] = PERSONAS["ubuntu"].ua
     mutate_jars(_normalize_personas)
+    _bootable_count = len(_bootable_keeper_jars())
+    if _bootable_count:
+        _configure_keeper_concurrency(_bootable_count)
     tasks = [asyncio.create_task(keeper_election_loop(), name="keeper-election"),
              asyncio.create_task(periodic_model_refresher(), name="model-refresher"),
              asyncio.create_task(get_initial_data(), name="initial-catalog")]
@@ -11208,7 +11419,11 @@ async def _lifespan(app):
     log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
-    log("INFO", f"Keeper startup · parallel starts {KEEPER_START_CONCURRENCY} · parallel logins {KEEPER_LOGIN_CONCURRENCY} · warm-up {KEEPER_WARMUP_SEC}s · cohort readiness barrier ON")
+    _fleet_target = len(_bootable_keeper_jars())
+    _preferred_keepers, _preferred_exits = _api_preferred_targets() if _fleet_target else (0, 0)
+    log("INFO", f"Keeper fleet · bootable accounts {_fleet_target} · target keepers {_fleet_target} · "
+                f"parallel starts {KEEPER_START_CONCURRENCY} · parallel logins {KEEPER_LOGIN_CONCURRENCY} · "
+                f"hard concurrency cap {KEEPER_CONCURRENCY_HARD_CAP}")
     log("INFO", f"Keeper recovery · soft refresh then restart after {_keeper_recovery_restart_after} failed readiness checks · parallel {_keeper_recovery_gate._value}")
     log("INFO", f"Transport recovery · same-keeper restart ON · quarantine {TRANSPORT_FAILURE_QUARANTINE_SEC:.0f}s · bound wait {BOUND_KEEPER_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Pre-dispatch transport guard · HEAD probe every request {'ON' if TRANSPORT_PROBE_EVERY_REQUEST else 'OFF'} · timeout {TRANSPORT_PROBE_TIMEOUT_MS}ms · recovery wait {PREDISPATCH_RECOVERY_WAIT_SEC:.0f}s")
@@ -11216,6 +11431,9 @@ async def _lifespan(app):
     log("INFO", f"Stream completion policy · first assistant output <= {FIRST_ASSISTANT_RESPONSE_SEC:.1f}s · provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} · partial UI preservation ON")
     log("INFO", f"Arena UI stream recovery · {'ON' if ARENA_UI_STREAM_RECOVERY else 'OFF'} · history/search + session-id matching · timeout {ARENA_UI_RECOVERY_TIMEOUT_SEC:.0f}s · no prompt replay")
     log("INFO", f"Customer error privacy · opaque friendly messages ON · private registry {_ERROR_EVENTS_FILE} · Errors tab enabled")
+    log("INFO", f"Readiness leases · TTL {_API_VERIFICATION_TTL:.0f}s · staggered proactive renewal 55-72% · "
+                f"admission {_API_ADMISSION_MIN_KEEPERS} keeper/{_API_ADMISSION_MIN_EXITS} exit · "
+                f"preferred {_preferred_keepers}/{_preferred_exits} · inline wait {_API_READY_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Reliability SLO · rolling window {_reliability_window.maxlen} · target {_RELIABILITY_TARGET*100:.0f}%")
     log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
     log("INFO", "Stream decoder · Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini · snapshot de-dup ON")
