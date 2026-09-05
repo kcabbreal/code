@@ -204,8 +204,19 @@ KEEPER_WARMUP_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_KEEPER_WARMUP_SE
 KEEPER_REQUEST_READY_SEC = max(30, min(180, int(os.environ.get("BRIDGENA_KEEPER_REQUEST_READY_SEC", "100"))))
 API_DUPLICATE_WINDOW_SEC = max(0, min(60, int(os.environ.get("BRIDGENA_DUPLICATE_WINDOW_SEC", "15"))))
 VERIFICATION_TIMEOUT_SEC = max(5, min(180, int(os.environ.get("BRIDGENA_VERIFICATION_TIMEOUT", "90"))))
+VERIFICATION_MIN_TOKEN_LEN = max(
+    32, min(512, int(os.environ.get("BRIDGENA_VERIFICATION_MIN_TOKEN_LEN", "80")))
+)
+KEEPER_START_CONCURRENCY = max(
+    1, min(8, int(os.environ.get("BRIDGENA_KEEPER_START_CONCURRENCY", "3")))
+)
+KEEPER_LOGIN_CONCURRENCY = max(
+    1, min(4, int(os.environ.get("BRIDGENA_KEEPER_LOGIN_CONCURRENCY", "2")))
+)
+_keeper_start_gate = asyncio.Semaphore(KEEPER_START_CONCURRENCY)
+_keeper_login_gate = asyncio.Semaphore(KEEPER_LOGIN_CONCURRENCY)
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.2-adapter-keeper-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.2.3-fleet-verification-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2287,6 +2298,38 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
     mutate_jars(pick)
     return chosen.get("jar")
 
+def acquire_ready_jar(exclude: Optional[set] = None) -> Optional[dict]:
+    """Select a different authenticated keeper that is ready right now."""
+    now = time.time()
+    excluded = set(exclude or ())
+    candidates = []
+    for jar in load_jars():
+        sid = jar.get("id")
+        if (not sid or sid in excluded or not jar.get("enabled", True)
+                or not jar_has_auth(jar)):
+            continue
+        session = keeper.sessions.get(sid)
+        if not keeper_session_ready(session):
+            continue
+        candidates.append(jar)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda jar: (
+        0 if now - _captcha_failed_jars.get(jar.get("id"), 0.0) > 300 else 1,
+        float(jar.get("last_used", 0) or 0),
+    ))
+    selected = candidates[0]
+    selected_id = selected["id"]
+
+    def mark_used(jars):
+        for jar in jars:
+            if jar.get("id") == selected_id:
+                jar["last_used"] = now
+                jar["usage_count"] = int(jar.get("usage_count", 0) or 0) + 1
+                break
+    mutate_jars(mark_used)
+    return selected
+
 async def auto_login_on_boot():
     """Auto-start keeper sessions for all accounts with email+password on boot.
     Checks if already authenticated first to avoid unnecessary login.
@@ -2698,6 +2741,7 @@ class KeeperSession:
         self.page = None
         self._loop_task = None
         self._action_lock = asyncio.Lock()
+        self._relogin_lock = asyncio.Lock()
 
         self.running = False
         self.status = "stopped"
@@ -3079,9 +3123,9 @@ class KeeperSession:
             pass
 
     async def _verify_auth_state(self, page) -> bool:
-        """Thorough check to verify whether user is genuinely logged into localhost:6767."""
+        """Verify public authentication without trusting transient hydration UI."""
         try:
-            # 1. If page contains expected email near footer/chip -> logged in
+            # The account identity rendered by the application is strongest.
             if self.email:
                 try:
                     email_loc = page.locator(f"text=/{re.escape(self.email)}/i").first
@@ -3090,42 +3134,50 @@ class KeeperSession:
                 except Exception:
                     pass
 
-            # 2. Prefer the authenticated history request over transient UI.
-            # During hydration the Log In control can briefly remain visible
-            # even after the session cookie has become valid.
+            cookies = await page.context.cookies([page.url])
+            auth_cookie_names = (
+                "arena-auth", "arena-auth-prod-v1.0", "arena-auth-prod-v1.1",
+                "__session", "authToken", "clerk-db-jwt",
+            )
+            has_auth_cookie = any(
+                any(marker.lower() in str(cookie.get("name", "")).lower()
+                    for marker in auth_cookie_names)
+                for cookie in cookies
+            )
+
+            # A 200 history response is considered authenticated only when the
+            # browser also holds the account cookie. This prevents public/empty
+            # 200 responses from creating false-positive keeper readiness.
             status_code = await page.evaluate(
                 "async () => { try { const r = await fetch('/api/history/unified?limit=1', "
                 "{credentials:'include'}); return r.status; } catch(e) { return 0; } }"
             )
-            if status_code == 200:
+            if status_code == 200 and has_auth_cookie:
                 return True
 
-            # 3. If Login button is visible on page, we are NOT logged in
             login_btn = page.locator("button:has-text('Log In'), a:has-text('Log In'), button:has-text('Sign In'), a:has-text('Sign In'), button:has-text('Login'), a:has-text('Login')").first
             if await login_btn.count() > 0 and await login_btn.is_visible():
                 return False
 
-            # If 'Log In or Create' modal is visible, we are NOT logged in
             modal_title = page.locator("text='Log In or Create'").first
             if await modal_title.count() > 0 and await modal_title.is_visible():
                 return False
 
-            # 4. Check for typical auth cookies directly in the browser context
-            cookies = await page.context.cookies([page.url])
-            auth_cookie_names = ["arena-auth", "arena-auth-prod-v1.0", "arena-auth-prod-v1.1", "__session", "session", "authToken", "clerk-db-jwt"]
-            has_auth = any(any(n in c["name"] for n in auth_cookie_names) for c in cookies)
-            if has_auth:
+            if has_auth_cookie:
                 return True
-                
-            # 5. Fallback: Check if the user profile avatar or settings button is present
-            profile_btn = page.locator("button:has(svg), button[aria-label='User Profile'], button[aria-label='Settings']").last
+
+            # Never use the old button:has(svg) fallback: nearly every logged-
+            # out page has icon buttons. Only explicit account controls count.
+            profile_btn = page.locator(
+                "button[aria-label*='profile' i], button[aria-label*='account' i], "
+                "[data-testid*='user-menu' i], [data-testid*='profile-menu' i]"
+            ).first
             if await profile_btn.count() > 0 and any(
                     origin in (page.url or "") for origin in (ARENA_BASE, PUBLIC_AUTH_BASE)):
                 return True
 
         except Exception:
             pass
-        await self._screenshot(page, "unverified_auth_state")
         return False
     async def _screenshot(self, page, tag: str):
         try:
@@ -3375,6 +3427,7 @@ class KeeperSession:
             self._set_step("[5/6] Waiting for password field...")
             pw_loc = None
             pw_deadline = time.time() + 12
+            next_auth_probe = 0.0
             while time.time() < pw_deadline:
                 for sel in ["input[type='password']", "input[name='password']", "input[placeholder*='password' i]"]:
                     try:
@@ -3386,6 +3439,12 @@ class KeeperSession:
                         continue
                 if pw_loc:
                     break
+                if time.time() >= next_auth_probe:
+                    next_auth_probe = time.time() + 1.0
+                    if await self._verify_auth_state(page):
+                        await self._harvest_cookies()
+                        self._set_step("[SUCCESS] Email flow authenticated without a password step")
+                        return True, "Authenticated without password"
                 await asyncio.sleep(0.5)
 
             if not pw_loc:
@@ -3493,16 +3552,19 @@ class KeeperSession:
                  "sameSite": c.get("sameSite"), "expirationDate": c.get("expires")}
                 for c in cookies if c.get("name")
             ]
-            self._public_cookie_snapshot = simplified
             auth_val = (find_cookie(simplified, "arena-auth-prod-v1.0")
                         or find_cookie(simplified, "arena-auth-prod-v1.1")
                         or find_cookie(simplified, "arena-auth-prod-v1") or "")
+            if auth_val:
+                self._public_cookie_snapshot = simplified
             sig = hashlib.sha256(auth_val.encode()).hexdigest()[:10] if auth_val else "none"
 
             def upd(jars: list):
                 for j in jars:
                     if j["id"] != self.jar_id: continue
-                    if simplified:
+                    # Never replace a previously authenticated jar with public,
+                    # logged-out cookies from a failed or half-rendered login.
+                    if simplified and auth_val:
                         j["cookies"] = simplified
                         j["expired"] = False
             mutate_jars(upd)
@@ -3630,6 +3692,13 @@ class KeeperSession:
     # --- Relogin Flow ---
 
     async def relogin(self) -> bool:
+        # Collapse duplicate supervisor/manual relogin triggers for this
+        # account and cap simultaneous public login flows across the fleet.
+        async with self._relogin_lock:
+            async with _keeper_login_gate:
+                return await self._relogin_once()
+
+    async def _relogin_once(self) -> bool:
         self.status = "reconnecting"
         self.error = None
         self._set_step("Starting re-login sequence...")
@@ -3909,6 +3978,13 @@ class KeeperSession:
     # --- Cross-Platform Browser Lifecycle ---
 
     async def start(self) -> bool:
+        # Browser launches are memory-heavy and simultaneous profile startup
+        # makes public auth hydration unreliable. Bound fleet startup while
+        # keeping every account registered and independently recoverable.
+        async with _keeper_start_gate:
+            return await self._start_impl()
+
+    async def _start_impl(self) -> bool:
         if self.running:
             return True
             
@@ -4975,8 +5051,26 @@ _mint_last_no_session = 0.0
 _verification_adapter_warned_at = 0.0
 
 
+def _verification_token_ok(token) -> bool:
+    """Reject empty, truncated, placeholder, or obviously synthetic tokens."""
+    if not isinstance(token, str):
+        return False
+    value = token.strip()
+    if len(value) < VERIFICATION_MIN_TOKEN_LEN or any(ch.isspace() for ch in value):
+        return False
+    lowered = value.lower()
+    return not any(marker in lowered for marker in (
+        "fixture", "placeholder", "dummy-token", "test-token", "example-token",
+    ))
+
+
 def _externally_reachable_proxy(session) -> Optional[str]:
-    """Return the real upstream proxy, never a process-local browser shim."""
+    """Return the keeper's route, unwrapping a managed shim when possible.
+
+    If the route is an externally managed localhost tunnel, preserve it instead
+    of silently switching the adapter to direct egress. The adapter can then
+    either use that local route or reject it explicitly.
+    """
     candidate = getattr(session, "_used_proxy", None) or None
     if not candidate:
         return None
@@ -4989,7 +5083,7 @@ def _externally_reachable_proxy(session) -> Optional[str]:
                 return upstream
     except Exception:
         pass
-    return None
+    return candidate
 
 
 async def _solve_with_verification_adapter(challenge_type: str, session,
@@ -5038,11 +5132,13 @@ async def _solve_with_verification_adapter(challenge_type: str, session,
         if not LOCAL_UPSTREAM and not str(page_url).startswith(ARENA_BASE):
             page_url = ARENA_BASE
 
+        proxy_kind = ("local-route" if proxy and _is_loopback_proxy(proxy)
+                      else "upstream" if proxy else "direct")
         log("INFO", f"verification adapter request · type {challenge_type}"
             f" · origin {urlparse(page_url).hostname or 'unknown'}"
-            f" · proxy {'upstream' if proxy else 'direct'} · cookies {len(cookie_map)}")
+            f" · proxy {proxy_kind} · cookies {len(cookie_map)}")
 
-        result = await solver.solve(
+        solve_result = solver.solve(
             challenge_type=challenge_type,
             site_key=site_key,
             page_url=page_url,
@@ -5053,13 +5149,19 @@ async def _solve_with_verification_adapter(challenge_type: str, session,
             cookies=cookie_map,
             timeout=VERIFICATION_TIMEOUT_SEC,
         )
+        result = (await asyncio.wait_for(solve_result, timeout=VERIFICATION_TIMEOUT_SEC + 5)
+                  if hasattr(solve_result, "__await__") else solve_result)
         token = result.get("token") if isinstance(result, dict) and result.get("ok") else None
-        if isinstance(token, str) and len(token) > 20:
+        if _verification_token_ok(token):
             log("OK", "verification adapter completed"
                 + f" · provider {result.get('provider', 'wrapper')}"
                 + f" · task {str(result.get('task_id') or '-')[:12]}"
                 + f" · {int(result.get('elapsed_ms') or 0)}ms")
             return token
+        if isinstance(token, str):
+            log("WARN", "verification adapter returned an invalid token shape"
+                + f" ({len(token)} chars; minimum {VERIFICATION_MIN_TOKEN_LEN})")
+            return None
         error = result.get("error") if isinstance(result, dict) else "invalid adapter response"
         log("WARN", f"verification adapter failed: {str(error)[:180]}")
     except asyncio.CancelledError:
@@ -5139,9 +5241,9 @@ async def mint_v3(jar_id=None):
                     "allowConfiguredFallback": ALLOW_CONFIGURED_RECAPTCHA_FALLBACK,
                     "action": RECAPTCHA_ACTION,
                 })
-                if isinstance(res, str) and len(res) > 20:
+                if _verification_token_ok(res):
                     v3_token = res
-                elif isinstance(res, dict) and isinstance(res.get("token"), str) and len(res["token"]) > 20:
+                elif isinstance(res, dict) and _verification_token_ok(res.get("token")):
                     log("OK", "recaptcha v3 token minted via " + str(res.get("source", "unknown"))
                         + " · key " + str(res.get("keyHint", "unknown"))
                         + " · action " + str(res.get("action", RECAPTCHA_ACTION)))
@@ -5224,9 +5326,11 @@ async def mint_v2_escalation(jar_id=None, settle_s: float = 20.0):
 
             await asyncio.sleep(LOCAL_VERIFICATION_POLL_MS / 1000.0)
             tok = await s.page.evaluate(RC_V2_READ_JS)
-            if tok and not str(tok).startswith("__ERR__"):
+            if _verification_token_ok(tok) and not str(tok).startswith("__ERR__"):
                 log("OK", f"[{sid}] local verification: V2 auto-pass token captured ({len(tok)} chars)")
                 return tok
+            if tok and not str(tok).startswith("__ERR__"):
+                log("WARN", f"[{sid}] local verification: ignored invalid V2 token shape ({len(str(tok))} chars)")
 
             if not has_onnx:
                 log("WARN", f"[{sid}] local verification: interactive challenge shown but ONNX solver unavailable")
@@ -5246,8 +5350,10 @@ async def mint_v2_escalation(jar_id=None, settle_s: float = 20.0):
                     if str(tok).startswith("__ERR__"):
                         log("WARN", f"[{sid}] local verification widget error: {tok}")
                         return None
-                    log("OK", f"[{sid}] local verification: V2 token verified ({len(tok)} chars)")
-                    return tok
+                    if _verification_token_ok(tok):
+                        log("OK", f"[{sid}] local verification: V2 token verified ({len(tok)} chars)")
+                        return tok
+                    log("WARN", f"[{sid}] local verification: ignored invalid V2 token shape ({len(str(tok))} chars)")
                 await asyncio.sleep(LOCAL_VERIFICATION_POLL_MS / 1000.0)
 
             log("WARN", f"[{sid}] local verification: solver completed but no token appeared")
@@ -5297,7 +5403,7 @@ async def _mint_v2_escalation_legacy(jar_id=None, settle_s: float = 20.0):
 
         await asyncio.sleep(1.2)
         tok = await s.page.evaluate(RC_V2_READ_JS)
-        if tok and not str(tok).startswith("__ERR__"):
+        if _verification_token_ok(tok) and not str(tok).startswith("__ERR__"):
             return tok
 
         if has_onnx and hasattr(s, "solve_recaptcha_image_challenge"):
@@ -5309,7 +5415,10 @@ async def _mint_v2_escalation_legacy(jar_id=None, settle_s: float = 20.0):
         while time.time() < deadline:
             tok = await s.page.evaluate(RC_V2_READ_JS)
             if tok:
-                return None if str(tok).startswith("__ERR__") else tok
+                if str(tok).startswith("__ERR__"):
+                    return None
+                if _verification_token_ok(tok):
+                    return tok
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
         raise
@@ -5568,7 +5677,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
     route_fails: list = []
     cf_clear_attempts = 0
     same_jar_429 = 0
-    rc_attempts = 0
+    rc_attempts: Dict[str, int] = {}
     tried = set()
     bound_jar_id = (mc or {}).get("jar_id")
     wanted_jar_id = jar_hint or bound_jar_id
@@ -5776,11 +5885,12 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     continue
 
                 if verdict == "RECAPTCHA":
-                    _captcha_failed_jars[jar.get("id")] = time.time()
-                    if rc_attempts < 2:
-                        rc_attempts += 1
+                    failed_jar_id = jar.get("id")
+                    _captcha_failed_jars[failed_jar_id] = time.time()
+                    if rc_attempts.get(failed_jar_id, 0) < 1:
+                        rc_attempts[failed_jar_id] = rc_attempts.get(failed_jar_id, 0) + 1
                         log("WARN", f"[{jar.get('name')}] Arena verification rejected token (HTTP {e.status}) — escalating to V2 challenge solver")
-                        esc = await mint_v2_escalation(jar.get("id"), settle_s=20.0)
+                        esc = await mint_v2_escalation(failed_jar_id, settle_s=20.0)
                         if esc:
                             pending_v2_token = esc
                             log("OK", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar")
@@ -5792,8 +5902,13 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         conv = {}
                         response_text = ""
                         reasoning_text = ""
-                        log("WARN", f"[{jar.get('name')}] follow-up verification failed — rebuilding as fresh create-evaluation")
-                        if attempt + 1 < max_attempts:
+                    if attempt + 1 < max_attempts:
+                        next_jar = acquire_ready_jar(exclude=tried)
+                        if next_jar:
+                            tried.add(next_jar["id"])
+                            pending_v2_token = None
+                            log("WARN", f"[{next_jar.get('name')}] Rotating to a ready account after verification rejection on {jar.get('name')}")
+                            jar = next_jar
                             continue
                     log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation failed")
                     yield ("error", "403: Arena rejected this session's verification token. The request was stopped without repeated retries; wait briefly and try a new chat.")
@@ -5902,17 +6017,28 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         return
 
                     if verdict == "RECAPTCHA":
-                        if rc_attempts < 2:
-                            rc_attempts += 1
-                            esc = await mint_v2_escalation(jar.get("id"), settle_s=20.0)
+                        failed_jar_id = jar.get("id")
+                        _captcha_failed_jars[failed_jar_id] = time.time()
+                        if rc_attempts.get(failed_jar_id, 0) < 1:
+                            rc_attempts[failed_jar_id] = rc_attempts.get(failed_jar_id, 0) + 1
+                            esc = await mint_v2_escalation(failed_jar_id, settle_s=20.0)
                             if esc:
                                 _attach_v2(base, esc)
                                 log("WARN", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar")
                                 continue
-                            fresh = await mint_v3(jar.get("id"))
-                            if fresh:
-                                _attach_v3(base, fresh)
-                                log("WARN", f"[{jar.get('name')}] recaptcha rejected — fresh V3 token, retrying SAME jar")
+                        if mc:
+                            clear_conversation_model(chat_id, model_name)
+                            mc = None
+                            conv = {}
+                            response_text = ""
+                            reasoning_text = ""
+                        if attempt + 1 < max_attempts:
+                            next_jar = acquire_ready_jar(exclude=tried)
+                            if next_jar:
+                                tried.add(next_jar["id"])
+                                pending_v2_token = None
+                                log("WARN", f"[{next_jar.get('name')}] Rotating to a ready account after verification rejection on {jar.get('name')}")
+                                jar = next_jar
                                 continue
                         log("WARN", f"[{jar.get('name')}] recaptcha unresolved — jar KEPT HEALTHY (starvation is our bug, not their death)")
                         yield ("error", "403: arena's recaptcha check rejected us and the keeper could not mint a token on this exit. "
@@ -6703,7 +6829,7 @@ from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
 from fastapi.security import APIKeyHeader
 
-app = FastAPI(title="Bridgena", version="3.2.2")
+app = FastAPI(title="Bridgena", version="3.2.3")
 
 # ---------- v3 optional VNC integration ----------
 _V3_VNC_PROCS=[]
@@ -7525,7 +7651,7 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.2", "models": len(get_models()),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.2.3", "models": len(get_models()),
                          "pool_alive": sum(1 for r in rows if r["verdict"] == "alive"),
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
