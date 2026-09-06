@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.1-extension-path-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.3-model-catalog-refresh-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1864,6 +1864,25 @@ def save_models(models: list) -> None:
     _models_cache = models
     _models_cache_time = time.time()
 
+
+def _catalog_names(models: list) -> list[str]:
+    out, seen = [], set()
+    for m in models or []:
+        try:
+            n = model_name(m).strip()
+        except Exception:
+            n = str((m or {}).get("name") or (m or {}).get("publicName") or (m or {}).get("id") or "").strip() if isinstance(m, dict) else str(m).strip()
+        if n and n not in seen:
+            seen.add(n); out.append(n)
+    return out
+
+def _valid_model_catalog(models: list) -> bool:
+    # Arena's public catalog size changes over time; requiring >50 made valid
+    # refreshes look like failures and left models.json stale. Validate shape
+    # and a small non-empty unique-name floor instead.
+    floor = max(1, int(os.getenv("BRIDGENA_MODEL_REFRESH_MIN", "3") or 3))
+    return isinstance(models, list) and len(_catalog_names(models)) >= floor
+
 def find_cookie(cookies: list, name: str) -> str:
     for c in cookies:
         if c.get("name") == name:
@@ -2529,10 +2548,20 @@ async def refresh_models_via_worker(worker):
                     continue
                 filtered.append(m)
             
-            if filtered:
+            if _valid_model_catalog(filtered):
+                before = set(_catalog_names(get_models()))
+                after = set(_catalog_names(filtered))
                 save_models(filtered)
-                log("OK", f"Model catalog refreshed via worker ({len(filtered)} models)")
+                added = sorted(after - before)
+                removed = sorted(before - after)
+                log("OK", f"Model catalog refreshed via worker ({len(after)} unique models · +{len(added)} / -{len(removed)})")
+                if added:
+                    log("INFO", f"Model catalog added sample: {added[:20]}")
+                if removed:
+                    log("INFO", f"Model catalog removed sample: {removed[:20]}")
                 return filtered
+            elif filtered:
+                log("WARN", f"Model extractor returned only {len(_catalog_names(filtered))} unique model(s); refusing to replace current catalog")
         log("WARN", "Could not find a balanced initialModels array in page/Flight source.")
     except Exception as e:
         log("ERROR", f"Failed to refresh models: {e}")
@@ -3509,7 +3538,7 @@ async def refresh_model_catalog() -> dict:
             if s and s.running and s.page and not s.page.is_closed():
                 tried_any_worker = True
                 fetched_models = await refresh_models_via_worker(s)
-                if fetched_models and len(fetched_models) > 50:
+                if _valid_model_catalog(fetched_models):
                     break
     except Exception as e:
         def mark_fail_exc(s):
@@ -3517,14 +3546,14 @@ async def refresh_model_catalog() -> dict:
         mutate_state(mark_fail_exc)
         return {"ok": False, "models": get_models(), "reason": f"Refresh crashed: {type(e).__name__}: {e}"}
 
-    if fetched_models and len(fetched_models) > 50:
+    if _valid_model_catalog(fetched_models):
         def mark_done(s):
             s["last_refresh"] = time.time()
             s["refresh_started"] = 0
         mutate_state(mark_done)
         return {
             "ok": True, "models": fetched_models,
-            "reason": f"Refreshed successfully — {len(fetched_models)} models loaded.",
+            "reason": f"Refreshed successfully — {len(_catalog_names(fetched_models))} unique models loaded.",
         }
 
     def mark_fail(s):
@@ -3534,7 +3563,7 @@ async def refresh_model_catalog() -> dict:
     if not tried_any_worker:
         reason = "No live keeper session with an open browser page was available to fetch the catalog."
     else:
-        reason = "Fetched the page but couldn't extract a valid model list (regex/parse failure) — catalog left unchanged."
+        reason = "Fetched the page but could not extract a valid model catalog — existing models.json was preserved."
     return {"ok": False, "models": get_models(), "reason": reason}
 
 class BridgeHTTPError(Exception):
@@ -10314,12 +10343,25 @@ def models_page(models: list, blocked: list) -> str:
     rows = "".join(_row(m) for m in models[:400])
     return page("Models", '<div class="pagehead"><div><h1>Model Catalog</h1><p>' + str(len(models)) +
                 " known · " + str(len(blocked)) + ' blocked on this account set</p></div>' +
-                """<div class="row"><button class="btn" onclick="fetch('/keeper/config',{method:'POST'}).then(()=>toast('refresh queued'))">↻ Refresh</button></div></div>
+                """<div class="row"><button class="btn" id="refreshModels" onclick="refreshModelsNow()">↻ Refresh</button></div></div>
 <div class="card"><input id="q" placeholder="filter…" oninput="flt()" style="margin-bottom:12px">
 <table><thead><tr><th>name</th><th>arena id</th><th>state</th><th></th></tr></thead><tbody id="tb">""" +
                 rows + """</tbody></table></div>""", active="models", raw_js="""
 function flt(){var q=document.getElementById('q').value.toLowerCase();
-document.querySelectorAll('#tb tr').forEach(r=>{r.style.display=r.textContent.toLowerCase().includes(q)?'':'none'})}""")
+document.querySelectorAll('#tb tr').forEach(r=>{r.style.display=r.textContent.toLowerCase().includes(q)?'':'none'})}
+async function refreshModelsNow(){
+ const b=document.getElementById('refreshModels'); b.disabled=true; b.textContent='Refreshing…';
+ try{
+   const r=await fetch('/models/refresh',{method:'POST',headers:{'Accept':'application/json'}});
+   const j=await r.json();
+   if(!r.ok || !j.ok) throw new Error(j.reason||('HTTP '+r.status));
+   if(typeof toast==='function') toast(j.reason||'Model catalog refreshed');
+   setTimeout(()=>location.reload(),250);
+ }catch(e){
+   b.disabled=false; b.textContent='↻ Refresh';
+   if(typeof toast==='function') toast('Refresh failed: '+(e.message||e)); else alert('Refresh failed: '+(e.message||e));
+ }
+}""")
 
 
 def _legacy_chat_page(models: list, default_model: str) -> str:
@@ -11521,7 +11563,12 @@ def _release_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> No
 # needs to understand provider-specific private stream frames.
 V4_TRANSPORT = os.environ.get("BRIDGENA_V4_TRANSPORT", "extension").strip().lower()
 V4_FALLBACK_LEGACY = os.environ.get("BRIDGENA_V4_FALLBACK_LEGACY", "0").strip().lower() in {"1","true","yes","on"}
-V4_EXTENSION_TOKEN = os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN", "").strip()
+# v4.1.2: use one control-plane token for the bundled extension workers.
+# If the operator did not provide one, generate an ephemeral token and inject it
+# into the bundled MV3 service worker before Chromium starts. This prevents a
+# stale/empty extension token from silently producing connected workers=0.
+import secrets as _v4_secrets
+V4_EXTENSION_TOKEN = os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN", "").strip() or _v4_secrets.token_urlsafe(24)
 V4_FIRST_TOKEN_SEC = max(5.0, min(180.0, float(os.environ.get("BRIDGENA_V4_FIRST_TOKEN_SEC", "45"))))
 V4_IDLE_STREAM_SEC = max(5.0, min(180.0, float(os.environ.get("BRIDGENA_V4_IDLE_STREAM_SEC", "30"))))
 V4_JOB_MAX_SEC = max(30.0, min(900.0, float(os.environ.get("BRIDGENA_V4_JOB_MAX_SEC", "300"))))
@@ -11532,18 +11579,46 @@ V4_PROFILE_DIR = os.environ.get("BRIDGENA_V4_PROFILE_DIR", os.path.join(os.path.
 V4_EXTENSION_DIR = os.environ.get("BRIDGENA_V4_EXTENSION_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension"))
 V4_BROWSER_PROXY = os.environ.get("BRIDGENA_V4_BROWSER_PROXY", "").strip()
 
-# v4.1: the authenticated keeper fleet *is* the headed extension worker fleet.
-# KeeperSession.start() already restores jar cookies, assigns a stable proxy,
-# launches a persistent Chromium profile and supervises browser health. Reuse
-# that machinery instead of creating a second, unauthenticated browser fleet.
+# v4.1.2: the authenticated keeper fleet *is* the headed extension worker fleet.
+# Keep the bundled worker configuration synchronized with this process before
+# any persistent Chromium context is launched.
+def _v4_prepare_bundled_extension():
+    manifest_path=os.path.join(V4_EXTENSION_DIR, "manifest.json")
+    sw_path=os.path.join(V4_EXTENSION_DIR, "service-worker.js")
+    if not os.path.isfile(manifest_path):
+        log("WARN", f"v4 bundled extension manifest missing: {V4_EXTENSION_DIR}")
+        return False
+    try:
+        # Give the MV3 worker explicit permission for its local control socket.
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            manifest=json.load(fh)
+        hp=list(manifest.get("host_permissions") or [])
+        for pat in ("http://127.0.0.1/*", "http://localhost/*"):
+            if pat not in hp:
+                hp.append(pat)
+        manifest["host_permissions"]=hp
+        manifest["version"]="4.1.2"
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2)
+            fh.write("\n")
+
+        # Inject the exact local WS URL and token into the worker defaults.
+        if os.path.isfile(sw_path):
+            sw=Path(sw_path).read_text(encoding="utf-8")
+            ws_url=os.environ.get("BRIDGENA_V4_EXTENSION_WS_URL", "ws://127.0.0.1:8000/v4/extension/ws").strip()
+            replacement='const DEFAULTS='+json.dumps({"wsUrl":ws_url,"token":V4_EXTENSION_TOKEN,"workerId":"","proxyLabel":""},separators=(",",":"))+';'
+            sw=re.sub(r'^const DEFAULTS=.*?;$', replacement, sw, count=1, flags=re.M)
+            Path(sw_path).write_text(sw, encoding="utf-8")
+            log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token=ephemeral" if not os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else f"v4 worker bootstrap synchronized · ws={ws_url} · token=configured")
+        return True
+    except Exception as exc:
+        log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
+        return False
+
 if V4_TRANSPORT == "extension" and V4_AUTO_ATTACH_KEEPERS:
-    if os.path.isfile(os.path.join(V4_EXTENSION_DIR, "manifest.json")):
-        # v4 browser transport must load the bundled Bridgena worker extension.
-        # Override any stale legacy extension path from .env/config.
+    if _v4_prepare_bundled_extension():
         os.environ["BRIDGENA_CAPTCHA_EXT"] = V4_EXTENSION_DIR
         log("INFO", f"v4 extension injection path forced to bundled worker: {V4_EXTENSION_DIR}")
-    else:
-        log("WARN", f"v4 bundled extension manifest missing: {V4_EXTENSION_DIR}")
 
 _v4_workers: Dict[str, dict] = {}
 _v4_jobs: Dict[str, asyncio.Queue] = {}
@@ -11722,14 +11797,23 @@ async def _api_run_turn(chat_id: str, prompt: str, model_name: str, **kwargs):
 @app.websocket("/v4/extension/ws")
 async def v4_extension_ws(ws: WebSocket):
     token=ws.query_params.get("token", "")
+    peer=getattr(getattr(ws, "client", None), "host", "?")
+    origin=str(ws.headers.get("origin") or "")[:160]
     if V4_EXTENSION_TOKEN and not hmac.compare_digest(token, V4_EXTENSION_TOKEN):
+        log("WARN", f"v4 extension socket rejected · peer={peer} · origin={origin or '-'} · token mismatch")
         await ws.close(code=4403)
         return
     await ws.accept()
     worker_id=None
     try:
-        hello=await asyncio.wait_for(ws.receive_json(), timeout=10.0)
+        try:
+            hello=await asyncio.wait_for(ws.receive_json(), timeout=10.0)
+        except asyncio.TimeoutError:
+            log("WARN", f"v4 extension socket accepted but hello timed out · peer={peer} · origin={origin or '-'}")
+            await ws.close(code=4408)
+            return
         if hello.get("type") != "hello":
+            log("WARN", f"v4 extension socket malformed hello · peer={peer} · type={str(hello.get('type') or '-')[:40]}")
             await ws.close(code=4400); return
         worker_id=str(hello.get("worker_id") or ("browser-"+uuid7()[:8]))
         async with _v4_worker_lock:
@@ -12776,6 +12860,17 @@ async def raw_models():
     return JSONResponse(read_json(MODELS_RAW_DEBUG_FILE, []))
 
 
+@app.post("/models/refresh")
+async def models_refresh_api(request: Request):
+    g = await _page_guard(request)
+    if g:
+        return g
+    result = await refresh_model_catalog()
+    code = 200 if result.get("ok") else 503
+    log("OK" if result.get("ok") else "WARN", f"Models-page refresh: {result.get('reason','unknown result')}")
+    return JSONResponse(result, status_code=code, headers={"Cache-Control":"no-store"})
+
+
 @app.post("/keeper/config")
 async def keeper_config():
     asyncio.create_task(_kick_refresh())
@@ -13583,7 +13678,7 @@ def _cli():
     args = ap.parse_args()
     jars_count = len([j for j in load_jars() if not j.get("expired")])
     print("=" * 62)
-    print("  BRIDGENA v4.1.1 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
+    print("  BRIDGENA v4.1.2 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
     print("=" * 62)
     print(f"  * Live Chat   : {PUBLIC_APP_URL}/chat")
     print(f"  * Dashboard   : {PUBLIC_APP_URL}/dashboard")
