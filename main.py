@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.15-clean-eof-recovery")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.16-id-aware-history-recovery")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1926,7 +1926,7 @@ FIRST_ASSISTANT_RESPONSE_SEC = max(1.0, min(30.0, float(os.environ.get("BRIDGENA
 REQUIRE_PROVIDER_FINISH = os.environ.get("BRIDGENA_REQUIRE_PROVIDER_FINISH", "1").strip().lower() not in ("0", "false", "no", "off")
 ARENA_UI_STREAM_RECOVERY = os.environ.get("BRIDGENA_ARENA_UI_STREAM_RECOVERY", "1").strip().lower() not in ("0", "false", "no", "off")
 ARENA_UI_RECOVERY_TIMEOUT_SEC = max(5.0, min(60.0, float(os.environ.get("BRIDGENA_ARENA_UI_RECOVERY_TIMEOUT_SEC", "30"))))
-ARENA_HISTORY_RECOVERY_LIMIT = max(5, min(200, int(os.environ.get("BRIDGENA_ARENA_HISTORY_RECOVERY_LIMIT", "60"))))
+ARENA_HISTORY_RECOVERY_LIMIT = max(5, min(200, int(os.environ.get("BRIDGENA_ARENA_HISTORY_RECOVERY_LIMIT", "120"))))
 ARENA_HISTORY_POLL_SEC = max(0.25, min(3.0, float(os.environ.get("BRIDGENA_ARENA_HISTORY_POLL_SEC", "0.65"))))
 ARENA_HISTORY_STABLE_POLLS = max(2, min(8, int(os.environ.get("BRIDGENA_ARENA_HISTORY_STABLE_POLLS", "3"))))
 ARENA_SALVAGE_QUICK_SEC = max(1.0, min(8.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_QUICK_SEC", "3"))))
@@ -7479,6 +7479,35 @@ async def _arena_history_probe(page, *, arena_id: str, model_message_id: str,
                 return out;
               }
 
+              // Provider-specific history payloads do not always annotate model
+              // output with role=assistant. Once an object is proven to belong to
+              // this exact evaluation/message ID, inspect response-shaped fields
+              // directly. User/input/prompt fields are deliberately excluded so a
+              // duplicate ACK cannot be "recovered" as the user's own message.
+              function collectExactIdResponseText(o, depth=0, out=[]) {
+                if (!o || depth > 10) return out;
+                if (Array.isArray(o)) {
+                  for (const x of o) collectExactIdResponseText(x, depth+1, out);
+                  return out;
+                }
+                if (typeof o !== 'object') return out;
+
+                for (const [k,v] of Object.entries(o)) {
+                  const kl = String(k).toLowerCase();
+                  if (/(cookie|token|password|authorization|prompt|input|user|human|request)/.test(kl)) continue;
+
+                  const responseLike = /(^|_)(response|answer|output|completion|assistant|model)(_|$)/.test(kl)
+                    || /^(text|content|markdown)$/.test(kl)
+                    || /(modela|modelb).*(response|output|answer|text|content)/.test(kl);
+                  if (responseLike) {
+                    const t = scalarText(v);
+                    if (t && t.length >= 2 && (!promptL || !t.toLowerCase().startsWith(promptL))) out.push(t);
+                  }
+                  if (v && typeof v === 'object') collectExactIdResponseText(v, depth+1, out);
+                }
+                return out;
+              }
+
               function findRoute(o, depth=0) {
                 if (!o || depth > 6) return '';
                 if (Array.isArray(o)) {
@@ -7570,7 +7599,16 @@ async def _arena_history_probe(page, *, arena_id: str, model_message_id: str,
 
                 const score = scoreObject(v);
                 if (score > 0) {
-                  const assistants = collectAssistant(v);
+                  let assistants = collectAssistant(v);
+                  let exactBlob = '';
+                  try { exactBlob = JSON.stringify(v).toLowerCase(); } catch(e) {}
+                  const exactIdMatch = !!(
+                    (arenaL && exactBlob.includes(arenaL)) ||
+                    (messageL && exactBlob.includes(messageL))
+                  );
+                  if (exactIdMatch) {
+                    assistants = assistants.concat(collectExactIdResponseText(v));
+                  }
                   let bestText = '';
                   for (const t of assistants) {
                     const tn = norm(t);
@@ -7611,7 +7649,8 @@ async def _arena_history_probe(page, *, arena_id: str, model_message_id: str,
                 route:best ? best.route : '',
                 complete:best ? best.complete : null,
                 path:best ? best.path : '',
-                candidateCount:roots.length
+                candidateCount:roots.length,
+                exactIdMatched:!!(best && ((arenaL && best.score >= 12000) || (messageL && best.score >= 15000)))
               };
             }""",
             [
