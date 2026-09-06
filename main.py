@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.9-bound-readiness-gate")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.10-duplicate-message-ack")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -8850,12 +8850,21 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     # existing answer from Arena history/UI. Never mint a new ID
                     # for this logical turn.
                     _body_low = (e.body or "").lower()
-                    if (e.status == 400 and not follow_url and retry_envelope_ids
-                            and "evaluation session" in _body_low and "already exists" in _body_low):
-                        existing_id = str(base.get("id") or "")
-                        log("OK", f"[{jar.get('name')}] duplicate create ID acknowledged by Arena · "
+                    _duplicate_create_ack = bool(
+                        e.status == 400 and not follow_url and retry_envelope_ids
+                        and "evaluation session" in _body_low and "already exists" in _body_low
+                    )
+                    _duplicate_message_ack = bool(
+                        e.status == 400 and follow_url and retry_envelope_ids
+                        and "message already exists" in _body_low
+                        and "evaluation session" in _body_low
+                    )
+                    if _duplicate_create_ack or _duplicate_message_ack:
+                        existing_id = str(base.get("id") or (mc or {}).get("arena_id") or "")
+                        ack_kind = "follow-up message" if _duplicate_message_ack else "create ID"
+                        log("OK", f"[{jar.get('name')}] duplicate {ack_kind} acknowledged by Arena · "
                                   f"evaluation {existing_id[:12]}… · recovering existing turn")
-                        _bump_undelivered_retry("duplicate_ack")
+                        _bump_undelivered_retry("duplicate_message_ack" if _duplicate_message_ack else "duplicate_ack")
 
                         # The 400 itself proves this evaluation exists upstream,
                         # so establish continuity even if UI indexing is briefly
@@ -8922,15 +8931,15 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                 yield ("content", final_text)
                             else:
                                 response_text = final_text or response_text
-                            log("OK", f"[{jar.get('name')}] duplicate-ID turn recovered · "
+                            log("OK", f"[{jar.get('name')}] duplicate {'message' if _duplicate_message_ack else 'ID'} turn recovered · "
                                       f"{len(response_text)} chars · source {salvage.get('source') or 'history/UI'}")
                             yield ("done", response_text)
                             return
 
-                        log("WARN", f"[{jar.get('name')}] duplicate create proves delivery, but answer "
-                                    "is not visible in Arena history yet; replay suppressed")
-                        yield ("error", "502: Arena confirmed that this evaluation already exists, so the original "
-                                        "turn was delivered. Bridgena suppressed replay to avoid a duplicate message, "
+                        log("WARN", f"[{jar.get('name')}] duplicate {'follow-up message' if _duplicate_message_ack else 'create'} "
+                                    "proves delivery, but answer is not visible in Arena history yet; replay suppressed")
+                        yield ("error", "502: Arena confirmed that this exact message/evaluation already exists, so the "
+                                        "original turn was delivered. Bridgena suppressed replay to avoid a duplicate message, "
                                         "but the completed answer was not visible in Arena history yet. Retry the client "
                                         "request only after the existing thread becomes visible.")
                         return
