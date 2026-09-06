@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.7-duplicate-id-recovery")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.8-delivered-stream-recovery")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1931,6 +1931,7 @@ ARENA_HISTORY_POLL_SEC = max(0.25, min(3.0, float(os.environ.get("BRIDGENA_ARENA
 ARENA_HISTORY_STABLE_POLLS = max(2, min(8, int(os.environ.get("BRIDGENA_ARENA_HISTORY_STABLE_POLLS", "3"))))
 ARENA_SALVAGE_QUICK_SEC = max(1.0, min(8.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_QUICK_SEC", "3"))))
 ARENA_POST_RESTART_SALVAGE_SEC = max(5.0, min(45.0, float(os.environ.get("BRIDGENA_ARENA_POST_RESTART_SALVAGE_SEC", "22"))))
+ARENA_DELIVERED_WAIT_SEC = max(8.0, min(90.0, float(os.environ.get("BRIDGENA_ARENA_DELIVERED_WAIT_SEC", "40"))))
 ARENA_SALVAGE_RECOVERY_WAIT_SEC = max(5.0, min(40.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_RECOVERY_WAIT_SEC", "18"))))
 UNDELIVERED_ENVELOPE_RETRY_MAX = max(0, min(2, int(os.environ.get("BRIDGENA_UNDELIVERED_ENVELOPE_RETRY_MAX", "1"))))
 THROTTLE_THREAD_REHOME = os.environ.get("BRIDGENA_THROTTLE_THREAD_REHOME", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -8043,10 +8044,11 @@ async def _attempt_ui_stream_salvage(*, session, chat_id: str, model_name: str,
         timeout_sec=timeout_sec,
     )
 
-    if result.get("ok"):
-        # A create-evaluation may have succeeded upstream even though Bridgena
-        # lost the fetch response. Persist the thread binding once the Arena UI
-        # proves the conversation exists.
+    if result.get("ok") or result.get("trace_found"):
+        # Once authenticated history/UI proves this evaluation exists, persist
+        # the binding even if the model is still generating. Completion and
+        # delivery are separate facts: keeping the binding lets later recovery
+        # resume the exact turn instead of rediscovering it from scratch.
         conv_now = get_conversation(chat_id) or {}
         conv_now["model"] = model_name
         conv_now["arena"] = dict(conv_now.get("arena") or {})
@@ -8060,7 +8062,9 @@ async def _attempt_ui_stream_salvage(*, session, chat_id: str, model_name: str,
         save_conversation(chat_id, conv_now)
         if result.get("url"):
             save_conversation_ui_url(chat_id, model_name, result["url"])
-    else:
+        if result.get("trace_found") and not result.get("ok"):
+            log("INFO", f"[{jar.get('name')}] Arena delivery confirmed; persisted in-progress evaluation binding {str(arena_id)[:12]}…")
+    if not result.get("ok"):
         log("WARN", f"[{jar.get('name')}] Arena stream salvage failed · "
                     f"{result.get('reason') or 'unknown'} · "
                     f"best chars {len(str(result.get('text') or ''))} · "
@@ -8607,6 +8611,29 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             if salvage.get("ok"):
                                 _bump_arena_ui_recovery("post_restart_recovered")
 
+                    # A mid-stream browser break does not mean the Arena model stopped.
+                    # If authenticated history proves the exact turn exists, give that
+                    # delivered evaluation one final bounded completion window. This is
+                    # recovery-only: it never resubmits the prompt.
+                    if (not salvage.get("ok")) and salvage.get("trace_found"):
+                        browser_session = keeper.sessions.get(jar.get("id")) or browser_session
+                        log("INFO", f"[{jar.get('name')}] delivered evaluation still incomplete after route repair; "
+                                    f"polling exact Arena turn for up to {ARENA_DELIVERED_WAIT_SEC:.1f}s")
+                        salvage = await _attempt_ui_stream_salvage(
+                            session=browser_session,
+                            chat_id=chat_id,
+                            model_name=model_name,
+                            arena_id=str(base.get("id") or (mc or {}).get("arena_id") or ""),
+                            model_message_id=str(base.get("modelAMessageId") or ""),
+                            user_prompt=prompt,
+                            partial_text=response_text or "",
+                            jar=jar,
+                            proxy=proxy,
+                            cached_url=str(salvage.get("url") or (mc or {}).get("ui_url") or ""),
+                            timeout_sec=ARENA_DELIVERED_WAIT_SEC,
+                            stage="delivered-wait",
+                        )
+
                     if salvage.get("ok"):
                         final_text = str(salvage.get("text") or "")
                         suffix = str(salvage.get("suffix") or "")
@@ -8626,14 +8653,14 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         return
 
                     if response_text or reasoning_text:
-                        yield ("error", "502: Arena returned partial assistant output but never delivered a complete "
-                                        "provider finish event. Bridgena tried history recovery, repaired the bound "
-                                        "browser route, then checked history again; no completed answer could be confirmed. "
-                                        "The partial response remains visible above.")
+                        yield ("error", "502: Arena accepted the turn and partial assistant output was observed, but completion "
+                                        "could not be confirmed before the delivered-turn recovery window expired. "
+                                        "The exact Arena evaluation remains bound for subsequent continuation/recovery; "
+                                        "the partial response remains visible above.")
                     else:
-                        yield ("error", "502: Arena opened the response but the browser transport was interrupted. "
-                                        "Bridgena repaired the bound browser route and checked Arena history again, "
-                                        "but no completed answer could be confirmed.")
+                        yield ("error", "502: Arena accepted the turn, but the browser stream was interrupted and the exact "
+                                        "evaluation did not reach a confirmed completed state before the recovery window expired. "
+                                        "Its Arena binding was preserved for subsequent continuation/recovery.")
                     return
                 if not e.status:
                     log("WARN", f"[{jar.get('name')}] browser transport failed before an HTTP response; "
