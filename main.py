@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-# ================================================================
-#  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
-#  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.2.2-navigation-deadlock-recovery-fix.py).
-# ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -314,7 +309,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.2.2-navigation-deadlock-recovery-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.3.0-reliability-observability-sweep")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -940,6 +935,39 @@ def canonical_public_model_name(value: str) -> str:
 def _model_key(value: str) -> str:
     """Canonical comparison key for Arena display labels and API slugs."""
     return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
+def _v4_model_aliases_for_request(value: str) -> list[str]:
+    """Return safe model-picker aliases for one public API model label."""
+    raw = str(value or "auto").strip() or "auto"
+    if raw == "auto":
+        return ["auto"]
+    out: list[str] = []
+    def add(v):
+        v = str(v or "").strip()
+        if v and v not in out:
+            out.append(v)
+
+    add(raw)
+    wanted = _model_key(raw)
+    try:
+        for item in get_models():
+            aliases = _model_aliases(item)
+            keys = {_model_key(x) for x in aliases if x}
+            if raw in aliases or wanted in keys:
+                for alias in aliases:
+                    add(alias)
+                break
+    except Exception:
+        pass
+
+    # Arena has historically exposed the Max route under both a human-facing
+    # Max/Arena Max label and an internal boss-bandit identity.
+    if wanted in {"max", "arena-max", "boss-bandit"}:
+        for alias in ("Max", "Arena Max", "boss-bandit", "boss bandit"):
+            add(alias)
+
+    return out[:24]
 
 
 # Captured from Arena's working direct-chat client on 2026-09-03. These are
@@ -5681,7 +5709,6 @@ class KeeperSession:
         self.page = None
         self.status = "stopped"
         self._set_step("Keeper stopped")
-        log("INFO", f"[{self.name}] Keeper stopped")
 
     async def restart(self):
         self.last_restart = time.time()
@@ -11131,8 +11158,11 @@ def _register_private_error(*, status_code: int, detail: Any, source: str,
     with _error_events_lock:
         _error_events.append(row)
     _persist_error_event(row)
+    context_preview = redact(str(safe_context))[:900] if safe_context else ""
     log("WARN", f"Customer error {error_id} · HTTP {row['status']} · {row['source']} · "
-                f"{row['method']} {row['path']} · internal: {safe_detail[:260]}")
+                f"{row['method']} {row['path']} · exception={row['exception_type'] or '-'} · "
+                f"internal: {safe_detail[:900]}" +
+                (f" · context={context_preview}" if context_preview else ""))
     return error_id, _public_error_phrase(error_id, row["status"])
 
 
@@ -11861,12 +11891,47 @@ def _release_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> No
 # needs to understand provider-specific private stream frames.
 V4_TRANSPORT = os.environ.get("BRIDGENA_V4_TRANSPORT", "extension").strip().lower()
 V4_FALLBACK_LEGACY = os.environ.get("BRIDGENA_V4_FALLBACK_LEGACY", "0").strip().lower() in {"1","true","yes","on"}
-# v4.1.2: use one control-plane token for the bundled extension workers.
-# If the operator did not provide one, generate an ephemeral token and inject it
-# into the bundled MV3 service worker before Chromium starts. This prevents a
-# stale/empty extension token from silently producing connected workers=0.
+# v4.3: keep the loopback extension credential stable across process restarts.
+# An operator-provided token still wins. Otherwise a private local token file is
+# created once and reused, avoiding reconnect storms from still-running headed
+# browser profiles after a control-plane restart.
 import secrets as _v4_secrets
-V4_EXTENSION_TOKEN = os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN", "").strip() or _v4_secrets.token_urlsafe(24)
+V4_EXTENSION_TOKEN_FILE = os.environ.get(
+    "BRIDGENA_V4_EXTENSION_TOKEN_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bridgena-v4-extension-token"),
+).strip()
+
+def _v4_load_or_create_extension_token() -> tuple[str, str]:
+    configured = os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN", "").strip()
+    if configured:
+        return configured, "configured"
+    try:
+        if V4_EXTENSION_TOKEN_FILE and os.path.isfile(V4_EXTENSION_TOKEN_FILE):
+            with open(V4_EXTENSION_TOKEN_FILE, "r", encoding="utf-8") as fh:
+                existing = fh.read().strip()
+            if len(existing) >= 24:
+                return existing, "persistent-local"
+    except Exception as exc:
+        log("WARN", f"v4 extension token read failed · {type(exc).__name__}: {redact(str(exc))[:180]}")
+    token = _v4_secrets.token_urlsafe(32)
+    if V4_EXTENSION_TOKEN_FILE:
+        try:
+            parent = os.path.dirname(os.path.abspath(V4_EXTENSION_TOKEN_FILE))
+            os.makedirs(parent, exist_ok=True)
+            tmp = V4_EXTENSION_TOKEN_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(token + "\n")
+            try:
+                os.chmod(tmp, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp, V4_EXTENSION_TOKEN_FILE)
+            return token, "persistent-local"
+        except Exception as exc:
+            log("WARN", f"v4 extension token persist failed · {type(exc).__name__}: {redact(str(exc))[:180]}")
+    return token, "ephemeral-fallback"
+
+V4_EXTENSION_TOKEN, V4_EXTENSION_TOKEN_MODE = _v4_load_or_create_extension_token()
 V4_FIRST_TOKEN_SEC = max(5.0, min(180.0, float(os.environ.get("BRIDGENA_V4_FIRST_TOKEN_SEC", "45"))))
 V4_IDLE_STREAM_SEC = max(5.0, min(180.0, float(os.environ.get("BRIDGENA_V4_IDLE_STREAM_SEC", "30"))))
 V4_JOB_MAX_SEC = max(30.0, min(900.0, float(os.environ.get("BRIDGENA_V4_JOB_MAX_SEC", "300"))))
@@ -11993,7 +12058,7 @@ def _v4_prepare_bundled_extension():
         if "debugger" not in perms:
             perms.append("debugger")
         manifest["permissions"]=perms
-        manifest["version"]="4.2.2"
+        manifest["version"]="4.3.0"
         with open(manifest_path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
             fh.write("\n")
@@ -12194,6 +12259,7 @@ function txt(el){return (el?.innerText||el?.textContent||"").trim()}
 function emit(type,request_id,extra={}){chrome.runtime.sendMessage({type:"BRIDGENA_"+type.toUpperCase(),request_id,...extra}).catch(()=>{})}
 function trace(id,stage,extra={}){emit("trace",id,{stage,...extra})}
 function phase(id,value){
+  if(active&&active.id===id)active.phase=String(value||"");
   chrome.runtime.sendMessage({
     type:"BRIDGENA_PHASE_LOCAL",request_id:id,phase:String(value||"")
   }).catch(()=>{});
@@ -12506,6 +12572,28 @@ async function clickNewChat(id=null){
   return true;
 }
 
+function runtimeDiagnostics(model=""){
+  const c=composer();
+  const stop=stopButton();
+  const controls=allDom('button,[role="button"]').filter(visible);
+  return {
+    href:location.href,
+    readyState:document.readyState,
+    visibility:document.visibilityState,
+    model:model||"",
+    composer:!!c,
+    composer_tag:c?.tagName||"",
+    composer_placeholder:c?.getAttribute?.("placeholder")||"",
+    generating:!!stop,
+    challenge:challengePresent(),
+    login_required:loginRequired(),
+    transcript_messages:conversationMessageCount(),
+    visible_user_messages:visibleUserMessageCount(),
+    assistant_candidates:assistantCandidates("").length,
+    nearby_controls:controls.slice(-16).map(el=>modelControlBlob(el).slice(0,100))
+  };
+}
+
 function blankChatShell(){
   const c=composer();
   if(!c||stopButton())return false;
@@ -12520,62 +12608,250 @@ function blankChatShell(){
   return explicit.length===0;
 }
 
-async function selectModel(model){
-  if(!model||model==='auto')return true;
-  const clean=s=>(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
-  const base=s=>clean(String(s||'').replace(/\s*\([^)]*\)\s*$/,''));
-  const wanted=clean(model),wantedBase=base(model);
-
-  const current=[...document.querySelectorAll('button,[role="button"]')].find(x=>{
-    if(!visible(x))return false;
-    const t=txt(x).trim();
-    return clean(t)===wanted || base(t)===wantedBase;
-  });
-  if(current)return true;
-
-  const triggers=[...document.querySelectorAll('button,[role="button"]')].filter(visible);
-  const trigger=triggers.find(x=>/select model|choose model|model selector/i.test(
-    (x.getAttribute('aria-label')||'')+' '+(x.getAttribute('data-testid')||'')+' '+txt(x)
-  ))||triggers.find(x=>/\bmodel\b/i.test(
-    (x.getAttribute('aria-label')||'')+' '+(x.getAttribute('data-testid')||'')+' '+txt(x)
-  ))||triggers.find(x=>/^(max|auto|battle|side by side)$/i.test(txt(x).trim()));
-
-  if(!trigger)return false;
-  trigger.click();await sleep(450);
-
-  const nodes=[...document.querySelectorAll(
-    '[role="option"],[role="menuitem"],[role="menuitemradio"],[role="listbox"] button,[role="menu"] button,li,button'
-  )].filter(visible);
-
-  const exact=nodes.find(x=>clean(txt(x))===wanted);
-  const baseExact=nodes.filter(x=>base(txt(x))===wantedBase);
-  const prefix=nodes.filter(x=>{
-    const t=clean(txt(x)),b=base(txt(x));
-    return t.startsWith(wanted+' ')||wanted.startsWith(t+' ')||
-           b.startsWith(wantedBase+' ')||wantedBase.startsWith(b+' ');
-  });
-
-  const opt=exact || (baseExact.length===1?baseExact[0]:null) || (prefix.length===1?prefix[0]:null);
-  if(opt){opt.click();await sleep(400);return true}
-  try{document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true}))}catch{}
-  return false;
+function allDom(selector){
+  const out=[],seen=new Set();
+  for(const root of domRoots()){
+    let nodes=[];
+    try{nodes=[...root.querySelectorAll(selector)]}catch{}
+    for(const n of nodes){
+      if(!seen.has(n)){seen.add(n);out.push(n)}
+    }
+  }
+  return out;
 }
 
-async function selectModelStable(model,id){
+function modelClean(s){
+  return String(s||"").toLowerCase().replace(/[^a-z0-9]+/g," ").replace(/\s+/g," ").trim();
+}
+function modelBase(s){
+  return modelClean(String(s||"").replace(/\s*\([^)]*\)\s*$/,""));
+}
+function modelVariants(values){
+  const out=new Set();
+  const add=v=>{
+    const c=modelClean(v);
+    if(!c)return;
+    out.add(c);
+    out.add(modelBase(c));
+    if(c.startsWith("arena "))out.add(c.slice(6).trim());
+    if(c.endsWith(" model"))out.add(c.slice(0,-6).trim());
+  };
+  for(const v of values||[])add(v);
+
+  if(out.has("max")||out.has("arena max")||out.has("boss bandit")){
+    ["max","arena max","boss bandit"].forEach(x=>out.add(x));
+  }
+  return [...out].filter(Boolean);
+}
+
+function modelMatchScore(label,variants){
+  const raw=String(label||"").trim();
+  if(!raw)return -1;
+  const t=modelClean(raw),b=modelBase(raw);
+  const lines=raw.split(/\n+/).map(modelClean).filter(Boolean);
+  let score=-1;
+  for(const a of variants){
+    const ab=modelBase(a);
+    if(t===a)score=Math.max(score,1000);
+    if(b===ab)score=Math.max(score,980);
+    if(t==="arena "+a || (t.startsWith("arena ")&&t.slice(6)===a))score=Math.max(score,970);
+    if(lines.includes(a)||lines.includes(ab))score=Math.max(score,950);
+    if(t.startsWith(a+" "))score=Math.max(score,850);
+    if(b.startsWith(ab+" "))score=Math.max(score,830);
+  }
+  return score;
+}
+
+function modelControlBlob(el){
+  return [
+    el?.getAttribute?.("aria-label")||"",
+    el?.getAttribute?.("data-testid")||"",
+    el?.getAttribute?.("title")||"",
+    txt(el)
+  ].join(" ").replace(/\s+/g," ").trim();
+}
+
+function modelPickerDiagnostics(model,aliases){
+  const variants=modelVariants([model,...(aliases||[])]);
+  const controls=allDom('button,[role="button"],[aria-haspopup]').filter(visible);
+  const options=allDom(
+    '[role="option"],[role="menuitem"],[role="menuitemradio"],'+
+    '[role="listbox"] button,[role="menu"] button,li,button'
+  ).filter(visible);
+  const bestControls=controls.map(el=>({
+    text:modelControlBlob(el).slice(0,120),
+    score:modelMatchScore(modelControlBlob(el),variants),
+    popup:el.getAttribute("aria-haspopup")||"",
+    testid:el.getAttribute("data-testid")||""
+  })).filter(x=>x.score>=0||/model/i.test(x.text)).sort((a,b)=>b.score-a.score).slice(0,12);
+  const bestOptions=options.map(el=>({
+    text:txt(el).replace(/\s+/g," ").trim().slice(0,140),
+    score:modelMatchScore(txt(el),variants),
+    role:el.getAttribute("role")||""
+  })).filter(x=>x.score>=0).sort((a,b)=>b.score-a.score).slice(0,16);
+  return {
+    requested:model,
+    aliases:(aliases||[]).slice(0,12),
+    controls:bestControls,
+    options:bestOptions,
+    href:location.href,
+    visibility:document.visibilityState,
+    composer:!!composer()
+  };
+}
+
+async function selectModel(model,aliases=[],id=null){
+  if(!model||model==='auto')return true;
+  const variants=modelVariants([model,...(aliases||[])]);
+
+  const controls=allDom('button,[role="button"],[aria-haspopup]').filter(visible);
+
+  // First prove that an already-selected model is actually represented by a
+  // model-ish control. A random "Max" button elsewhere on the page is not enough.
+  const current=controls.map(el=>{
+    const blob=modelControlBlob(el);
+    let score=modelMatchScore(blob,variants);
+    if(/model/i.test((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('data-testid')||'')))score+=90;
+    if(el.getAttribute("aria-haspopup"))score+=25;
+    return {el,score,blob};
+  }).sort((a,b)=>b.score-a.score)[0];
+
+  if(current&&current.score>=1020){
+    if(id)trace(id,"model-already-selected",{
+      model,
+      control:current.blob.slice(0,140),
+      score:current.score
+    });
+    return true;
+  }
+
+  const triggerRanked=controls.map(el=>{
+    const blob=modelControlBlob(el);
+    let score=0;
+    if(/select model|choose model|model selector|change model/i.test(blob))score+=130;
+    if(/\bmodel\b/i.test((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('data-testid')||'')))score+=100;
+    if(el.getAttribute("aria-haspopup")==="listbox")score+=45;
+    else if(el.getAttribute("aria-haspopup"))score+=20;
+    const match=modelMatchScore(blob,variants);
+    if(match>=950)score+=80;
+    return {el,score,blob};
+  }).filter(x=>x.score>=45).sort((a,b)=>b.score-a.score);
+
+  const trigger=triggerRanked[0]?.el||null;
+  if(!trigger){
+    if(id)trace(id,"model-picker-missing",modelPickerDiagnostics(model,aliases));
+    return false;
+  }
+
+  const collectOptions=()=>{
+    const nodes=allDom(
+      '[role="option"],[role="menuitem"],[role="menuitemradio"],'+
+      '[role="listbox"] button,[role="menu"] button,'+
+      '[data-radix-popper-content-wrapper] button,'+
+      '[data-radix-popper-content-wrapper] [role="option"],li,button'
+    ).filter(visible);
+    return nodes.map(el=>({
+      el,
+      text:txt(el).replace(/\s+/g," ").trim(),
+      score:modelMatchScore(txt(el),variants)
+    })).filter(x=>x.text&&x.score>=0).sort((a,b)=>b.score-a.score);
+  };
+
+  // Snapshot menu-like nodes that were already visible so generic page buttons
+  // cannot masquerade as picker options merely because their text matches.
+  const preOpenVisible=new Set(allDom(
+    '[role="option"],[role="menuitem"],[role="menuitemradio"],'+
+    '[role="listbox"] button,[role="menu"] button,'+
+    '[data-radix-popper-content-wrapper] button,'+
+    '[data-radix-popper-content-wrapper] [role="option"],li,button'
+  ).filter(visible));
+
+  const collectPickerOptions=()=>{
+    const ranked=collectOptions().filter(x=>x.el!==trigger);
+    const menuLike=ranked.filter(x=>{
+      const el=x.el;
+      const role=el.getAttribute("role")||"";
+      return !preOpenVisible.has(el) ||
+        /option|menuitem/i.test(role) ||
+        !!el.closest('[role="listbox"],[role="menu"],[data-radix-popper-content-wrapper]');
+    });
+    return menuLike.length?menuLike:ranked.filter(x=>!preOpenVisible.has(x.el));
+  };
+
+  trigger.click();
+  await settleUi(420,id,"model-picker-open-settle");
+  let ranked=collectPickerOptions();
+
+  // React occasionally ignores DOM .click(). Escalate to a browser-level click
+  // only for the ordinary model picker control.
+  if(!ranked.length||ranked[0].score<830){
+    await nativeClick(trigger,id,"model-trigger-native-cdp");
+    await settleUi(520,id,"model-picker-native-open-settle");
+    ranked=collectPickerOptions();
+  }
+
+  const best=ranked[0]||null;
+  const second=ranked[1]||null;
+  const uniquelyStrong=best && best.score>=830 &&
+    (!second || best.score-second.score>=80 || best.score>=950);
+
+  if(!uniquelyStrong){
+    if(id)trace(id,"model-option-unresolved",modelPickerDiagnostics(model,aliases));
+    try{document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true}))}catch{}
+    return false;
+  }
+
+  if(id)trace(id,"model-option-match",{
+    requested:model,
+    matched:best.text.slice(0,140),
+    score:best.score,
+    runner_up:second?{text:second.text.slice(0,100),score:second.score}:null
+  });
+
+  // Prefer native input because some Arena picker implementations ignore
+  // untrusted synthetic clicks.
+  const nativeOk=await nativeClick(best.el,id,"model-option-native-cdp");
+  if(!nativeOk){
+    try{best.el.click()}catch{}
+  }
+  await settleUi(650,id,"model-selection-settle");
+
+  // Verify if possible. If the strongly matched option disappeared and the
+  // composer remains usable, the selection was committed by the picker.
+  const afterControls=allDom('button,[role="button"],[aria-haspopup]').filter(visible);
+  const verified=afterControls.some(el=>{
+    const blob=modelControlBlob(el);
+    return modelMatchScore(blob,variants)>=950 &&
+      (/model/i.test((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('data-testid')||'')) ||
+       !!el.getAttribute("aria-haspopup"));
+  });
+  const optionStillVisible=visible(best.el);
+  const committed=verified || (!optionStillVisible && !!composer());
+
+  if(id)trace(id,"model-selection-verify",{
+    model,verified,option_still_visible:optionStillVisible,
+    composer:!!composer(),committed
+  });
+  return committed;
+}
+
+async function selectModelStable(model,aliases,id){
   if(!model||model==='auto')return true;
   for(let attempt=1;attempt<=3;attempt++){
-    // Do not manipulate the model menu while Arena is between route renders.
-    await waitForComposer(attempt===1?8000:5000,id,"pre-model-composer-wait");
-    await settleUi(attempt===1?300:550);
+    const c=await waitForComposer(attempt===1?8000:5000,id,"pre-model-composer-wait");
+    if(!c){
+      trace(id,"model-selection-no-composer",{attempt,model});
+      continue;
+    }
+    await settleUi(attempt===1?300:550,id,"pre-model-settle");
 
-    const ok=await selectModel(model);
+    const ok=await selectModel(model,aliases||[],id);
     trace(id,"model-selection-attempt",{attempt,ok,model});
     if(ok){
-      await settleUi(650);
+      await settleUi(650,id,"post-model-settle");
       return true;
     }
 
-    // A failed lookup may have left a menu/popover open.
     try{
       document.dispatchEvent(new KeyboardEvent('keydown',{
         key:'Escape',code:'Escape',bubbles:true,cancelable:true
@@ -12583,6 +12859,7 @@ async function selectModelStable(model,id){
     }catch{}
     await sleep(350*attempt);
   }
+  trace(id,"model-selection-final-diagnostics",modelPickerDiagnostics(model,aliases||[]));
   return false;
 }
 
@@ -12780,7 +13057,7 @@ function visibleUserMessageCount(){
   return seen.size;
 }
 
-async function nativeSubmit(el,id){
+async function nativeClick(el,id,stage="native-click-cdp"){
   try{
     let x=null,y=null;
     if(el&&visible(el)){
@@ -12795,16 +13072,23 @@ async function nativeSubmit(el,id){
       request_id:id,
       x,y
     });
-    trace(id,"submit-native-cdp",{
+    trace(id,stage,{
       ok:!!result?.ok,
       method:result?.method||"",
-      error:String(result?.error||"").slice(0,140)
+      error:String(result?.error||"").slice(0,180)
     });
     return !!result?.ok;
   }catch(e){
-    trace(id,"submit-native-cdp-error",{message:String(e?.message||e).slice(0,140)});
+    trace(id,stage+"-error",{
+      name:String(e?.name||"Error"),
+      message:String(e?.message||e).slice(0,220)
+    });
     return false;
   }
+}
+
+async function nativeSubmit(el,id){
+  return await nativeClick(el,id,"submit-native-cdp");
 }
 
 function realClick(el,id){
@@ -12990,10 +13274,11 @@ async function submitPrompt(c,payload,id){
 
 async function run(job){
   if(active){emit('error',job.request_id,{message:'worker already has an active job'});return}
-  active={id:job.request_id,last:'',cancel:false};
+  active={id:job.request_id,last:'',cancel:false,phase:'dispatch'};
   try{
     trace(job.request_id,"job-received",{
       model:job.model||"auto",
+      model_aliases:(job.model_aliases||[]).slice(0,12),
       navigation_recovered:!!job._navigation_recovered,
       visibility:document.visibilityState,
       href:location.href
@@ -13270,8 +13555,23 @@ async function run(job){
     tracker.stop();
     throw new Error('job cancelled');
   }catch(e){
-    trace(job.request_id,"job-error",{message:String(e?.message||e).slice(0,250)});
-    emit('error',job.request_id,{message:String(e?.message||e)})
+    const message=String(e?.message||e);
+    const diag=runtimeDiagnostics(job.model||"");
+    trace(job.request_id,"job-error",{
+      name:String(e?.name||"Error"),
+      message:message.slice(0,700),
+      stack:String(e?.stack||"").slice(0,1200),
+      phase:active?.phase||"",
+      using_session:!!job.reuse_session,
+      diagnostics:diag
+    });
+    emit('error',job.request_id,{
+      message,
+      name:String(e?.name||"Error"),
+      href:location.href,
+      visibility:document.visibilityState,
+      diagnostics:diag
+    })
   }finally{active=null}
 }
 
@@ -13298,8 +13598,7 @@ setInterval(publishState,5000);
         with open(content_path, "w", encoding="utf-8") as fh:
             fh.write(content_source)
 
-        token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + navigation-deadlock recovery v4.2.2")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={V4_EXTENSION_TOKEN_MODE} · storage-safe · native-editor + reliability/observability sweep v4.3.0")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
@@ -13434,6 +13733,7 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
         payload={
             "type":"send_message", "request_id":request_id,
             "chat_id":chat_id, "model":model_name,
+            "model_aliases":_v4_model_aliases_for_request(model_name),
             "prompt":effective_prompt,
             "recovery_prompt":handoff_prompt or prompt,
             "system_prompt":system_prompt or "",
@@ -13447,12 +13747,27 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
         first_deadline=started+V4_FIRST_TOKEN_SEC
         hard_deadline=started+V4_JOB_MAX_SEC
         last_activity=started
+        last_stage="dispatch"
+        last_trace={}
+        trace_count=0
+
+        def _worker_diag():
+            w=_v4_workers.get(worker_id) or {}
+            return (
+                f"worker={worker_id} stage={last_stage} "
+                f"ready={bool(w.get('ready'))} challenge={bool(w.get('challenge'))} "
+                f"login_required={bool(w.get('login_required'))} "
+                f"trace_count={trace_count}"
+            )
+
         while True:
             now=time.monotonic()
             if now >= hard_deadline:
                 try: await worker["ws"].send_json({"type":"cancel","request_id":request_id})
                 except Exception: pass
-                yield ("error", f"504: headed-browser job exceeded {V4_JOB_MAX_SEC:.0f}s")
+                detail=f"504: headed-browser job exceeded {V4_JOB_MAX_SEC:.0f}s · {_worker_diag()}"
+                log("ERROR", f"v4 job timeout · {request_id[-12:]} · {detail}")
+                yield ("error", detail)
                 return
             timeout=min(1.0, hard_deadline-now)
             try:
@@ -13462,12 +13777,19 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
                 if first is None and now >= first_deadline:
                     try: await worker["ws"].send_json({"type":"cancel","request_id":request_id})
                     except Exception: pass
-                    yield ("error", f"504: headed-browser worker produced no assistant output within {V4_FIRST_TOKEN_SEC:.0f}s")
+                    detail=(f"504: headed-browser worker produced no assistant output within "
+                            f"{V4_FIRST_TOKEN_SEC:.0f}s · {_worker_diag()} · "
+                            f"last_trace={redact(str(last_trace))[:700]}")
+                    log("ERROR", f"v4 first-output timeout · {request_id[-12:]} · {detail}")
+                    yield ("error", detail)
                     return
                 if first is not None and now-last_activity >= V4_IDLE_STREAM_SEC:
                     try: await worker["ws"].send_json({"type":"cancel","request_id":request_id})
                     except Exception: pass
-                    yield ("error", f"504: headed-browser response stalled for {V4_IDLE_STREAM_SEC:.0f}s")
+                    detail=(f"504: headed-browser response stalled for {V4_IDLE_STREAM_SEC:.0f}s · "
+                            f"{_worker_diag()} · last_trace={redact(str(last_trace))[:700]}")
+                    log("ERROR", f"v4 stream stall · {request_id[-12:]} · {detail}")
+                    yield ("error", detail)
                     return
                 continue
             et=str(event.get("type") or "")
@@ -13475,7 +13797,16 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
             if et == "trace":
                 stage=str(event.get("stage") or "?")
                 extras={k:v for k,v in event.items() if k not in {"type","request_id","stage"}}
-                log("INFO", f"v4 job trace · {request_id[-12:]} · {stage}" + (f" · {redact(str(extras))[:260]}" if extras else ""))
+                last_stage=stage
+                last_trace=extras
+                trace_count += 1
+                noisy_error_stage=any(token in stage.lower() for token in (
+                    "error","failed","missing","unresolved","timeout","diagnostic"
+                ))
+                level="WARN" if noisy_error_stage else "INFO"
+                max_detail=1800 if noisy_error_stage else 700
+                log(level, f"v4 job trace · {request_id[-12:]} · {stage}" +
+                    (f" · {redact(str(extras))[:max_detail]}" if extras else ""))
                 continue
             if et == "accepted":
                 log("INFO", f"v4 job accepted · {request_id[-12:]} · worker={worker_id}")
@@ -13522,17 +13853,34 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
                 yield ("done", accumulated or final)
                 return
             if et == "error":
-                message=str(event.get("message") or "unknown extension error")[:500]
+                message=str(event.get("message") or "unknown extension error")[:900]
+                extension_diag={
+                    k:v for k,v in event.items()
+                    if k not in {"type","request_id","message"}
+                }
                 if reuse_session and any(token in message.lower() for token in (
                     "session", "composer not found", "requested model could not be selected"
                 )):
                     _v4_session_drop(chat_id, "session UI became unusable")
-                yield ("error", "502: headed-browser worker: "+message)
+                detail=(
+                    "502: headed-browser worker: "+message+
+                    f" · {_worker_diag()}"+
+                    (f" · extension={redact(str(extension_diag))[:900]}" if extension_diag else "")
+                )
+                log("ERROR", f"v4 job error · {request_id[-12:]} · model={model_name} · "
+                             f"session={'resume' if reuse_session else 'new'} · {detail}")
+                yield ("error", detail)
                 return
     except (WebSocketDisconnect, RuntimeError) as exc:
-        yield ("error", f"502: headed-browser worker disconnected: {type(exc).__name__}")
+        detail=(f"502: headed-browser worker disconnected: {type(exc).__name__}: "
+                f"{redact(str(exc))[:300]} · worker={worker_id}")
+        log("ERROR", f"v4 transport disconnect · {request_id[-12:]} · {detail}")
+        yield ("error", detail)
     except Exception as exc:
-        yield ("error", f"502: headed-browser transport error: {type(exc).__name__}: {redact(str(exc))[:240]}")
+        detail=(f"502: headed-browser transport error: {type(exc).__name__}: "
+                f"{redact(str(exc))[:500]} · worker={worker_id}")
+        log("ERROR", f"v4 transport exception · {request_id[-12:]} · {detail}")
+        yield ("error", detail)
     finally:
         _v4_jobs.pop(request_id, None)
         await _v4_release_worker(worker_id, success=success, model=model_name,
@@ -13551,6 +13899,21 @@ async def _api_run_turn(chat_id: str, prompt: str, model_name: str, **kwargs):
             yield item
 
 
+_v4_ws_warn_last: Dict[str, float] = {}
+_v4_ws_warn_suppressed: Dict[str, int] = {}
+
+def _v4_ws_warn_once(key: str, message: str, interval: float = 20.0) -> None:
+    now=time.monotonic()
+    last=float(_v4_ws_warn_last.get(key) or 0.0)
+    if now-last >= interval:
+        suppressed=int(_v4_ws_warn_suppressed.pop(key,0) or 0)
+        suffix=f" · suppressed={suppressed}" if suppressed else ""
+        log("WARN", message+suffix)
+        _v4_ws_warn_last[key]=now
+    else:
+        _v4_ws_warn_suppressed[key]=int(_v4_ws_warn_suppressed.get(key) or 0)+1
+
+
 @app.websocket("/v4/extension/ws")
 async def v4_extension_ws(ws: WebSocket):
     token=ws.query_params.get("token", "")
@@ -13562,14 +13925,22 @@ async def v4_extension_ws(ws: WebSocket):
             log("WARN", f"v4 extension socket rejected · peer={peer} · origin={origin or '-'} · token mismatch")
             await ws.close(code=4403)
             return
-        log("WARN", f"v4 extension socket accepted from loopback with stale token · peer={peer} · origin={origin or '-'}")
+        _v4_ws_warn_once(
+            f"stale:{peer}:{origin}",
+            f"v4 extension socket accepted from loopback with stale token · peer={peer} · "
+            f"origin={origin or '-'} · server_token_mode={V4_EXTENSION_TOKEN_MODE}",
+        )
     await ws.accept()
     worker_id=None
     try:
         try:
             hello=await asyncio.wait_for(ws.receive_json(), timeout=10.0)
         except asyncio.TimeoutError:
-            log("WARN", f"v4 extension socket accepted but hello timed out · peer={peer} · origin={origin or '-'}")
+            _v4_ws_warn_once(
+                f"hello-timeout:{peer}:{origin}",
+                f"v4 extension socket hello timeout · peer={peer} · origin={origin or '-'} · "
+                f"server_token_mode={V4_EXTENSION_TOKEN_MODE} · timeout=10s",
+            )
             await ws.close(code=4408)
             return
         if hello.get("type") != "hello":
