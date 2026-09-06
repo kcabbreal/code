@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.6-worker-readiness-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.7-challenge-detection-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.6-worker-readiness-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.7-challenge-detection-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11782,8 +11782,104 @@ connect();
         with open(sw_path, "w", encoding="utf-8") as fh:
             fh.write(sw_source)
 
+        # v4.1.7: Arena normally keeps invisible reCAPTCHA/Enterprise iframes in
+        # the DOM. Those are transport prerequisites, not interactive challenge
+        # screens. Rebuild the content script with challenge detection based on
+        # visible challenge UI instead of the mere presence of a reCAPTCHA URL.
+        content_path=os.path.join(V4_EXTENSION_DIR, "arena-content.js")
+        content_source=r"""let active=null;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function visible(el){
+  if(!el)return false;
+  const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+  if(s.visibility==="hidden"||s.display==="none"||Number(s.opacity||1)===0)return false;
+  return r.width>=8&&r.height>=8;
+}
+function text(el){return (el?.innerText||el?.textContent||"").trim()}
+function emit(type,request_id,extra={}){chrome.runtime.sendMessage({type:"BRIDGENA_"+type.toUpperCase(),request_id,...extra}).catch(()=>{})}
+
+function challengePresent(){
+  // Ignore normal invisible Enterprise anchor/helper frames. Only treat a
+  // captcha/challenge iframe as active when it is actually visible and large
+  // enough to be an interactive user-facing challenge.
+  const frameChallenge=[...document.querySelectorAll("iframe")].some(f=>{
+    const src=(f.src||"").toLowerCase(),title=(f.title||"").toLowerCase();
+    if(!/(recaptcha|captcha|challenge|turnstile)/i.test(src+" "+title))return false;
+    if(!visible(f))return false;
+    const r=f.getBoundingClientRect();
+    if(r.width<180||r.height<80)return false;
+    // reCAPTCHA anchor/check-box/helper frames can exist during normal page
+    // operation. Prefer explicit challenge/bframe/dialog signals.
+    return /bframe|challenge|verify|captcha/i.test(src+" "+title) ||
+           r.height>=180;
+  });
+
+  const textChallenge=[...document.querySelectorAll(
+    '[role="dialog"],[aria-modal="true"],main,section,form,body>div'
+  )].some(el=>{
+    if(!visible(el))return false;
+    const t=text(el).replace(/\s+/g," ").trim();
+    if(!t||t.length>700)return false;
+    return /verify you are human|verification required|complete the security check|prove you are human|checking your browser/i.test(t);
+  });
+
+  return frameChallenge||textChallenge;
+}
+
+function loginRequired(){
+  // Only use visible, explicit account-auth controls; generic "Sign in" text
+  // buried in menus/footer should not de-schedule an authenticated keeper.
+  return [...document.querySelectorAll('button,a,[role="button"]')].some(x=>{
+    if(!visible(x))return false;
+    const t=text(x).replace(/\s+/g," ").trim();
+    const aria=(x.getAttribute("aria-label")||"").trim();
+    return /^(sign in|log in|login)$/i.test(t)||/^(sign in|log in|login)$/i.test(aria);
+  });
+}
+function composer(){let all=[...document.querySelectorAll('textarea,[contenteditable="true"]')].filter(visible);return all.sort((a,b)=>b.getBoundingClientRect().top-a.getBoundingClientRect().top)[0]||null}
+function sendButton(){let btns=[...document.querySelectorAll('button')].filter(visible);return btns.find(b=>/send|submit/i.test((b.getAttribute('aria-label')||'')+' '+text(b)))||btns.find(b=>b.type==='submit')||null}
+function stopButton(){return [...document.querySelectorAll('button')].find(b=>visible(b)&&/stop|cancel generation/i.test((b.getAttribute('aria-label')||'')+' '+text(b)))}
+function assistants(){let sels=['[data-message-author-role="assistant"]','[data-role="assistant"]','[data-author="assistant"]','article'];for(let s of sels){let a=[...document.querySelectorAll(s)].filter(visible).filter(x=>text(x));if(a.length)return a}return []}
+function latestAssistant(){let a=assistants();return a.length?text(a[a.length-1]):''}
+function setValue(el,value){el.focus();if(el.tagName==='TEXTAREA'||el.tagName==='INPUT'){let p=Object.getPrototypeOf(el),d=Object.getOwnPropertyDescriptor(p,'value');if(d?.set)d.set.call(el,value);else el.value=value;el.dispatchEvent(new Event('input',{bubbles:true}));}else{el.textContent=value;el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));}}
+async function clickNewChat(){let c=[...document.querySelectorAll('button,a')].find(x=>visible(x)&&/new chat|new conversation/i.test(text(x)));if(c){c.click();await sleep(500);return true}return false}
+async function selectModel(model){if(!model||model==='auto')return true;let exact=[...document.querySelectorAll('button,[role="button"]')].find(x=>visible(x)&&text(x).toLowerCase()===model.toLowerCase());if(exact)return true;let trigger=[...document.querySelectorAll('button,[role="button"]')].find(x=>visible(x)&&/model|select model/i.test((x.getAttribute('aria-label')||'')+' '+text(x)));if(trigger){trigger.click();await sleep(300);let opt=[...document.querySelectorAll('[role="option"],button,li')].find(x=>visible(x)&&text(x).toLowerCase().includes(model.toLowerCase()));if(opt){opt.click();await sleep(250);return true}}return false}
+async function run(job){if(active){emit('error',job.request_id,{message:'worker already has an active job'});return}active={id:job.request_id,last:'',cancel:false};try{
+ if(loginRequired()){emit('login_required',job.request_id);return}
+ if(challengePresent()){emit('challenge',job.request_id);return}
+ if(job.fresh_chat)await clickNewChat();
+ await selectModel(job.model);
+ let c=null;for(let i=0;i<50&&!c;i++){c=composer();if(!c)await sleep(100)}
+ if(!c)throw new Error('Arena composer not found');
+ let payload=(job.system_prompt?('System instructions:\n'+job.system_prompt+'\n\n'):'')+job.prompt;
+ setValue(c,payload);await sleep(80);
+ let b=sendButton();if(b&&!b.disabled)b.click();else c.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',bubbles:true}));
+ emit('accepted',job.request_id);
+ let stable=0,lastChange=Date.now(),seen=false;
+ while(!active.cancel){
+   if(challengePresent()){emit('challenge',job.request_id);return}
+   let cur=latestAssistant();
+   if(cur){seen=true;if(cur.startsWith(active.last)){let d=cur.slice(active.last.length);if(d){active.last=cur;lastChange=Date.now();stable=0;emit('delta',job.request_id,{text:d});}}else if(cur!==active.last){active.last=cur;lastChange=Date.now();stable=0;}}
+   let generating=!!stopButton();
+   if(seen&&!generating&&Date.now()-lastChange>900){stable++;if(stable>=2){emit('done',job.request_id,{text:active.last});return}}else stable=0;
+   await sleep(180);
+ }
+ throw new Error('job cancelled');
+ }catch(e){emit('error',job.request_id,{message:String(e?.message||e)})}finally{active=null}}
+chrome.runtime.onMessage.addListener((m)=>{if(m?.type==='BRIDGENA_SEND')run(m.job);else if(m?.type==='BRIDGENA_CANCEL'&&active?.id===m.request_id)active.cancel=true});
+
+function publishState(){
+  const challenge=challengePresent(),login=loginRequired(),ready=!challenge&&!login&&!!composer();
+  emit('worker_state','',{ready,login_required:login,challenge});
+}
+setTimeout(publishState,1200);
+setInterval(publishState,5000);
+"""
+        with open(content_path, "w", encoding="utf-8") as fh:
+            fh.write(content_source)
+
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · visible-challenge detector")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
@@ -13876,7 +13972,7 @@ def _cli():
     args = ap.parse_args()
     jars_count = len([j for j in load_jars() if not j.get("expired")])
     print("=" * 62)
-    print("  BRIDGENA v4.1.6 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
+    print("  BRIDGENA v4.1.7 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
     print("=" * 62)
     print(f"  * Live Chat   : {PUBLIC_APP_URL}/chat")
     print(f"  * Dashboard   : {PUBLIC_APP_URL}/dashboard")
