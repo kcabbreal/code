@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.18-reasoning-fingerprint-recovery")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.19-exit-stream-lanes")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1923,6 +1923,46 @@ TRANSPORT_PROBE_FRESH_SEC = max(0.0, min(60.0, float(os.environ.get("BRIDGENA_TR
 PREDISPATCH_RECOVERY_WAIT_SEC = max(4.0, min(30.0, float(os.environ.get("BRIDGENA_PREDISPATCH_RECOVERY_WAIT_SEC", "16"))))
 ACCOUNT_FAILOVER_MAX = max(0, min(6, int(os.environ.get("BRIDGENA_ACCOUNT_FAILOVER_MAX", "3"))))
 FIRST_ASSISTANT_RESPONSE_SEC = max(1.0, min(30.0, float(os.environ.get("BRIDGENA_FIRST_ASSISTANT_RESPONSE_SEC", "5"))))
+from contextlib import asynccontextmanager
+
+# Keeper lanes and proxy-exit lanes are separate capacity constraints. Several
+# keepers can legitimately share one configured SOCKS exit; cap simultaneous
+# long-lived browser streams on that shared exit so one tunnel is not
+# oversubscribed by otherwise-independent keeper workers.
+EXIT_STREAM_CONCURRENCY = max(1, min(8, int(os.environ.get("BRIDGENA_EXIT_STREAM_CONCURRENCY", "2"))))
+EXIT_STREAM_WAIT_SEC = max(1.0, min(30.0, float(os.environ.get("BRIDGENA_EXIT_STREAM_WAIT_SEC", "8"))))
+_exit_stream_lanes = {}
+
+def _exit_stream_lane(proxy):
+    key = _proxy_hkey(proxy) if proxy else "direct"
+    lane = _exit_stream_lanes.get(key)
+    if lane is None:
+        lane = asyncio.Semaphore(EXIT_STREAM_CONCURRENCY)
+        _exit_stream_lanes[key] = lane
+    return key, lane
+
+@asynccontextmanager
+async def _browser_transport_guard(session, proxy, jar_name=""):
+    key, lane = _exit_stream_lane(proxy)
+    t0 = time.monotonic()
+    acquired = False
+    try:
+        try:
+            await asyncio.wait_for(lane.acquire(), timeout=EXIT_STREAM_WAIT_SEC)
+            acquired = True
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"shared exit {key} saturated; no stream lane within {EXIT_STREAM_WAIT_SEC:.1f}s"
+            )
+        waited = time.monotonic() - t0
+        if waited >= 0.05:
+            log("INFO", f"[{jar_name}] shared-exit stream lane acquired · exit {key} · "
+                        f"wait {waited:.2f}s · limit {EXIT_STREAM_CONCURRENCY}")
+        async with session._action_lock:
+            yield key
+    finally:
+        if acquired:
+            lane.release()
 REQUIRE_PROVIDER_FINISH = os.environ.get("BRIDGENA_REQUIRE_PROVIDER_FINISH", "1").strip().lower() not in ("0", "false", "no", "off")
 ARENA_UI_STREAM_RECOVERY = os.environ.get("BRIDGENA_ARENA_UI_STREAM_RECOVERY", "1").strip().lower() not in ("0", "false", "no", "off")
 ARENA_UI_RECOVERY_TIMEOUT_SEC = max(5.0, min(60.0, float(os.environ.get("BRIDGENA_ARENA_UI_RECOVERY_TIMEOUT_SEC", "30"))))
@@ -8576,7 +8616,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                 _unknown_frames = 0
                 _semantic_deadline = _transport_t0 + FIRST_ASSISTANT_RESPONSE_SEC
 
-                async with browser_session._action_lock:
+                async with _browser_transport_guard(browser_session, proxy, jar.get("name") or jar.get("id") or "keeper"):
                     _bridge_iter = browser_session.bridge_fetch(url, base)
                     try:
                         while True:
@@ -12757,4 +12797,3 @@ def _cli():
 
 if __name__ == "__main__":
     _cli()
- 
