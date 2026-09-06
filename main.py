@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.6-mint-diagnostics")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.7-duplicate-id-recovery")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -8754,6 +8754,100 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
 
                     # A failed POST may already have been processed. Do not turn
                     # it into a new conversation or replay it automatically.
+                    #
+                    # An exact-ID retry can legitimately receive HTTP 400
+                    # "Evaluation session ... already exists." That is not a bad
+                    # client request: it is positive evidence that the original
+                    # create-evaluation POST reached Arena. Treat the duplicate as
+                    # a delivery ACK, persist the thread binding, and recover the
+                    # existing answer from Arena history/UI. Never mint a new ID
+                    # for this logical turn.
+                    _body_low = (e.body or "").lower()
+                    if (e.status == 400 and not follow_url and retry_envelope_ids
+                            and "evaluation session" in _body_low and "already exists" in _body_low):
+                        existing_id = str(base.get("id") or "")
+                        log("OK", f"[{jar.get('name')}] duplicate create ID acknowledged by Arena · "
+                                  f"evaluation {existing_id[:12]}… · recovering existing turn")
+                        _bump_undelivered_retry("duplicate_ack")
+
+                        # The 400 itself proves this evaluation exists upstream,
+                        # so establish continuity even if UI indexing is briefly
+                        # behind. This prevents the next client turn from being
+                        # rebuilt as another create-evaluation.
+                        conv2 = dict(conv)
+                        conv2["model"] = model_name
+                        conv2["arena"] = dict(conv2.get("arena") or {})
+                        conv2["arena"][model_name] = {
+                            "arena_id": existing_id, "mode": "direct",
+                            "jar_id": jar.get("id"), "proxy": proxy,
+                        }
+                        save_conversation(chat_id, conv2)
+
+                        salvage = await _attempt_ui_stream_salvage(
+                            session=browser_session,
+                            chat_id=chat_id,
+                            model_name=model_name,
+                            arena_id=existing_id,
+                            model_message_id=str(base.get("modelAMessageId") or ""),
+                            user_prompt=prompt,
+                            partial_text=response_text or "",
+                            jar=jar,
+                            proxy=proxy,
+                            cached_url=str((mc or {}).get("ui_url") or ""),
+                            timeout_sec=max(ARENA_POST_RESTART_SALVAGE_SEC, 12.0),
+                            stage="duplicate-create-ack",
+                        )
+
+                        if not salvage.get("ok"):
+                            _bump_arena_ui_recovery("post_restart_attempted")
+                            recovered_browser = await _recover_keeper_before_salvage(
+                                str(jar.get("id") or ""),
+                                reason="duplicate create acknowledged before answer recovery",
+                                timeout_sec=ARENA_SALVAGE_RECOVERY_WAIT_SEC,
+                            )
+                            if recovered_browser:
+                                browser_session = keeper.sessions.get(jar.get("id"))
+                                salvage = await _attempt_ui_stream_salvage(
+                                    session=browser_session,
+                                    chat_id=chat_id,
+                                    model_name=model_name,
+                                    arena_id=existing_id,
+                                    model_message_id=str(base.get("modelAMessageId") or ""),
+                                    user_prompt=prompt,
+                                    partial_text=response_text or "",
+                                    jar=jar,
+                                    proxy=proxy,
+                                    cached_url=str((mc or {}).get("ui_url") or ""),
+                                    timeout_sec=max(ARENA_POST_RESTART_SALVAGE_SEC, 12.0),
+                                    stage="duplicate-create-post-restart",
+                                )
+                                if salvage.get("ok"):
+                                    _bump_arena_ui_recovery("post_restart_recovered")
+
+                        if salvage.get("ok"):
+                            final_text = str(salvage.get("text") or "")
+                            suffix = str(salvage.get("suffix") or "")
+                            if suffix:
+                                response_text += suffix
+                                yield ("content", suffix)
+                            elif not response_text and final_text:
+                                response_text = final_text
+                                yield ("content", final_text)
+                            else:
+                                response_text = final_text or response_text
+                            log("OK", f"[{jar.get('name')}] duplicate-ID turn recovered · "
+                                      f"{len(response_text)} chars · source {salvage.get('source') or 'history/UI'}")
+                            yield ("done", response_text)
+                            return
+
+                        log("WARN", f"[{jar.get('name')}] duplicate create proves delivery, but answer "
+                                    "is not visible in Arena history yet; replay suppressed")
+                        yield ("error", "502: Arena confirmed that this evaluation already exists, so the original "
+                                        "turn was delivered. Bridgena suppressed replay to avoid a duplicate message, "
+                                        "but the completed answer was not visible in Arena history yet. Retry the client "
+                                        "request only after the existing thread becomes visible.")
+                        return
+
                     if verdict == "SESSION":
                         _quarantine_api_keeper(jar.get("id"), "upstream session/login gate", 180.0)
                         browser_session.status = "degraded"
