@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.23-self-healing-proxy-pool")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.24-active-20s-recovery")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1899,7 +1899,7 @@ _API_PREFERRED_EXITS_CONFIG = os.environ.get(
 # follows the actual account fleet; one healthy keeper/exit can still serve.
 _API_ADMISSION_MIN_KEEPERS = max(1, min(2, int(os.environ.get("BRIDGENA_ADMISSION_MIN_KEEPERS", "1"))))
 _API_ADMISSION_MIN_EXITS = max(1, min(2, int(os.environ.get("BRIDGENA_ADMISSION_MIN_EXITS", "1"))))
-_API_READY_RECOVERY_WAIT_SEC = max(1.0, min(20.0, float(os.environ.get("BRIDGENA_API_READY_RECOVERY_WAIT_SEC", "7"))))
+_API_READY_RECOVERY_WAIT_SEC = max(5.0, min(20.0, float(os.environ.get("BRIDGENA_API_READY_RECOVERY_WAIT_SEC", "20"))))
 
 _API_FAILURE_QUARANTINE_S = max(15.0, float(os.environ.get("BRIDGENA_FAILURE_QUARANTINE_S", "90")))
 _api_verified_keepers: Dict[str, float] = {}
@@ -11523,6 +11523,79 @@ async def openai_stream(body: dict, keyinfo: dict):
     )
 
 
+async def _force_capacity_recovery_cycle(deadline: float, *, aggressive: bool = False) -> None:
+    """Best-effort capacity repair used by API admission.
+
+    This does not submit/replay user prompts. It only:
+      * force-probes circuit-open exits without waiting for background backoff;
+      * clears stale keeper retry timers so readiness can be rechecked now;
+      * wakes the verification scheduler;
+      * starts bounded same-keeper transport recovery for broken browser sessions.
+    """
+    # 1) Force-probe every circuit-open proxy now. The background loop may be
+    # sleeping in exponential backoff, but an API request should get one fresh
+    # recovery attempt within its own bounded 20s admission budget.
+    qkeys = list(_QUARANTINED_KEYS)
+    qproxies = [p for p in (_proxy_from_key(k) for k in qkeys) if p]
+    if qproxies and time.monotonic() < deadline:
+        try:
+            loop = asyncio.get_running_loop()
+            budget = max(0.5, min(4.0, deadline - time.monotonic()))
+            await asyncio.wait_for(
+                asyncio.gather(*[
+                    loop.run_in_executor(None, _recover_proxy_once, proxy)
+                    for proxy in qproxies[:max(1, PROBE_MAX_PARALLEL)]
+                ], return_exceptions=True),
+                timeout=budget,
+            )
+        except asyncio.TimeoutError:
+            pass
+        except Exception as exc:
+            log("WARN", f"API emergency proxy recovery recovered from {type(exc).__name__}: "
+                        f"{redact(str(exc))[:120]}")
+
+    # 2) Make all authenticated keepers immediately eligible for readiness work.
+    now = time.monotonic()
+    jars = {
+        str(j.get("id")): j
+        for j in load_jars()
+        if j.get("id") and j.get("enabled", True) and jar_has_auth(j)
+    }
+    for sid in jars:
+        _verification_preflight_retry_after.pop(sid, None)
+        # Expire only API-level quarantine. Browser/session health is still checked
+        # before any keeper is admitted.
+        if _api_keeper_quarantine_until.get(sid, 0.0) > now:
+            _api_keeper_quarantine_until.pop(sid, None)
+
+    _wake_verification_scheduler()
+
+    # 3) If capacity is still zero, actively repair a small bounded cohort rather
+    # than merely waiting for the background scheduler. Existing recovery workers
+    # are de-duplicated by _schedule_transport_recovery().
+    if aggressive and _verified_keeper_count() == 0 and time.monotonic() < deadline:
+        try:
+            await keeper.sync()
+        except Exception:
+            pass
+        launched = 0
+        for sid in jars:
+            if launched >= 3:
+                break
+            session = keeper.sessions.get(sid)
+            if not session:
+                continue
+            if keeper_session_ready(session, warmed=False):
+                # A running keeper may only need its readiness lease refreshed.
+                _wake_verification_scheduler()
+                continue
+            existing = _transport_recovery_tasks.get(sid)
+            if existing and not existing.done():
+                continue
+            _schedule_transport_recovery(sid, "API admission emergency capacity recovery")
+            launched += 1
+
+
 async def _require_api_ready():
     models_ready = bool(get_models())
 
@@ -11534,7 +11607,7 @@ async def _require_api_ready():
         try:
             await asyncio.wait_for(
                 _initial_verification_sweep_done.wait(),
-                timeout=min(_API_READY_RECOVERY_WAIT_SEC, 7.0),
+                timeout=min(_API_READY_RECOVERY_WAIT_SEC, 20.0),
             )
         except asyncio.TimeoutError:
             pass
@@ -11549,20 +11622,48 @@ async def _require_api_ready():
     _wake_verification_scheduler()
     deadline = time.monotonic() + _API_READY_RECOVERY_WAIT_SEC
     last_verified = -1
+    last_exits = -1
+    last_force = 0.0
+    force_round = 0
     while time.monotonic() < deadline:
         _refresh_api_ready_event()
         if bool(get_models()) and _api_ready_event.is_set():
             verified = _verified_keeper_count()
             exits = _verified_exit_count()
-            log("OK", f"API admission recovered inline · verified keepers {verified} · exits {exits}")
+            log("OK", f"API admission recovered inline · verified keepers {verified} · exits {exits} · "
+                      f"after {force_round} active recovery round(s)")
             return
 
         verified = _verified_keeper_count()
-        if verified != last_verified:
+        exits = _verified_exit_count()
+        now = time.monotonic()
+
+        # Actively repair capacity every ~2.5s inside the request's own bounded
+        # recovery budget. This is intentionally more aggressive than the
+        # background loops when the fleet has zero usable capacity.
+        if force_round == 0 or (now - last_force) >= 2.5:
+            force_round += 1
+            last_force = now
+            await _force_capacity_recovery_cycle(
+                deadline, aggressive=(verified == 0 or exits == 0)
+            )
+            _refresh_api_ready_event()
+            if bool(get_models()) and _api_ready_event.is_set():
+                verified = _verified_keeper_count()
+                exits = _verified_exit_count()
+                log("OK", f"API admission recovered during active repair · "
+                          f"verified keepers {verified} · exits {exits} · round {force_round}")
+                return
+
+        verified = _verified_keeper_count()
+        exits = _verified_exit_count()
+        if verified != last_verified or exits != last_exits:
             preferred_keepers, preferred_exits = _api_preferred_targets()
-            log("INFO", f"API admission waiting for keeper recovery · verified {verified} · "
-                        f"target {_API_ADMISSION_MIN_KEEPERS} · preferred {preferred_keepers}")
-            last_verified = verified
+            remaining = max(0.0, deadline - time.monotonic())
+            log("INFO", f"API admission active recovery · verified {verified} · exits {exits} · "
+                        f"target {_API_ADMISSION_MIN_KEEPERS}/{_API_ADMISSION_MIN_EXITS} · "
+                        f"preferred {preferred_keepers}/{preferred_exits} · {remaining:.1f}s left")
+            last_verified, last_exits = verified, exits
         await asyncio.sleep(0.25)
 
     verified = _verified_keeper_count()
@@ -11571,10 +11672,10 @@ async def _require_api_ready():
     raise HTTPException(
         status_code=503,
         detail=(f"Bridgena runtime capacity is temporarily unavailable after "
-                f"{_API_READY_RECOVERY_WAIT_SEC:.0f}s recovery wait: "
+                f"{_API_READY_RECOVERY_WAIT_SEC:.0f}s active recovery: "
                 f"usable keepers={verified}, usable exits={exits}, "
                 f"preferred capacity={preferred_keepers}/{preferred_exits}."),
-        headers={"Retry-After": "2"},
+        headers={"Retry-After": "1"},
     )
 
 @app.post("/v1/chat/completions")
