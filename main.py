@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.13-readiness-merge-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.14-v2-escalation-credit")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -8353,7 +8353,15 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
     response_text = ""
     reasoning_text = ""
     pending_v2_token = None
-    for attempt in range(max_attempts):
+    # A server-requested V2 escalation is a protocol continuation, not a general
+    # transport retry. Reserve exactly one extra loop slot so the harvested V2
+    # token can actually be sent even when BRIDGENA_REQUEST_MAX_ATTEMPTS=1.
+    # The bonus slot is inaccessible unless pending_v2_token was produced by the
+    # immediately preceding verification rejection, so other failure classes do
+    # not silently gain an extra retry.
+    for attempt in range(max_attempts + 1):
+        if attempt >= max_attempts and not pending_v2_token:
+            break
         p = bind_persona(jar)
         jar = await _live_cookies(jar)
         if not jar_has_auth(jar):
@@ -9034,9 +9042,10 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             esc = await mint_v2_escalation(failed_jar_id, settle_s=20.0)
                             if esc:
                                 pending_v2_token = esc
-                                log("OK", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar")
-                                if attempt + 1 < max_attempts:
-                                    continue
+                                log("OK", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar via dedicated verification continuation")
+                                # Do not tie this continuation to the generic request
+                                # attempt budget. The loop reserves one V2-only slot.
+                                continue
                         if mc:
                             clear_conversation_model(chat_id, model_name)
                         log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation did not complete; keeper quarantined 45s")
