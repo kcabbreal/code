@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.11-duplicate-reconciliation")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.12-duplicate-ack-budget")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1932,6 +1932,7 @@ ARENA_HISTORY_STABLE_POLLS = max(2, min(8, int(os.environ.get("BRIDGENA_ARENA_HI
 ARENA_SALVAGE_QUICK_SEC = max(1.0, min(8.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_QUICK_SEC", "3"))))
 ARENA_POST_RESTART_SALVAGE_SEC = max(5.0, min(45.0, float(os.environ.get("BRIDGENA_ARENA_POST_RESTART_SALVAGE_SEC", "22"))))
 ARENA_DELIVERED_WAIT_SEC = max(8.0, min(90.0, float(os.environ.get("BRIDGENA_ARENA_DELIVERED_WAIT_SEC", "40"))))
+DUPLICATE_ACK_RECOVERY_BUDGET_SEC = max(8.0, min(45.0, float(os.environ.get("BRIDGENA_DUPLICATE_ACK_RECOVERY_BUDGET_SEC", "24"))))
 ARENA_SALVAGE_RECOVERY_WAIT_SEC = max(5.0, min(40.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_RECOVERY_WAIT_SEC", "18"))))
 UNDELIVERED_ENVELOPE_RETRY_MAX = max(0, min(2, int(os.environ.get("BRIDGENA_UNDELIVERED_ENVELOPE_RETRY_MAX", "1"))))
 BOUND_VERIFICATION_READY_WAIT_SEC = max(5.0, min(90.0, float(os.environ.get("BRIDGENA_BOUND_VERIFICATION_READY_WAIT_SEC", "40"))))
@@ -8863,13 +8864,15 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         existing_id = str(base.get("id") or (mc or {}).get("arena_id") or "")
                         ack_kind = "follow-up message" if _duplicate_message_ack else "create ID"
                         log("OK", f"[{jar.get('name')}] duplicate {ack_kind} acknowledged by Arena · "
-                                  f"evaluation {existing_id[:12]}… · recovering existing turn")
+                                  f"evaluation {existing_id[:12]}… · reconciling existing turn")
                         _bump_undelivered_retry("duplicate_message_ack" if _duplicate_message_ack else "duplicate_ack")
 
-                        # The 400 itself proves this evaluation exists upstream,
-                        # so establish continuity even if UI indexing is briefly
-                        # behind. This prevents the next client turn from being
-                        # rebuilt as another create-evaluation.
+                        # The HTTP 400 duplicate ACK came back through this exact
+                        # browser-origin transport, so the keeper/route is alive enough
+                        # to reach Arena. Restarting it here used to destroy useful page
+                        # state and consumed ~50s before history was polled again.
+                        # Treat the ACK as authoritative delivery proof, persist the
+                        # binding immediately, and reconcile under ONE bounded deadline.
                         conv2 = dict(conv)
                         conv2["model"] = model_name
                         conv2["arena"] = dict(conv2.get("arena") or {})
@@ -8879,6 +8882,19 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         }
                         save_conversation(chat_id, conv2)
 
+                        ack_deadline = time.monotonic() + DUPLICATE_ACK_RECOVERY_BUDGET_SEC
+
+                        def _ack_remaining(default: float = 0.0) -> float:
+                            remaining = ack_deadline - time.monotonic()
+                            return max(default, remaining)
+
+                        # First use a short current-context/history pass. Because the
+                        # duplicate ACK itself proves delivery, there is no reason to
+                        # spend the full post-restart salvage timeout here.
+                        first_wait = min(8.0, max(1.0, ack_deadline - time.monotonic()))
+                        log("INFO", f"[{jar.get('name')}] duplicate ACK proves delivery · "
+                                    f"single reconciliation budget {DUPLICATE_ACK_RECOVERY_BUDGET_SEC:.1f}s · "
+                                    f"evaluation {existing_id[:12]}…")
                         salvage = await _attempt_ui_stream_salvage(
                             session=browser_session,
                             chat_id=chat_id,
@@ -8890,19 +8906,19 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             jar=jar,
                             proxy=proxy,
                             cached_url=str((mc or {}).get("ui_url") or ""),
-                            timeout_sec=max(ARENA_POST_RESTART_SALVAGE_SEC, 12.0),
-                            stage="duplicate-create-ack",
+                            timeout_sec=first_wait,
+                            stage="duplicate-ack-fast",
                         )
 
+                        # If indexing/generation is still catching up, spend only the
+                        # REMAINDER of the same budget polling the exact persisted turn.
+                        # Never restart the keeper and never resubmit the prompt here.
                         if not salvage.get("ok"):
-                            _bump_arena_ui_recovery("post_restart_attempted")
-                            recovered_browser = await _recover_keeper_before_salvage(
-                                str(jar.get("id") or ""),
-                                reason="duplicate create acknowledged before answer recovery",
-                                timeout_sec=ARENA_SALVAGE_RECOVERY_WAIT_SEC,
-                            )
-                            if recovered_browser:
-                                browser_session = keeper.sessions.get(jar.get("id"))
+                            remaining = ack_deadline - time.monotonic()
+                            if remaining > 0.75:
+                                browser_session = keeper.sessions.get(jar.get("id")) or browser_session
+                                log("INFO", f"[{jar.get('name')}] duplicate turn not visible yet; "
+                                            f"polling persisted evaluation for remaining {remaining:.1f}s")
                                 salvage = await _attempt_ui_stream_salvage(
                                     session=browser_session,
                                     chat_id=chat_id,
@@ -8913,38 +8929,10 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                     partial_text=response_text or "",
                                     jar=jar,
                                     proxy=proxy,
-                                    cached_url=str((mc or {}).get("ui_url") or ""),
-                                    timeout_sec=max(ARENA_POST_RESTART_SALVAGE_SEC, 12.0),
-                                    stage="duplicate-create-post-restart",
+                                    cached_url=str(salvage.get("url") or (mc or {}).get("ui_url") or ""),
+                                    timeout_sec=remaining,
+                                    stage="duplicate-ack-budget",
                                 )
-                                if salvage.get("ok"):
-                                    _bump_arena_ui_recovery("post_restart_recovered")
-
-                        # A duplicate ACK is itself authoritative proof that the exact
-                        # evaluation/message already exists upstream. History indexing
-                        # can lag behind that ACK, so do not require trace_found from the
-                        # first two salvage passes before entering the delivered-turn
-                        # completion window. Poll the exact persisted evaluation only;
-                        # never resubmit the prompt or mint replacement message IDs.
-                        if not salvage.get("ok"):
-                            browser_session = keeper.sessions.get(jar.get("id")) or browser_session
-                            log("INFO", f"[{jar.get('name')}] duplicate ACK proves delivery; "
-                                        f"polling exact Arena turn for up to {ARENA_DELIVERED_WAIT_SEC:.1f}s · "
-                                        f"evaluation {existing_id[:12]}…")
-                            salvage = await _attempt_ui_stream_salvage(
-                                session=browser_session,
-                                chat_id=chat_id,
-                                model_name=model_name,
-                                arena_id=existing_id,
-                                model_message_id=str(base.get("modelAMessageId") or ""),
-                                user_prompt=prompt,
-                                partial_text=response_text or "",
-                                jar=jar,
-                                proxy=proxy,
-                                cached_url=str(salvage.get("url") or (mc or {}).get("ui_url") or ""),
-                                timeout_sec=ARENA_DELIVERED_WAIT_SEC,
-                                stage="duplicate-delivered-wait",
-                            )
 
                         if salvage.get("ok"):
                             final_text = str(salvage.get("text") or "")
@@ -8962,12 +8950,17 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             yield ("done", response_text)
                             return
 
+                        # Delivery is known; returning within the client-facing budget is
+                        # preferable to keeping the SSE request open until the caller
+                        # disconnects. The persisted binding prevents this turn from
+                        # being mistaken for a fresh create on the next request.
                         log("WARN", f"[{jar.get('name')}] duplicate {'follow-up message' if _duplicate_message_ack else 'create'} "
-                                    "proves delivery, but answer was still incomplete after the delivered-turn recovery window; replay suppressed")
+                                    f"delivery confirmed but answer not reconciled within {DUPLICATE_ACK_RECOVERY_BUDGET_SEC:.1f}s; "
+                                    "binding preserved and replay suppressed")
                         yield ("error", "502: Arena confirmed that this exact message/evaluation already exists, so the "
-                                        "original turn was delivered. Bridgena suppressed replay and kept the existing "
-                                        "evaluation binding, but the completed answer was still unavailable after the "
-                                        "delivered-turn recovery window.")
+                                        "original turn was delivered. Bridgena preserved the existing evaluation binding and "
+                                        "suppressed replay, but the completed answer was not visible before the bounded "
+                                        "duplicate-reconciliation deadline.")
                         return
 
                     if verdict == "SESSION":
