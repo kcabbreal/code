@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.2.1-transcript-ack-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.2.2-navigation-deadlock-recovery-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.2.1-transcript-ack-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.2.2-navigation-deadlock-recovery-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11993,7 +11993,7 @@ def _v4_prepare_bundled_extension():
         if "debugger" not in perms:
             perms.append("debugger")
         manifest["permissions"]=perms
-        manifest["version"]="4.2.1"
+        manifest["version"]="4.2.2"
         with open(manifest_path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
             fh.write("\n")
@@ -12005,6 +12005,28 @@ def _v4_prepare_bundled_extension():
 
         sw_template = r"""const BOOT = __BOOT__;
 let ws=null,reconnectTimer=null,pingTimer=null,currentRequest=null;
+let pendingJob=null,pendingTabId=null,currentPhase="",lastDispatchAt=0;
+
+async function dispatchJob(tab,job,reason="server"){
+  if(!tab?.id||!job)return false;
+  pendingTabId=tab.id;
+  lastDispatchAt=Date.now();
+  send({
+    type:"trace",request_id:job.request_id,
+    stage:"sw-dispatch",reason,tab_id:tab.id
+  });
+  try{
+    await chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_SEND",job});
+    return true;
+  }catch(e){
+    send({
+      type:"trace",request_id:job.request_id,
+      stage:"sw-dispatch-failed",reason,
+      message:String(e?.message||e).slice(0,160)
+    });
+    return false;
+  }
+}
 
 async function cfg() {
   const saved=await chrome.storage.local.get({workerId:"",proxyLabel:""});
@@ -12028,11 +12050,31 @@ async function connect(){
   ws.onopen=()=>{send({type:"hello",worker_id:c.workerId,ready:true,proxy:c.proxyLabel||"",user_agent:navigator.userAgent});
     clearInterval(pingTimer);pingTimer=setInterval(()=>send({type:"heartbeat",ts:Date.now(),request_id:currentRequest||""}),15000);};
   ws.onmessage=async(ev)=>{let m;try{m=JSON.parse(ev.data)}catch{return}
-    if(m.type==="send_message"){currentRequest=m.request_id;let tab=await activeArenaTab();
-      try{await chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_SEND",job:m});}
-      catch(e){try{await chrome.tabs.reload(tab.id);setTimeout(()=>chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_SEND",job:m}).catch(x=>send({type:"error",request_id:m.request_id,message:String(x)})),1600);}
-      catch(x){send({type:"error",request_id:m.request_id,message:String(x)});}}}
-    else if(m.type==="cancel"){let tab=await activeArenaTab();chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_CANCEL",request_id:m.request_id}).catch(()=>{});}
+    if(m.type==="send_message"){
+      currentRequest=m.request_id;
+      pendingJob=m;
+      currentPhase="dispatch";
+      let tab=await activeArenaTab();
+      const ok=await dispatchJob(tab,m,"server");
+      if(!ok){
+        try{
+          await chrome.tabs.reload(tab.id);
+          setTimeout(async()=>{
+            const retry=await dispatchJob(tab,m,"reload-retry");
+            if(!retry)send({type:"error",request_id:m.request_id,message:"content script unavailable after reload"});
+          },1800);
+        }catch(x){
+          send({type:"error",request_id:m.request_id,message:String(x)});
+        }
+      }
+    }
+    else if(m.type==="cancel"){
+      let tab=await activeArenaTab();
+      chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_CANCEL",request_id:m.request_id}).catch(()=>{});
+      if(currentRequest===m.request_id){
+        currentRequest=null;pendingJob=null;pendingTabId=null;currentPhase="";
+      }
+    }
   };
   ws.onclose=()=>{clearInterval(pingTimer);reconnectTimer=setTimeout(connect,1500);};
   ws.onerror=()=>{try{ws.close()}catch{}};
@@ -12080,6 +12122,30 @@ async function nativeSubmit(tabId,msg){
 chrome.runtime.onMessage.addListener((msg,sender,sendResponse)=>{
   if(!msg||!msg.type)return;
 
+  // Local lifecycle messages stay inside the extension. They let the service
+  // worker recover only navigation that happened BEFORE prompt submission.
+  if(msg.type==="BRIDGENA_PHASE_LOCAL"){
+    if(msg.request_id&&msg.request_id===currentRequest){
+      currentPhase=String(msg.phase||"");
+    }
+    return;
+  }
+
+  if(msg.type==="BRIDGENA_CONTENT_READY_LOCAL"){
+    const tabId=sender?.tab?.id;
+    const canResume=!!(
+      pendingJob && currentRequest===pendingJob.request_id &&
+      tabId && (pendingTabId===null||pendingTabId===tabId) &&
+      currentPhase==="pre_navigation" &&
+      Date.now()-lastDispatchAt>300
+    );
+    if(canResume){
+      const recovered={...pendingJob,_navigation_recovered:true};
+      setTimeout(()=>dispatchJob({id:tabId},recovered,"post-navigation-resume"),120);
+    }
+    return;
+  }
+
   if(msg.type==="BRIDGENA_NATIVE_SUBMIT_LOCAL"){
     nativeSubmit(sender?.tab?.id,msg)
       .then(r=>sendResponse(r))
@@ -12090,7 +12156,16 @@ chrome.runtime.onMessage.addListener((msg,sender,sendResponse)=>{
   if(msg.type.startsWith("BRIDGENA_")){
     let out={...msg};delete out.type;
     send({type:msg.type.replace("BRIDGENA_","").toLowerCase(),...out});
-    if(msg.type==="BRIDGENA_DONE"||msg.type==="BRIDGENA_ERROR")currentRequest=null;
+    if(
+      msg.type==="BRIDGENA_DONE"||
+      msg.type==="BRIDGENA_ERROR"||
+      msg.type==="BRIDGENA_CHALLENGE"||
+      msg.type==="BRIDGENA_LOGIN_REQUIRED"
+    ){
+      if(!msg.request_id||msg.request_id===currentRequest){
+        currentRequest=null;pendingJob=null;pendingTabId=null;currentPhase="";
+      }
+    }
   }
 });
 chrome.runtime.onInstalled.addListener(()=>connect());
@@ -12118,6 +12193,11 @@ function visible(el){
 function txt(el){return (el?.innerText||el?.textContent||"").trim()}
 function emit(type,request_id,extra={}){chrome.runtime.sendMessage({type:"BRIDGENA_"+type.toUpperCase(),request_id,...extra}).catch(()=>{})}
 function trace(id,stage,extra={}){emit("trace",id,{stage,...extra})}
+function phase(id,value){
+  chrome.runtime.sendMessage({
+    type:"BRIDGENA_PHASE_LOCAL",request_id:id,phase:String(value||"")
+  }).catch(()=>{});
+}
 
 function challengePresent(){
   const frameChallenge=[...document.querySelectorAll("iframe")].some(f=>{
@@ -12208,11 +12288,32 @@ async function waitForComposer(timeoutMs=12000,id=null,stage="composer-wait"){
   return null;
 }
 
-async function settleUi(ms=500){
-  const until=Date.now()+ms;
-  while(Date.now()<until){
-    await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
-    await sleep(40);
+async function frameOrTimer(maxWait=100){
+  return await Promise.race([
+    new Promise(resolve=>{
+      try{
+        requestAnimationFrame(()=>requestAnimationFrame(()=>resolve("raf")));
+      }catch{resolve("no-raf")}
+    }),
+    sleep(maxWait).then(()=>"timer")
+  ]);
+}
+
+async function settleUi(ms=500,id=null,stage="ui-settle"){
+  const started=Date.now();
+  let rafTicks=0,timerFallbacks=0;
+  while(Date.now()-started<ms){
+    const mode=await frameOrTimer(Math.min(120,Math.max(40,ms)));
+    if(mode==="raf")rafTicks++;else timerFallbacks++;
+    await sleep(20);
+  }
+  if(id&&timerFallbacks){
+    trace(id,stage,{
+      elapsed_ms:Date.now()-started,
+      raf_ticks:rafTicks,
+      timer_fallbacks:timerFallbacks,
+      visibility:document.visibilityState
+    });
   }
 }
 
@@ -12390,14 +12491,33 @@ async function setValue(el,value,id){
   });
 }
 
-async function clickNewChat(){
+async function clickNewChat(id=null){
   const c=[...document.querySelectorAll('button,a,[role="button"]')].find(x=>
     visible(x)&&/new chat|new conversation|start new/i.test((x.getAttribute("aria-label")||"")+" "+txt(x))
   );
   if(!c)return false;
+  if(id)trace(id,"fresh-chat-click",{
+    href:location.href,
+    visibility:document.visibilityState,
+    label:(c.getAttribute("aria-label")||txt(c)).slice(0,100)
+  });
   c.click();
-  await settleUi(350);
+  await settleUi(350,id,"fresh-chat-settle");
   return true;
+}
+
+function blankChatShell(){
+  const c=composer();
+  if(!c||stopButton())return false;
+  if(conversationMessageCount()>0)return false;
+  if(assistantCandidates("").length>0)return false;
+
+  // Extra semantic-role guard in case Arena changed generic message wrappers.
+  const explicit=document.querySelectorAll(
+    '[data-message-author-role="user"],[data-message-author-role="assistant"],'+
+    '[data-role="user"],[data-role="assistant"],[data-author="user"],[data-author="assistant"]'
+  );
+  return explicit.length===0;
 }
 
 async function selectModel(model){
@@ -12872,7 +12992,13 @@ async function run(job){
   if(active){emit('error',job.request_id,{message:'worker already has an active job'});return}
   active={id:job.request_id,last:'',cancel:false};
   try{
-    trace(job.request_id,"job-received",{model:job.model||"auto"});
+    trace(job.request_id,"job-received",{
+      model:job.model||"auto",
+      navigation_recovered:!!job._navigation_recovered,
+      visibility:document.visibilityState,
+      href:location.href
+    });
+    phase(job.request_id,"started");
     if(loginRequired()){trace(job.request_id,"login-required");emit('login_required',job.request_id);return}
     if(challengePresent()){trace(job.request_id,"challenge-visible");emit('challenge',job.request_id);return}
 
@@ -12886,14 +13012,41 @@ async function run(job){
     }
 
     if(!usingSession){
-      const nc=await clickNewChat();
-      trace(job.request_id,"fresh-chat",{clicked:nc,recovery:!!job.reuse_session});
-      let postFresh=await waitForComposer(10000,job.request_id,"post-fresh-chat-wait");
-      if(!postFresh&&nc){
-        await settleUi(650);
-        const nc2=await clickNewChat();
-        trace(job.request_id,"fresh-chat-retry",{clicked:nc2});
-        postFresh=await waitForComposer(8000,job.request_id,"post-fresh-chat-retry-wait");
+      trace(job.request_id,"fresh-chat-preflight",{
+        blank_shell:blankChatShell(),
+        navigation_recovered:!!job._navigation_recovered,
+        messages:conversationMessageCount(),
+        href:location.href
+      });
+
+      if(blankChatShell()){
+        // Fresh keeper startup already gives us an empty Arena conversation.
+        // Clicking "New chat" here only adds a navigation/rerender failure
+        // surface and provides no isolation benefit.
+        trace(job.request_id,"fresh-chat",{
+          clicked:false,reused_blank:true,
+          recovery:!!job.reuse_session,
+          navigation_recovered:!!job._navigation_recovered
+        });
+      }else{
+        phase(job.request_id,"pre_navigation");
+        const nc=await clickNewChat(job.request_id);
+        trace(job.request_id,"fresh-chat",{
+          clicked:nc,reused_blank:false,
+          recovery:!!job.reuse_session,
+          navigation_recovered:!!job._navigation_recovered
+        });
+        phase(job.request_id,"post_navigation");
+
+        let postFresh=await waitForComposer(10000,job.request_id,"post-fresh-chat-wait");
+        if(!postFresh&&nc){
+          await settleUi(650,job.request_id,"fresh-chat-retry-settle");
+          phase(job.request_id,"pre_navigation");
+          const nc2=await clickNewChat(job.request_id);
+          trace(job.request_id,"fresh-chat-retry",{clicked:nc2});
+          phase(job.request_id,"post_navigation");
+          postFresh=await waitForComposer(8000,job.request_id,"post-fresh-chat-retry-wait");
+        }
       }
     }
 
@@ -12938,6 +13091,7 @@ async function run(job){
     const payload=((!usingSession&&job.system_prompt)?('System instructions:\n'+job.system_prompt+'\n\n'):'')+basePrompt;
     const baseline=assistantSnapshot(payload);
     let tracker=responseTracker(c,payload,job.request_id);
+    phase(job.request_id,"pre_submit");
     const submitted=await submitPrompt(c,payload,job.request_id);
     if(!submitted){
       tracker.stop();
@@ -12955,6 +13109,7 @@ async function run(job){
       throw new Error("Arena prompt could not be strongly confirmed as submitted");
     }
 
+    phase(job.request_id,"submitted");
     // Capture the real Arena conversation as soon as a committed submit exists.
     emit('session_update',job.request_id,{chat_id:job.chat_id||"",url:location.href,model:job.model||"auto"});
 
@@ -13125,6 +13280,14 @@ chrome.runtime.onMessage.addListener((m)=>{
   else if(m?.type==='BRIDGENA_CANCEL'&&active?.id===m.request_id)active.cancel=true
 });
 
+setTimeout(()=>{
+  chrome.runtime.sendMessage({
+    type:"BRIDGENA_CONTENT_READY_LOCAL",
+    href:location.href,
+    visibility:document.visibilityState
+  }).catch(()=>{});
+},80);
+
 function publishState(){
   const challenge=challengePresent(),login=loginRequired(),ready=!challenge&&!login&&!!composer();
   emit('worker_state','',{ready,login_required:login,challenge});
@@ -13136,7 +13299,7 @@ setInterval(publishState,5000);
             fh.write(content_source)
 
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + transcript-delta ACK v4.2.1")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + navigation-deadlock recovery v4.2.2")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
