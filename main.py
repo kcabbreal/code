@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.19-exit-stream-lanes")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.20-stream-forensics")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -4870,6 +4870,7 @@ class KeeperSession:
                             stopReason: responseStarted ? 'stream-error' : 'fetch-error'};
                 }
             }"""
+            _bridge_started_at = time.monotonic()
             eval_task = asyncio.create_task(asyncio.wait_for(page.evaluate(
                 script, [url, payload, req_id, RECAPTCHA_ACTION, STREAM_TAIL_GRACE_MS]
             ), timeout=180.0))
@@ -4894,7 +4895,23 @@ class KeeperSession:
                         next_index += 1
                 else:
                     yield line
-            result = await eval_task
+            try:
+                result = await eval_task
+            except Exception as _bridge_eval_exc:
+                _elapsed = time.monotonic() - _bridge_started_at
+                try:
+                    _page_closed = bool(page.is_closed())
+                except Exception:
+                    _page_closed = True
+                try:
+                    _page_url = str(page.url or "")[:180]
+                except Exception:
+                    _page_url = "<unavailable>"
+                log("WARN", f"[{self.name}] bridge evaluate terminated · elapsed {_elapsed:.2f}s · "
+                            f"page_closed={_page_closed} · page={_page_url} · "
+                            f"active_requests={self.active_requests} · "
+                            f"{type(_bridge_eval_exc).__name__}: {str(_bridge_eval_exc)[:220]}")
+                raise
             if eval_task.exception():
                 raise RuntimeError(f"Bridge evaluate exception: {eval_task.exception()}")
             # Console delivery can drop messages under load. The page retains
@@ -4922,6 +4939,44 @@ class KeeperSession:
                 stream_error = bool(result.get("streamError"))
                 finish_seen = bool(result.get("finishSeen"))
                 stop_reason = str(result.get("stopReason") or "unknown")
+
+                # Privacy-safe stream forensics: record frame *shape*, never payload text.
+                # This is intentionally diagnostic-only and must not alter decoding.
+                _raw_lines = list(result.get("lines") or [])
+                _frame_kinds = {}
+                _tail_shapes = []
+                for _raw in _raw_lines:
+                    _s = str(_raw or "").strip()
+                    _prefix = "plain"
+                    _etype = ""
+                    if ":" in _s:
+                        _candidate = _s.split(":", 1)[0].strip()
+                        if 0 < len(_candidate) <= 24:
+                            _prefix = _candidate
+                    _m = re.search(r'["\\\'](?:type|event)["\\\']\\s*:\\s*["\\\']([^"\\\']{1,48})', _s)
+                    if _m:
+                        _etype = _m.group(1)
+                    _key = f"{_prefix}/{_etype}" if _etype else _prefix
+                    _frame_kinds[_key] = _frame_kinds.get(_key, 0) + 1
+                    _tail_shapes.append(f"{_key}@{len(_s)}")
+                _tail_shapes = _tail_shapes[-12:]
+                _kind_summary = ",".join(f"{k}={v}" for k, v in sorted(_frame_kinds.items())[:20]) or "none"
+                _tail_summary = " | ".join(_tail_shapes) or "none"
+                _elapsed = time.monotonic() - _bridge_started_at
+                try:
+                    _page_closed = bool(page.is_closed())
+                except Exception:
+                    _page_closed = True
+                try:
+                    _page_url = str(page.url or "")[:160]
+                except Exception:
+                    _page_url = "<unavailable>"
+
+                if status_code == 200 and (stream_error or not finish_seen):
+                    log("WARN", f"[{self.name}] stream forensics · elapsed {_elapsed:.2f}s · "
+                                f"stop={stop_reason} · error={stream_error} · finish={finish_seen} · "
+                                f"page_closed={_page_closed} · page={_page_url} · "
+                                f"kinds[{_kind_summary}] · tail[{_tail_summary}]")
 
                 if status_code == 200 and stream_error and finish_seen:
                     # The provider already emitted its semantic terminal frame.
