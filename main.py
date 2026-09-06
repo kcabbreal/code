@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.11-public-model-labels-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.12-arena-ui-model-label-sync.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.11-public-model-labels-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.12-arena-ui-model-label-sync")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -897,22 +897,27 @@ def get_solver(models_dir: Optional[str] = None) -> RecaptchaSolver:
 
 
 def model_name(m) -> str:
-    """Return Arena's user-facing model label.
-
-    Arena catalog objects may carry a machine slug in `name`/`id` while the
-    actual label shown in the Arena UI lives in `publicName`. Public Bridgena
-    surfaces should therefore prefer `publicName`.
-    """
+    """Return the label a human actually sees in Arena's model picker."""
     if isinstance(m, str):
         return m
-    return m.get("publicName") or m.get("name") or m.get("id") or ""
+    for key in (
+        "uiName", "displayName", "modelDisplayName", "display_name",
+        "label", "title", "publicName", "name", "id",
+    ):
+        value = str(m.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _model_aliases(m) -> list[str]:
     if isinstance(m, str):
         return [m]
     out = []
-    for key in ("publicName", "name", "id"):
+    for key in (
+        "uiName", "displayName", "modelDisplayName", "display_name",
+        "label", "title", "publicName", "name", "id",
+    ):
         value = str(m.get(key) or "").strip()
         if value and value not in out:
             out.append(value)
@@ -2572,13 +2577,15 @@ async def refresh_models_via_worker(worker):
         def _looks_like_model_entry(v):
             if not isinstance(v, dict):
                 return False
-            ident = v.get("id") or v.get("publicName") or v.get("name")
+            ident = (
+                v.get("id") or v.get("publicName") or v.get("displayName")
+                or v.get("modelDisplayName") or v.get("label") or v.get("name")
+            )
             if not isinstance(ident, str) or not ident.strip():
                 return False
-            # Avoid generic page arrays by requiring a second model-ish signal
-            # when possible. Catalog entries vary, so this stays permissive.
             return any(k in v for k in (
-                "publicName", "organization", "capabilities", "provider",
+                "publicName", "displayName", "modelDisplayName", "display_name",
+                "label", "title", "organization", "capabilities", "provider",
                 "modelOrganization", "access", "availability", "outputCapabilities"
             )) or ("model" in str(v.get("type", "")).lower())
 
@@ -2673,12 +2680,127 @@ async def refresh_models_via_worker(worker):
         except Exception as e:
             log("WARN", f"Failed to write raw model debug dump: {e}")
 
+        # Learn the names Arena actually renders in its model picker. Catalog
+        # `id` / `publicName` values are not guaranteed to be selectable UI
+        # strings (e.g. `glm-5.2` vs `glm-5.2 (max)`).
+        ui_labels = []
+        try:
+            async with worker._action_lock:
+                page = worker.page
+                trigger = await page.evaluate("""
+                () => {
+                  const vis = e => {
+                    if (!e) return false;
+                    const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+                    return r.width>4 && r.height>4 && s.display!=='none' && s.visibility!=='hidden';
+                  };
+                  const txt=e=>(e.innerText||e.textContent||'').trim();
+                  const nodes=[...document.querySelectorAll('button,[role="button"]')].filter(vis);
+                  const scored=nodes.map((e,i)=>{
+                    const blob=((e.getAttribute('aria-label')||'')+' '+(e.getAttribute('data-testid')||'')+' '+txt(e)).toLowerCase();
+                    let score=0;
+                    if(/select model|choose model|model selector/.test(blob))score+=100;
+                    if(/\\bmodel\\b/.test(blob))score+=50;
+                    if(e.getAttribute('aria-haspopup'))score+=15;
+                    if(/^(max|auto|battle|side by side)$/i.test(txt(e)))score+=12;
+                    return {i,score};
+                  }).sort((a,b)=>b.score-a.score);
+                  return scored[0] && scored[0].score>=12 ? scored[0].i : -1;
+                }
+                """)
+                if isinstance(trigger, int) and trigger >= 0:
+                    buttons = page.locator('button,[role="button"]')
+                    if trigger < await buttons.count():
+                        await buttons.nth(trigger).click(timeout=3000)
+                        await page.wait_for_timeout(450)
+                        ui_labels = await page.evaluate("""
+                        () => {
+                          const vis=e=>{
+                            if(!e)return false;
+                            const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+                            return r.width>4&&r.height>4&&s.display!=='none'&&s.visibility!=='hidden';
+                          };
+                          const clean=s=>(s||'').replace(/\\s+/g,' ').trim();
+                          const sels=[
+                            '[role="option"]','[role="menuitem"]','[role="menuitemradio"]',
+                            '[role="listbox"] button','[role="menu"] button',
+                            '[data-radix-popper-content-wrapper] button',
+                            '[data-radix-popper-content-wrapper] [role="option"]',
+                            '[data-radix-popper-content-wrapper] [role="menuitem"]'
+                          ];
+                          const out=[];
+                          for(const sel of sels){
+                            for(const e of document.querySelectorAll(sel)){
+                              if(!vis(e))continue;
+                              const t=clean(e.innerText||e.textContent);
+                              if(!t||t.length>140)continue;
+                              if(/^(search|close|cancel|manage|learn more)$/i.test(t))continue;
+                              if(!out.includes(t))out.push(t);
+                            }
+                          }
+                          return out.slice(0,1000);
+                        }
+                        """)
+                        try:
+                            await page.keyboard.press("Escape")
+                        except Exception:
+                            pass
+        except Exception as e:
+            log("WARN", f"[{worker.name}] Arena UI model-label scan skipped: {type(e).__name__}: {e}")
+
+        def _ui_key(s: str) -> str:
+            s = str(s or "").strip().lower()
+            s = re.sub(r"[^a-z0-9]+", " ", s)
+            return re.sub(r"\\s+", " ", s).strip()
+
+        def _base_ui_key(s: str) -> str:
+            # Parenthetical Arena tier suffixes such as "(max)" should not stop
+            # us matching the catalog slug to the visible picker label.
+            s = re.sub(r"\\s*\\([^)]*\\)\\s*$", "", str(s or "")).strip()
+            return _ui_key(s)
+
+        if ui_labels:
+            normalized_ui = [(label, _ui_key(label), _base_ui_key(label)) for label in ui_labels]
+            matched = 0
+            for m in models_data:
+                if not isinstance(m, dict):
+                    continue
+                aliases = []
+                for key in ("displayName","modelDisplayName","display_name","label","title","publicName","name","id"):
+                    value = str(m.get(key) or "").strip()
+                    if value and value not in aliases:
+                        aliases.append(value)
+                best = None
+                best_score = -1
+                for alias in aliases:
+                    ak, ab = _ui_key(alias), _base_ui_key(alias)
+                    if not ak:
+                        continue
+                    for label, lk, lb in normalized_ui:
+                        score = -1
+                        if ak == lk:
+                            score = 1000
+                        elif ab and ab == lb:
+                            score = 950
+                        elif lk.startswith(ak + " ") or ak.startswith(lk + " "):
+                            score = 800
+                        elif lb.startswith(ab + " ") or ab.startswith(lb + " "):
+                            score = 760
+                        if score > best_score:
+                            best_score, best = score, label
+                if best and best_score >= 760:
+                    m["uiName"] = best
+                    matched += 1
+            log("INFO", f"[{worker.name}] Arena UI model labels learned · visible={len(ui_labels)} · matched={matched}")
+        else:
+            log("WARN", f"[{worker.name}] Arena UI model-label scan found no visible picker entries")
+
         filtered = []
         hidden = []
         for m in models_data:
             if not isinstance(m, dict):
                 continue
-            name = m.get("publicName") or m.get("id") or m.get("name")
+            name = model_name(m) or m.get("id") or m.get("name")
             if not name:
                 continue
             if not is_model_selectable(m):
@@ -11945,21 +12067,42 @@ async function clickNewChat(){
 
 async function selectModel(model){
   if(!model||model==='auto')return true;
-  const current=[...document.querySelectorAll('button,[role="button"]')].find(x=>
-    visible(x)&&txt(x).trim().toLowerCase()===model.toLowerCase()
-  );
+  const clean=s=>(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  const base=s=>clean(String(s||'').replace(/\s*\([^)]*\)\s*$/,''));
+  const wanted=clean(model),wantedBase=base(model);
+
+  const current=[...document.querySelectorAll('button,[role="button"]')].find(x=>{
+    if(!visible(x))return false;
+    const t=txt(x).trim();
+    return clean(t)===wanted || base(t)===wantedBase;
+  });
   if(current)return true;
-  const trigger=[...document.querySelectorAll('button,[role="button"]')].find(x=>
-    visible(x)&&/model|select model/i.test((x.getAttribute('aria-label')||'')+' '+(x.getAttribute('data-testid')||'')+' '+txt(x))
-  );
+
+  const triggers=[...document.querySelectorAll('button,[role="button"]')].filter(visible);
+  const trigger=triggers.find(x=>/select model|choose model|model selector/i.test(
+    (x.getAttribute('aria-label')||'')+' '+(x.getAttribute('data-testid')||'')+' '+txt(x)
+  ))||triggers.find(x=>/\bmodel\b/i.test(
+    (x.getAttribute('aria-label')||'')+' '+(x.getAttribute('data-testid')||'')+' '+txt(x)
+  ))||triggers.find(x=>/^(max|auto|battle|side by side)$/i.test(txt(x).trim()));
+
   if(!trigger)return false;
-  trigger.click();await sleep(350);
-  const opt=[...document.querySelectorAll('[role="option"],[role="menuitem"],button,li,div')].find(x=>
-    visible(x)&&txt(x).trim().toLowerCase()===model.toLowerCase()
-  )||[...document.querySelectorAll('[role="option"],[role="menuitem"],button,li')].find(x=>
-    visible(x)&&txt(x).toLowerCase().includes(model.toLowerCase())
-  );
-  if(opt){opt.click();await sleep(350);return true}
+  trigger.click();await sleep(450);
+
+  const nodes=[...document.querySelectorAll(
+    '[role="option"],[role="menuitem"],[role="menuitemradio"],[role="listbox"] button,[role="menu"] button,li,button'
+  )].filter(visible);
+
+  const exact=nodes.find(x=>clean(txt(x))===wanted);
+  const baseExact=nodes.filter(x=>base(txt(x))===wantedBase);
+  const prefix=nodes.filter(x=>{
+    const t=clean(txt(x)),b=base(txt(x));
+    return t.startsWith(wanted+' ')||wanted.startsWith(t+' ')||
+           b.startsWith(wantedBase+' ')||wantedBase.startsWith(b+' ');
+  });
+
+  const opt=exact || (baseExact.length===1?baseExact[0]:null) || (prefix.length===1?prefix[0]:null);
+  if(opt){opt.click();await sleep(400);return true}
+  try{document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true}))}catch{}
   return false;
 }
 
@@ -12244,7 +12387,7 @@ setInterval(publishState,5000);
             fh.write(content_source)
 
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + public model labels v4.1.11")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + Arena UI model-label sync v4.1.12")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
@@ -14389,4 +14532,3 @@ def _cli():
 
 if __name__ == "__main__":
     _cli()
-
