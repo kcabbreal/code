@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# ================================================================
+#  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
+#  modules: core · identity · pool · keepers · verification · UI · API · VNC
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.3.1-fresh-extension-submit-fix.py).
+# ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -309,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.3.0-reliability-observability-sweep")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.3.1-fresh-extension-submit-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11939,7 +11944,23 @@ V4_AUTOLAUNCH = os.environ.get("BRIDGENA_V4_AUTOLAUNCH", "0").strip().lower() in
 V4_AUTO_ATTACH_KEEPERS = os.environ.get("BRIDGENA_V4_AUTO_ATTACH_KEEPERS", "1").strip().lower() in {"1","true","yes","on"}
 V4_CHROME_BIN = os.environ.get("BRIDGENA_V4_CHROME_BIN", "").strip()
 V4_PROFILE_DIR = os.environ.get("BRIDGENA_V4_PROFILE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser-profile"))
-V4_EXTENSION_DIR = os.environ.get("BRIDGENA_V4_EXTENSION_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension"))
+
+# V4_EXTENSION_SOURCE_DIR is the operator/bundled template. Chromium is loaded
+# from V4_EXTENSION_DIR, a build-specific copy. Unpacked Chrome extension state
+# is cached by profile + extension identity; using a build-isolated directory
+# makes stale service-worker/content-script execution impossible after upgrades.
+V4_EXTENSION_BUILD = "4.3.1"
+V4_EXTENSION_SOURCE_DIR = os.environ.get(
+    "BRIDGENA_V4_EXTENSION_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension"),
+)
+V4_EXTENSION_DIR = os.environ.get(
+    "BRIDGENA_V4_RUNTIME_EXTENSION_DIR",
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        f".bridgena-extension-v{V4_EXTENSION_BUILD}",
+    ),
+)
 V4_BROWSER_PROXY = os.environ.get("BRIDGENA_V4_BROWSER_PROXY", "").strip()
 
 # v4.2: logical API conversations stay attached to their real Arena chat.
@@ -11971,6 +11992,7 @@ def _v4_sessions_load() -> None:
                             "worker_id": str(item.get("worker_id") or ""),
                             "url": str(item.get("url") or ""),
                             "model": str(item.get("model") or "auto"),
+                            "extension_build": str(item.get("extension_build") or ""),
                             "updated": updated,
                         }
         if _v4_sessions:
@@ -11998,7 +12020,8 @@ def _v4_session_get(chat_id: str, model: str) -> Optional[dict]:
             return None
         expired = now - float(item.get("updated") or 0) > V4_SESSION_TTL_SEC
         mismatch = str(item.get("model") or "auto") != str(model or "auto")
-        if expired or mismatch:
+        extension_mismatch = str(item.get("extension_build") or "") != V4_EXTENSION_BUILD
+        if expired or mismatch or extension_mismatch:
             _v4_sessions.pop(key, None)
             _v4_sessions_persist_locked()
             return None
@@ -12016,6 +12039,7 @@ def _v4_session_bind(chat_id: str, worker_id: str, url: str, model: str) -> None
             "worker_id": str(worker_id),
             "url": safe_url,
             "model": str(model or "auto"),
+            "extension_build": V4_EXTENSION_BUILD,
             "updated": time.time(),
         }
         if len(_v4_sessions) > V4_SESSION_MAX:
@@ -12042,10 +12066,28 @@ _v4_sessions_load()
 def _v4_prepare_bundled_extension():
     manifest_path=os.path.join(V4_EXTENSION_DIR, "manifest.json")
     sw_path=os.path.join(V4_EXTENSION_DIR, "service-worker.js")
-    if not os.path.isfile(manifest_path):
-        log("WARN", f"v4 bundled extension manifest missing: {V4_EXTENSION_DIR}")
-        return False
+
     try:
+        source_manifest=os.path.join(V4_EXTENSION_SOURCE_DIR, "manifest.json")
+        if os.path.abspath(V4_EXTENSION_SOURCE_DIR) != os.path.abspath(V4_EXTENSION_DIR):
+            if not os.path.isfile(source_manifest):
+                log("WARN", f"v4 bundled extension template missing: {V4_EXTENSION_SOURCE_DIR}")
+                return False
+            os.makedirs(V4_EXTENSION_DIR, exist_ok=True)
+            # Copy static assets/options on every bootstrap. Generated worker and
+            # content-script files are overwritten below.
+            for entry in os.listdir(V4_EXTENSION_SOURCE_DIR):
+                src=os.path.join(V4_EXTENSION_SOURCE_DIR, entry)
+                out=os.path.join(V4_EXTENSION_DIR, entry)
+                if os.path.isdir(src):
+                    shutil.copytree(src, out, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, out)
+
+        if not os.path.isfile(manifest_path):
+            log("WARN", f"v4 runtime extension manifest missing: {V4_EXTENSION_DIR}")
+            return False
+
         with open(manifest_path, "r", encoding="utf-8") as fh:
             manifest=json.load(fh)
         hp=list(manifest.get("host_permissions") or [])
@@ -12058,7 +12100,7 @@ def _v4_prepare_bundled_extension():
         if "debugger" not in perms:
             perms.append("debugger")
         manifest["permissions"]=perms
-        manifest["version"]="4.3.0"
+        manifest["version"]="4.3.1"
         with open(manifest_path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
             fh.write("\n")
@@ -12078,16 +12120,48 @@ async function dispatchJob(tab,job,reason="server"){
   lastDispatchAt=Date.now();
   send({
     type:"trace",request_id:job.request_id,
-    stage:"sw-dispatch",reason,tab_id:tab.id
+    stage:"sw-dispatch",reason,tab_id:tab.id,expected_build:BOOT.build
   });
   try{
+    let probe=null;
+    try{
+      probe=await chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_VERSION_PROBE"});
+    }catch(e){
+      send({
+        type:"trace",request_id:job.request_id,
+        stage:"content-build-probe-failed",
+        reason,
+        expected:BOOT.build,
+        message:String(e?.message||e).slice(0,220)
+      });
+      return false;
+    }
+
+    if(!probe || probe.build!==BOOT.build){
+      send({
+        type:"trace",request_id:job.request_id,
+        stage:"content-build-mismatch",
+        reason,
+        expected:BOOT.build,
+        actual:String(probe?.build||"missing"),
+        href:String(probe?.href||"").slice(0,240)
+      });
+      return false;
+    }
+
+    send({
+      type:"trace",request_id:job.request_id,
+      stage:"content-build-ok",
+      build:probe.build,
+      href:String(probe.href||"").slice(0,240)
+    });
     await chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_SEND",job});
     return true;
   }catch(e){
     send({
       type:"trace",request_id:job.request_id,
       stage:"sw-dispatch-failed",reason,
-      message:String(e?.message||e).slice(0,160)
+      message:String(e?.message||e).slice(0,220)
     });
     return false;
   }
@@ -12237,7 +12311,7 @@ chrome.runtime.onInstalled.addListener(()=>connect());
 chrome.runtime.onStartup.addListener(()=>connect());
 connect();
 """
-        boot=json.dumps({"wsUrl":ws_url,"token":V4_EXTENSION_TOKEN}, separators=(",",":"))
+        boot=json.dumps({"wsUrl":ws_url,"token":V4_EXTENSION_TOKEN,"build":V4_EXTENSION_BUILD}, separators=(",",":"))
         sw_source=sw_template.replace("__BOOT__", boot)
         with open(sw_path, "w", encoding="utf-8") as fh:
             fh.write(sw_source)
@@ -12247,7 +12321,8 @@ connect();
         # screens. Rebuild the content script with challenge detection based on
         # visible challenge UI instead of the mere presence of a reCAPTCHA URL.
         content_path=os.path.join(V4_EXTENSION_DIR, "arena-content.js")
-        content_source=r"""let active=null;
+        content_source=r"""const CONTENT_BUILD="4.3.1";
+let active=null;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function visible(el){
   if(!el)return false;
@@ -12395,9 +12470,15 @@ async function restoreSession(url,id){
   const target=new URL(url,location.href).href;
   if(location.href!==target){
     trace(id,"session-navigate",{from:location.href,to:target});
+    phase(id,"pre_navigation");
     location.assign(target);
+    // A real document navigation destroys this content script. If Arena keeps
+    // the same document for any reason, this wait still provides a safe local
+    // continuation. Otherwise the service worker resumes the pending job after
+    // BRIDGENA_CONTENT_READY_LOCAL from the new page.
     const c=await waitForComposer(12000,id,"session-restore-wait");
     if(!c)return false;
+    phase(id,"post_navigation");
   }else{
     const c=await waitForComposer(5000,id,"session-current-wait");
     if(!c)return false;
@@ -12572,6 +12653,21 @@ async function clickNewChat(id=null){
   return true;
 }
 
+function visibleUiBlockers(){
+  const roots=allDom(
+    '[role="dialog"],[aria-modal="true"],dialog,[data-radix-dialog-content],'+
+    '[class*="modal" i],[class*="dialog" i]'
+  ).filter(visible);
+  return roots.slice(0,6).map(el=>({
+    text:normalizedText(txt(el)).slice(0,320),
+    buttons:[...el.querySelectorAll('button,[role="button"]')]
+      .filter(visible)
+      .map(b=>(b.getAttribute("aria-label")||txt(b)).replace(/\s+/g," ").trim())
+      .filter(Boolean)
+      .slice(0,12)
+  }));
+}
+
 function runtimeDiagnostics(model=""){
   const c=composer();
   const stop=stopButton();
@@ -12590,6 +12686,8 @@ function runtimeDiagnostics(model=""){
     transcript_messages:conversationMessageCount(),
     visible_user_messages:visibleUserMessageCount(),
     assistant_candidates:assistantCandidates("").length,
+    ui_blockers:visibleUiBlockers(),
+    content_build:CONTENT_BUILD,
     nearby_controls:controls.slice(-16).map(el=>modelControlBlob(el).slice(0,100))
   };
 }
@@ -12642,6 +12740,24 @@ function modelVariants(values){
     ["max","arena max","boss bandit"].forEach(x=>out.add(x));
   }
   return [...out].filter(Boolean);
+}
+
+function routeModelMatches(model,aliases=[]){
+  try{
+    const u=new URL(location.href);
+    const routeRaw=
+      u.searchParams.get("model_a")||
+      u.searchParams.get("model")||
+      u.searchParams.get("modelId")||
+      "";
+    if(!routeRaw)return false;
+    const route=modelClean(routeRaw);
+    const vars=modelVariants([model,...(aliases||[])]);
+    return vars.some(v=>{
+      const c=modelClean(v);
+      return route===c || modelBase(route)===modelBase(c);
+    });
+  }catch{return false}
 }
 
 function modelMatchScore(label,variants){
@@ -12702,6 +12818,14 @@ function modelPickerDiagnostics(model,aliases){
 
 async function selectModel(model,aliases=[],id=null){
   if(!model||model==='auto')return true;
+  if(routeModelMatches(model,aliases)){
+    if(id)trace(id,"model-route-already-selected",{
+      model,
+      href:location.href,
+      aliases:(aliases||[]).slice(0,12)
+    });
+    return true;
+  }
   const variants=modelVariants([model,...(aliases||[])]);
 
   const controls=allDom('button,[role="button"],[aria-haspopup]').filter(visible);
@@ -13067,15 +13191,19 @@ async function nativeClick(el,id,stage="native-click-cdp"){
       x=r.left+r.width/2;
       y=r.top+r.height/2;
     }
-    const result=await chrome.runtime.sendMessage({
+    const request=chrome.runtime.sendMessage({
       type:"BRIDGENA_NATIVE_SUBMIT_LOCAL",
       request_id:id,
       x,y
     });
+    const result=await Promise.race([
+      request,
+      sleep(3500).then(()=>({ok:false,error:"native input RPC timeout"}))
+    ]);
     trace(id,stage,{
       ok:!!result?.ok,
       method:result?.method||"",
-      error:String(result?.error||"").slice(0,180)
+      error:String(result?.error||(!result?"native input RPC returned no response":"")).slice(0,220)
     });
     return !!result?.ok;
   }catch(e){
@@ -13188,25 +13316,70 @@ async function submitPrompt(c,payload,id){
     return false;
   };
 
-  trace(id,"submit-enter-keydown",{form:!!c.closest("form")});
-  c.focus();
-  c.dispatchEvent(new KeyboardEvent('keydown',{
-    key:'Enter',code:'Enter',keyCode:13,which:13,
-    bubbles:true,cancelable:true,composed:true,
-    ctrlKey:false,shiftKey:false,altKey:false,metaKey:false
-  }));
-  await sleep(80);
-  c.dispatchEvent(new KeyboardEvent('keyup',{
-    key:'Enter',code:'Enter',keyCode:13,which:13,
-    bubbles:true,cancelable:true,composed:true
-  }));
+  // Prefer the actual enabled Send control. This is materially more reliable
+  // than synthesizing Enter against Arena's controlled textarea, and unlike a
+  // blind retry we only click while the exact prompt is still present.
+  let liveComposer=(c&&c.isConnected)?c:composer();
+  let clickTarget=submitControl(liveComposer);
 
-  if(await waitStrong(4200,"submission-confirmed"))return true;
+  if(
+    liveComposer &&
+    composerValue(liveComposer) &&
+    clickTarget &&
+    !clickTarget.disabled
+  ){
+    trace(id,"submit-send-first",{
+      tag:clickTarget.tagName,
+      label:(clickTarget.getAttribute("aria-label")||txt(clickTarget)).slice(0,120),
+      value_chars:composerValue(liveComposer).length
+    });
 
-  // A route change + cleared composer is ambiguous: a new chat shell may have
-  // been created without the generation being accepted. Do not blindly replay
-  // the prompt. Give the live DOM several seconds to produce a committed user
-  // message or generation signal first.
+    const nativeOk=await nativeClick(clickTarget,id,"submit-send-native-cdp");
+    if(await waitStrong(5200,"submission-confirmed-send-native"))return true;
+
+    // If CDP was unavailable or Arena did not react, the prompt is still in the
+    // composer, so one DOM click is non-duplicating and safe.
+    let afterNative=evidence();
+    liveComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
+    if(
+      !afterNative.strong &&
+      liveComposer &&
+      composerValue(liveComposer) &&
+      clickTarget?.isConnected
+    ){
+      realClick(clickTarget,id);
+      if(await waitStrong(5200,"submission-confirmed-send-click"))return true;
+    }
+
+    let afterClick=evidence();
+    if(afterClick.cleared&&afterClick.hrefChanged){
+      trace(id,"submission-route-ambiguous",afterClick);
+      if(await waitStrong(12000,"submission-confirmed-send-delayed"))return true;
+      trace(id,"submission-ambiguous-no-ack",evidence());
+      return false;
+    }
+  }
+
+  // Reacquire after button attempts; React may replace the textarea/button.
+  liveComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
+
+  // Keyboard fallback only when the exact prompt is still present.
+  if(liveComposer&&composerValue(liveComposer)){
+    trace(id,"submit-enter-keydown",{form:!!liveComposer.closest("form")});
+    liveComposer.focus();
+    liveComposer.dispatchEvent(new KeyboardEvent('keydown',{
+      key:'Enter',code:'Enter',keyCode:13,which:13,
+      bubbles:true,cancelable:true,composed:true,
+      ctrlKey:false,shiftKey:false,altKey:false,metaKey:false
+    }));
+    await sleep(80);
+    liveComposer.dispatchEvent(new KeyboardEvent('keyup',{
+      key:'Enter',code:'Enter',keyCode:13,which:13,
+      bubbles:true,cancelable:true,composed:true
+    }));
+    if(await waitStrong(4200,"submission-confirmed-enter"))return true;
+  }
+
   let e=evidence();
   if(e.cleared&&e.hrefChanged){
     trace(id,"submission-route-ambiguous",e);
@@ -13215,29 +13388,16 @@ async function submitPrompt(c,payload,id){
     return false;
   }
 
-  // Synthetic Enter genuinely did nothing and the text is still in the
-  // composer, so a browser-level click is safe as a fallback.
-  let liveComposer=(c&&c.isConnected)?c:composer();
-  const clickTarget=submitControl(liveComposer);
-  if(liveComposer&&composerValue(liveComposer)&&clickTarget&&!clickTarget.disabled){
-    await nativeSubmit(clickTarget,id);
-    if(await waitStrong(4200,"submission-confirmed-native"))return true;
-
-    e=evidence();
-    if(e.cleared&&e.hrefChanged){
-      if(await waitStrong(9000,"submission-confirmed-native-delayed"))return true;
-      trace(id,"submission-native-ambiguous-no-ack",evidence());
-      return false;
-    }
-
-    realClick(clickTarget,id);
-    if(await waitStrong(2600,"submission-confirmed-click"))return true;
-  }else if(liveComposer&&composerValue(liveComposer)){
+  // Native Enter is only attempted while the prompt is visibly still present.
+  liveComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
+  if(liveComposer&&composerValue(liveComposer)){
     liveComposer.focus();
     await nativeSubmit(null,id);
-    if(await waitStrong(3200,"submission-confirmed-native-enter"))return true;
+    if(await waitStrong(4200,"submission-confirmed-native-enter"))return true;
   }
 
+  // requestSubmit is the last ordinary form fallback and is never called once
+  // transcript/generation evidence indicates a submit may already have landed.
   liveComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
   const form=liveComposer?.closest("form");
   if(liveComposer&&composerValue(liveComposer)&&form&&typeof form.requestSubmit==="function"){
@@ -13247,9 +13407,12 @@ async function submitPrompt(c,payload,id){
         .find(x=>!x.disabled&&(x.type==="submit"||/send|submit/i.test((x.getAttribute("aria-label")||"")+" "+txt(x))));
       form.requestSubmit(submitter||undefined);
     }catch(err){
-      trace(id,"requestSubmit-error",{message:String(err?.message||err).slice(0,120)});
+      trace(id,"requestSubmit-error",{
+        name:String(err?.name||"Error"),
+        message:String(err?.message||err).slice(0,220)
+      });
     }
-    if(await waitStrong(2600,"submission-confirmed-fallback"))return true;
+    if(await waitStrong(4200,"submission-confirmed-fallback"))return true;
   }
 
   const finalComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
@@ -13278,6 +13441,7 @@ async function run(job){
   try{
     trace(job.request_id,"job-received",{
       model:job.model||"auto",
+      content_build:CONTENT_BUILD,
       model_aliases:(job.model_aliases||[]).slice(0,12),
       navigation_recovered:!!job._navigation_recovered,
       visibility:document.visibilityState,
@@ -13575,7 +13739,16 @@ async function run(job){
   }finally{active=null}
 }
 
-chrome.runtime.onMessage.addListener((m)=>{
+chrome.runtime.onMessage.addListener((m,sender,sendResponse)=>{
+  if(m?.type==='BRIDGENA_VERSION_PROBE'){
+    sendResponse({
+      build:CONTENT_BUILD,
+      href:location.href,
+      readyState:document.readyState,
+      visibility:document.visibilityState
+    });
+    return;
+  }
   if(m?.type==='BRIDGENA_SEND')run(m.job);
   else if(m?.type==='BRIDGENA_CANCEL'&&active?.id===m.request_id)active.cancel=true
 });
@@ -13583,6 +13756,7 @@ chrome.runtime.onMessage.addListener((m)=>{
 setTimeout(()=>{
   chrome.runtime.sendMessage({
     type:"BRIDGENA_CONTENT_READY_LOCAL",
+    build:CONTENT_BUILD,
     href:location.href,
     visibility:document.visibilityState
   }).catch(()=>{});
@@ -13598,7 +13772,7 @@ setInterval(publishState,5000);
         with open(content_path, "w", encoding="utf-8") as fh:
             fh.write(content_source)
 
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={V4_EXTENSION_TOKEN_MODE} · storage-safe · native-editor + reliability/observability sweep v4.3.0")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={V4_EXTENSION_TOKEN_MODE} · storage-safe · native-editor + fresh-extension/send-first v4.3.1")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
@@ -13606,7 +13780,7 @@ setInterval(publishState,5000);
 
 if V4_TRANSPORT == "extension" and V4_AUTO_ATTACH_KEEPERS:
     os.environ["BRIDGENA_CAPTCHA_EXT"] = V4_EXTENSION_DIR
-    log("INFO", f"v4 extension injection path forced to bundled worker: {V4_EXTENSION_DIR}")
+    log("INFO", f"v4 extension injection path forced to build-isolated worker: {V4_EXTENSION_DIR} · source={V4_EXTENSION_SOURCE_DIR}")
     _v4_prepare_bundled_extension()
 
 _v4_workers: Dict[str, dict] = {}
@@ -15790,7 +15964,7 @@ async def _lifespan(app):
     log("INFO", f"BRIDGENA build {BUILD_STAMP} · v4 browser-extension control plane · legacy fallback retained")
     log("INFO", f"v4 transport · {V4_TRANSPORT} · legacy fallback {'on' if V4_FALLBACK_LEGACY else 'off'}")
     if V4_TRANSPORT == "extension" and V4_AUTO_ATTACH_KEEPERS:
-        log("OK", f"v4 keeper mode · autonomous headed browsers ON · bundled extension {V4_EXTENSION_DIR}")
+        log("OK", f"v4 keeper mode · autonomous headed browsers ON · build-isolated extension {V4_EXTENSION_DIR} · build {V4_EXTENSION_BUILD}")
         log("INFO", "v4 keeper mode · existing account cookies + sticky proxy assignment reused automatically")
 
     if V4_AUTOLAUNCH and not V4_AUTO_ATTACH_KEEPERS:
@@ -15809,7 +15983,7 @@ async def _lifespan(app):
     log("INFO", f"Transport recovery · same-keeper restart ON · quarantine {TRANSPORT_FAILURE_QUARANTINE_SEC:.0f}s · bound wait {BOUND_KEEPER_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Pre-dispatch transport guard · HEAD probe every request {'ON' if TRANSPORT_PROBE_EVERY_REQUEST else 'OFF'} · timeout {TRANSPORT_PROBE_TIMEOUT_MS}ms · recovery wait {PREDISPATCH_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Account failover · max {ACCOUNT_FAILOVER_MAX} alternate keeper(s) · thread handoff ON for pre-generation account/session failures · 429+verification+partial-stream excluded")
-    log("INFO", f"Stream completion policy · first assistant output <= {FIRST_ASSISTANT_RESPONSE_SEC:.1f}s · provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} · partial UI preservation ON")
+    log("INFO", f"Stream completion policy · extension first-output timeout {V4_FIRST_TOKEN_SEC:.0f}s · idle timeout {V4_IDLE_STREAM_SEC:.0f}s · provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} · partial UI preservation ON")
     log("INFO", f"Arena stream salvage · {'ON' if ARENA_UI_STREAM_RECOVERY else 'OFF'} · "
                 f"quick {ARENA_SALVAGE_QUICK_SEC:.0f}s current-context check → same-keeper route repair → "
                 f"{ARENA_POST_RESTART_SALVAGE_SEC:.0f}s post-restart history/UI salvage · no prompt replay")
