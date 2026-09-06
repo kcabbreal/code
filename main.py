@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.8-delivered-stream-recovery")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.9-bound-readiness-gate")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1934,6 +1934,7 @@ ARENA_POST_RESTART_SALVAGE_SEC = max(5.0, min(45.0, float(os.environ.get("BRIDGE
 ARENA_DELIVERED_WAIT_SEC = max(8.0, min(90.0, float(os.environ.get("BRIDGENA_ARENA_DELIVERED_WAIT_SEC", "40"))))
 ARENA_SALVAGE_RECOVERY_WAIT_SEC = max(5.0, min(40.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_RECOVERY_WAIT_SEC", "18"))))
 UNDELIVERED_ENVELOPE_RETRY_MAX = max(0, min(2, int(os.environ.get("BRIDGENA_UNDELIVERED_ENVELOPE_RETRY_MAX", "1"))))
+BOUND_VERIFICATION_READY_WAIT_SEC = max(5.0, min(90.0, float(os.environ.get("BRIDGENA_BOUND_VERIFICATION_READY_WAIT_SEC", "40"))))
 THROTTLE_THREAD_REHOME = os.environ.get("BRIDGENA_THROTTLE_THREAD_REHOME", "1").strip().lower() not in ("0", "false", "no", "off")
 CONTEXT_CAPSULE_MAX_CHARS = max(4000, min(MAX_PROMPT, int(os.environ.get("BRIDGENA_CONTEXT_CAPSULE_MAX_CHARS", str(min(MAX_PROMPT, 60000))))))
 _thread_rehome_stats = {"armed": 0, "activated": 0, "inline": 0, "completed": 0, "missing_context": 0}
@@ -7227,6 +7228,11 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     log("WARN", f"[{failed_name}] confirmed-absence retry "
                                 f"{undelivered_envelope_retries}/{UNDELIVERED_ENVELOPE_RETRY_MAX} · "
                                 f"reusing exact message IDs · {reason}")
+                    # The same keeper may still be coming back from the HTTP-0
+                    # repair that triggered this retry. Nudge the readiness loop;
+                    # _run_turn_impl will wait for verification admission before
+                    # it mints a token or replays these exact IDs.
+                    _wake_verification_scheduler()
                     continue
 
                 if retry_info.get("_kind") == "retry-same-account":
@@ -8270,6 +8276,60 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             "migrate_thread": True,
         })
         return
+
+    # A bound conversation (and especially an exact-ID confirmed-absence retry)
+    # must not mint or POST merely because the browser process exists. The
+    # verification lease is the request-admission truth. After a transport
+    # restart the quarantine timer can expire before Enterprise execute is
+    # usable again; without this gate the retry races readiness recovery and
+    # can navigate the same keeper while it is being refreshed/relogged.
+    if bound_jar_id or retry_envelope_ids:
+        sid = str(jar.get("id") or "")
+        wait_reason = "exact-ID retry" if retry_envelope_ids else "bound conversation"
+        deadline = time.monotonic() + BOUND_VERIFICATION_READY_WAIT_SEC
+        announced = False
+        while time.monotonic() < deadline:
+            session = keeper.sessions.get(sid)
+            transport_task = _transport_recovery_tasks.get(sid)
+            transport_busy = bool(transport_task and not transport_task.done())
+            relogin_lock = getattr(session, "_relogin_lock", None) if session else None
+            relogin_busy = bool(relogin_lock and relogin_lock.locked())
+            ready = bool(
+                _api_keeper_verified(sid)
+                and keeper_session_ready(session)
+                and not transport_busy
+                and not relogin_busy
+                and getattr(session, "status", "") == "running"
+            )
+            if ready:
+                break
+            if not announced:
+                announced = True
+                log("INFO", f"[{jar.get('name')}] {wait_reason} waiting up to "
+                            f"{BOUND_VERIFICATION_READY_WAIT_SEC:.0f}s for same-keeper verification readiness")
+            _wake_verification_scheduler()
+            await asyncio.sleep(0.5)
+        else:
+            session = keeper.sessions.get(sid)
+            state = getattr(session, "status", "missing") if session else "missing"
+            transport_task = _transport_recovery_tasks.get(sid)
+            transport_busy = bool(transport_task and not transport_task.done())
+            relogin_lock = getattr(session, "_relogin_lock", None) if session else None
+            relogin_busy = bool(relogin_lock and relogin_lock.locked())
+            log("WARN", f"[{jar.get('name')}] {wait_reason} withheld before token mint · "
+                        f"verification_ready={_api_keeper_verified(sid)} · status={state} · "
+                        f"transport_recovery={transport_busy} · relogin={relogin_busy}")
+            if retry_envelope_ids:
+                yield ("error", "503: The original turn was not replayed because its bound keeper is still "
+                                "recovering verification readiness. Bridgena preserved the exact evaluation/message IDs; "
+                                "retry after the same keeper is readmitted.")
+                return
+            yield ("retry-account", {
+                "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+                "reason": "bound keeper verification readiness did not recover before dispatch",
+                "migrate_thread": True,
+            })
+            return
 
     # Catch dead SOCKS/browser routes before minting a token or submitting a
     # model request. New/unbound chats fail over immediately while the broken
