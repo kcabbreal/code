@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.8-ui-execution-stream-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.9-enter-submit-react-state-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.8-ui-execution-stream-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.9-enter-submit-react-state-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11858,23 +11858,50 @@ function stopButton(){
   );
 }
 
-function setValue(el,value){
+async function setValue(el,value,id){
   el.focus();
+  await sleep(60);
+
   if(el.tagName==='TEXTAREA'||el.tagName==='INPUT'){
-    let p=Object.getPrototypeOf(el),d=Object.getOwnPropertyDescriptor(p,'value');
-    if(d?.set)d.set.call(el,value);else el.value=value;
-    el.dispatchEvent(new Event('input',{bubbles:true}));
+    // React controlled inputs need the native prototype setter, followed by
+    // an input transaction. Using el.value directly can leave React state at
+    // the old/empty value even though the DOM visibly contains text.
+    const proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
+    const desc=Object.getOwnPropertyDescriptor(proto,'value');
+    if(desc?.set)desc.set.call(el,"");
+    else el.value="";
+    el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward',data:null}));
+    await sleep(30);
+    if(desc?.set)desc.set.call(el,value);
+    else el.value=value;
+    el.dispatchEvent(new InputEvent('beforeinput',{bubbles:true,cancelable:true,inputType:'insertText',data:value}));
+    el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));
     el.dispatchEvent(new Event('change',{bubbles:true}));
   }else{
+    // Arena's richer editors are happiest when text is inserted through the
+    // browser's editing command, because it updates the editor's internal
+    // document model in addition to the visible DOM.
     try{
       const sel=getSelection(),range=document.createRange();
-      range.selectNodeContents(el);sel.removeAllRanges();sel.addRange(range);
+      range.selectNodeContents(el);
+      sel.removeAllRanges();sel.addRange(range);
+      document.execCommand("delete",false,null);
+      await sleep(20);
       document.execCommand("insertText",false,value);
     }catch{
+      el.textContent="";
+      el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward',data:null}));
       el.textContent=value;
+      el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));
     }
-    el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));
   }
+
+  await sleep(120);
+  trace(id,"editor-state-synced",{
+    tag:el.tagName,
+    value_chars:composerValue(el).length,
+    form:!!el.closest("form")
+  });
 }
 
 async function clickNewChat(){
@@ -11937,29 +11964,31 @@ function bodyHasPrompt(prompt){
   const p=String(prompt||"").trim();
   if(!p)return false;
   const probe=p.slice(0,Math.min(120,p.length));
-  return (document.body?.innerText||"").includes(probe);
+  const roots=[
+    ...document.querySelectorAll('[data-message-author-role="user"],[data-role="user"],[data-author="user"],[data-testid*="user" i],article,main')
+  ].filter(visible);
+  return roots.some(x=>txt(x).includes(probe));
 }
 function composerValue(c){return (c?.value??c?.innerText??c?.textContent??"").trim()}
 
 async function submitPrompt(c,payload,id){
-  setValue(c,payload);await sleep(180);
+  await setValue(c,payload,id);
   trace(id,"prompt-inserted",{composer:c.tagName,chars:payload.length,value_chars:composerValue(c).length});
 
-  const b=submitControl(c);
-  if(b){
-    trace(id,"submit-click",{label:(b.getAttribute("aria-label")||txt(b)).slice(0,100)});
-    b.click();
-  }else{
-    const form=c.closest("form");
-    if(form&&typeof form.requestSubmit==="function"){
-      trace(id,"submit-requestSubmit");
-      form.requestSubmit();
-    }else{
-      trace(id,"submit-enter");
-      c.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
-      c.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
-    }
-  }
+  // DevTools capture of Arena's real composer shows the successful path is
+  // keydown(Enter) -> React onKeyDown -> FORM submit. Mirror that ordering.
+  trace(id,"submit-enter-keydown",{form:!!c.closest("form")});
+  c.focus();
+  c.dispatchEvent(new KeyboardEvent('keydown',{
+    key:'Enter',code:'Enter',keyCode:13,which:13,
+    bubbles:true,cancelable:true,composed:true,
+    ctrlKey:false,shiftKey:false,altKey:false,metaKey:false
+  }));
+  await sleep(80);
+  c.dispatchEvent(new KeyboardEvent('keyup',{
+    key:'Enter',code:'Enter',keyCode:13,which:13,
+    bubbles:true,cancelable:true,composed:true
+  }));
 
   for(let i=0;i<20;i++){
     await sleep(150);
@@ -11974,11 +12003,17 @@ async function submitPrompt(c,payload,id){
 
   const form=c.closest("form");
   if(form&&typeof form.requestSubmit==="function"){
-    trace(id,"submit-fallback-form");
-    try{form.requestSubmit()}catch{}
+    trace(id,"submit-fallback-requestSubmit");
+    try{
+      const submitter=[...form.querySelectorAll('button,input[type="submit"]')]
+        .find(x=>!x.disabled&&(x.type==="submit"||/send|submit/i.test((x.getAttribute("aria-label")||"")+" "+txt(x))));
+      form.requestSubmit(submitter||undefined);
+    }catch(e){
+      trace(id,"requestSubmit-error",{message:String(e?.message||e).slice(0,120)});
+    }
   }else{
     const b2=submitControl(c);
-    if(b2){trace(id,"submit-fallback-click");b2.click()}
+    if(b2){trace(id,"submit-fallback-click",{label:(b2.getAttribute("aria-label")||txt(b2)).slice(0,100)});b2.click()}
   }
   for(let i=0;i<15;i++){
     await sleep(150);
@@ -12084,7 +12119,7 @@ setInterval(publishState,5000);
             fh.write(content_source)
 
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · verified-submit + DOM stream v4.1.8")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + Enter/onSubmit v4.1.9")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
