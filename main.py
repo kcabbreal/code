@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.15-native-cdp-submit-fallback.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.17-stream-completion-grace-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.15-native-cdp-submit-fallback")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.17-stream-completion-grace-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -12033,8 +12033,26 @@ function loginRequired(){
   });
 }
 
+function domRoots(){
+  const roots=[document],seen=new Set([document]);
+  const queue=[document.documentElement];
+  while(queue.length){
+    const node=queue.shift();
+    if(!node||!node.querySelectorAll)continue;
+    for(const el of node.querySelectorAll('*')){
+      if(el.shadowRoot&&!seen.has(el.shadowRoot)){
+        seen.add(el.shadowRoot);
+        roots.push(el.shadowRoot);
+        queue.push(el.shadowRoot);
+      }
+    }
+  }
+  return roots;
+}
+
 function composer(){
   const selectors=[
+    'textarea[placeholder*="ask" i]',
     'textarea[placeholder*="message" i]',
     'textarea[placeholder*="prompt" i]',
     'textarea',
@@ -12042,10 +12060,50 @@ function composer(){
     '[contenteditable="true"]'
   ];
   let all=[];
-  for(const s of selectors)all.push(...document.querySelectorAll(s));
+  for(const root of domRoots()){
+    for(const s of selectors){
+      try{all.push(...root.querySelectorAll(s))}catch{}
+    }
+  }
   all=[...new Set(all)].filter(visible);
-  all.sort((a,b)=>b.getBoundingClientRect().top-a.getBoundingClientRect().top);
+  all.sort((a,b)=>{
+    // Prefer a visible composer lower in the viewport and associated with a
+    // form/send control over incidental textareas in dialogs/settings.
+    const af=!!a.closest?.('form'),bf=!!b.closest?.('form');
+    if(af!==bf)return bf-af;
+    return b.getBoundingClientRect().top-a.getBoundingClientRect().top;
+  });
   return all[0]||null;
+}
+
+async function waitForComposer(timeoutMs=12000,id=null,stage="composer-wait"){
+  const started=Date.now();
+  let lastDiag=0;
+  while(Date.now()-started<timeoutMs){
+    const c=composer();
+    if(c)return c;
+    const now=Date.now();
+    if(id&&now-lastDiag>1800){
+      lastDiag=now;
+      trace(id,stage,{
+        elapsed_ms:now-started,
+        href:location.href,
+        readyState:document.readyState,
+        login_required:loginRequired(),
+        challenge:challengePresent()
+      });
+    }
+    await sleep(120);
+  }
+  return null;
+}
+
+async function settleUi(ms=500){
+  const until=Date.now()+ms;
+  while(Date.now()<until){
+    await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+    await sleep(40);
+  }
 }
 
 function submitControl(c){
@@ -12118,8 +12176,10 @@ async function clickNewChat(){
   const c=[...document.querySelectorAll('button,a,[role="button"]')].find(x=>
     visible(x)&&/new chat|new conversation|start new/i.test((x.getAttribute("aria-label")||"")+" "+txt(x))
   );
-  if(c){c.click();await sleep(650);return true}
-  return false;
+  if(!c)return false;
+  c.click();
+  await settleUi(350);
+  return true;
 }
 
 async function selectModel(model){
@@ -12160,6 +12220,31 @@ async function selectModel(model){
   const opt=exact || (baseExact.length===1?baseExact[0]:null) || (prefix.length===1?prefix[0]:null);
   if(opt){opt.click();await sleep(400);return true}
   try{document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true}))}catch{}
+  return false;
+}
+
+async function selectModelStable(model,id){
+  if(!model||model==='auto')return true;
+  for(let attempt=1;attempt<=3;attempt++){
+    // Do not manipulate the model menu while Arena is between route renders.
+    await waitForComposer(attempt===1?8000:5000,id,"pre-model-composer-wait");
+    await settleUi(attempt===1?300:550);
+
+    const ok=await selectModel(model);
+    trace(id,"model-selection-attempt",{attempt,ok,model});
+    if(ok){
+      await settleUi(650);
+      return true;
+    }
+
+    // A failed lookup may have left a menu/popover open.
+    try{
+      document.dispatchEvent(new KeyboardEvent('keydown',{
+        key:'Escape',code:'Escape',bubbles:true,cancelable:true
+      }));
+    }catch{}
+    await sleep(350*attempt);
+  }
   return false;
 }
 
@@ -12558,16 +12643,56 @@ async function run(job){
     if(job.fresh_chat){
       const nc=await clickNewChat();
       trace(job.request_id,"fresh-chat",{clicked:nc});
+      // Route changes can temporarily remove the composer entirely. Wait for
+      // the new-chat shell before touching model controls.
+      let postFresh=await waitForComposer(10000,job.request_id,"post-fresh-chat-wait");
+      if(!postFresh&&nc){
+        // One conservative recovery click if the first route transition did
+        // not produce a usable chat surface.
+        await settleUi(650);
+        const nc2=await clickNewChat();
+        trace(job.request_id,"fresh-chat-retry",{clicked:nc2});
+        postFresh=await waitForComposer(8000,job.request_id,"post-fresh-chat-retry-wait");
+      }
     }
 
-    const modelOk=await selectModel(job.model);
+    const modelOk=await selectModelStable(job.model,job.request_id);
     trace(job.request_id,"model-selection",{ok:modelOk,model:job.model||"auto"});
-    if(modelOk)await sleep(800);
 
-    let c=null;
-    for(let i=0;i<60&&!c;i++){c=composer();if(!c)await sleep(100)}
-    if(!c){trace(job.request_id,"composer-missing");throw new Error('Arena composer not found')}
-    trace(job.request_id,"composer-found",{tag:c.tagName,placeholder:c.getAttribute("placeholder")||""});
+    // A requested model must resolve before dispatch. Running with whatever
+    // model happens to be selected would produce a semantically wrong API
+    // response even if transport succeeds.
+    if(job.model&&job.model!=="auto"&&!modelOk){
+      trace(job.request_id,"model-selection-unresolved",{model:job.model});
+      throw new Error("Arena requested model could not be selected");
+    }
+
+    let c=await waitForComposer(12000,job.request_id,"post-model-composer-wait");
+    if(!c){
+      // Model selection itself can rerender the entire composer. Close any
+      // transient popover and give the stable chat shell one final chance.
+      try{
+        document.dispatchEvent(new KeyboardEvent('keydown',{
+          key:'Escape',code:'Escape',bubbles:true,cancelable:true
+        }));
+      }catch{}
+      await settleUi(700);
+      c=await waitForComposer(6000,job.request_id,"composer-recovery-wait");
+    }
+    if(!c){
+      trace(job.request_id,"composer-missing",{
+        href:location.href,
+        readyState:document.readyState,
+        login_required:loginRequired(),
+        challenge:challengePresent()
+      });
+      throw new Error('Arena composer not found');
+    }
+    trace(job.request_id,"composer-found",{
+      tag:c.tagName,
+      placeholder:c.getAttribute("placeholder")||"",
+      form:!!c.closest("form")
+    });
 
     const payload=(job.system_prompt?('System instructions:\n'+job.system_prompt+'\n\n'):'')+job.prompt;
     const baseline=assistantSnapshot(payload);
@@ -12585,54 +12710,142 @@ async function run(job){
     emit('accepted',job.request_id);
     trace(job.request_id,"accepted",{baseline_chars:baseline.length});
 
-    let stable=0,lastChange=Date.now(),seen=false,startedGenerating=false,lastDiag=Date.now();
+    let lastChange=Date.now(),seen=false,startedGenerating=false,lastDiag=Date.now();
+    let generationStoppedAt=0,lastGenerating=false,completionProbeAt=0;
+    const COMPLETE_TEXT_IDLE_MS=2800;
+    const COMPLETE_MUTATION_IDLE_MS=1400;
+    const COMPLETE_STOP_GRACE_MS=2200;
+
     while(!active.cancel){
       if(challengePresent()){trace(job.request_id,"challenge-during-job");emit('challenge',job.request_id);return}
 
       const generating=!!stopButton();
-      if(generating&&!startedGenerating){startedGenerating=true;trace(job.request_id,"generation-started")}
+      if(generating&&!startedGenerating){
+        startedGenerating=true;
+        trace(job.request_id,"generation-started");
+      }
+      if(lastGenerating&&!generating){
+        generationStoppedAt=Date.now();
+        trace(job.request_id,"generation-stop-observed");
+      }else if(generating){
+        generationStoppedAt=0;
+      }
+      lastGenerating=generating;
 
       const cur=tracker.snapshot();
       if(Date.now()-lastDiag>3000){
         const st=tracker.stats();
-        trace(job.request_id,"response-observer",{mutations:st.mutations,best_chars:st.best_chars,generating});
+        trace(job.request_id,"response-observer",{
+          mutations:st.mutations,
+          best_chars:st.best_chars,
+          generating,
+          text_idle_ms:Date.now()-lastChange,
+          mutation_idle_ms:st.idle_ms
+        });
         lastDiag=Date.now();
       }
+
       if(cur&&cur!==baseline){
-        if(!seen){seen=true;trace(job.request_id,"assistant-found",{chars:cur.length,candidates:assistantCandidates(payload).length})}
+        if(!seen){
+          seen=true;
+          trace(job.request_id,"assistant-found",{
+            chars:cur.length,
+            candidates:assistantCandidates(payload).length
+          });
+        }
+
         if(cur.startsWith(active.last)){
           const d=cur.slice(active.last.length);
           if(d){
-            active.last=cur;lastChange=Date.now();stable=0;
+            active.last=cur;
+            lastChange=Date.now();
+            completionProbeAt=0;
             emit('delta',job.request_id,{text:d});
           }
         }else if(!active.last){
-          active.last=cur;lastChange=Date.now();stable=0;
+          active.last=cur;
+          lastChange=Date.now();
+          completionProbeAt=0;
           emit('delta',job.request_id,{text:cur});
         }else if(cur!==active.last){
           let n=0,lim=Math.min(active.last.length,cur.length);
           while(n<lim&&active.last[n]===cur[n])n++;
           if(n>=Math.min(24,active.last.length)){
             const d=cur.slice(n);
-            active.last=cur;lastChange=Date.now();stable=0;
+            active.last=cur;
+            lastChange=Date.now();
+            completionProbeAt=0;
             if(d)emit('delta',job.request_id,{text:d});
           }
         }
       }
 
-      if(seen&&!generating&&Date.now()-lastChange>1000){
-        stable++;
-        if(stable>=2){
-          trace(job.request_id,"done",{chars:active.last.length});
-          tracker.stop();
-          emit('done',job.request_id,{text:active.last});
-          return
+      if(seen&&!generating){
+        const now=Date.now();
+        const st=tracker.stats();
+        const textIdle=now-lastChange;
+        const mutationIdle=st.idle_ms;
+        const stopGrace=!startedGenerating || (generationStoppedAt>0 && now-generationStoppedAt>=COMPLETE_STOP_GRACE_MS);
+
+        if(
+          textIdle>=COMPLETE_TEXT_IDLE_MS &&
+          mutationIdle>=COMPLETE_MUTATION_IDLE_MS &&
+          stopGrace
+        ){
+          // One extra delayed snapshot guards against Arena briefly removing
+          // its Stop control between token batches / DOM rerenders.
+          if(!completionProbeAt){
+            completionProbeAt=now;
+            trace(job.request_id,"completion-candidate",{
+              chars:active.last.length,
+              text_idle_ms:textIdle,
+              mutation_idle_ms:mutationIdle,
+              stop_grace_ms:generationStoppedAt?now-generationStoppedAt:null
+            });
+          }else if(now-completionProbeAt>=700){
+            const finalSnapshot=tracker.snapshot();
+            if(finalSnapshot&&finalSnapshot!==active.last){
+              if(finalSnapshot.startsWith(active.last)){
+                const d=finalSnapshot.slice(active.last.length);
+                active.last=finalSnapshot;
+                lastChange=Date.now();
+                completionProbeAt=0;
+                if(d)emit('delta',job.request_id,{text:d});
+              }else{
+                completionProbeAt=0;
+                lastChange=Date.now();
+              }
+            }else{
+              const finalStats=tracker.stats();
+              if(
+                Date.now()-lastChange>=COMPLETE_TEXT_IDLE_MS &&
+                finalStats.idle_ms>=COMPLETE_MUTATION_IDLE_MS
+              ){
+                trace(job.request_id,"done",{
+                  chars:active.last.length,
+                  text_idle_ms:Date.now()-lastChange,
+                  mutation_idle_ms:finalStats.idle_ms,
+                  completion_grace:true
+                });
+                tracker.stop();
+                emit('done',job.request_id,{text:active.last});
+                return;
+              }
+            }
+          }
+        }else{
+          completionProbeAt=0;
         }
-      }else stable=0;
+      }else{
+        completionProbeAt=0;
+      }
 
       if(startedGenerating&&!seen&&Date.now()-lastChange>8000){
         const st=tracker.stats();
-        trace(job.request_id,"generation-without-visible-response",{mutations:st.mutations,best_chars:st.best_chars});
+        trace(job.request_id,"generation-without-visible-response",{
+          mutations:st.mutations,
+          best_chars:st.best_chars
+        });
         lastChange=Date.now();
       }
       await sleep(180);
@@ -12661,7 +12874,7 @@ setInterval(publishState,5000);
             fh.write(content_source)
 
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + native-CDP submit fallback v4.1.15")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + stream completion grace v4.1.17")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
