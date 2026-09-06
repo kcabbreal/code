@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.14-assistant-boundary-stream-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.15-native-cdp-submit-fallback.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.14-assistant-boundary-stream-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.15-native-cdp-submit-fallback")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11879,7 +11879,11 @@ def _v4_prepare_bundled_extension():
             if pat not in hp:
                 hp.append(pat)
         manifest["host_permissions"]=hp
-        manifest["version"]="4.1.5"
+        perms=list(manifest.get("permissions") or [])
+        if "debugger" not in perms:
+            perms.append("debugger")
+        manifest["permissions"]=perms
+        manifest["version"]="4.1.15"
         with open(manifest_path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
             fh.write("\n")
@@ -11923,9 +11927,62 @@ async function connect(){
   ws.onclose=()=>{clearInterval(pingTimer);reconnectTimer=setTimeout(connect,1500);};
   ws.onerror=()=>{try{ws.close()}catch{}};
 }
-chrome.runtime.onMessage.addListener((msg,sender)=>{if(msg&&msg.type&&msg.type.startsWith("BRIDGENA_")){
-  let out={...msg};delete out.type;send({type:msg.type.replace("BRIDGENA_","").toLowerCase(),...out});
-  if(msg.type==="BRIDGENA_DONE"||msg.type==="BRIDGENA_ERROR")currentRequest=null;}});
+async function nativeSubmit(tabId,msg){
+  if(!tabId)throw new Error("native submit has no tab id");
+  const target={tabId};
+  let attached=false;
+  try{
+    await chrome.debugger.attach(target,"1.3");
+    attached=true;
+
+    // Prefer the actual visible Send control when content script supplied its
+    // viewport center. This is a browser-level input event, not a DOM event.
+    if(Number.isFinite(msg.x)&&Number.isFinite(msg.y)){
+      await chrome.debugger.sendCommand(target,"Input.dispatchMouseEvent",{
+        type:"mouseMoved",x:msg.x,y:msg.y,button:"none"
+      });
+      await chrome.debugger.sendCommand(target,"Input.dispatchMouseEvent",{
+        type:"mousePressed",x:msg.x,y:msg.y,button:"left",buttons:1,clickCount:1
+      });
+      await chrome.debugger.sendCommand(target,"Input.dispatchMouseEvent",{
+        type:"mouseReleased",x:msg.x,y:msg.y,button:"left",buttons:0,clickCount:1
+      });
+      return {ok:true,method:"cdp-click"};
+    }
+
+    // Fallback to native Enter in the focused composer.
+    await chrome.debugger.sendCommand(target,"Input.dispatchKeyEvent",{
+      type:"rawKeyDown",key:"Enter",code:"Enter",
+      windowsVirtualKeyCode:13,nativeVirtualKeyCode:13
+    });
+    await chrome.debugger.sendCommand(target,"Input.dispatchKeyEvent",{
+      type:"keyUp",key:"Enter",code:"Enter",
+      windowsVirtualKeyCode:13,nativeVirtualKeyCode:13
+    });
+    return {ok:true,method:"cdp-enter"};
+  }finally{
+    if(attached){
+      try{await chrome.debugger.detach(target)}catch{}
+    }
+  }
+}
+
+chrome.runtime.onMessage.addListener((msg,sender,sendResponse)=>{
+  if(!msg||!msg.type)return;
+
+  if(msg.type==="BRIDGENA_NATIVE_SUBMIT_LOCAL"){
+    nativeSubmit(sender?.tab?.id,msg)
+      .then(r=>sendResponse(r))
+      .catch(e=>sendResponse({ok:false,error:String(e?.message||e)}));
+    return true;
+  }
+
+  if(msg.type.startsWith("BRIDGENA_")){
+    let out={...msg};delete out.type;
+    send({type:msg.type.replace("BRIDGENA_","").toLowerCase(),...out});
+    if(msg.type==="BRIDGENA_DONE"||msg.type==="BRIDGENA_ERROR")currentRequest=null;
+  }
+});
 chrome.runtime.onInstalled.addListener(()=>connect());
 chrome.runtime.onStartup.addListener(()=>connect());
 connect();
@@ -12304,6 +12361,33 @@ function visibleUserMessageCount(){
   return seen.size;
 }
 
+async function nativeSubmit(el,id){
+  try{
+    let x=null,y=null;
+    if(el&&visible(el)){
+      el.scrollIntoView({block:'center',inline:'center'});
+      await sleep(40);
+      const r=el.getBoundingClientRect();
+      x=r.left+r.width/2;
+      y=r.top+r.height/2;
+    }
+    const result=await chrome.runtime.sendMessage({
+      type:"BRIDGENA_NATIVE_SUBMIT_LOCAL",
+      request_id:id,
+      x,y
+    });
+    trace(id,"submit-native-cdp",{
+      ok:!!result?.ok,
+      method:result?.method||"",
+      error:String(result?.error||"").slice(0,140)
+    });
+    return !!result?.ok;
+  }catch(e){
+    trace(id,"submit-native-cdp-error",{message:String(e?.message||e).slice(0,140)});
+    return false;
+  }
+}
+
 function realClick(el,id){
   if(!el)return false;
   try{
@@ -12374,8 +12458,26 @@ async function submitPrompt(c,payload,id){
 
   const clickTarget=submitControl(c);
   if(clickTarget&&!clickTarget.disabled){
+    // Native browser input first. Arena occasionally ignores synthetic
+    // KeyboardEvent/click even though the controlled composer is valid.
+    await nativeSubmit(clickTarget,id);
+    for(let i=0;i<14;i++){
+      await sleep(150);
+      const cleared=composerValue(c).length===0;
+      const visiblePrompt=bodyHasPrompt(payload);
+      const generating=!!stopButton();
+      const hrefChanged=location.href!==startHref;
+      const newUserMessage=visibleUserMessageCount()>startUserCount;
+      if(cleared||visiblePrompt||generating||hrefChanged||newUserMessage){
+        trace(id,"submission-confirmed-native",{cleared,visiblePrompt,generating,hrefChanged,newUserMessage});
+        return true;
+      }
+    }
+
+    // Keep the old DOM click as a compatibility fallback for browsers where
+    // chrome.debugger attachment is unavailable.
     realClick(clickTarget,id);
-    for(let i=0;i<12;i++){
+    for(let i=0;i<10;i++){
       await sleep(150);
       const cleared=composerValue(c).length===0;
       const visiblePrompt=bodyHasPrompt(payload);
@@ -12388,6 +12490,22 @@ async function submitPrompt(c,payload,id){
       }
     }
   }else{
+    // If the Send button is not discoverable, CDP Enter still gives us a true
+    // browser-level key event against the already-focused composer.
+    c.focus();
+    await nativeSubmit(null,id);
+    for(let i=0;i<10;i++){
+      await sleep(150);
+      const cleared=composerValue(c).length===0;
+      const visiblePrompt=bodyHasPrompt(payload);
+      const generating=!!stopButton();
+      const hrefChanged=location.href!==startHref;
+      const newUserMessage=visibleUserMessageCount()>startUserCount;
+      if(cleared||visiblePrompt||generating||hrefChanged||newUserMessage){
+        trace(id,"submission-confirmed-native-enter",{cleared,visiblePrompt,generating,hrefChanged,newUserMessage});
+        return true;
+      }
+    }
     trace(id,"submit-control-unavailable",{found:!!clickTarget,disabled:!!clickTarget?.disabled});
   }
 
@@ -12423,7 +12541,8 @@ async function submitPrompt(c,payload,id){
     send_found:!!finalButton,
     send_disabled:!!finalButton?.disabled,
     href_changed:location.href!==startHref,
-    user_messages_delta:visibleUserMessageCount()-startUserCount
+    user_messages_delta:visibleUserMessageCount()-startUserCount,
+    native_cdp_attempted:true
   });
   return false;
 }
@@ -12542,7 +12661,7 @@ setInterval(publishState,5000);
             fh.write(content_source)
 
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + assistant-boundary stream v4.1.14")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + native-CDP submit fallback v4.1.15")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
