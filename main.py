@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.3.1-fresh-extension-submit-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.3.2-terms-gate-worker-health-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.3.1-fresh-extension-submit-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.3.2-terms-gate-worker-health-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11949,7 +11949,7 @@ V4_PROFILE_DIR = os.environ.get("BRIDGENA_V4_PROFILE_DIR", os.path.join(os.path.
 # from V4_EXTENSION_DIR, a build-specific copy. Unpacked Chrome extension state
 # is cached by profile + extension identity; using a build-isolated directory
 # makes stale service-worker/content-script execution impossible after upgrades.
-V4_EXTENSION_BUILD = "4.3.1"
+V4_EXTENSION_BUILD = "4.3.2"
 V4_EXTENSION_SOURCE_DIR = os.environ.get(
     "BRIDGENA_V4_EXTENSION_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension"),
@@ -12100,7 +12100,7 @@ def _v4_prepare_bundled_extension():
         if "debugger" not in perms:
             perms.append("debugger")
         manifest["permissions"]=perms
-        manifest["version"]="4.3.1"
+        manifest["version"]="4.3.2"
         with open(manifest_path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
             fh.write("\n")
@@ -12137,13 +12137,19 @@ async function dispatchJob(tab,job,reason="server"){
       return false;
     }
 
-    if(!probe || probe.build!==BOOT.build){
+    if(
+      !probe ||
+      probe.build!==BOOT.build ||
+      probe.contentFingerprint!==BOOT.contentFingerprint
+    ){
       send({
         type:"trace",request_id:job.request_id,
         stage:"content-build-mismatch",
         reason,
         expected:BOOT.build,
         actual:String(probe?.build||"missing"),
+        expected_fingerprint:String(BOOT.contentFingerprint||""),
+        actual_fingerprint:String(probe?.contentFingerprint||"missing"),
         href:String(probe?.href||"").slice(0,240)
       });
       return false;
@@ -12153,6 +12159,7 @@ async function dispatchJob(tab,job,reason="server"){
       type:"trace",request_id:job.request_id,
       stage:"content-build-ok",
       build:probe.build,
+      fingerprint:probe.contentFingerprint,
       href:String(probe.href||"").slice(0,240)
     });
     await chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_SEND",job});
@@ -12299,7 +12306,8 @@ chrome.runtime.onMessage.addListener((msg,sender,sendResponse)=>{
       msg.type==="BRIDGENA_DONE"||
       msg.type==="BRIDGENA_ERROR"||
       msg.type==="BRIDGENA_CHALLENGE"||
-      msg.type==="BRIDGENA_LOGIN_REQUIRED"
+      msg.type==="BRIDGENA_LOGIN_REQUIRED"||
+      msg.type==="BRIDGENA_TERMS_REQUIRED"
     ){
       if(!msg.request_id||msg.request_id===currentRequest){
         currentRequest=null;pendingJob=null;pendingTabId=null;currentPhase="";
@@ -12311,7 +12319,7 @@ chrome.runtime.onInstalled.addListener(()=>connect());
 chrome.runtime.onStartup.addListener(()=>connect());
 connect();
 """
-        boot=json.dumps({"wsUrl":ws_url,"token":V4_EXTENSION_TOKEN,"build":V4_EXTENSION_BUILD}, separators=(",",":"))
+        boot=json.dumps({"wsUrl":ws_url,"token":V4_EXTENSION_TOKEN,"build":V4_EXTENSION_BUILD,"contentFingerprint":"v4.3.2-terms-gate-r1"}, separators=(",",":"))
         sw_source=sw_template.replace("__BOOT__", boot)
         with open(sw_path, "w", encoding="utf-8") as fh:
             fh.write(sw_source)
@@ -12321,7 +12329,8 @@ connect();
         # screens. Rebuild the content script with challenge detection based on
         # visible challenge UI instead of the mere presence of a reCAPTCHA URL.
         content_path=os.path.join(V4_EXTENSION_DIR, "arena-content.js")
-        content_source=r"""const CONTENT_BUILD="4.3.1";
+        content_source=r"""const CONTENT_BUILD="4.3.2";
+const CONTENT_FINGERPRINT="v4.3.2-terms-gate-r1";
 let active=null;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function visible(el){
@@ -12363,6 +12372,40 @@ function loginRequired(){
     return /^(sign in|log in|login)$/i.test(t)||/^(sign in|log in|login)$/i.test(a);
   });
 }
+
+function termsGate(){
+  const roots=[
+    ...document.querySelectorAll(
+      '[role="dialog"],[aria-modal="true"],dialog,[data-radix-dialog-content],'+
+      '[class*="modal" i],[class*="dialog" i]'
+    )
+  ].filter(visible);
+
+  for(const el of roots){
+    const t=normalizedText(txt(el));
+    if(!t)return;
+    const buttons=[...el.querySelectorAll('button,[role="button"]')]
+      .filter(visible)
+      .map(b=>(b.getAttribute("aria-label")||txt(b)).replace(/\s+/g," ").trim())
+      .filter(Boolean);
+
+    const termsText=
+      /terms of use/i.test(t) &&
+      /privacy policy/i.test(t) &&
+      /agree/i.test(t);
+    const agreeButton=buttons.some(x=>/^agree$/i.test(x));
+
+    if(termsText&&agreeButton){
+      return {
+        element:el,
+        text:t.slice(0,420),
+        buttons:buttons.slice(0,12)
+      };
+    }
+  }
+  return null;
+}
+function termsRequired(){return !!termsGate()}
 
 function domRoots(){
   const roots=[document],seen=new Set([document]);
@@ -12658,14 +12701,14 @@ function visibleUiBlockers(){
     '[role="dialog"],[aria-modal="true"],dialog,[data-radix-dialog-content],'+
     '[class*="modal" i],[class*="dialog" i]'
   ).filter(visible);
-  return roots.slice(0,6).map(el=>({
+  return roots.map(el=>({
     text:normalizedText(txt(el)).slice(0,320),
     buttons:[...el.querySelectorAll('button,[role="button"]')]
       .filter(visible)
       .map(b=>(b.getAttribute("aria-label")||txt(b)).replace(/\s+/g," ").trim())
       .filter(Boolean)
       .slice(0,12)
-  }));
+  })).filter(x=>x.text||x.buttons.length).slice(0,6);
 }
 
 function runtimeDiagnostics(model=""){
@@ -12683,6 +12726,7 @@ function runtimeDiagnostics(model=""){
     generating:!!stop,
     challenge:challengePresent(),
     login_required:loginRequired(),
+    terms_required:termsRequired(),
     transcript_messages:conversationMessageCount(),
     visible_user_messages:visibleUserMessageCount(),
     assistant_candidates:assistantCandidates("").length,
@@ -13302,7 +13346,7 @@ async function submitPrompt(c,payload,id){
         trace(id,stage,e);
         return true;
       }
-      if(challengePresent()||loginRequired())return false;
+      if(challengePresent()||loginRequired()||termsRequired())return false;
       if(Date.now()-lastDiag>2200){
         lastDiag=Date.now();
         trace(id,"submission-ack-wait",{
@@ -13450,6 +13494,20 @@ async function run(job){
     phase(job.request_id,"started");
     if(loginRequired()){trace(job.request_id,"login-required");emit('login_required',job.request_id);return}
     if(challengePresent()){trace(job.request_id,"challenge-visible");emit('challenge',job.request_id);return}
+    if(termsRequired()){
+      const gate=termsGate();
+      trace(job.request_id,"terms-required",{
+        text:gate?.text||"",
+        buttons:gate?.buttons||[],
+        href:location.href
+      });
+      emit('terms_required',job.request_id,{
+        text:gate?.text||"",
+        buttons:gate?.buttons||[],
+        href:location.href
+      });
+      return;
+    }
 
     let usingSession=!!job.reuse_session;
     if(usingSession){
@@ -13499,12 +13557,27 @@ async function run(job){
       }
     }
 
+    if(termsRequired()){
+      const gate=termsGate();
+      trace(job.request_id,"terms-required-after-navigation",{
+        text:gate?.text||"",
+        buttons:gate?.buttons||[],
+        href:location.href
+      });
+      emit('terms_required',job.request_id,{
+        text:gate?.text||"",
+        buttons:gate?.buttons||[],
+        href:location.href
+      });
+      return;
+    }
+
     // A resumed Arena chat already owns its model. On a fresh/rebuilt chat we
     // select it exactly once. Python invalidates a sticky session if the client
     // changes models.
     let modelOk=true;
     if(!usingSession){
-      modelOk=await selectModelStable(job.model,job.request_id);
+      modelOk=await selectModelStable(job.model,job.model_aliases||[],job.request_id);
       trace(job.request_id,"model-selection",{ok:modelOk,model:job.model||"auto"});
     }else{
       trace(job.request_id,"model-selection-skipped-session",{model:job.model||"auto"});
@@ -13554,6 +13627,20 @@ async function run(job){
         emit('login_required',job.request_id);
         return;
       }
+      if(termsRequired()){
+        const gate=termsGate();
+        trace(job.request_id,"terms-required-during-submit",{
+          text:gate?.text||"",
+          buttons:gate?.buttons||[],
+          href:location.href
+        });
+        emit('terms_required',job.request_id,{
+          text:gate?.text||"",
+          buttons:gate?.buttons||[],
+          href:location.href
+        });
+        return;
+      }
       if(usingSession)throw new Error("Arena session submit could not be strongly confirmed");
       throw new Error("Arena prompt could not be strongly confirmed as submitted");
     }
@@ -13583,6 +13670,19 @@ async function run(job){
 
     while(!active.cancel){
       if(challengePresent()){trace(job.request_id,"challenge-during-job");emit('challenge',job.request_id);return}
+      if(termsRequired()){
+        const gate=termsGate();
+        trace(job.request_id,"terms-required-during-job",{
+          text:gate?.text||"",
+          buttons:gate?.buttons||[]
+        });
+        emit('terms_required',job.request_id,{
+          text:gate?.text||"",
+          buttons:gate?.buttons||[],
+          href:location.href
+        });
+        return;
+      }
 
       const generating=!!stopButton();
       if(generating&&!startedGenerating){
@@ -13743,6 +13843,7 @@ chrome.runtime.onMessage.addListener((m,sender,sendResponse)=>{
   if(m?.type==='BRIDGENA_VERSION_PROBE'){
     sendResponse({
       build:CONTENT_BUILD,
+      contentFingerprint:CONTENT_FINGERPRINT,
       href:location.href,
       readyState:document.readyState,
       visibility:document.visibilityState
@@ -13763,8 +13864,18 @@ setTimeout(()=>{
 },80);
 
 function publishState(){
-  const challenge=challengePresent(),login=loginRequired(),ready=!challenge&&!login&&!!composer();
-  emit('worker_state','',{ready,login_required:login,challenge});
+  const challenge=challengePresent();
+  const login=loginRequired();
+  const terms=termsRequired();
+  const ready=!challenge&&!login&&!terms&&!!composer();
+  emit('worker_state','',{
+    ready,
+    login_required:login,
+    challenge,
+    terms_required:terms,
+    content_build:CONTENT_BUILD,
+    content_fingerprint:CONTENT_FINGERPRINT
+  });
 }
 setTimeout(publishState,1200);
 setInterval(publishState,5000);
@@ -13772,7 +13883,7 @@ setInterval(publishState,5000);
         with open(content_path, "w", encoding="utf-8") as fh:
             fh.write(content_source)
 
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={V4_EXTENSION_TOKEN_MODE} · storage-safe · native-editor + fresh-extension/send-first v4.3.1")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={V4_EXTENSION_TOKEN_MODE} · storage-safe · native-editor + terms-gate worker health v4.3.2")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
@@ -13802,7 +13913,7 @@ def _v4_worker_score(worker: dict, model: str) -> float:
     # ready=false even after the keeper/browser has passed server readiness.
     if worker.get("busy") or worker.get("ws") is None:
         return -1e9
-    if worker.get("challenge") or worker.get("login_required"):
+    if worker.get("challenge") or worker.get("login_required") or worker.get("terms_required"):
         return -1e9
     last_seen = float(worker.get("last_seen") or 0)
     if last_seen and (time.monotonic() - last_seen) > 45.0:
@@ -13931,6 +14042,7 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
                 f"worker={worker_id} stage={last_stage} "
                 f"ready={bool(w.get('ready'))} challenge={bool(w.get('challenge'))} "
                 f"login_required={bool(w.get('login_required'))} "
+                f"terms_required={bool(w.get('terms_required'))} "
                 f"trace_count={trace_count}"
             )
 
@@ -14000,6 +14112,19 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
                 return
             if et == "login_required":
                 yield ("error", "503: headed browser profile is not logged in to Arena")
+                return
+            if et == "terms_required":
+                async with _v4_worker_lock:
+                    state=_v4_workers.get(worker_id)
+                    if state:
+                        state["terms_required"]=True
+                        state["ready"]=False
+                gate_text=redact(str(event.get("text") or ""))[:420]
+                log("WARN", f"v4 worker requires one-time Arena Terms acknowledgement · {worker_id} · "
+                            f"request={request_id[-12:]} · {gate_text}")
+                yield ("error",
+                       "503: headed browser requires one-time Arena Terms of Use acknowledgement "
+                       "in its headed window; this worker is quarantined until acknowledged")
                 return
             if et == "delta":
                 piece=str(event.get("text") or "")
@@ -14124,7 +14249,8 @@ async def v4_extension_ws(ws: WebSocket):
         async with _v4_worker_lock:
             _v4_workers[worker_id]={
                 "id":worker_id,"ws":ws,"ready":bool(hello.get("ready",True)),"busy":False,
-                "challenge":False,"login_required":False,"recent_errors":0,"last_used":0.0,
+                "challenge":False,"login_required":False,"terms_required":False,
+                "recent_errors":0,"last_used":0.0,
                 "connected_at":time.monotonic(),"last_seen":time.monotonic(),
                 "latency_ms":float(hello.get("latency_ms") or 0),
                 "proxy":str(hello.get("proxy") or ""),"models":{},
@@ -14143,14 +14269,22 @@ async def v4_extension_ws(ws: WebSocket):
                         old_ready=bool(worker.get("ready"))
                         old_challenge=bool(worker.get("challenge"))
                         old_login=bool(worker.get("login_required"))
+                        old_terms=bool(worker.get("terms_required"))
                         worker["ready"]=bool(msg.get("ready", worker.get("ready")))
                         worker["challenge"]=bool(msg.get("challenge",False))
                         worker["login_required"]=bool(msg.get("login_required",False))
+                        worker["terms_required"]=bool(msg.get("terms_required",False))
+                        worker["content_build"]=str(msg.get("content_build") or worker.get("content_build") or "")
+                        worker["content_fingerprint"]=str(msg.get("content_fingerprint") or worker.get("content_fingerprint") or "")
                         worker["latency_ms"]=float(msg.get("latency_ms") or worker.get("latency_ms") or 0)
                         if (old_ready != worker["ready"] or
                             old_challenge != worker["challenge"] or
-                            old_login != worker["login_required"]):
-                            log("INFO", f"v4 worker state · {worker_id} · ready={worker['ready']} · challenge={worker['challenge']} · login_required={worker['login_required']}")
+                            old_login != worker["login_required"] or
+                            old_terms != worker["terms_required"]):
+                            level="WARN" if worker["terms_required"] else "INFO"
+                            log(level, f"v4 worker state · {worker_id} · ready={worker['ready']} · "
+                                      f"challenge={worker['challenge']} · login_required={worker['login_required']} · "
+                                      f"terms_required={worker['terms_required']}")
             rid=str(msg.get("request_id") or "")
             q=_v4_jobs.get(rid)
             if q:
@@ -14478,12 +14612,14 @@ async def _require_api_ready():
             advisory_ready = sum(1 for w in _v4_workers.values() if w.get("ready"))
             challenged = sum(1 for w in _v4_workers.values() if w.get("challenge"))
             login_required = sum(1 for w in _v4_workers.values() if w.get("login_required"))
+            terms_required = sum(1 for w in _v4_workers.values() if w.get("terms_required"))
         raise HTTPException(
             status_code=503,
             detail=(f"Bridgena v4 headed-browser capacity unavailable after "
                     f"{min(_API_READY_RECOVERY_WAIT_SEC, 20.0):.0f}s: "
                     f"connected workers={connected}, schedulable workers={ready}, "
-                    f"advisory-ready={advisory_ready}, challenged={challenged}, login-required={login_required}."),
+                    f"advisory-ready={advisory_ready}, challenged={challenged}, "
+                    f"login-required={login_required}, terms-required={terms_required}."),
             headers={"Retry-After": "1"},
         )
 
@@ -15984,6 +16120,7 @@ async def _lifespan(app):
     log("INFO", f"Pre-dispatch transport guard · HEAD probe every request {'ON' if TRANSPORT_PROBE_EVERY_REQUEST else 'OFF'} · timeout {TRANSPORT_PROBE_TIMEOUT_MS}ms · recovery wait {PREDISPATCH_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Account failover · max {ACCOUNT_FAILOVER_MAX} alternate keeper(s) · thread handoff ON for pre-generation account/session failures · 429+verification+partial-stream excluded")
     log("INFO", f"Stream completion policy · extension first-output timeout {V4_FIRST_TOKEN_SEC:.0f}s · idle timeout {V4_IDLE_STREAM_SEC:.0f}s · provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} · partial UI preservation ON")
+    log("INFO", "Browser operator gates · Terms-of-Use dialogs detected as unschedulable worker state · never auto-accepted · automatic re-admission after manual acknowledgement")
     log("INFO", f"Arena stream salvage · {'ON' if ARENA_UI_STREAM_RECOVERY else 'OFF'} · "
                 f"quick {ARENA_SALVAGE_QUICK_SEC:.0f}s current-context check → same-keeper route repair → "
                 f"{ARENA_POST_RESTART_SALVAGE_SEC:.0f}s post-restart history/UI salvage · no prompt replay")
