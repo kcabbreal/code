@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.24-active-20s-recovery")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.8.0-disposable-evaluations-context-capsule")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11206,26 +11206,112 @@ def _openai_system_context(body: dict) -> str:
     return "\n\n".join(parts)
 
 
-def _format_conversation_prompt(body: dict) -> str:
-    """Return only the newest user turn.
+def _disposable_context_prompt(body: dict) -> str:
+    """Build a bounded, non-recursive transcript for one disposable Arena evaluation.
 
-    Arena owns the persistent transcript after create-evaluation. Replaying the
-    full OpenAI/Claude history into post-to-evaluation duplicates context and
-    caused very large envelopes plus incorrect follow-up behavior.
+    Browser keepers/auth/proxies remain persistent, but every API message gets a
+    fresh Arena evaluation. Conversation continuity therefore comes exclusively
+    from the client-supplied transcript. System messages stay in system_prompt
+    and are not duplicated here.
+
+    The newest user message is always preserved and clearly separated. Recent
+    history is retained verbatim (subject to the hard MAX_PROMPT envelope); when
+    older history cannot fit, it is omitted with a neutral marker rather than
+    recursively embedding an earlier Bridgena capsule.
     """
-    return _last_openai_user_prompt(body)
+    messages = body.get("messages") or []
+    rows = []
+    newest_user_index = -1
+    for i, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        if role == "user":
+            value = _openai_text_content(message.get("content", "")).strip()
+            if value:
+                newest_user_index = i
+
+    if newest_user_index < 0:
+        return ""
+
+    newest = _openai_text_content(messages[newest_user_index].get("content", "")).strip()
+    if not newest:
+        return ""
+
+    for i, message in enumerate(messages[:newest_user_index]):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        if role in ("system", "developer"):
+            # These belong to the higher-priority system context, not transcript text.
+            continue
+        value = _openai_text_content(message.get("content", "")).strip()
+        if not value:
+            continue
+        label = {
+            "user": "User",
+            "assistant": "Assistant",
+            "tool": "Tool",
+            "function": "Tool",
+        }.get(role, role.title() or "Message")
+        rows.append(f"{label}:\n{value}")
+
+    prefix = (
+        "Previous messages from this same conversation are provided below. "
+        "Use them only as conversation history and continue naturally. "
+        "Do not mention that the history was supplied separately.\n\n"
+        "--- BEGIN PREVIOUS CONVERSATION ---\n"
+    )
+    suffix = (
+        "\n--- END PREVIOUS CONVERSATION ---\n\n"
+        "Reply to the newest user message below.\n\n"
+        "Newest user message:\nUser:\n"
+    )
+
+    # Reserve the newest turn first. It is the one piece that must never be lost.
+    fixed = prefix + suffix + newest
+    if len(fixed) >= MAX_PROMPT:
+        room = max(1, MAX_PROMPT - len(suffix) - 256)
+        return (suffix + newest[-room:])[-MAX_PROMPT:]
+
+    budget = MAX_PROMPT - len(prefix) - len(suffix) - len(newest)
+    kept = []
+    used = 0
+    omitted = 0
+
+    # Prefer the most recent transcript while preserving complete message blocks.
+    for row in reversed(rows):
+        cost = len(row) + 2
+        if used + cost <= budget:
+            kept.append(row)
+            used += cost
+        else:
+            omitted += 1
+
+    kept.reverse()
+    history = "\n\n".join(kept)
+    if omitted:
+        marker = f"[{omitted} older message(s) omitted to fit the context budget.]"
+        if len(marker) + 2 <= max(0, budget - len(history)):
+            history = (marker + ("\n\n" + history if history else ""))
+        elif history:
+            # Make room for the marker without sacrificing the newest user turn.
+            history = marker + "\n\n" + history[-max(0, budget - len(marker) - 2):]
+
+    return (prefix + history + suffix + newest)[:MAX_PROMPT]
+
+
+def _format_conversation_prompt(body: dict) -> str:
+    return _disposable_context_prompt(body)
 
 
 def _anthropic_prompt(body: dict) -> str:
-    """Return only the newest Anthropic user turn."""
-    messages = body.get("messages") or []
-    for message in reversed(messages):
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        value = _openai_text_content(message.get("content", "")).strip()
-        if value:
-            return value
-    return ""
+    return _disposable_context_prompt(body)
+
+
+def _disposable_chat_id(prefix: str = "api") -> str:
+    """Unique logical id per API message: guarantees create-evaluation semantics."""
+    return f"{prefix}-ephemeral-{uuid7()}"
 
 
 def _anthropic_system_context(body: dict) -> str:
@@ -11379,7 +11465,7 @@ async def openai_stream(body: dict, keyinfo: dict):
     model = body.get("model", "auto")
     # A caller-supplied opaque thread id preserves Arena context without storing
     # prompt or response content. One-off API calls receive a random id.
-    chat_id = _logical_chat_id(body, keyinfo, "api")
+    chat_id = _disposable_chat_id("api")
     tenant_id = _tenant_identity(keyinfo)
     system_prompt = _openai_system_context(body)
 
@@ -11408,7 +11494,7 @@ async def openai_stream(body: dict, keyinfo: dict):
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
-                                                handoff_prompt=_failover_handoff_prompt(body)):
+                                                handoff_prompt=prompt):
                 if kind == "content":
                     acc += payload
                     content_chunks += 1
@@ -11706,13 +11792,13 @@ async def chat_completions(request: Request):
                "model": body.get("model", "auto"), "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]}
         acc = ""
         try:
-            chat_id = _logical_chat_id(body, keyinfo, "api")
+            chat_id = _disposable_chat_id("api")
             async for kind, payload in run_turn(chat_id, prompt,
                                                 body.get("model", "auto"),
                                                 attachments=body.get("attachments"),
                                                 system_prompt=_openai_system_context(body),
                                                 tenant_id=_tenant_identity(keyinfo),
-                                                handoff_prompt=_failover_handoff_prompt(body)):
+                                                handoff_prompt=prompt):
                 if kind == "content":
                     acc += payload
                 elif kind == "error":
@@ -11844,7 +11930,7 @@ async def anthropic_messages(request: Request):
                         f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
         raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
 
-    chat_id = _logical_chat_id(body, keyinfo, "anthropic")
+    chat_id = _disposable_chat_id("anthropic")
     tenant_id = _tenant_identity(keyinfo)
     system_prompt = _anthropic_system_context(body)
     message_id = "msg_" + uuid7().replace("-", "")
@@ -11857,7 +11943,7 @@ async def anthropic_messages(request: Request):
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
-                                                handoff_prompt=_failover_handoff_prompt(body)):
+                                                handoff_prompt=prompt):
                 if kind in ("content", "reasoning") and isinstance(payload, str):
                     acc += payload
                 elif kind == "error":
@@ -11888,7 +11974,7 @@ async def anthropic_messages(request: Request):
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
-                                                handoff_prompt=_failover_handoff_prompt(body)):
+                                                handoff_prompt=prompt):
                 if kind in ("content", "reasoning") and isinstance(payload, str):
                     acc += payload
                     chunks += 1
@@ -13042,6 +13128,7 @@ async def _lifespan(app):
     app.state.background_tasks = tasks
     app.state.ready_at = time.time()
     log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
+    log("INFO", "Conversation mode · disposable Arena evaluation per API message · bounded client-history capsule")
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
     _fleet_target = len(_bootable_keeper_jars())
