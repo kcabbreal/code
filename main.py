@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.8.0-disposable-evaluations-context-capsule")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.8.1-nondestructive-keeper-recovery")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -9383,7 +9383,21 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     if verdict == "RECAPTCHA":
                         failed_jar_id = jar.get("id")
                         _captcha_failed_jars[failed_jar_id] = time.time()
-                        _quarantine_api_keeper(failed_jar_id, "upstream verification challenge/rejection", 45.0)
+
+                        # A request-level verification rejection is not proof that
+                        # the authenticated keeper/account is dead. The old v3.8.0
+                        # path quarantined the keeper for 45 seconds, which could
+                        # collapse fleet capacity after one rejected request.
+                        #
+                        # Keep the existing verification/escalation behavior
+                        # unchanged, but make keeper lifecycle non-destructive:
+                        # revoke only the API readiness lease and hand the browser
+                        # to the normal transport/readiness recovery machinery.
+                        _mark_api_keeper_unready(
+                            failed_jar_id,
+                            "upstream verification rejection; scheduling local readiness recovery",
+                        )
+
                         if rc_attempts.get(failed_jar_id, 0) < 1:
                             rc_attempts[failed_jar_id] = rc_attempts.get(failed_jar_id, 0) + 1
                             reason = ("server requested V2 escalation"
@@ -9397,13 +9411,32 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                 # Do not tie this continuation to the generic request
                                 # attempt budget. The loop reserves one V2-only slot.
                                 continue
+
+                        # Do not exile the keeper. Start ordinary local recovery so
+                        # the next request can use it again as soon as browser/auth/
+                        # route readiness is healthy. No cross-account replay is
+                        # introduced here.
+                        try:
+                            _api_keeper_quarantine_until.pop(str(failed_jar_id), None)
+                            _verification_preflight_retry_after.pop(str(failed_jar_id), None)
+                            _schedule_transport_recovery(
+                                str(failed_jar_id),
+                                "post-rejection local keeper recovery",
+                            )
+                            _wake_verification_scheduler()
+                        except Exception as recovery_exc:
+                            log("WARN", f"[{jar.get('name')}] post-rejection recovery scheduling failed · "
+                                        f"{type(recovery_exc).__name__}: {redact(str(recovery_exc))[:160]}")
+
                         if mc:
                             clear_conversation_model(chat_id, model_name)
-                        log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation did not complete; keeper quarantined 45s")
+
+                        log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}); "
+                                    "keeper retained and local recovery started")
                         rejection = (e.body or "").strip().replace("\n", " ")[:220]
                         yield ("error",
-                               "503: Arena rejected verification for this request and the same-keeper escalation did not complete. "
-                               "The selected keeper was quarantined for 45s; no cross-account replay was attempted."
+                               "503: Arena rejected verification for this request and the same-keeper continuation did not complete. "
+                               "The keeper was retained and local readiness recovery was started; no cross-account replay was attempted."
                                + (f" Upstream: {rejection}" if rejection else ""))
                         return
 
@@ -9532,11 +9565,26 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             response_text = ""
                             reasoning_text = ""
                         # Verification rejection is intentionally NOT a
-                        # cross-account failover condition. Keep recovery local.
-                        log("WARN", f"[{jar.get('name')}] recaptcha unresolved — jar KEPT HEALTHY (starvation is our bug, not their death)")
-                        yield ("error", "403: arena's recaptcha check rejected us and the keeper could not mint a token on this exit. "
-                                        "Jars were NOT expired. Fix order: keeper live on this exit → solver models present "
-                                        "(recaptcha_solver.py + models/ + onnxruntime) → 'recaptcha token:' WARN says which link.")
+                        # cross-account failover condition. Keep recovery local
+                        # and non-destructive.
+                        _mark_api_keeper_unready(
+                            failed_jar_id,
+                            "verification rejection; local readiness recovery requested",
+                        )
+                        try:
+                            _api_keeper_quarantine_until.pop(str(failed_jar_id), None)
+                            _verification_preflight_retry_after.pop(str(failed_jar_id), None)
+                            _schedule_transport_recovery(
+                                str(failed_jar_id),
+                                "post-rejection local keeper recovery",
+                            )
+                            _wake_verification_scheduler()
+                        except Exception:
+                            pass
+                        log("WARN", f"[{jar.get('name')}] verification unresolved — keeper retained; local recovery started")
+                        yield ("error", "503: Arena rejected verification for this request. "
+                                        "The keeper was retained and local readiness recovery was started; "
+                                        "no cross-account replay was attempted.")
                         return
 
                     if verdict == "PROMPT":
@@ -13129,6 +13177,7 @@ async def _lifespan(app):
     app.state.ready_at = time.time()
     log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
     log("INFO", "Conversation mode · disposable Arena evaluation per API message · bounded client-history capsule")
+    log("INFO", "Keeper rejection policy · non-destructive local recovery · no 45s API exile")
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
     _fleet_target = len(_bootable_keeper_jars())
