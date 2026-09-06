@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.21-followup-delivery-truth")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.22-transient-proxy-discipline")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -5278,7 +5278,45 @@ class KeeperSession:
                     _probe_fail_reason[used] = "keeper shim bypassed: browser capability error (proxy NOT exiled)"
                     log("WARN", f"[{self.name}] {used.split('@')[-1]} kept in pool — Chromium capability error, not a dead proxy")
                 elif not _local_route_err:
-                    quarantine_proxy(used, f"keeper {self.name}: {txt[:90]}")
+                    # ERR_NETWORK_CHANGED is a Chromium/network-stack transition,
+                    # not proof that the shared upstream proxy is dead. Exiling a
+                    # shared exit here can destabilize other live keepers that are
+                    # already using it. Treat transient browser/network failures as
+                    # strikes and reserve hard quarantine for explicit tunnel/proxy
+                    # refusal classes.
+                    _low = txt.lower()
+                    _transient_net = any(k in _low for k in (
+                        "err_network_changed",
+                        "err_network_io_suspended",
+                        "err_internet_disconnected",
+                        "err_connection_reset",
+                        "err_connection_closed",
+                        "err_timed_out",
+                        "timeout",
+                    ))
+                    _hard_proxy = any(k in _low for k in (
+                        "err_proxy_connection_failed",
+                        "err_tunnel_connection_failed",
+                        "proxy connection failed",
+                        "tunnel connection failed",
+                        "connection refused",
+                        "connect refused",
+                        "authentication failed",
+                        "proxy authentication",
+                    ))
+                    if _transient_net and not _hard_proxy:
+                        strike_proxy(used, f"keeper transient browser network failure: {txt[:90]}")
+                        _probe_fail_reason[used] = "transient keeper network change; exit retained pending strike threshold"
+                        log("WARN", f"[{self.name}] transient network change on shared exit "
+                                    f"{used.split('@')[-1]} — strike recorded, proxy retained")
+                    elif _hard_proxy:
+                        quarantine_proxy(used, f"keeper hard proxy/tunnel failure: {txt[:90]}")
+                    else:
+                        # Unknown browser startup failures are not strong enough
+                        # evidence to globally exile a shared exit. Record a strike.
+                        strike_proxy(used, f"keeper startup failure: {txt[:90]}")
+                        log("WARN", f"[{self.name}] ambiguous keeper startup failure on "
+                                    f"{used.split('@')[-1]} — strike recorded, proxy retained")
             pool = get_proxy_pool() or []
             left = [c for c in pool if c not in self._tried_proxies]
             if _retryable and left:
