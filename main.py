@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.10-duplicate-message-ack")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.11-duplicate-reconciliation")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -8920,6 +8920,32 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                 if salvage.get("ok"):
                                     _bump_arena_ui_recovery("post_restart_recovered")
 
+                        # A duplicate ACK is itself authoritative proof that the exact
+                        # evaluation/message already exists upstream. History indexing
+                        # can lag behind that ACK, so do not require trace_found from the
+                        # first two salvage passes before entering the delivered-turn
+                        # completion window. Poll the exact persisted evaluation only;
+                        # never resubmit the prompt or mint replacement message IDs.
+                        if not salvage.get("ok"):
+                            browser_session = keeper.sessions.get(jar.get("id")) or browser_session
+                            log("INFO", f"[{jar.get('name')}] duplicate ACK proves delivery; "
+                                        f"polling exact Arena turn for up to {ARENA_DELIVERED_WAIT_SEC:.1f}s · "
+                                        f"evaluation {existing_id[:12]}…")
+                            salvage = await _attempt_ui_stream_salvage(
+                                session=browser_session,
+                                chat_id=chat_id,
+                                model_name=model_name,
+                                arena_id=existing_id,
+                                model_message_id=str(base.get("modelAMessageId") or ""),
+                                user_prompt=prompt,
+                                partial_text=response_text or "",
+                                jar=jar,
+                                proxy=proxy,
+                                cached_url=str(salvage.get("url") or (mc or {}).get("ui_url") or ""),
+                                timeout_sec=ARENA_DELIVERED_WAIT_SEC,
+                                stage="duplicate-delivered-wait",
+                            )
+
                         if salvage.get("ok"):
                             final_text = str(salvage.get("text") or "")
                             suffix = str(salvage.get("suffix") or "")
@@ -8937,11 +8963,11 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             return
 
                         log("WARN", f"[{jar.get('name')}] duplicate {'follow-up message' if _duplicate_message_ack else 'create'} "
-                                    "proves delivery, but answer is not visible in Arena history yet; replay suppressed")
+                                    "proves delivery, but answer was still incomplete after the delivered-turn recovery window; replay suppressed")
                         yield ("error", "502: Arena confirmed that this exact message/evaluation already exists, so the "
-                                        "original turn was delivered. Bridgena suppressed replay to avoid a duplicate message, "
-                                        "but the completed answer was not visible in Arena history yet. Retry the client "
-                                        "request only after the existing thread becomes visible.")
+                                        "original turn was delivered. Bridgena suppressed replay and kept the existing "
+                                        "evaluation binding, but the completed answer was still unavailable after the "
+                                        "delivered-turn recovery window.")
                         return
 
                     if verdict == "SESSION":
