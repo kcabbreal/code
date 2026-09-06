@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.2.0-sticky-arena-sessions.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.2.1-transcript-ack-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.2.0-sticky-arena-sessions")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.2.1-transcript-ack-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11993,7 +11993,7 @@ def _v4_prepare_bundled_extension():
         if "debugger" not in perms:
             perms.append("debugger")
         manifest["permissions"]=perms
-        manifest["version"]="4.2.0"
+        manifest["version"]="4.2.1"
         with open(manifest_path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
             fh.write("\n")
@@ -12240,22 +12240,88 @@ async function restoreSession(url,id){
   return true;
 }
 
-function committedPromptCount(prompt){
-  const p=normalizedText(prompt),probe=p.slice(0,Math.min(160,p.length));
-  if(!probe)return 0;
+function promptFragments(prompt){
+  const p=normalizedText(prompt);
+  if(!p)return [];
+  if(p.length<=32)return [p];
+
+  const out=[];
+  const add=s=>{
+    s=normalizedText(s);
+    if(s.length>=18&&!out.includes(s))out.push(s);
+  };
+  add(p.slice(0,Math.min(96,p.length)));
+  add(p.slice(Math.max(0,p.length-96)));
+
+  // Recovery/context capsules end with the newest user turn. Including a
+  // fragment around that marker makes acknowledgement survive UI truncation
+  // of the older history while still binding the evidence to this request.
+  const marker=p.toLowerCase().lastIndexOf("newest user message:");
+  if(marker>=0)add(p.slice(marker,Math.min(p.length,marker+160)));
+  return out;
+}
+
+function promptMatchesText(text,prompt){
+  const t=normalizedText(text),p=normalizedText(prompt);
+  if(!t||!p)return false;
+  if(p.length<=32)return t===p || t.endsWith(p);
+
+  const probes=promptFragments(p);
+  if(!probes.length)return false;
+  const hits=probes.filter(x=>t.includes(x)).length;
+  // Long payloads require two independent fragments when available, which
+  // prevents a generic page container from becoming "proof" of submission.
+  return hits>=Math.min(2,probes.length);
+}
+
+function transcriptBoundaries(){
   const selector=[
-    '[data-message-author-role="user"]','[data-role="user"]','[data-author="user"]',
-    '[data-testid*="user" i]','article','[role="article"]',
-    '[data-testid*="message" i]','[class*="message" i]','[class*="bubble" i]'
+    '[data-message-author-role="user"]','[data-message-author-role="assistant"]',
+    '[data-role="user"]','[data-role="assistant"]',
+    '[data-author="user"]','[data-author="assistant"]',
+    '[data-testid*="user" i]','[data-testid*="assistant" i]',
+    '[data-testid*="message" i]','[class*="message" i]','[class*="bubble" i]',
+    'article','[role="article"]'
   ].join(',');
   const raw=[...document.querySelectorAll(selector)].filter(el=>{
     if(!visible(el)||el===document.body||el===document.documentElement||el.tagName==='MAIN')return false;
-    if(el.closest('form')||el.querySelector('textarea,input,[contenteditable="true"]'))return false;
-    return normalizedText(txt(el)).includes(probe);
+    if(el.closest('nav,aside,[role="navigation"],form'))return false;
+    if(el.matches('textarea,input,[contenteditable="true"]')||
+       el.querySelector('textarea,input,[contenteditable="true"]'))return false;
+    return !!normalizedText(txt(el));
   });
-  // Count only the innermost matching boundaries to avoid article/message
-  // wrapper nesting turning one committed user turn into several matches.
-  return raw.filter(el=>!raw.some(other=>other!==el&&el.contains(other))).length;
+  return raw.filter(el=>!raw.some(other=>other!==el&&el.contains(other)));
+}
+
+function conversationMessageCount(){
+  return transcriptBoundaries().length;
+}
+
+function renderedPromptBoundaryCount(prompt){
+  const p=normalizedText(prompt);
+  if(!p)return 0;
+  const main=document.querySelector('main')||document.body;
+  let raw=transcriptBoundaries().filter(el=>main.contains(el)&&promptMatchesText(txt(el),p));
+
+  // Arena occasionally changes the message wrapper class. Fall back to
+  // compact visible descendants of <main>, but never forms/navigation or
+  // giant conversation containers.
+  if(!raw.length){
+    const maxLen=Math.max(260,Math.min(9000,p.length+700));
+    const generic=[...main.querySelectorAll('div,p,section,li')].filter(el=>{
+      if(!visible(el)||el.closest('nav,aside,[role="navigation"],form'))return false;
+      if(el.matches('textarea,input,[contenteditable="true"],button')||
+         el.querySelector('textarea,input,[contenteditable="true"]'))return false;
+      const t=normalizedText(txt(el));
+      return !!t&&t.length<=maxLen&&promptMatchesText(t,p);
+    });
+    raw=generic.filter(el=>!generic.some(other=>other!==el&&el.contains(other)));
+  }
+  return raw.length;
+}
+
+function committedPromptCount(prompt){
+  return renderedPromptBoundaryCount(prompt);
 }
 
 function submitControl(c){
@@ -12649,6 +12715,10 @@ function realClick(el,id){
 async function submitPrompt(c,payload,id){
   const startHref=location.href;
   const startCommitted=committedPromptCount(payload);
+  const startMessages=conversationMessageCount();
+  const startUsers=visibleUserMessageCount();
+  const startAssistants=assistantCandidates(payload).length;
+  const startGenerating=!!stopButton();
 
   await setValue(c,payload,id);
   const initialButton=submitControl(c);
@@ -12658,27 +12728,58 @@ async function submitPrompt(c,payload,id){
     value_chars:composerValue(c).length,
     send_found:!!initialButton,
     send_disabled:!!initialButton?.disabled,
-    send_label:initialButton?(initialButton.getAttribute("aria-label")||txt(initialButton)).slice(0,100):""
+    send_label:initialButton?(initialButton.getAttribute("aria-label")||txt(initialButton)).slice(0,100):"",
+    baseline_messages:startMessages,
+    baseline_users:startUsers,
+    baseline_assistants:startAssistants
   });
 
   const evidence=()=>{
-    const committed=committedPromptCount(payload)>startCommitted;
-    const generating=!!stopButton();
-    const assistant=assistantCandidates(payload).length>0;
-    const cleared=composerValue(c).length===0;
+    const liveComposer=(c&&c.isConnected)?c:composer();
+    const committedNow=committedPromptCount(payload);
+    const messageNow=conversationMessageCount();
+    const userNow=visibleUserMessageCount();
+    const assistantNow=assistantCandidates(payload).length;
+    const generatingNow=!!stopButton();
+
+    const committed=committedNow>startCommitted;
+    const newMessage=messageNow>startMessages;
+    const newUser=userNow>startUsers;
+    const assistant=assistantNow>startAssistants;
+    const generating=!startGenerating&&generatingNow;
+    const cleared=liveComposer?composerValue(liveComposer).length===0:false;
     const hrefChanged=location.href!==startHref;
-    return {committed,generating,assistant,cleared,hrefChanged};
+
+    // Strong acknowledgement is explicitly a before/after transition. Existing
+    // assistant messages in a sticky chat are never allowed to count.
+    const strong=committed||newUser||assistant||generating||(cleared&&newMessage);
+    return {
+      strong,committed,newMessage,newUser,assistant,generating,cleared,hrefChanged,
+      committed_count:committedNow,message_count:messageNow,user_count:userNow,
+      assistant_count:assistantNow
+    };
   };
+
   const waitStrong=async(ms,stage)=>{
     const deadline=Date.now()+ms;
+    let lastDiag=0;
     while(Date.now()<deadline){
       await sleep(140);
       const e=evidence();
-      if(e.committed||e.generating||e.assistant){
+      if(e.strong){
         trace(id,stage,e);
         return true;
       }
-      if(challengePresent())return false;
+      if(challengePresent()||loginRequired())return false;
+      if(Date.now()-lastDiag>2200){
+        lastDiag=Date.now();
+        trace(id,"submission-ack-wait",{
+          stage,
+          committed:e.committed,newMessage:e.newMessage,newUser:e.newUser,
+          assistant:e.assistant,generating:e.generating,cleared:e.cleared,
+          hrefChanged:e.hrefChanged
+        });
+      }
     }
     return false;
   };
@@ -12705,7 +12806,7 @@ async function submitPrompt(c,payload,id){
   let e=evidence();
   if(e.cleared&&e.hrefChanged){
     trace(id,"submission-route-ambiguous",e);
-    if(await waitStrong(4500,"submission-confirmed-delayed"))return true;
+    if(await waitStrong(12000,"submission-confirmed-delayed"))return true;
     trace(id,"submission-ambiguous-no-ack",evidence());
     return false;
   }
@@ -12720,7 +12821,7 @@ async function submitPrompt(c,payload,id){
 
     e=evidence();
     if(e.cleared&&e.hrefChanged){
-      if(await waitStrong(3500,"submission-confirmed-native-delayed"))return true;
+      if(await waitStrong(9000,"submission-confirmed-native-delayed"))return true;
       trace(id,"submission-native-ambiguous-no-ack",evidence());
       return false;
     }
@@ -12749,14 +12850,20 @@ async function submitPrompt(c,payload,id){
 
   const finalComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
   const finalButton=submitControl(finalComposer);
+  const finalEvidence=evidence();
   trace(id,"submission-unconfirmed",{
     value_chars:finalComposer?composerValue(finalComposer).length:0,
     committed_delta:committedPromptCount(payload)-startCommitted,
+    message_delta:conversationMessageCount()-startMessages,
+    user_delta:visibleUserMessageCount()-startUsers,
+    assistant_delta:assistantCandidates(payload).length-startAssistants,
     send_found:!!finalButton,
     send_disabled:!!finalButton?.disabled,
     href_changed:location.href!==startHref,
     generating:!!stopButton(),
-    challenge:challengePresent()
+    challenge:challengePresent(),
+    login_required:loginRequired(),
+    strong:finalEvidence.strong
   });
   return false;
 }
@@ -12832,7 +12939,21 @@ async function run(job){
     const baseline=assistantSnapshot(payload);
     let tracker=responseTracker(c,payload,job.request_id);
     const submitted=await submitPrompt(c,payload,job.request_id);
-    if(!submitted){tracker.stop();throw new Error("Arena prompt could not be strongly confirmed as submitted")}
+    if(!submitted){
+      tracker.stop();
+      if(challengePresent()){
+        trace(job.request_id,"challenge-during-submit");
+        emit('challenge',job.request_id);
+        return;
+      }
+      if(loginRequired()){
+        trace(job.request_id,"login-required-during-submit");
+        emit('login_required',job.request_id);
+        return;
+      }
+      if(usingSession)throw new Error("Arena session submit could not be strongly confirmed");
+      throw new Error("Arena prompt could not be strongly confirmed as submitted");
+    }
 
     // Capture the real Arena conversation as soon as a committed submit exists.
     emit('session_update',job.request_id,{chat_id:job.chat_id||"",url:location.href,model:job.model||"auto"});
@@ -13015,7 +13136,7 @@ setInterval(publishState,5000);
             fh.write(content_source)
 
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + sticky Arena sessions v4.2.0")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + transcript-delta ACK v4.2.1")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
