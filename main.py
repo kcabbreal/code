@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.13-submit-control-stabilization-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.14-assistant-boundary-stream-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.13-submit-control-stabilization-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.14-assistant-boundary-stream-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -12106,45 +12106,66 @@ async function selectModel(model){
   return false;
 }
 
+function normalizedText(s){
+  return String(s||"").replace(/\s+/g," ").trim();
+}
+function promptProbe(prompt){
+  const p=normalizedText(prompt);
+  if(!p)return "";
+  // Long enough to avoid accidental overlap with a normal answer, short
+  // enough to survive UI wrapping/whitespace changes.
+  return p.slice(0,Math.min(180,p.length));
+}
+function contaminatedByPrompt(text,prompt){
+  const t=normalizedText(text),probe=promptProbe(prompt);
+  if(!t)return true;
+  if(probe&&t.includes(probe))return true;
+  // Bridgena's context capsule markers must never be surfaced as assistant
+  // output even if a parent chat container is accidentally considered.
+  if(/Previous messages from this same conversation are provided below/i.test(t))return true;
+  if(/--- BEGIN PREVIOUS CONVERSATION ---/i.test(t))return true;
+  if(/Reply to the newest user message below/i.test(t))return true;
+  if(/Newest user message:/i.test(t))return true;
+  return false;
+}
 function excludedResponseNode(el,prompt){
   if(!el||!visible(el))return true;
   if(el.closest('nav,aside,[data-sidebar],[role="navigation"],form'))return true;
   if(el.matches('textarea,input,[contenteditable="true"]')||el.querySelector('textarea,input,[contenteditable="true"]'))return true;
-  const t=txt(el).replace(/\s+/g," ").trim();
-  if(!t)return true;
-  const p=String(prompt||"").trim();
-  if(p&&t===p)return true;
+  const t=normalizedText(txt(el));
+  if(!t||contaminatedByPrompt(t,prompt))return true;
   return false;
 }
 
-function assistantCandidates(prompt=""){
+function explicitAssistantCandidates(prompt=""){
   const selectors=[
     '[data-message-author-role="assistant"]',
     '[data-role="assistant"]',
     '[data-author="assistant"]',
     '[data-testid*="assistant" i]',
-    '[data-testid*="message" i]',
-    '[class*="assistant" i]',
-    'article',
-    '[role="article"]',
-    'main [class*="prose" i]',
-    'main [class*="markdown" i]',
-    'main [class*="message" i]'
+    '[aria-label*="assistant" i]'
   ];
   const out=[],seen=new Set();
   for(const s of selectors){
     for(const el of document.querySelectorAll(s)){
       if(seen.has(el)||excludedResponseNode(el,prompt))continue;
       const v=txt(el);
-      if(!v)continue;
+      if(!v||contaminatedByPrompt(v,prompt))continue;
       seen.add(el);out.push({el,text:v});
     }
   }
   return out;
 }
 
+function assistantCandidates(prompt=""){
+  // Diagnostics only: explicit assistant-semantic nodes. Generic article/
+  // markdown/message containers are intentionally excluded here because they
+  // can contain both the user prompt and the assistant region.
+  return explicitAssistantCandidates(prompt);
+}
+
 function assistantSnapshot(prompt=""){
-  const a=assistantCandidates(prompt);
+  const a=explicitAssistantCandidates(prompt);
   return a.length?a[a.length-1].text:"";
 }
 
@@ -12158,60 +12179,101 @@ function responseTracker(c,prompt,id){
   for(const el of root.querySelectorAll('*'))baselineNodes.add(el);
 
   let bestEl=null,bestText="",lastMutation=Date.now(),mutations=0;
-  const score=(el,t)=>{
-    let s=t.length;
-    if(el.matches('[data-message-author-role="assistant"],[data-role="assistant"],[data-author="assistant"]'))s+=5000;
-    if(/assistant|markdown|prose|message/i.test((el.className||"")+" "+(el.getAttribute?.("data-testid")||"")))s+=1500;
-    if(el.matches('article,[role="article"]'))s+=600;
+  const explicitSelector='[data-message-author-role="assistant"],[data-role="assistant"],[data-author="assistant"],[data-testid*="assistant" i],[aria-label*="assistant" i]';
+  const genericSelector='article,[role="article"],[data-testid*="message" i],[class*="message" i],[class*="prose" i],[class*="markdown" i]';
+
+  const semanticStrength=el=>{
+    if(el.matches(explicitSelector))return 3;
+    if(el.closest(explicitSelector))return 2;
+    if(el.matches(genericSelector))return 1;
+    return 0;
+  };
+
+  const score=(el,t,isNew)=>{
+    let s=Math.min(t.length,4000);
+    const sem=semanticStrength(el);
+    s+=sem*2500;
+    if(isNew)s+=1800;
+    // Prefer leaf-ish response regions over giant conversation wrappers.
+    const childText=[...el.children].reduce((n,ch)=>n+normalizedText(txt(ch)).length,0);
+    if(childText<t.length*0.9)s+=500;
     const r=el.getBoundingClientRect();
-    if(r.top>0)s+=Math.min(500,r.top/4);
+    if(r.top>0)s+=Math.min(300,r.top/5);
     return s;
   };
+
   const consider=el=>{
-    if(!(el instanceof Element))return;
-    // Walk both the mutation node and a few useful ancestors; modern React
-    // apps often update a nested text span while the message wrapper is stable.
-    const chain=[el,el.parentElement,el.parentElement?.parentElement,el.closest('article,[role="article"],[data-testid*="message" i],[class*="message" i],[class*="prose" i],[class*="markdown" i]')].filter(Boolean);
+    if(!(el instanceof Element)||!root.contains(el))return;
+    // Do not climb arbitrary parents anymore. Only inspect the changed/new
+    // element itself and the nearest message-like boundary. This prevents a
+    // mutation inside the user message from promoting the whole chat wrapper.
+    const boundary=el.closest(explicitSelector+','+genericSelector);
+    const chain=[el,boundary].filter((x,i,a)=>x&&a.indexOf(x)===i);
     for(const x of chain){
       if(!root.contains(x)||excludedResponseNode(x,prompt))continue;
-      const t=txt(x);
-      if(!t||t.length<1)continue;
-      // Ignore pre-submit static DOM unless its text has changed because of a
-      // descendant mutation.
+      const t=normalizedText(txt(x));
+      if(!t||contaminatedByPrompt(t,prompt))continue;
+
       const isNew=!baselineNodes.has(x);
-      if(!isNew&&x===root)continue;
-      if(score(x,t)>score(bestEl||x,bestText||"")){
+      const sem=semanticStrength(x);
+      // Generic nodes are eligible only when they were created after submit.
+      // Existing generic wrappers are too ambiguous to classify safely.
+      if(sem<2&&!isNew)continue;
+
+      const s=score(x,t,isNew);
+      const currentScore=bestEl?score(bestEl,bestText,!baselineNodes.has(bestEl)):-1;
+      if(s>currentScore){
         bestEl=x;bestText=t;
       }else if(x===bestEl&&t!==bestText){
         bestText=t;
       }
     }
   };
+
   const mo=new MutationObserver(ms=>{
     mutations+=ms.length;lastMutation=Date.now();
     for(const m of ms){
-      if(m.type==="characterData")consider(m.target.parentElement);
-      else{
-        consider(m.target);
-        for(const n of m.addedNodes)if(n.nodeType===1)consider(n);
+      if(m.type==="characterData"){
+        consider(m.target.parentElement);
+      }else{
+        for(const n of m.addedNodes){
+          if(n.nodeType===1){
+            consider(n);
+            // A newly inserted message shell may already contain the real
+            // assistant body by the time MutationObserver runs.
+            for(const d of n.querySelectorAll?.(explicitSelector+','+genericSelector)||[])consider(d);
+          }
+        }
+        // Only reconsider the target if it has explicit assistant semantics.
+        if(m.target instanceof Element && (m.target.matches(explicitSelector)||m.target.closest(explicitSelector))){
+          consider(m.target);
+        }
       }
     }
   });
   mo.observe(root,{subtree:true,childList:true,characterData:true});
-  trace(id,"response-observer-started",{root:root.tagName});
+  trace(id,"response-observer-started",{root:root.tagName,mode:"assistant-boundary"});
 
   return {
     snapshot(){
-      // First prefer explicit assistant semantics if Arena exposes them.
       const explicit=assistantSnapshot(prompt);
-      if(explicit&&(!bestText||explicit.length>=bestText.length))return explicit;
-      if(bestEl&&root.contains(bestEl)&&visible(bestEl)){
-        const live=txt(bestEl);
-        if(live)bestText=live;
+      if(explicit&&!contaminatedByPrompt(explicit,prompt)){
+        if(!bestText||explicit.length>=bestText.length)return explicit;
       }
-      return bestText;
+      if(bestEl&&root.contains(bestEl)&&visible(bestEl)){
+        const live=normalizedText(txt(bestEl));
+        if(live&&!contaminatedByPrompt(live,prompt))bestText=live;
+      }
+      return contaminatedByPrompt(bestText,prompt)?"":bestText;
     },
-    stats(){return {mutations,best_chars:bestText.length,idle_ms:Date.now()-lastMutation}},
+    stats(){
+      return {
+        mutations,
+        best_chars:bestText.length,
+        idle_ms:Date.now()-lastMutation,
+        best_semantic:bestEl?semanticStrength(bestEl):0
+      };
+    },
     stop(){try{mo.disconnect()}catch{}}
   };
 }
@@ -12390,9 +12452,16 @@ async function run(job){
 
     const payload=(job.system_prompt?('System instructions:\n'+job.system_prompt+'\n\n'):'')+job.prompt;
     const baseline=assistantSnapshot(payload);
-    const tracker=responseTracker(c,payload,job.request_id);
+    let tracker=responseTracker(c,payload,job.request_id);
     const submitted=await submitPrompt(c,payload,job.request_id);
     if(!submitted){tracker.stop();throw new Error("Arena prompt could not be confirmed as submitted")}
+
+    // Submission itself mutates the page heavily (new user bubble, navigation,
+    // title/sidebar updates). Throw those mutations away and start a clean
+    // assistant-only observation window after the user message is committed.
+    tracker.stop();
+    tracker=responseTracker(c,payload,job.request_id);
+    trace(job.request_id,"response-observer-rebased");
 
     emit('accepted',job.request_id);
     trace(job.request_id,"accepted",{baseline_chars:baseline.length});
@@ -12411,7 +12480,7 @@ async function run(job){
         lastDiag=Date.now();
       }
       if(cur&&cur!==baseline){
-        if(!seen){seen=true;trace(job.request_id,"assistant-found",{chars:cur.length,candidates:assistantCandidates().length})}
+        if(!seen){seen=true;trace(job.request_id,"assistant-found",{chars:cur.length,candidates:assistantCandidates(payload).length})}
         if(cur.startsWith(active.last)){
           const d=cur.slice(active.last.length);
           if(d){
@@ -12473,7 +12542,7 @@ setInterval(publishState,5000);
             fh.write(content_source)
 
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + submit-control stabilization v4.1.13")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + assistant-boundary stream v4.1.14")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
