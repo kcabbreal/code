@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.14-v2-escalation-credit")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.15-clean-eof-recovery")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1961,6 +1961,7 @@ def _undelivered_retry_snapshot() -> dict:
         return dict(_undelivered_retry_stats)
 
 ARENA_UI_RECOVERY_STABLE_SEC = max(0.8, min(6.0, float(os.environ.get("BRIDGENA_ARENA_UI_RECOVERY_STABLE_SEC", "1.8"))))
+ARENA_UI_STALE_GENERATING_ACCEPT_SEC = max(3.0, min(15.0, float(os.environ.get("BRIDGENA_UI_STALE_GENERATING_ACCEPT_SEC", "6.0"))))
 _arena_ui_recovery_stats = {"attempted": 0, "recovered": 0, "history_api_recovered": 0, "history_api_match": 0, "history_index_waits": 0, "ui_recovered": 0, "post_restart_attempted": 0, "post_restart_recovered": 0, "recovery_wait_timeout": 0, "not_found": 0, "incomplete": 0, "navigation_failed": 0}
 _arena_ui_recovery_stats_guard = threading.Lock()
 
@@ -4906,15 +4907,25 @@ class KeeperSession:
                         retry_after=retry_after,
                     )
                 if status_code == 200 and REQUIRE_PROVIDER_FINISH and not finish_seen:
-                    log("WARN", f"[{self.name}] stream audit · HTTP 200 ended without provider finish · "
-                                f"frames {frame_count} · stop {stop_reason}")
-                    raise BridgeHTTPError(
-                        200, "Arena response ended without a provider finish event",
-                        frame_count=frame_count, response_started=True,
-                        stream_error=True, finish_seen=False,
-                        stop_reason=(stop_reason or "eof-without-finish"),
-                        retry_after=retry_after,
-                    )
+                    # A natural reader EOF is a valid terminal condition for providers
+                    # that close their stream without emitting Arena's usual explicit
+                    # finish metadata. Do not manufacture a mid-stream failure from a
+                    # clean transport close; the caller still requires decodable semantic
+                    # output before it can report success. Interrupted/error drains remain
+                    # failures and continue through the salvage path below.
+                    if stop_reason == "eof" and not stream_error:
+                        log("WARN", f"[{self.name}] stream audit · HTTP 200 clean EOF without explicit provider finish · "
+                                    f"frames {frame_count} · accepting transport terminal; semantic-output guard remains active")
+                    else:
+                        log("WARN", f"[{self.name}] stream audit · HTTP 200 ended without provider finish · "
+                                    f"frames {frame_count} · stop {stop_reason}")
+                        raise BridgeHTTPError(
+                            200, "Arena response ended without a provider finish event",
+                            frame_count=frame_count, response_started=True,
+                            stream_error=True, finish_seen=False,
+                            stop_reason=(stop_reason or "eof-without-finish"),
+                            retry_after=retry_after,
+                        )
                 if status_code != 200:
                     raise BridgeHTTPError(
                         status_code, error_body,
@@ -7988,10 +7999,20 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                 stable_for = time.monotonic() - stable_since if current else 0.0
                 suffix, confidence = _stream_recovery_suffix(partial_text, current)
 
-                if current and not generating and stable_for >= ARENA_UI_RECOVERY_STABLE_SEC:
+                ui_complete = current and (not generating) and stable_for >= ARENA_UI_RECOVERY_STABLE_SEC
+                stale_generating_complete = (
+                    current and generating and
+                    stable_for >= ARENA_UI_STALE_GENERATING_ACCEPT_SEC and
+                    len(current) >= max(24, len(str(partial_text or "")))
+                )
+                if ui_complete or stale_generating_complete:
                     if not partial_text or confidence >= 0.90:
                         _bump_arena_ui_recovery("recovered")
                         _bump_arena_ui_recovery("ui_recovered")
+                        source = "ui-stable-stale-generating" if stale_generating_complete else "ui"
+                        if stale_generating_complete:
+                            log("WARN", f"[{name}] Arena UI generating marker remained set, but exact assistant text "
+                                        f"was unchanged for {stable_for:.1f}s; accepting stabilized recovery")
                         log("OK", f"[{name}] Arena UI stream recovery · recovered {len(current)} chars · "
                                   f"stable {stable_for:.1f}s · {best_url}")
                         return {
@@ -8001,7 +8022,7 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                             "confidence": confidence,
                             "url": best_url,
                             "complete": True,
-                            "source": "ui",
+                            "source": source,
                             "trace_found": True,
                         }
 
