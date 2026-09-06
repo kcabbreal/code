@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.17-partial-terminal-fallback")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.18-reasoning-fingerprint-recovery")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -8704,7 +8704,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         arena_id=str(base.get("id") or (mc or {}).get("arena_id") or ""),
                         model_message_id=str(base.get("modelAMessageId") or ""),
                         user_prompt=prompt,
-                        partial_text=response_text or "",
+                        partial_text=response_text or reasoning_text or "",
                         jar=jar,
                         proxy=proxy,
                         cached_url=str((mc or {}).get("ui_url") or ""),
@@ -8731,7 +8731,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                 arena_id=str(base.get("id") or (mc or {}).get("arena_id") or ""),
                                 model_message_id=str(base.get("modelAMessageId") or ""),
                                 user_prompt=prompt,
-                                partial_text=response_text or "",
+                                partial_text=response_text or reasoning_text or "",
                                 jar=jar,
                                 proxy=proxy,
                                 cached_url=str((mc or {}).get("ui_url") or ""),
@@ -8756,7 +8756,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             arena_id=str(base.get("id") or (mc or {}).get("arena_id") or ""),
                             model_message_id=str(base.get("modelAMessageId") or ""),
                             user_prompt=prompt,
-                            partial_text=response_text or "",
+                            partial_text=response_text or reasoning_text or "",
                             jar=jar,
                             proxy=proxy,
                             cached_url=str(salvage.get("url") or (mc or {}).get("ui_url") or ""),
@@ -8796,11 +8796,16 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                     "closing as degraded terminal success and preserving Arena binding")
                         yield ("done", response_text)
                         return
-                    if response_text or reasoning_text:
-                        yield ("error", "502: Arena accepted the turn and some assistant output was observed, but only a short or "
+                    if response_text:
+                        yield ("error", "502: Arena accepted the turn and some user-visible assistant content was observed, but only a short or "
                                         "unrecoverable fragment was available when the delivered-turn recovery window expired. "
                                         "The exact Arena evaluation remains bound for subsequent continuation/recovery; "
                                         "the partial response remains visible above.")
+                    elif reasoning_text:
+                        yield ("error", "502: Arena accepted the turn and provider reasoning frames were observed, but no user-visible assistant "
+                                        "content was recovered before the delivered-turn recovery window expired. Bridgena used the reasoning "
+                                        "frames only as an internal history-matching fingerprint and did not expose them as final content. "
+                                        "The exact Arena evaluation remains bound for subsequent continuation/recovery.")
                     else:
                         yield ("error", "502: Arena accepted the turn, but the browser stream was interrupted and the exact "
                                         "evaluation did not reach a confirmed completed state before the recovery window expired. "
@@ -8827,7 +8832,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         arena_id=str(base.get("id") or (mc or {}).get("arena_id") or ""),
                         model_message_id=str(base.get("modelAMessageId") or ""),
                         user_prompt=prompt,
-                        partial_text=response_text or "",
+                        partial_text=response_text or reasoning_text or "",
                         jar=jar,
                         proxy=proxy,
                         cached_url=str((mc or {}).get("ui_url") or ""),
@@ -8851,7 +8856,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                 arena_id=str(base.get("id") or (mc or {}).get("arena_id") or ""),
                                 model_message_id=str(base.get("modelAMessageId") or ""),
                                 user_prompt=prompt,
-                                partial_text=response_text or "",
+                                partial_text=response_text or reasoning_text or "",
                                 jar=jar,
                                 proxy=proxy,
                                 cached_url=str((mc or {}).get("ui_url") or ""),
@@ -8985,7 +8990,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             arena_id=existing_id,
                             model_message_id=str(base.get("modelAMessageId") or ""),
                             user_prompt=prompt,
-                            partial_text=response_text or "",
+                            partial_text=response_text or reasoning_text or "",
                             jar=jar,
                             proxy=proxy,
                             cached_url=str((mc or {}).get("ui_url") or ""),
@@ -9009,7 +9014,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                     arena_id=existing_id,
                                     model_message_id=str(base.get("modelAMessageId") or ""),
                                     user_prompt=prompt,
-                                    partial_text=response_text or "",
+                                    partial_text=response_text or reasoning_text or "",
                                     jar=jar,
                                     proxy=proxy,
                                     cached_url=str(salvage.get("url") or (mc or {}).get("ui_url") or ""),
@@ -11121,7 +11126,9 @@ async def openai_stream(body: dict, keyinfo: dict):
 
     async def gen():
         acc = ""
+        reasoning_acc = ""
         content_chunks = 0
+        reasoning_chunks = 0
         terminal_sent = False
         outcome = "complete"
         try:
@@ -11136,6 +11143,9 @@ async def openai_stream(body: dict, keyinfo: dict):
                     content_chunks += 1
                     yield chunk({"content": payload})
                 elif kind == "reasoning":
+                    reasoning_piece = payload if isinstance(payload, str) else str(payload or "")
+                    reasoning_acc += reasoning_piece
+                    reasoning_chunks += 1
                     yield chunk({"reasoning_content": payload})
                 elif kind == "error":
                     outcome = "partial-upstream-error" if content_chunks > 0 else "upstream-error"
@@ -11149,6 +11159,8 @@ async def openai_stream(body: dict, keyinfo: dict):
                             "chat_id": str(chat_id)[:120],
                             "partial_chars": len(acc),
                             "content_chunks": content_chunks,
+                            "reasoning_chars": len(reasoning_acc),
+                            "reasoning_chunks": reasoning_chunks,
                         },
                     )
                     public_error = {
