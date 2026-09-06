@@ -226,7 +226,9 @@ COOLDOWN_SEC = 60                 # soft preference; the pool is never hard-lock
 REFRESH_INTERVAL = 3600
 CURL_TTFB_TIMEOUT = int(os.environ.get("CURL_TTFB_TIMEOUT", "40"))
 PROXY_FLAG_TTL = int(os.environ.get("PROXY_FLAG_TTL", "10800"))      # arena-block: ~3h, self-expiring
-PROXY_QUARANTINE = int(os.environ.get("PROXY_QUARANTINE", "21600"))  # dead-tunnel exile: 6h
+PROXY_QUARANTINE = int(os.environ.get("PROXY_QUARANTINE", "21600"))  # legacy compatibility; pool quarantine is non-destructive
+PROXY_RECOVERY_INTERVAL_SEC = max(5.0, min(300.0, float(os.environ.get("BRIDGENA_PROXY_RECOVERY_INTERVAL_SEC", "15"))))
+PROXY_RECOVERY_MAX_BACKOFF_SEC = max(PROXY_RECOVERY_INTERVAL_SEC, min(900.0, float(os.environ.get("BRIDGENA_PROXY_RECOVERY_MAX_BACKOFF_SEC", "120"))))
 _FLAGGED_TTL = PROXY_FLAG_TTL     # legacy alias (primitives use it)
 PROBE_OK_TTL = 900
 PROBE_BUDGET = 40
@@ -312,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.22-transient-proxy-discipline")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.23-self-healing-proxy-pool")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -5547,6 +5549,9 @@ import os, time
 from typing import Dict, List, Optional, Tuple
 
 _proxy_strikes: Dict[str, int] = {}
+_proxy_recovery_due: Dict[str, float] = {}
+_proxy_recovery_failures: Dict[str, int] = {}
+_proxy_quarantine_reason: Dict[str, str] = {}
 _pick_ctr = 0
 import threading as _th
 _pick_mu = _th.Lock()
@@ -5585,42 +5590,121 @@ def _append_dead(line: str, reason: str) -> None:
 
 
 def quarantine_proxy(proxy_url: str, reason: str = "") -> None:
-    """Tunnel-dead: cut from the pool, park in proxies.dead.txt with reason."""
+    """Open a recoverable circuit without deleting the proxy from configuration."""
     key = _proxy_hkey(proxy_url)
+    norm = _normalize_proxy(proxy_url) or proxy_url
     _QUARANTINED_KEYS.add(key)
-    try:
-        raw = proxy_url if proxy_url.startswith(("socks", "http")) else _normalize_proxy(proxy_url) or proxy_url
-        _append_dead(raw, reason or "quarantined")
-        lines = _pool_lines()
-        keep = [l for l in lines if _proxy_hkey(_normalize_proxy(l) or l) != key]
-        if len(keep) != len(lines):
-            pool_save(keep)
-        cfg = get_config()
-        px = cfg.get("proxies") or []
-        px2 = [l for l in px if _proxy_hkey(_normalize_proxy(l) or l) != key]
-        if len(px2) != len(px):
-            cfg["proxies"] = px2
-            save_config(cfg)
-        _flagged_exits.pop(key, None)
-        _proxy_strikes.pop(key, None)
-        log("WARN", f"proxy quarantined: {key} — {redact(reason)[:120]}")
-    except Exception as e:
-        log("WARN", f"quarantine bookkeeping failed for {key}: {type(e).__name__}: {e}")
+    _proxy_quarantine_reason[key] = redact(reason or "temporarily unavailable")[:160]
+    failures = _proxy_recovery_failures.get(key, 0)
+    delay = min(PROXY_RECOVERY_MAX_BACKOFF_SEC,
+                PROXY_RECOVERY_INTERVAL_SEC * (2 ** min(failures, 4)))
+    _proxy_recovery_due[key] = time.time() + delay
+    _proxy_probe_cache[norm] = (False, time.time() + min(delay, 30.0))
+    log("WARN", f"proxy circuit opened: {key} — retained in pool · recovery probe in {delay:.0f}s · "
+                f"{_proxy_quarantine_reason[key]}")
 
 
 def strike_proxy(proxy_url: str, reason: str = "") -> bool:
-    """Timeout/soft-failure: one strike; quarantine only at STRIKES_MAX."""
+    """Soft failure: accumulate strikes; threshold opens a recoverable circuit."""
     key = _proxy_hkey(proxy_url)
     _proxy_strikes[key] = _proxy_strikes.get(key, 0) + 1
     if _proxy_strikes[key] >= STRIKES_MAX:
         quarantine_proxy(proxy_url, f"{STRIKES_MAX} strikes: {reason}")
         return True
-    log("WARN", f"exit {key}: {redact(reason)[:80]} (strike {_proxy_strikes[key]}/{STRIKES_MAX})")
+    log("WARN", f"exit {key}: {redact(reason)[:80]} "
+                f"(strike {_proxy_strikes[key]}/{STRIKES_MAX}; retained)")
     return False
 
 
 def clear_strikes(proxy_url: str) -> None:
-    _proxy_strikes.pop(_proxy_hkey(proxy_url), None)
+    key = _proxy_hkey(proxy_url)
+    _proxy_strikes.pop(key, None)
+    _proxy_recovery_failures.pop(key, None)
+    _proxy_recovery_due.pop(key, None)
+    _proxy_quarantine_reason.pop(key, None)
+    _QUARANTINED_KEYS.discard(key)
+
+
+def _proxy_from_key(hkey: str) -> Optional[str]:
+    for raw in _pool_lines():
+        if not raw.strip() or raw.startswith("#"):
+            continue
+        norm = _normalize_proxy(raw) or raw
+        if _proxy_hkey(norm) == hkey:
+            return norm
+    try:
+        for raw in (get_config().get("proxies") or []):
+            norm = _normalize_proxy(raw) or raw
+            if _proxy_hkey(norm) == hkey:
+                return norm
+    except Exception:
+        pass
+    return None
+
+
+def _recover_proxy_once(proxy_url: str) -> bool:
+    """Probe a circuit-open exit and automatically heal it in place."""
+    norm = _normalize_proxy(proxy_url) or proxy_url
+    key = _proxy_hkey(norm)
+    try:
+        ok, ms = _proxy_probe(norm)
+    except Exception as exc:
+        ok, ms = False, -1
+        _probe_fail_reason[norm] = f"recovery probe exception: {type(exc).__name__}: {exc}"
+
+    now = time.time()
+    if ok:
+        _proxy_probe_cache[norm] = (True, now + PROBE_OK_TTL)
+        _proxy_latency[norm] = max(int(ms or 0), 1)
+        _proxy_health_record(norm, True, max(int(ms or 0), 1), source="auto-recovery")
+        _QUARANTINED_KEYS.discard(key)
+        _proxy_strikes.pop(key, None)
+        _proxy_recovery_due.pop(key, None)
+        _proxy_recovery_failures.pop(key, None)
+        _proxy_quarantine_reason.pop(key, None)
+        _flagged_exits.pop(key, None)
+        log("OK", f"proxy recovered automatically: {key} · Arena probe {max(int(ms or 0), 1)}ms · re-admitted")
+        return True
+
+    failures = _proxy_recovery_failures.get(key, 0) + 1
+    _proxy_recovery_failures[key] = failures
+    delay = min(PROXY_RECOVERY_MAX_BACKOFF_SEC,
+                PROXY_RECOVERY_INTERVAL_SEC * (2 ** min(failures, 4)))
+    _proxy_recovery_due[key] = now + delay
+    _proxy_probe_cache[norm] = (False, now + min(delay, 30.0))
+    why = _probe_fail_reason.get(norm, "Arena probe failed")
+    log("WARN", f"proxy recovery pending: {key} · attempt {failures} failed · "
+                f"next probe in {delay:.0f}s · {redact(why)[:100]}")
+    return False
+
+
+async def proxy_recovery_loop() -> None:
+    """Continuously heal circuit-open proxies. Never deletes pool entries."""
+    log("INFO", f"Proxy auto-recovery · interval {PROXY_RECOVERY_INTERVAL_SEC:.0f}s · "
+                f"max backoff {PROXY_RECOVERY_MAX_BACKOFF_SEC:.0f}s · non-destructive")
+    while True:
+        try:
+            now = time.time()
+            due = []
+            for key in list(_QUARANTINED_KEYS):
+                if _proxy_recovery_due.get(key, 0.0) <= now:
+                    proxy = _proxy_from_key(key)
+                    if proxy:
+                        due.append(proxy)
+                    else:
+                        _proxy_recovery_due[key] = now + PROXY_RECOVERY_MAX_BACKOFF_SEC
+            if due:
+                loop = asyncio.get_running_loop()
+                await asyncio.gather(*[
+                    loop.run_in_executor(None, _recover_proxy_once, proxy)
+                    for proxy in due[:PROBE_MAX_PARALLEL]
+                ], return_exceptions=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log("WARN", f"proxy auto-recovery loop recovered from {type(exc).__name__}: "
+                        f"{redact(str(exc))[:140]}")
+        await asyncio.sleep(min(PROXY_RECOVERY_INTERVAL_SEC, 15.0))
 
 
 # ---------- picker ----------
@@ -5752,6 +5836,12 @@ def _sweep_all_impl() -> dict:
                 _proxy_latency[norm] = max(ms, 1)
                 _proxy_health_record(norm, True, ms, source="sweep")
                 _proxy_strikes.pop(key, None)
+                _proxy_recovery_failures.pop(key, None)
+                _proxy_recovery_due.pop(key, None)
+                _proxy_quarantine_reason.pop(key, None)
+                if key in _QUARANTINED_KEYS:
+                    _QUARANTINED_KEYS.discard(key)
+                    log("OK", f"proxy sweep recovered circuit-open exit: {key} · re-admitted")
                 if key in _flagged_exits:
                     _flagged_exits.pop(key, None)   # alive on arena again — un-flag
             else:
@@ -5911,25 +6001,22 @@ def upload_pool(text: str) -> dict:
 
 
 def prune_bad() -> int:
-    """Cut lines whose verdicts say they're unusable (quarantined or flagged-dead strikes)."""
-    bad = set(_QUARANTINED_KEYS)
-    lines = _pool_lines()
-    keep = []
-    cut = 0
-    for l in lines:
+    """Non-destructive prune: circuit-break bad exits and let auto-recovery heal them."""
+    affected = 0
+    for l in _pool_lines():
         if not l.strip() or l.startswith("#"):
             continue
         norm = _normalize_proxy(l) or l
         k = _proxy_hkey(norm)
-        if k in bad or _proxy_strikes.get(k, 0) >= STRIKES_MAX or (norm in _proxy_probe_cache and not _proxy_probe_cache[norm][0]):
-            _append_dead(norm, "pruned by verdict")
-            cut += 1
-        else:
-            keep.append(l)
-    if cut:
-        pool_save(keep)
-    log("OK", f"proxy prune 'bad': {cut} cut from proxies.txt (kept {len(keep)})")
-    return cut
+        cached = _proxy_probe_cache.get(norm)
+        if (k in _QUARANTINED_KEYS or
+                _proxy_strikes.get(k, 0) >= STRIKES_MAX or
+                (cached and not cached[0])):
+            if k not in _QUARANTINED_KEYS:
+                quarantine_proxy(norm, "marked bad by proxy manager")
+            affected += 1
+    log("OK", f"proxy prune 'bad': {affected} circuit-open · 0 deleted · auto-recovery active")
+    return affected
 
 
 def remove_one(hkey: str) -> int:
@@ -6022,7 +6109,7 @@ def snapshot_rows() -> List[dict]:
         verdict, why = "unknown", ""
         cached = _proxy_probe_cache.get(norm)
         if k in _QUARANTINED_KEYS or _proxy_strikes.get(k, 0) >= STRIKES_MAX:
-            verdict, why = "dead", _probe_fail_reason.get(norm, _probe_fail_reason.get(norm, "quarantined"))
+            verdict, why = "recovering", (_proxy_quarantine_reason.get(k) or _probe_fail_reason.get(norm, "temporarily circuit-open"))
         elif k in flagged:
             exp = int(_flagged_exits.get(k, now) - now)
             why = f"flagged ~{exp}s left: " + (_probe_fail_reason.get(norm) or "arena refused CONNECT")
@@ -12846,7 +12933,8 @@ async def _lifespan(app):
         _configure_keeper_concurrency(_bootable_count)
     tasks = [asyncio.create_task(keeper_election_loop(), name="keeper-election"),
              asyncio.create_task(periodic_model_refresher(), name="model-refresher"),
-             asyncio.create_task(get_initial_data(), name="initial-catalog")]
+             asyncio.create_task(get_initial_data(), name="initial-catalog"),
+             asyncio.create_task(proxy_recovery_loop(), name="proxy-auto-recovery")]
     if jars_have_creds():
         tasks.append(asyncio.create_task(auto_login_on_boot(), name="auto-login"))
         tasks.append(asyncio.create_task(_api_verification_readiness_loop(), name="verification-readiness"))
@@ -12885,6 +12973,7 @@ async def _lifespan(app):
                 f"same-account retries {UPSTREAM_429_SAME_ACCOUNT_RETRIES} · Retry-After honored · no route/account rotation")
     log("INFO", "Capacity target · queued multi-user admission · one stable browser transport lane per keeper")
     log("INFO", "Proxy allocator · full-pool startup scan + distinct keeper assignment enabled")
+    log("INFO", "Proxy lifecycle · non-destructive circuit breaker · auto-recovery + automatic re-admission · no automatic deletion")
     if get_verification_solver:
         log("OK", f"Verification adapter factory loaded: {_VERIFICATION_FACTORY_SPEC}")
     else:
