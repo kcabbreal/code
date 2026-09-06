@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.9-enter-submit-react-state-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.11-public-model-labels-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.9-enter-submit-react-state-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.11-public-model-labels-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -897,11 +897,39 @@ def get_solver(models_dir: Optional[str] = None) -> RecaptchaSolver:
 
 
 def model_name(m) -> str:
+    """Return Arena's user-facing model label.
 
-    """Arena catalog entries carry publicName/id; OpenAI surface needs one canonical name."""
+    Arena catalog objects may carry a machine slug in `name`/`id` while the
+    actual label shown in the Arena UI lives in `publicName`. Public Bridgena
+    surfaces should therefore prefer `publicName`.
+    """
     if isinstance(m, str):
         return m
-    return m.get("name") or m.get("publicName") or m.get("id") or ""
+    return m.get("publicName") or m.get("name") or m.get("id") or ""
+
+
+def _model_aliases(m) -> list[str]:
+    if isinstance(m, str):
+        return [m]
+    out = []
+    for key in ("publicName", "name", "id"):
+        value = str(m.get(key) or "").strip()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def canonical_public_model_name(value: str) -> str:
+    """Map a cached slug/internal id to the current Arena display label."""
+    raw = str(value or "auto").strip() or "auto"
+    if raw == "auto":
+        return raw
+    wanted = _model_key(raw)
+    for item in get_models():
+        aliases = _model_aliases(item)
+        if raw in aliases or wanted in {_model_key(x) for x in aliases}:
+            return model_name(item) or raw
+    return raw
 
 
 def _model_key(value: str) -> str:
@@ -935,9 +963,9 @@ def resolve_model_id(public_name: str, jar: Optional[dict] = None) -> str:
     for item in get_models():
         if not isinstance(item, dict):
             continue
-        labels = (item.get("name"), item.get("publicName"), item.get("id"))
+        labels = _model_aliases(item)
         if public_name in labels or wanted in {_model_key(x) for x in labels if x}:
-            return item.get("id") or public_name
+            return item.get("id") or item.get("name") or public_name
     if wanted in _VERIFIED_MODEL_IDS:
         return _VERIFIED_MODEL_IDS[wanted]
     jar_map = (jar or {}).get("model_map", {})
@@ -10494,7 +10522,9 @@ async function refreshModelsNow(){
 
 
 def _legacy_chat_page(models: list, default_model: str) -> str:
-    opts = "".join(f'<option value="{esc(m["name"])}"{" selected" if m["name"]==default_model else ""}>{esc(m["name"])}</option>' for m in models[:300]) or '<option>gpt-4.1</option>'
+    public_names = [model_name(m) for m in models if model_name(m)]
+    public_default = canonical_public_model_name(default_model)
+    opts = "".join(f'<option value="{esc(n)}"{" selected" if n==public_default else ""}>{esc(n)}</option>' for n in public_names[:300]) or '<option>auto</option>'
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bridgena · Live Chat</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -10564,9 +10594,10 @@ def chat_page(models: list, default_model: str) -> str:
     than a React build; the visual tokens and interaction model match the
     shadcn/Vercel family without adding a fragile CDN/runtime dependency.
     """
-    names = [m.get("name", "") for m in models if m.get("name")]
+    names = [model_name(m) for m in models if model_name(m)]
     payload = _json.dumps(names, ensure_ascii=False).replace("</", "<\\/")
-    selected = _json.dumps(default_model or (names[0] if names else "auto"), ensure_ascii=False)
+    selected_name = canonical_public_model_name(default_model or (names[0] if names else "auto"))
+    selected = _json.dumps(selected_name, ensure_ascii=False)
     template = r'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bridgena</title>
 <style>
@@ -11932,23 +11963,35 @@ async function selectModel(model){
   return false;
 }
 
-function assistantCandidates(){
+function excludedResponseNode(el,prompt){
+  if(!el||!visible(el))return true;
+  if(el.closest('nav,aside,[data-sidebar],[role="navigation"],form'))return true;
+  if(el.matches('textarea,input,[contenteditable="true"]')||el.querySelector('textarea,input,[contenteditable="true"]'))return true;
+  const t=txt(el).replace(/\s+/g," ").trim();
+  if(!t)return true;
+  const p=String(prompt||"").trim();
+  if(p&&t===p)return true;
+  return false;
+}
+
+function assistantCandidates(prompt=""){
   const selectors=[
     '[data-message-author-role="assistant"]',
     '[data-role="assistant"]',
     '[data-author="assistant"]',
     '[data-testid*="assistant" i]',
-    '[data-testid*="message" i] .prose',
+    '[data-testid*="message" i]',
     '[class*="assistant" i]',
-    'article .prose',
-    'article [class*="markdown" i]',
-    '[class*="message" i] [class*="markdown" i]',
-    'main article'
+    'article',
+    '[role="article"]',
+    'main [class*="prose" i]',
+    'main [class*="markdown" i]',
+    'main [class*="message" i]'
   ];
   const out=[],seen=new Set();
   for(const s of selectors){
     for(const el of document.querySelectorAll(s)){
-      if(seen.has(el)||!visible(el))continue;
+      if(seen.has(el)||excludedResponseNode(el,prompt))continue;
       const v=txt(el);
       if(!v)continue;
       seen.add(el);out.push({el,text:v});
@@ -11956,9 +11999,78 @@ function assistantCandidates(){
   }
   return out;
 }
-function assistantSnapshot(){
-  const a=assistantCandidates();
+
+function assistantSnapshot(prompt=""){
+  const a=assistantCandidates(prompt);
   return a.length?a[a.length-1].text:"";
+}
+
+function chatRoot(c){
+  return c?.closest('main')||document.querySelector('main')||document.body;
+}
+
+function responseTracker(c,prompt,id){
+  const root=chatRoot(c);
+  const baselineNodes=new WeakSet();
+  for(const el of root.querySelectorAll('*'))baselineNodes.add(el);
+
+  let bestEl=null,bestText="",lastMutation=Date.now(),mutations=0;
+  const score=(el,t)=>{
+    let s=t.length;
+    if(el.matches('[data-message-author-role="assistant"],[data-role="assistant"],[data-author="assistant"]'))s+=5000;
+    if(/assistant|markdown|prose|message/i.test((el.className||"")+" "+(el.getAttribute?.("data-testid")||"")))s+=1500;
+    if(el.matches('article,[role="article"]'))s+=600;
+    const r=el.getBoundingClientRect();
+    if(r.top>0)s+=Math.min(500,r.top/4);
+    return s;
+  };
+  const consider=el=>{
+    if(!(el instanceof Element))return;
+    // Walk both the mutation node and a few useful ancestors; modern React
+    // apps often update a nested text span while the message wrapper is stable.
+    const chain=[el,el.parentElement,el.parentElement?.parentElement,el.closest('article,[role="article"],[data-testid*="message" i],[class*="message" i],[class*="prose" i],[class*="markdown" i]')].filter(Boolean);
+    for(const x of chain){
+      if(!root.contains(x)||excludedResponseNode(x,prompt))continue;
+      const t=txt(x);
+      if(!t||t.length<1)continue;
+      // Ignore pre-submit static DOM unless its text has changed because of a
+      // descendant mutation.
+      const isNew=!baselineNodes.has(x);
+      if(!isNew&&x===root)continue;
+      if(score(x,t)>score(bestEl||x,bestText||"")){
+        bestEl=x;bestText=t;
+      }else if(x===bestEl&&t!==bestText){
+        bestText=t;
+      }
+    }
+  };
+  const mo=new MutationObserver(ms=>{
+    mutations+=ms.length;lastMutation=Date.now();
+    for(const m of ms){
+      if(m.type==="characterData")consider(m.target.parentElement);
+      else{
+        consider(m.target);
+        for(const n of m.addedNodes)if(n.nodeType===1)consider(n);
+      }
+    }
+  });
+  mo.observe(root,{subtree:true,childList:true,characterData:true});
+  trace(id,"response-observer-started",{root:root.tagName});
+
+  return {
+    snapshot(){
+      // First prefer explicit assistant semantics if Arena exposes them.
+      const explicit=assistantSnapshot(prompt);
+      if(explicit&&(!bestText||explicit.length>=bestText.length))return explicit;
+      if(bestEl&&root.contains(bestEl)&&visible(bestEl)){
+        const live=txt(bestEl);
+        if(live)bestText=live;
+      }
+      return bestText;
+    },
+    stats(){return {mutations,best_chars:bestText.length,idle_ms:Date.now()-lastMutation}},
+    stop(){try{mo.disconnect()}catch{}}
+  };
 }
 function bodyHasPrompt(prompt){
   const p=String(prompt||"").trim();
@@ -12047,22 +12159,28 @@ async function run(job){
     if(!c){trace(job.request_id,"composer-missing");throw new Error('Arena composer not found')}
     trace(job.request_id,"composer-found",{tag:c.tagName,placeholder:c.getAttribute("placeholder")||""});
 
-    const baseline=assistantSnapshot();
     const payload=(job.system_prompt?('System instructions:\n'+job.system_prompt+'\n\n'):'')+job.prompt;
+    const baseline=assistantSnapshot(payload);
+    const tracker=responseTracker(c,payload,job.request_id);
     const submitted=await submitPrompt(c,payload,job.request_id);
-    if(!submitted)throw new Error("Arena prompt could not be confirmed as submitted");
+    if(!submitted){tracker.stop();throw new Error("Arena prompt could not be confirmed as submitted")}
 
     emit('accepted',job.request_id);
     trace(job.request_id,"accepted",{baseline_chars:baseline.length});
 
-    let stable=0,lastChange=Date.now(),seen=false,startedGenerating=false;
+    let stable=0,lastChange=Date.now(),seen=false,startedGenerating=false,lastDiag=Date.now();
     while(!active.cancel){
       if(challengePresent()){trace(job.request_id,"challenge-during-job");emit('challenge',job.request_id);return}
 
       const generating=!!stopButton();
       if(generating&&!startedGenerating){startedGenerating=true;trace(job.request_id,"generation-started")}
 
-      const cur=assistantSnapshot();
+      const cur=tracker.snapshot();
+      if(Date.now()-lastDiag>3000){
+        const st=tracker.stats();
+        trace(job.request_id,"response-observer",{mutations:st.mutations,best_chars:st.best_chars,generating});
+        lastDiag=Date.now();
+      }
       if(cur&&cur!==baseline){
         if(!seen){seen=true;trace(job.request_id,"assistant-found",{chars:cur.length,candidates:assistantCandidates().length})}
         if(cur.startsWith(active.last)){
@@ -12089,13 +12207,20 @@ async function run(job){
         stable++;
         if(stable>=2){
           trace(job.request_id,"done",{chars:active.last.length});
+          tracker.stop();
           emit('done',job.request_id,{text:active.last});
           return
         }
       }else stable=0;
 
+      if(startedGenerating&&!seen&&Date.now()-lastChange>8000){
+        const st=tracker.stats();
+        trace(job.request_id,"generation-without-visible-response",{mutations:st.mutations,best_chars:st.best_chars});
+        lastChange=Date.now();
+      }
       await sleep(180);
     }
+    tracker.stop();
     throw new Error('job cancelled');
   }catch(e){
     trace(job.request_id,"job-error",{message:String(e?.message||e).slice(0,250)});
@@ -12119,7 +12244,7 @@ setInterval(publishState,5000);
             fh.write(content_source)
 
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + Enter/onSubmit v4.1.9")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + public model labels v4.1.11")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
@@ -12447,7 +12572,8 @@ async def openai_stream(body: dict, keyinfo: dict):
     prompt = _format_conversation_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
-    model = body.get("model", "auto")
+    model = canonical_public_model_name(body.get("model", "auto"))
+    body["model"] = model
     # A caller-supplied opaque thread id preserves Arena context without storing
     # prompt or response content. One-off API calls receive a random id.
     chat_id = _disposable_chat_id("api")
@@ -12781,6 +12907,7 @@ async def chat_completions(request: Request):
     await _require_api_ready()
     keyinfo = await _require_key(request)
     body = await request.json()
+    body["model"] = canonical_public_model_name(body.get("model", "auto"))
     prompt = _format_conversation_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
@@ -12931,7 +13058,8 @@ async def anthropic_messages(request: Request):
     prompt = _anthropic_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
-    model = body.get("model", "auto")
+    model = canonical_public_model_name(body.get("model", "auto"))
+    body["model"] = model
     await _wait_if_model_rate_limited(model)
     await _pace_api_request(_tenant_identity(keyinfo))
     reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
@@ -13088,17 +13216,29 @@ async def anthropic_messages(request: Request):
 async def models_api():
     state = load_state()
     blocked = state.get("blocked_models", [])
-    data = [{"id": model_name(m), "object": "model", "created": int(time.time()), "owned_by": "arena-bridge",
-             "arena_id": m.get("id") if isinstance(m, dict) else None} for m in get_models() if model_name(m) not in blocked]
+    now = int(time.time())
+    data, seen = [], set()
+    for m in get_models():
+        public = model_name(m).strip()
+        if not public or public in blocked or public in seen:
+            continue
+        seen.add(public)
+        data.append({
+            "id": public,
+            "object": "model",
+            "created": now,
+            "owned_by": "arena",
+        })
     return JSONResponse({"object": "list", "data": data})
 
 
 @app.get("/v1/models/{model_id:path}")
 @app.get("/models/{model_id:path}")
 async def model_one(model_id: str):
+    public = canonical_public_model_name(model_id)
     for m in get_models():
-        if model_name(m) == model_id or (isinstance(m, dict) and m.get("id") == model_id):
-            return JSONResponse({"id": m.get("name"), "object": "model", "owned_by": "arena-bridge"})
+        if model_name(m) == public:
+            return JSONResponse({"id": public, "object": "model", "owned_by": "arena"})
     raise HTTPException(status_code=404, detail="unknown model")
 
 
@@ -14249,3 +14389,4 @@ def _cli():
 
 if __name__ == "__main__":
     _cli()
+
