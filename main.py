@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.5-worker-connectivity-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.6-worker-readiness-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.5-worker-connectivity-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.6-worker-readiness-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11807,11 +11807,20 @@ def _v4_stat(model: str) -> dict:
 
 
 def _v4_worker_score(worker: dict, model: str) -> float:
-    if not worker.get("ready") or worker.get("busy") or worker.get("ws") is None:
+    # v4.1.6: a connected local extension worker is schedulable unless there is
+    # a concrete reason not to use it. The content-script `ready` bit is
+    # advisory because Arena page transitions can transiently publish
+    # ready=false even after the keeper/browser has passed server readiness.
+    if worker.get("busy") or worker.get("ws") is None:
         return -1e9
     if worker.get("challenge") or worker.get("login_required"):
         return -1e9
+    last_seen = float(worker.get("last_seen") or 0)
+    if last_seen and (time.monotonic() - last_seen) > 45.0:
+        return -1e9
     score = 100.0
+    if not worker.get("ready"):
+        score -= 8.0
     score -= min(30.0, float(worker.get("latency_ms") or 0) / 100.0)
     score -= min(25.0, float(worker.get("recent_errors") or 0) * 5.0)
     seen = (worker.get("models") or {}).get(str(model), {})
@@ -11997,7 +12006,8 @@ async def v4_extension_ws(ws: WebSocket):
             _v4_workers[worker_id]={
                 "id":worker_id,"ws":ws,"ready":bool(hello.get("ready",True)),"busy":False,
                 "challenge":False,"login_required":False,"recent_errors":0,"last_used":0.0,
-                "last_seen":time.monotonic(),"latency_ms":float(hello.get("latency_ms") or 0),
+                "connected_at":time.monotonic(),"last_seen":time.monotonic(),
+                "latency_ms":float(hello.get("latency_ms") or 0),
                 "proxy":str(hello.get("proxy") or ""),"models":{},
                 "user_agent":str(hello.get("user_agent") or "")[:240],
             }
@@ -12011,10 +12021,17 @@ async def v4_extension_ws(ws: WebSocket):
                 if worker:
                     worker["last_seen"]=time.monotonic()
                     if et == "worker_state":
+                        old_ready=bool(worker.get("ready"))
+                        old_challenge=bool(worker.get("challenge"))
+                        old_login=bool(worker.get("login_required"))
                         worker["ready"]=bool(msg.get("ready", worker.get("ready")))
                         worker["challenge"]=bool(msg.get("challenge",False))
                         worker["login_required"]=bool(msg.get("login_required",False))
                         worker["latency_ms"]=float(msg.get("latency_ms") or worker.get("latency_ms") or 0)
+                        if (old_ready != worker["ready"] or
+                            old_challenge != worker["challenge"] or
+                            old_login != worker["login_required"]):
+                            log("INFO", f"v4 worker state · {worker_id} · ready={worker['ready']} · challenge={worker['challenge']} · login_required={worker['login_required']}")
             rid=str(msg.get("request_id") or "")
             q=_v4_jobs.get(rid)
             if q:
@@ -12317,11 +12334,15 @@ async def _require_api_ready():
         async with _v4_worker_lock:
             connected = len(_v4_workers)
             ready = sum(1 for w in _v4_workers.values() if _v4_worker_score(w, "auto") > -1e8)
+            advisory_ready = sum(1 for w in _v4_workers.values() if w.get("ready"))
+            challenged = sum(1 for w in _v4_workers.values() if w.get("challenge"))
+            login_required = sum(1 for w in _v4_workers.values() if w.get("login_required"))
         raise HTTPException(
             status_code=503,
             detail=(f"Bridgena v4 headed-browser capacity unavailable after "
                     f"{min(_API_READY_RECOVERY_WAIT_SEC, 20.0):.0f}s: "
-                    f"connected workers={connected}, ready workers={ready}."),
+                    f"connected workers={connected}, schedulable workers={ready}, "
+                    f"advisory-ready={advisory_ready}, challenged={challenged}, login-required={login_required}."),
             headers={"Retry-After": "1"},
         )
 
@@ -13855,7 +13876,7 @@ def _cli():
     args = ap.parse_args()
     jars_count = len([j for j in load_jars() if not j.get("expired")])
     print("=" * 62)
-    print("  BRIDGENA v4.1.5 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
+    print("  BRIDGENA v4.1.6 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
     print("=" * 62)
     print(f"  * Live Chat   : {PUBLIC_APP_URL}/chat")
     print(f"  * Dashboard   : {PUBLIC_APP_URL}/dashboard")
