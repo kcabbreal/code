@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.12-arena-ui-model-label-sync.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.13-submit-control-stabilization-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.12-arena-ui-model-label-sync")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.13-submit-control-stabilization-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -12226,9 +12226,61 @@ function bodyHasPrompt(prompt){
 }
 function composerValue(c){return (c?.value??c?.innerText??c?.textContent??"").trim()}
 
+function visibleUserMessageCount(){
+  const sels=[
+    '[data-message-author-role="user"]',
+    '[data-role="user"]',
+    '[data-author="user"]',
+    '[data-testid*="user" i]'
+  ];
+  const seen=new Set();
+  for(const s of sels){
+    for(const e of document.querySelectorAll(s)){
+      if(visible(e))seen.add(e);
+    }
+  }
+  return seen.size;
+}
+
+function realClick(el,id){
+  if(!el)return false;
+  try{
+    el.scrollIntoView({block:'center',inline:'center'});
+    const r=el.getBoundingClientRect();
+    const x=r.left+r.width/2,y=r.top+r.height/2;
+    const common={bubbles:true,cancelable:true,composed:true,clientX:x,clientY:y,button:0};
+    el.dispatchEvent(new PointerEvent('pointerdown',{...common,buttons:1,pointerId:1,pointerType:'mouse',isPrimary:true}));
+    el.dispatchEvent(new MouseEvent('mousedown',{...common,buttons:1}));
+    el.dispatchEvent(new PointerEvent('pointerup',{...common,buttons:0,pointerId:1,pointerType:'mouse',isPrimary:true}));
+    el.dispatchEvent(new MouseEvent('mouseup',{...common,buttons:0}));
+    el.dispatchEvent(new MouseEvent('click',{...common,buttons:0}));
+    try{el.click()}catch{}
+    trace(id,"submit-real-click",{
+      tag:el.tagName,
+      label:(el.getAttribute("aria-label")||txt(el)).slice(0,120),
+      disabled:!!el.disabled
+    });
+    return true;
+  }catch(e){
+    trace(id,"submit-real-click-error",{message:String(e?.message||e).slice(0,120)});
+    return false;
+  }
+}
+
 async function submitPrompt(c,payload,id){
+  const startHref=location.href;
+  const startUserCount=visibleUserMessageCount();
+
   await setValue(c,payload,id);
-  trace(id,"prompt-inserted",{composer:c.tagName,chars:payload.length,value_chars:composerValue(c).length});
+  const initialButton=submitControl(c);
+  trace(id,"prompt-inserted",{
+    composer:c.tagName,
+    chars:payload.length,
+    value_chars:composerValue(c).length,
+    send_found:!!initialButton,
+    send_disabled:!!initialButton?.disabled,
+    send_label:initialButton?(initialButton.getAttribute("aria-label")||txt(initialButton)).slice(0,100):""
+  });
 
   // DevTools capture of Arena's real composer shows the successful path is
   // keydown(Enter) -> React onKeyDown -> FORM submit. Mirror that ordering.
@@ -12245,15 +12297,36 @@ async function submitPrompt(c,payload,id){
     bubbles:true,cancelable:true,composed:true
   }));
 
-  for(let i=0;i<20;i++){
+  for(let i=0;i<14;i++){
     await sleep(150);
     const cleared=composerValue(c).length===0;
     const visiblePrompt=bodyHasPrompt(payload);
     const generating=!!stopButton();
-    if(cleared||visiblePrompt||generating){
-      trace(id,"submission-confirmed",{cleared,visiblePrompt,generating});
+    const hrefChanged=location.href!==startHref;
+    const newUserMessage=visibleUserMessageCount()>startUserCount;
+    if(cleared||visiblePrompt||generating||hrefChanged||newUserMessage){
+      trace(id,"submission-confirmed",{cleared,visiblePrompt,generating,hrefChanged,newUserMessage});
       return true;
     }
+  }
+
+  const clickTarget=submitControl(c);
+  if(clickTarget&&!clickTarget.disabled){
+    realClick(clickTarget,id);
+    for(let i=0;i<12;i++){
+      await sleep(150);
+      const cleared=composerValue(c).length===0;
+      const visiblePrompt=bodyHasPrompt(payload);
+      const generating=!!stopButton();
+      const hrefChanged=location.href!==startHref;
+      const newUserMessage=visibleUserMessageCount()>startUserCount;
+      if(cleared||visiblePrompt||generating||hrefChanged||newUserMessage){
+        trace(id,"submission-confirmed-click",{cleared,visiblePrompt,generating,hrefChanged,newUserMessage});
+        return true;
+      }
+    }
+  }else{
+    trace(id,"submit-control-unavailable",{found:!!clickTarget,disabled:!!clickTarget?.disabled});
   }
 
   const form=c.closest("form");
@@ -12272,12 +12345,24 @@ async function submitPrompt(c,payload,id){
   }
   for(let i=0;i<15;i++){
     await sleep(150);
-    if(composerValue(c).length===0||bodyHasPrompt(payload)||stopButton()){
-      trace(id,"submission-confirmed-fallback");
+    const cleared=composerValue(c).length===0;
+    const visiblePrompt=bodyHasPrompt(payload);
+    const generating=!!stopButton();
+    const hrefChanged=location.href!==startHref;
+    const newUserMessage=visibleUserMessageCount()>startUserCount;
+    if(cleared||visiblePrompt||generating||hrefChanged||newUserMessage){
+      trace(id,"submission-confirmed-fallback",{cleared,visiblePrompt,generating,hrefChanged,newUserMessage});
       return true;
     }
   }
-  trace(id,"submission-unconfirmed");
+  const finalButton=submitControl(c);
+  trace(id,"submission-unconfirmed",{
+    value_chars:composerValue(c).length,
+    send_found:!!finalButton,
+    send_disabled:!!finalButton?.disabled,
+    href_changed:location.href!==startHref,
+    user_messages_delta:visibleUserMessageCount()-startUserCount
+  });
   return false;
 }
 
@@ -12296,6 +12381,7 @@ async function run(job){
 
     const modelOk=await selectModel(job.model);
     trace(job.request_id,"model-selection",{ok:modelOk,model:job.model||"auto"});
+    if(modelOk)await sleep(800);
 
     let c=null;
     for(let i=0;i<60&&!c;i++){c=composer();if(!c)await sleep(100)}
@@ -12387,7 +12473,7 @@ setInterval(publishState,5000);
             fh.write(content_source)
 
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + Arena UI model-label sync v4.1.12")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + submit-control stabilization v4.1.13")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
