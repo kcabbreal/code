@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.17-stream-completion-grace-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.2.0-sticky-arena-sessions.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.17-stream-completion-grace-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.2.0-sticky-arena-sessions")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11634,6 +11634,12 @@ def _disposable_context_prompt(body: dict) -> str:
         }.get(role, role.title() or "Message")
         rows.append(f"{label}:\n{value}")
 
+    # A genuinely new conversation should enter Arena exactly as the user's
+    # newest turn. The history capsule is only needed when we are rebuilding an
+    # existing client transcript into a fresh Arena conversation.
+    if not rows:
+        return newest[-MAX_PROMPT:]
+
     prefix = (
         "Previous messages from this same conversation are provided below. "
         "Use them only as conversation history and continue naturally. "
@@ -11742,6 +11748,16 @@ def _tenant_identity(keyinfo: Optional[dict]) -> str:
 def _first_user_text(body: dict) -> str:
     for message in body.get("messages") or []:
         if isinstance(message, dict) and message.get("role") == "user":
+            value = _openai_text_content(message.get("content", "")).strip()
+            if value:
+                return value
+    return ""
+
+
+def _latest_user_text(body: dict) -> str:
+    """Newest user turn only, for an already-bound Arena conversation."""
+    for message in reversed(body.get("messages") or []):
+        if isinstance(message, dict) and str(message.get("role") or "").lower() == "user":
             value = _openai_text_content(message.get("content", "")).strip()
             if value:
                 return value
@@ -11861,6 +11877,100 @@ V4_PROFILE_DIR = os.environ.get("BRIDGENA_V4_PROFILE_DIR", os.path.join(os.path.
 V4_EXTENSION_DIR = os.environ.get("BRIDGENA_V4_EXTENSION_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension"))
 V4_BROWSER_PROXY = os.environ.get("BRIDGENA_V4_BROWSER_PROXY", "").strip()
 
+# v4.2: logical API conversations stay attached to their real Arena chat.
+# Only opaque ids, worker ids and Arena URLs are persisted -- never prompt text.
+V4_SESSION_TTL_SEC = max(300.0, min(7*24*3600.0, float(os.environ.get("BRIDGENA_V4_SESSION_TTL_SEC", "21600"))))
+V4_SESSION_MAX = max(32, min(10000, int(os.environ.get("BRIDGENA_V4_SESSION_MAX", "2000"))))
+V4_SESSION_FILE = os.environ.get(
+    "BRIDGENA_V4_SESSION_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "v4_sessions.json"),
+)
+_v4_sessions: Dict[str, dict] = {}
+_v4_sessions_guard = threading.Lock()
+
+def _v4_sessions_load() -> None:
+    try:
+        if not os.path.isfile(V4_SESSION_FILE):
+            return
+        with open(V4_SESSION_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        now = time.time()
+        if isinstance(raw, dict):
+            with _v4_sessions_guard:
+                for cid, item in raw.items():
+                    if not isinstance(item, dict):
+                        continue
+                    updated = float(item.get("updated") or 0)
+                    if updated and now - updated <= V4_SESSION_TTL_SEC:
+                        _v4_sessions[str(cid)] = {
+                            "worker_id": str(item.get("worker_id") or ""),
+                            "url": str(item.get("url") or ""),
+                            "model": str(item.get("model") or "auto"),
+                            "updated": updated,
+                        }
+        if _v4_sessions:
+            log("INFO", f"v4 sticky sessions restored · {len(_v4_sessions)} binding(s)")
+    except Exception as exc:
+        log("WARN", f"v4 sticky session restore skipped: {type(exc).__name__}: {redact(str(exc))[:140]}")
+
+def _v4_sessions_persist_locked() -> None:
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(V4_SESSION_FILE)), exist_ok=True)
+        tmp = V4_SESSION_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(_v4_sessions, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp, V4_SESSION_FILE)
+    except Exception as exc:
+        log("WARN", f"v4 sticky session persist skipped: {type(exc).__name__}: {redact(str(exc))[:140]}")
+
+def _v4_session_get(chat_id: str, model: str) -> Optional[dict]:
+    now = time.time()
+    key = str(chat_id)
+    with _v4_sessions_guard:
+        item = _v4_sessions.get(key)
+        if not item:
+            return None
+        expired = now - float(item.get("updated") or 0) > V4_SESSION_TTL_SEC
+        mismatch = str(item.get("model") or "auto") != str(model or "auto")
+        if expired or mismatch:
+            _v4_sessions.pop(key, None)
+            _v4_sessions_persist_locked()
+            return None
+        return dict(item)
+
+def _v4_session_bind(chat_id: str, worker_id: str, url: str, model: str) -> None:
+    key = str(chat_id)
+    if not key or not worker_id:
+        return
+    safe_url = str(url or "")
+    if safe_url and not (safe_url.startswith("https://arena.ai/") or safe_url.startswith("https://www.arena.ai/")):
+        safe_url = ""
+    with _v4_sessions_guard:
+        _v4_sessions[key] = {
+            "worker_id": str(worker_id),
+            "url": safe_url,
+            "model": str(model or "auto"),
+            "updated": time.time(),
+        }
+        if len(_v4_sessions) > V4_SESSION_MAX:
+            victims = sorted(_v4_sessions.items(), key=lambda kv: float(kv[1].get("updated") or 0))
+            for old_key, _ in victims[:len(_v4_sessions)-V4_SESSION_MAX]:
+                _v4_sessions.pop(old_key, None)
+        _v4_sessions_persist_locked()
+
+def _v4_session_drop(chat_id: str, reason: str = "") -> None:
+    key = str(chat_id)
+    removed = None
+    with _v4_sessions_guard:
+        removed = _v4_sessions.pop(key, None)
+        if removed is not None:
+            _v4_sessions_persist_locked()
+    if removed is not None:
+        log("INFO", f"v4 sticky session released · {key[:18]}…" + (f" · {reason}" if reason else ""))
+
+_v4_sessions_load()
+
 # v4.1.4: the authenticated keeper fleet *is* the headed extension worker fleet.
 # Force the bundled extension path before any bootstrap work. A bootstrap
 # preparation error must never resurrect a stale legacy extension path.
@@ -11883,7 +11993,7 @@ def _v4_prepare_bundled_extension():
         if "debugger" not in perms:
             perms.append("debugger")
         manifest["permissions"]=perms
-        manifest["version"]="4.1.15"
+        manifest["version"]="4.2.0"
         with open(manifest_path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
             fh.write("\n")
@@ -12106,6 +12216,48 @@ async function settleUi(ms=500){
   }
 }
 
+function validArenaUrl(value){
+  try{
+    const u=new URL(String(value||""),location.href);
+    return u.protocol==="https:" && (u.hostname==="arena.ai"||u.hostname.endsWith(".arena.ai"));
+  }catch{return false}
+}
+
+async function restoreSession(url,id){
+  if(!validArenaUrl(url))return false;
+  const target=new URL(url,location.href).href;
+  if(location.href!==target){
+    trace(id,"session-navigate",{from:location.href,to:target});
+    location.assign(target);
+    const c=await waitForComposer(12000,id,"session-restore-wait");
+    if(!c)return false;
+  }else{
+    const c=await waitForComposer(5000,id,"session-current-wait");
+    if(!c)return false;
+  }
+  await settleUi(450);
+  trace(id,"session-resumed",{url:location.href});
+  return true;
+}
+
+function committedPromptCount(prompt){
+  const p=normalizedText(prompt),probe=p.slice(0,Math.min(160,p.length));
+  if(!probe)return 0;
+  const selector=[
+    '[data-message-author-role="user"]','[data-role="user"]','[data-author="user"]',
+    '[data-testid*="user" i]','article','[role="article"]',
+    '[data-testid*="message" i]','[class*="message" i]','[class*="bubble" i]'
+  ].join(',');
+  const raw=[...document.querySelectorAll(selector)].filter(el=>{
+    if(!visible(el)||el===document.body||el===document.documentElement||el.tagName==='MAIN')return false;
+    if(el.closest('form')||el.querySelector('textarea,input,[contenteditable="true"]'))return false;
+    return normalizedText(txt(el)).includes(probe);
+  });
+  // Count only the innermost matching boundaries to avoid article/message
+  // wrapper nesting turning one committed user turn into several matches.
+  return raw.filter(el=>!raw.some(other=>other!==el&&el.contains(other))).length;
+}
+
 function submitControl(c){
   const form=c?.closest("form");
   if(form){
@@ -12312,7 +12464,9 @@ function assistantSnapshot(prompt=""){
 }
 
 function chatRoot(c){
-  return c?.closest('main')||document.querySelector('main')||document.body;
+  const attached=(c&&c.isConnected)?c:null;
+  const fromComposer=attached?.closest('main');
+  return (fromComposer&&fromComposer.isConnected?fromComposer:null)||document.querySelector('main')||document.body;
 }
 
 function responseTracker(c,prompt,id){
@@ -12420,13 +12574,7 @@ function responseTracker(c,prompt,id){
   };
 }
 function bodyHasPrompt(prompt){
-  const p=String(prompt||"").trim();
-  if(!p)return false;
-  const probe=p.slice(0,Math.min(120,p.length));
-  const roots=[
-    ...document.querySelectorAll('[data-message-author-role="user"],[data-role="user"],[data-author="user"],[data-testid*="user" i],article,main')
-  ].filter(visible);
-  return roots.some(x=>txt(x).includes(probe));
+  return committedPromptCount(prompt)>0;
 }
 function composerValue(c){return (c?.value??c?.innerText??c?.textContent??"").trim()}
 
@@ -12500,7 +12648,7 @@ function realClick(el,id){
 
 async function submitPrompt(c,payload,id){
   const startHref=location.href;
-  const startUserCount=visibleUserMessageCount();
+  const startCommitted=committedPromptCount(payload);
 
   await setValue(c,payload,id);
   const initialButton=submitControl(c);
@@ -12513,8 +12661,28 @@ async function submitPrompt(c,payload,id){
     send_label:initialButton?(initialButton.getAttribute("aria-label")||txt(initialButton)).slice(0,100):""
   });
 
-  // DevTools capture of Arena's real composer shows the successful path is
-  // keydown(Enter) -> React onKeyDown -> FORM submit. Mirror that ordering.
+  const evidence=()=>{
+    const committed=committedPromptCount(payload)>startCommitted;
+    const generating=!!stopButton();
+    const assistant=assistantCandidates(payload).length>0;
+    const cleared=composerValue(c).length===0;
+    const hrefChanged=location.href!==startHref;
+    return {committed,generating,assistant,cleared,hrefChanged};
+  };
+  const waitStrong=async(ms,stage)=>{
+    const deadline=Date.now()+ms;
+    while(Date.now()<deadline){
+      await sleep(140);
+      const e=evidence();
+      if(e.committed||e.generating||e.assistant){
+        trace(id,stage,e);
+        return true;
+      }
+      if(challengePresent())return false;
+    }
+    return false;
+  };
+
   trace(id,"submit-enter-keydown",{form:!!c.closest("form")});
   c.focus();
   c.dispatchEvent(new KeyboardEvent('keydown',{
@@ -12528,106 +12696,67 @@ async function submitPrompt(c,payload,id){
     bubbles:true,cancelable:true,composed:true
   }));
 
-  for(let i=0;i<14;i++){
-    await sleep(150);
-    const cleared=composerValue(c).length===0;
-    const visiblePrompt=bodyHasPrompt(payload);
-    const generating=!!stopButton();
-    const hrefChanged=location.href!==startHref;
-    const newUserMessage=visibleUserMessageCount()>startUserCount;
-    if(cleared||visiblePrompt||generating||hrefChanged||newUserMessage){
-      trace(id,"submission-confirmed",{cleared,visiblePrompt,generating,hrefChanged,newUserMessage});
-      return true;
-    }
+  if(await waitStrong(4200,"submission-confirmed"))return true;
+
+  // A route change + cleared composer is ambiguous: a new chat shell may have
+  // been created without the generation being accepted. Do not blindly replay
+  // the prompt. Give the live DOM several seconds to produce a committed user
+  // message or generation signal first.
+  let e=evidence();
+  if(e.cleared&&e.hrefChanged){
+    trace(id,"submission-route-ambiguous",e);
+    if(await waitStrong(4500,"submission-confirmed-delayed"))return true;
+    trace(id,"submission-ambiguous-no-ack",evidence());
+    return false;
   }
 
-  const clickTarget=submitControl(c);
-  if(clickTarget&&!clickTarget.disabled){
-    // Native browser input first. Arena occasionally ignores synthetic
-    // KeyboardEvent/click even though the controlled composer is valid.
+  // Synthetic Enter genuinely did nothing and the text is still in the
+  // composer, so a browser-level click is safe as a fallback.
+  let liveComposer=(c&&c.isConnected)?c:composer();
+  const clickTarget=submitControl(liveComposer);
+  if(liveComposer&&composerValue(liveComposer)&&clickTarget&&!clickTarget.disabled){
     await nativeSubmit(clickTarget,id);
-    for(let i=0;i<14;i++){
-      await sleep(150);
-      const cleared=composerValue(c).length===0;
-      const visiblePrompt=bodyHasPrompt(payload);
-      const generating=!!stopButton();
-      const hrefChanged=location.href!==startHref;
-      const newUserMessage=visibleUserMessageCount()>startUserCount;
-      if(cleared||visiblePrompt||generating||hrefChanged||newUserMessage){
-        trace(id,"submission-confirmed-native",{cleared,visiblePrompt,generating,hrefChanged,newUserMessage});
-        return true;
-      }
+    if(await waitStrong(4200,"submission-confirmed-native"))return true;
+
+    e=evidence();
+    if(e.cleared&&e.hrefChanged){
+      if(await waitStrong(3500,"submission-confirmed-native-delayed"))return true;
+      trace(id,"submission-native-ambiguous-no-ack",evidence());
+      return false;
     }
 
-    // Keep the old DOM click as a compatibility fallback for browsers where
-    // chrome.debugger attachment is unavailable.
     realClick(clickTarget,id);
-    for(let i=0;i<10;i++){
-      await sleep(150);
-      const cleared=composerValue(c).length===0;
-      const visiblePrompt=bodyHasPrompt(payload);
-      const generating=!!stopButton();
-      const hrefChanged=location.href!==startHref;
-      const newUserMessage=visibleUserMessageCount()>startUserCount;
-      if(cleared||visiblePrompt||generating||hrefChanged||newUserMessage){
-        trace(id,"submission-confirmed-click",{cleared,visiblePrompt,generating,hrefChanged,newUserMessage});
-        return true;
-      }
-    }
-  }else{
-    // If the Send button is not discoverable, CDP Enter still gives us a true
-    // browser-level key event against the already-focused composer.
-    c.focus();
+    if(await waitStrong(2600,"submission-confirmed-click"))return true;
+  }else if(liveComposer&&composerValue(liveComposer)){
+    liveComposer.focus();
     await nativeSubmit(null,id);
-    for(let i=0;i<10;i++){
-      await sleep(150);
-      const cleared=composerValue(c).length===0;
-      const visiblePrompt=bodyHasPrompt(payload);
-      const generating=!!stopButton();
-      const hrefChanged=location.href!==startHref;
-      const newUserMessage=visibleUserMessageCount()>startUserCount;
-      if(cleared||visiblePrompt||generating||hrefChanged||newUserMessage){
-        trace(id,"submission-confirmed-native-enter",{cleared,visiblePrompt,generating,hrefChanged,newUserMessage});
-        return true;
-      }
-    }
-    trace(id,"submit-control-unavailable",{found:!!clickTarget,disabled:!!clickTarget?.disabled});
+    if(await waitStrong(3200,"submission-confirmed-native-enter"))return true;
   }
 
-  const form=c.closest("form");
-  if(form&&typeof form.requestSubmit==="function"){
+  liveComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
+  const form=liveComposer?.closest("form");
+  if(liveComposer&&composerValue(liveComposer)&&form&&typeof form.requestSubmit==="function"){
     trace(id,"submit-fallback-requestSubmit");
     try{
       const submitter=[...form.querySelectorAll('button,input[type="submit"]')]
         .find(x=>!x.disabled&&(x.type==="submit"||/send|submit/i.test((x.getAttribute("aria-label")||"")+" "+txt(x))));
       form.requestSubmit(submitter||undefined);
-    }catch(e){
-      trace(id,"requestSubmit-error",{message:String(e?.message||e).slice(0,120)});
+    }catch(err){
+      trace(id,"requestSubmit-error",{message:String(err?.message||err).slice(0,120)});
     }
-  }else{
-    const b2=submitControl(c);
-    if(b2){trace(id,"submit-fallback-click",{label:(b2.getAttribute("aria-label")||txt(b2)).slice(0,100)});b2.click()}
+    if(await waitStrong(2600,"submission-confirmed-fallback"))return true;
   }
-  for(let i=0;i<15;i++){
-    await sleep(150);
-    const cleared=composerValue(c).length===0;
-    const visiblePrompt=bodyHasPrompt(payload);
-    const generating=!!stopButton();
-    const hrefChanged=location.href!==startHref;
-    const newUserMessage=visibleUserMessageCount()>startUserCount;
-    if(cleared||visiblePrompt||generating||hrefChanged||newUserMessage){
-      trace(id,"submission-confirmed-fallback",{cleared,visiblePrompt,generating,hrefChanged,newUserMessage});
-      return true;
-    }
-  }
-  const finalButton=submitControl(c);
+
+  const finalComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
+  const finalButton=submitControl(finalComposer);
   trace(id,"submission-unconfirmed",{
-    value_chars:composerValue(c).length,
+    value_chars:finalComposer?composerValue(finalComposer).length:0,
+    committed_delta:committedPromptCount(payload)-startCommitted,
     send_found:!!finalButton,
     send_disabled:!!finalButton?.disabled,
     href_changed:location.href!==startHref,
-    user_messages_delta:visibleUserMessageCount()-startUserCount,
-    native_cdp_attempted:true
+    generating:!!stopButton(),
+    challenge:challengePresent()
   });
   return false;
 }
@@ -12640,15 +12769,20 @@ async function run(job){
     if(loginRequired()){trace(job.request_id,"login-required");emit('login_required',job.request_id);return}
     if(challengePresent()){trace(job.request_id,"challenge-visible");emit('challenge',job.request_id);return}
 
-    if(job.fresh_chat){
+    let usingSession=!!job.reuse_session;
+    if(usingSession){
+      const resumed=await restoreSession(job.session_url,job.request_id);
+      if(!resumed){
+        trace(job.request_id,"session-restore-failed",{url:job.session_url||""});
+        usingSession=false;
+      }
+    }
+
+    if(!usingSession){
       const nc=await clickNewChat();
-      trace(job.request_id,"fresh-chat",{clicked:nc});
-      // Route changes can temporarily remove the composer entirely. Wait for
-      // the new-chat shell before touching model controls.
+      trace(job.request_id,"fresh-chat",{clicked:nc,recovery:!!job.reuse_session});
       let postFresh=await waitForComposer(10000,job.request_id,"post-fresh-chat-wait");
       if(!postFresh&&nc){
-        // One conservative recovery click if the first route transition did
-        // not produce a usable chat surface.
         await settleUi(650);
         const nc2=await clickNewChat();
         trace(job.request_id,"fresh-chat-retry",{clicked:nc2});
@@ -12656,12 +12790,16 @@ async function run(job){
       }
     }
 
-    const modelOk=await selectModelStable(job.model,job.request_id);
-    trace(job.request_id,"model-selection",{ok:modelOk,model:job.model||"auto"});
-
-    // A requested model must resolve before dispatch. Running with whatever
-    // model happens to be selected would produce a semantically wrong API
-    // response even if transport succeeds.
+    // A resumed Arena chat already owns its model. On a fresh/rebuilt chat we
+    // select it exactly once. Python invalidates a sticky session if the client
+    // changes models.
+    let modelOk=true;
+    if(!usingSession){
+      modelOk=await selectModelStable(job.model,job.request_id);
+      trace(job.request_id,"model-selection",{ok:modelOk,model:job.model||"auto"});
+    }else{
+      trace(job.request_id,"model-selection-skipped-session",{model:job.model||"auto"});
+    }
     if(job.model&&job.model!=="auto"&&!modelOk){
       trace(job.request_id,"model-selection-unresolved",{model:job.model});
       throw new Error("Arena requested model could not be selected");
@@ -12669,8 +12807,6 @@ async function run(job){
 
     let c=await waitForComposer(12000,job.request_id,"post-model-composer-wait");
     if(!c){
-      // Model selection itself can rerender the entire composer. Close any
-      // transient popover and give the stable chat shell one final chance.
       try{
         document.dispatchEvent(new KeyboardEvent('keydown',{
           key:'Escape',code:'Escape',bubbles:true,cancelable:true
@@ -12681,34 +12817,38 @@ async function run(job){
     }
     if(!c){
       trace(job.request_id,"composer-missing",{
-        href:location.href,
-        readyState:document.readyState,
-        login_required:loginRequired(),
-        challenge:challengePresent()
+        href:location.href,readyState:document.readyState,
+        login_required:loginRequired(),challenge:challengePresent(),usingSession
       });
       throw new Error('Arena composer not found');
     }
     trace(job.request_id,"composer-found",{
-      tag:c.tagName,
-      placeholder:c.getAttribute("placeholder")||"",
-      form:!!c.closest("form")
+      tag:c.tagName,placeholder:c.getAttribute("placeholder")||"",
+      form:!!c.closest("form"),usingSession
     });
 
-    const payload=(job.system_prompt?('System instructions:\n'+job.system_prompt+'\n\n'):'')+job.prompt;
+    const basePrompt=usingSession?job.prompt:(job.recovery_prompt||job.prompt);
+    const payload=((!usingSession&&job.system_prompt)?('System instructions:\n'+job.system_prompt+'\n\n'):'')+basePrompt;
     const baseline=assistantSnapshot(payload);
     let tracker=responseTracker(c,payload,job.request_id);
     const submitted=await submitPrompt(c,payload,job.request_id);
-    if(!submitted){tracker.stop();throw new Error("Arena prompt could not be confirmed as submitted")}
+    if(!submitted){tracker.stop();throw new Error("Arena prompt could not be strongly confirmed as submitted")}
 
-    // Submission itself mutates the page heavily (new user bubble, navigation,
-    // title/sidebar updates). Throw those mutations away and start a clean
-    // assistant-only observation window after the user message is committed.
+    // Capture the real Arena conversation as soon as a committed submit exists.
+    emit('session_update',job.request_id,{chat_id:job.chat_id||"",url:location.href,model:job.model||"auto"});
+
+    // A first submit may replace the whole route/main. Never reattach the
+    // mutation observer through a stale textarea from the previous React tree.
     tracker.stop();
-    tracker=responseTracker(c,payload,job.request_id);
-    trace(job.request_id,"response-observer-rebased");
+    const liveComposer=await waitForComposer(2500,job.request_id,"post-submit-live-root-wait");
+    tracker=responseTracker(liveComposer&&liveComposer.isConnected?liveComposer:null,payload,job.request_id);
+    trace(job.request_id,"response-observer-rebased",{
+      live_composer:!!(liveComposer&&liveComposer.isConnected),
+      href:location.href
+    });
 
     emit('accepted',job.request_id);
-    trace(job.request_id,"accepted",{baseline_chars:baseline.length});
+    trace(job.request_id,"accepted",{baseline_chars:baseline.length,using_session:usingSession});
 
     let lastChange=Date.now(),seen=false,startedGenerating=false,lastDiag=Date.now();
     let generationStoppedAt=0,lastGenerating=false,completionProbeAt=0;
@@ -12828,6 +12968,7 @@ async function run(job){
                   completion_grace:true
                 });
                 tracker.stop();
+                emit('session_update',job.request_id,{chat_id:job.chat_id||"",url:location.href,model:job.model||"auto"});
                 emit('done',job.request_id,{text:active.last});
                 return;
               }
@@ -12874,7 +13015,7 @@ setInterval(publishState,5000);
             fh.write(content_source)
 
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + stream completion grace v4.1.17")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · native-editor + sticky Arena sessions v4.2.0")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
@@ -12926,11 +13067,24 @@ def _v4_worker_score(worker: dict, model: str) -> float:
     return score
 
 
-async def _v4_pick_worker(model: str, wait_sec: float = 20.0) -> Optional[dict]:
+async def _v4_pick_worker(model: str, wait_sec: float = 20.0,
+                          preferred_worker_id: str = "", preferred_only: bool = False) -> Optional[dict]:
     deadline=time.monotonic()+max(0.1, wait_sec)
+    preferred_worker_id=str(preferred_worker_id or "")
     while time.monotonic() < deadline:
         async with _v4_worker_lock:
-            candidates=sorted(_v4_workers.values(), key=lambda w:_v4_worker_score(w, model), reverse=True)
+            if preferred_worker_id:
+                preferred=_v4_workers.get(preferred_worker_id)
+                if preferred and _v4_worker_score(preferred, model) > -1e8:
+                    preferred["busy"]=True
+                    preferred["last_used"]=time.monotonic()
+                    return preferred
+                if preferred_only:
+                    candidates=[]
+                else:
+                    candidates=sorted(_v4_workers.values(), key=lambda w:_v4_worker_score(w, model), reverse=True)
+            else:
+                candidates=sorted(_v4_workers.values(), key=lambda w:_v4_worker_score(w, model), reverse=True)
             if candidates and _v4_worker_score(candidates[0], model) > -1e8:
                 worker=candidates[0]
                 worker["busy"]=True
@@ -12960,8 +13114,21 @@ async def _v4_release_worker(worker_id: str, *, success: bool, model: str, ttfb:
 
 async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
                                  attachments=None, system_prompt: str="",
-                                 tenant_id: str="", handoff_prompt: str=""):
-    worker=await _v4_pick_worker(model_name, wait_sec=20.0)
+                                 tenant_id: str="", handoff_prompt: str="",
+                                 turn_prompt: str=""):
+    session=_v4_session_get(chat_id, model_name)
+    worker=None
+    if session and session.get("worker_id"):
+        worker=await _v4_pick_worker(
+            model_name, wait_sec=12.0,
+            preferred_worker_id=str(session.get("worker_id") or ""),
+            preferred_only=True,
+        )
+        if not worker:
+            _v4_session_drop(chat_id, "bound worker unavailable; rebuilding from client transcript")
+            session=None
+    if not worker:
+        worker=await _v4_pick_worker(model_name, wait_sec=20.0)
     if not worker:
         if V4_FALLBACK_LEGACY:
             async for item in run_turn(chat_id, prompt, model_name, attachments=attachments,
@@ -12978,13 +13145,20 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
     _v4_jobs[request_id]=q
     started=time.monotonic(); first=None; success=False; accumulated=""
     try:
+        reuse_session=bool(session)
+        effective_prompt=(turn_prompt or prompt) if reuse_session else (handoff_prompt or prompt)
         payload={
             "type":"send_message", "request_id":request_id,
             "chat_id":chat_id, "model":model_name,
-            "prompt":prompt, "system_prompt":system_prompt or "",
-            "fresh_chat":True, "disposable":True,
+            "prompt":effective_prompt,
+            "recovery_prompt":handoff_prompt or prompt,
+            "system_prompt":system_prompt or "",
+            "fresh_chat":not reuse_session, "disposable":False,
+            "reuse_session":reuse_session,
+            "session_url":str((session or {}).get("url") or ""),
         }
-        log("INFO", f"v4 job dispatch · {request_id[-12:]} · worker={worker_id} · model={model_name}")
+        log("INFO", f"v4 job dispatch · {request_id[-12:]} · worker={worker_id} · model={model_name} · "
+                    f"session={'resume' if reuse_session else 'new'} · chat={str(chat_id)[:18]}…")
         await worker["ws"].send_json(payload)
         first_deadline=started+V4_FIRST_TOKEN_SEC
         hard_deadline=started+V4_JOB_MAX_SEC
@@ -13022,6 +13196,12 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
             if et == "accepted":
                 log("INFO", f"v4 job accepted · {request_id[-12:]} · worker={worker_id}")
                 continue
+            if et == "session_update":
+                session_url=str(event.get("url") or "")
+                _v4_session_bind(chat_id, worker_id, session_url, model_name)
+                log("INFO", f"v4 sticky session bound · {str(chat_id)[:18]}… · worker={worker_id} · "
+                            f"url={'yes' if session_url else 'same-tab'}")
+                continue
             if et in {"state","heartbeat"}:
                 continue
             if et == "challenge":
@@ -13058,7 +13238,12 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
                 yield ("done", accumulated or final)
                 return
             if et == "error":
-                yield ("error", "502: headed-browser worker: "+str(event.get("message") or "unknown extension error")[:500])
+                message=str(event.get("message") or "unknown extension error")[:500]
+                if reuse_session and any(token in message.lower() for token in (
+                    "session", "composer not found", "requested model could not be selected"
+                )):
+                    _v4_session_drop(chat_id, "session UI became unusable")
+                yield ("error", "502: headed-browser worker: "+message)
                 return
     except (WebSocketDisconnect, RuntimeError) as exc:
         yield ("error", f"502: headed-browser worker disconnected: {type(exc).__name__}")
@@ -13076,7 +13261,9 @@ async def _api_run_turn(chat_id: str, prompt: str, model_name: str, **kwargs):
         async for item in _v4_extension_run_turn(chat_id, prompt, model_name, **kwargs):
             yield item
     else:
-        async for item in run_turn(chat_id, prompt, model_name, **kwargs):
+        legacy_kwargs=dict(kwargs)
+        legacy_kwargs.pop("turn_prompt", None)
+        async for item in run_turn(chat_id, prompt, model_name, **legacy_kwargs):
             yield item
 
 
@@ -13166,7 +13353,26 @@ async def v4_workers(request: Request):
         stats[model]={"ok":s["ok"],"fail":s["fail"],
                       "median_ttfb":sorted(s["ttfb"])[len(s["ttfb"])//2] if s["ttfb"] else None,
                       "median_duration":sorted(s["duration"])[len(s["duration"])//2] if s["duration"] else None}
-    return JSONResponse({"build":BUILD_STAMP,"transport":V4_TRANSPORT,"workers":rows,"models":stats})
+    with _v4_sessions_guard:
+        session_count=len(_v4_sessions)
+    return JSONResponse({"build":BUILD_STAMP,"transport":V4_TRANSPORT,"workers":rows,"models":stats,
+                         "sticky_sessions":session_count})
+
+
+@app.get("/v4/sessions")
+async def v4_sessions(request: Request):
+    await _require_admin(request)
+    now=time.time()
+    with _v4_sessions_guard:
+        rows=[{
+            "chat_id":cid[:24] + ("…" if len(cid)>24 else ""),
+            "worker_id":str(item.get("worker_id") or ""),
+            "model":str(item.get("model") or "auto"),
+            "has_url":bool(item.get("url")),
+            "age_sec":max(0, int(now-float(item.get("updated") or now))),
+        } for cid,item in _v4_sessions.items()]
+    rows.sort(key=lambda x:x["age_sec"])
+    return JSONResponse({"build":BUILD_STAMP,"ttl_sec":V4_SESSION_TTL_SEC,"count":len(rows),"sessions":rows})
 
 
 def _v4_find_chrome() -> Optional[str]:
@@ -13204,9 +13410,10 @@ async def openai_stream(body: dict, keyinfo: dict):
         raise HTTPException(status_code=400, detail="no user message")
     model = canonical_public_model_name(body.get("model", "auto"))
     body["model"] = model
-    # A caller-supplied opaque thread id preserves Arena context without storing
-    # prompt or response content. One-off API calls receive a random id.
-    chat_id = _disposable_chat_id("api")
+    # v4.2: stable tenant-scoped id binds follow-up API turns to the same real
+    # Arena conversation. No prompt/response content is stored in the binding.
+    chat_id = _logical_chat_id(body, keyinfo, "api")
+    turn_prompt = _latest_user_text(body)
     tenant_id = _tenant_identity(keyinfo)
     system_prompt = _openai_system_context(body)
 
@@ -13235,7 +13442,8 @@ async def openai_stream(body: dict, keyinfo: dict):
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
-                                                handoff_prompt=prompt):
+                                                handoff_prompt=prompt,
+                                                turn_prompt=turn_prompt):
                 if kind == "content":
                     acc += payload
                     content_chunks += 1
@@ -13560,13 +13768,15 @@ async def chat_completions(request: Request):
                "model": body.get("model", "auto"), "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]}
         acc = ""
         try:
-            chat_id = _disposable_chat_id("api")
+            chat_id = _logical_chat_id(body, keyinfo, "api")
+            turn_prompt = _latest_user_text(body)
             async for kind, payload in _api_run_turn(chat_id, prompt,
                                                 body.get("model", "auto"),
                                                 attachments=body.get("attachments"),
                                                 system_prompt=_openai_system_context(body),
                                                 tenant_id=_tenant_identity(keyinfo),
-                                                handoff_prompt=prompt):
+                                                handoff_prompt=prompt,
+                                                turn_prompt=turn_prompt):
                 if kind == "content":
                     acc += payload
                 elif kind == "error":
@@ -13699,7 +13909,8 @@ async def anthropic_messages(request: Request):
                         f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
         raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
 
-    chat_id = _disposable_chat_id("anthropic")
+    chat_id = _logical_chat_id(body, keyinfo, "anthropic")
+    turn_prompt = _latest_user_text(body)
     tenant_id = _tenant_identity(keyinfo)
     system_prompt = _anthropic_system_context(body)
     message_id = "msg_" + uuid7().replace("-", "")
@@ -13712,7 +13923,8 @@ async def anthropic_messages(request: Request):
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
-                                                handoff_prompt=prompt):
+                                                handoff_prompt=prompt,
+                                                turn_prompt=turn_prompt):
                 if kind in ("content", "reasoning") and isinstance(payload, str):
                     acc += payload
                 elif kind == "error":
@@ -13743,7 +13955,8 @@ async def anthropic_messages(request: Request):
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
-                                                handoff_prompt=prompt):
+                                                handoff_prompt=prompt,
+                                                turn_prompt=turn_prompt):
                 if kind in ("content", "reasoning") and isinstance(payload, str):
                     acc += payload
                     chunks += 1
@@ -14928,7 +15141,7 @@ async def _lifespan(app):
     if V4_AUTOLAUNCH and not V4_AUTO_ATTACH_KEEPERS:
         try: _v4_launch_browser_once()
         except Exception as exc: log("WARN", f"v4 browser autolaunch failed · {type(exc).__name__}: {redact(str(exc))[:160]}")
-    log("INFO", "Conversation mode · disposable Arena evaluation per API message · bounded client-history capsule")
+    log("INFO", "Conversation mode · sticky Arena chat sessions · bounded history capsule only for rebuild/recovery")
     log("INFO", "Keeper rejection policy · non-destructive local recovery · no 45s API exile")
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
@@ -14988,13 +15201,13 @@ app.router.lifespan_context = _lifespan  # starlette late-bind
 # ================================================================
 def _cli():
     import argparse
-    ap = argparse.ArgumentParser(description="Bridgena v4.1 autonomous headed keeper bridge")
+    ap = argparse.ArgumentParser(description="Bridgena v4.2 sticky Arena session bridge")
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--workers", type=int, default=int(os.environ.get("BRIDGENA_WORKERS", "1")))
     args = ap.parse_args()
     jars_count = len([j for j in load_jars() if not j.get("expired")])
     print("=" * 62)
-    print("  BRIDGENA v4.1.8 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
+    print("  BRIDGENA v4.2 — Sticky Arena Session Bridge (" + BUILD_STAMP + ")")
     print("=" * 62)
     print(f"  * Live Chat   : {PUBLIC_APP_URL}/chat")
     print(f"  * Dashboard   : {PUBLIC_APP_URL}/dashboard")
