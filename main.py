@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.16-id-aware-history-recovery")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.17-partial-terminal-fallback")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1962,6 +1962,7 @@ def _undelivered_retry_snapshot() -> dict:
 
 ARENA_UI_RECOVERY_STABLE_SEC = max(0.8, min(6.0, float(os.environ.get("BRIDGENA_ARENA_UI_RECOVERY_STABLE_SEC", "1.8"))))
 ARENA_UI_STALE_GENERATING_ACCEPT_SEC = max(3.0, min(15.0, float(os.environ.get("BRIDGENA_UI_STALE_GENERATING_ACCEPT_SEC", "6.0"))))
+PARTIAL_TERMINAL_MIN_CHARS = max(24, min(2000, int(os.environ.get("BRIDGENA_PARTIAL_TERMINAL_MIN_CHARS", "64"))))
 _arena_ui_recovery_stats = {"attempted": 0, "recovered": 0, "history_api_recovered": 0, "history_api_match": 0, "history_index_waits": 0, "ui_recovered": 0, "post_restart_attempted": 0, "post_restart_recovered": 0, "recovery_wait_timeout": 0, "not_found": 0, "incomplete": 0, "navigation_failed": 0}
 _arena_ui_recovery_stats_guard = threading.Lock()
 
@@ -8781,9 +8782,23 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         yield ("done", response_text)
                         return
 
+                    if response_text and len(response_text.strip()) >= PARTIAL_TERMINAL_MIN_CHARS:
+                        # Degraded-success policy: Arena accepted this exact turn and the live
+                        # transport already yielded meaningful semantic assistant output. If
+                        # history/UI recovery cannot prove completion before its bounded
+                        # deadline, do not turn useful already-delivered text into a hard API
+                        # failure. Close the client stream cleanly with the captured output.
+                        # The Arena binding remains persisted, so later turns still continue
+                        # from the authoritative upstream thread. Tiny fragments are excluded
+                        # by PARTIAL_TERMINAL_MIN_CHARS and continue to fail below.
+                        log("WARN", f"[{jar.get('name')}] delivered-turn recovery exhausted, but "
+                                    f"{len(response_text)} semantic chars were already streamed; "
+                                    "closing as degraded terminal success and preserving Arena binding")
+                        yield ("done", response_text)
+                        return
                     if response_text or reasoning_text:
-                        yield ("error", "502: Arena accepted the turn and partial assistant output was observed, but completion "
-                                        "could not be confirmed before the delivered-turn recovery window expired. "
+                        yield ("error", "502: Arena accepted the turn and some assistant output was observed, but only a short or "
+                                        "unrecoverable fragment was available when the delivered-turn recovery window expired. "
                                         "The exact Arena evaluation remains bound for subsequent continuation/recovery; "
                                         "the partial response remains visible above.")
                     else:
