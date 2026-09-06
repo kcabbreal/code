@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.12-duplicate-ack-budget")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.13-readiness-merge-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -9039,8 +9039,12 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                     continue
                         if mc:
                             clear_conversation_model(chat_id, model_name)
-                        log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation did not complete; failing fast")
-                        yield ("error", "503: Verification is not ready on the selected keeper. Bridgena quarantined it instead of retrying the same prompt across accounts; retry after readiness returns.")
+                        log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation did not complete; keeper quarantined 45s")
+                        rejection = (e.body or "").strip().replace("\n", " ")[:220]
+                        yield ("error",
+                               "503: Arena rejected verification for this request and the same-keeper escalation did not complete. "
+                               "The selected keeper was quarantined for 45s; no cross-account replay was attempted."
+                               + (f" Upstream: {rejection}" if rejection else ""))
                         return
 
                     if e.status == 400 and "user message is invalid" in (e.body or "").lower():
@@ -11697,13 +11701,20 @@ async def clear_logs():
 @app.get("/healthz")
 async def healthz():
     rows = snapshot_rows()
-    ready_keepers = sum(1 for sid, session in keeper.sessions.items()
-                        if keeper_session_ready(session)
-                        and any(j.get("id") == sid and j.get("enabled", True) and jar_has_auth(j)
-                                for j in load_jars()))
+    jars = load_jars()
+    browser_ready_ids = [
+        j.get("id") for j in jars
+        if j.get("enabled", True) and jar_has_auth(j)
+        and keeper_session_ready(keeper.sessions.get(j.get("id")))
+    ]
+    verification_ready_ids = [sid for sid in browser_ready_ids if _api_keeper_verified(sid)]
+    ready_keepers = len(browser_ready_ids)
+    verification_ready_keepers = len(verification_ready_ids)
+    verification_ready_exits = len({_api_keeper_exit_key(sid) for sid in verification_ready_ids})
+    _refresh_api_ready_event()
     bootable_count = len(_bootable_keeper_jars())
     preferred_keepers, preferred_exits = _api_preferred_targets() if bootable_count else (0, 0)
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.4",
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.13",
                          "models": len(get_models()),
                          "bootable_accounts": bootable_count,
                          "keeper_fleet_target": bootable_count,
@@ -11716,8 +11727,11 @@ async def healthz():
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
                                              if keeper_session_ready(session)),
-                         "api_ready": bool(get_models()) and ready_keepers > 0,
+                         "api_ready": bool(_api_ready_event.is_set()),
                          "ready_authenticated_keepers": ready_keepers,
+                         "browser_ready_authenticated_keepers": ready_keepers,
+                         "verification_ready_keepers": verification_ready_keepers,
+                         "verification_ready_exits": verification_ready_exits,
                          "global_concurrency": API_TURN_CONCURRENCY,
                          "per_api_concurrency": "unlimited",
                          "configured_proxies": len(get_proxy_pool()),
@@ -11797,16 +11811,21 @@ async def keeper_diagnostics(request: Request):
 async def readyz():
     models_ready = bool(get_models())
     jars = load_jars()
-    ready_ids = []
+    browser_ready_ids = []
     for jar in jars:
         sid = jar.get("id")
         if jar.get("enabled", True) and jar_has_auth(jar) and keeper_session_ready(keeper.sessions.get(sid)):
-            ready_ids.append(sid)
-    ready = models_ready and bool(ready_ids)
+            browser_ready_ids.append(sid)
+    verification_ready_ids = [sid for sid in browser_ready_ids if _api_keeper_verified(sid)]
+    _refresh_api_ready_event()
+    ready = models_ready and bool(_api_ready_event.is_set())
     return JSONResponse({"ready": ready, "build": BUILD_STAMP,
                          "checks": {"models": models_ready,
-                                    "authenticated_keeper": bool(ready_ids),
-                                    "ready_authenticated_keepers": len(ready_ids),
+                                    "authenticated_keeper": bool(browser_ready_ids),
+                                    "ready_authenticated_keepers": len(browser_ready_ids),
+                                    "verification_ready_keeper": bool(verification_ready_ids),
+                                    "verification_ready_keepers": len(verification_ready_ids),
+                                    "verification_ready_exits": len({_api_keeper_exit_key(sid) for sid in verification_ready_ids}),
                                     "global_concurrency": API_TURN_CONCURRENCY,
                                     "per_api_concurrency": "unlimited",
                                     "estimated_browser_lanes":
