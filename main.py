@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.4-worker-model-refresh-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.5-worker-connectivity-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.4-worker-model-refresh-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.5-worker-connectivity-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -5280,7 +5280,11 @@ class KeeperSession:
                         user_agent=self.user_agent or KEEPER_UA,  # persona-bound; cf_clearance is UA+IP-bound
                     )
                     if _pw_proxy:
-                        _pc_kw["proxy"] = _pw_proxy
+                        _local_proxy = dict(_pw_proxy)
+                        existing_bypass = str(_local_proxy.get("bypass") or "").strip()
+                        local_bypass = "localhost,127.0.0.1,[::1]"
+                        _local_proxy["bypass"] = ",".join(x for x in (existing_bypass, local_bypass) if x)
+                        _pc_kw["proxy"] = _local_proxy
                     self.context = await self.playwright.chromium.launch_persistent_context(**_pc_kw)
                     self.browser = None
                     self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
@@ -11717,34 +11721,69 @@ def _v4_prepare_bundled_extension():
         with open(manifest_path, "r", encoding="utf-8") as fh:
             manifest=json.load(fh)
         hp=list(manifest.get("host_permissions") or [])
-        for pat in ("http://127.0.0.1/*", "http://localhost/*"):
+        for pat in ("https://arena.ai/*", "https://*.arena.ai/*",
+                    "http://127.0.0.1/*", "http://localhost/*"):
             if pat not in hp:
                 hp.append(pat)
         manifest["host_permissions"]=hp
-        manifest["version"]="4.1.4"
+        manifest["version"]="4.1.5"
         with open(manifest_path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
             fh.write("\n")
 
-        if os.path.isfile(sw_path):
-            with open(sw_path, "r", encoding="utf-8") as fh:
-                sw=fh.read()
-            ws_url=os.environ.get("BRIDGENA_V4_EXTENSION_WS_URL", "ws://127.0.0.1:8000/v4/extension/ws").strip()
-            replacement='const DEFAULTS='+json.dumps(
-                {"wsUrl":ws_url,"token":V4_EXTENSION_TOKEN,"workerId":"","proxyLabel":""},
-                separators=(",",":")
-            )+';'
-            patched, n = re.subn(r'^const DEFAULTS=.*?;$', replacement, sw, count=1, flags=re.M)
-            if n == 0:
-                # Keep startup observable instead of silently writing an unconfigured worker.
-                log("WARN", "v4 worker bootstrap: DEFAULTS declaration not found in service-worker.js")
-            else:
-                with open(sw_path, "w", encoding="utf-8") as fh:
-                    fh.write(patched)
-                token_mode = "configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-                log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode}")
-        else:
-            log("WARN", f"v4 worker bootstrap service worker missing: {sw_path}")
+        ws_url=os.environ.get(
+            "BRIDGENA_V4_EXTENSION_WS_URL",
+            f"ws://127.0.0.1:{PORT}/v4/extension/ws"
+        ).strip()
+
+        sw_template = r"""const BOOT = __BOOT__;
+let ws=null,reconnectTimer=null,pingTimer=null,currentRequest=null;
+
+async function cfg() {
+  const saved=await chrome.storage.local.get({workerId:"",proxyLabel:""});
+  if(!saved.workerId) {
+    saved.workerId="keeper-"+crypto.randomUUID();
+    await chrome.storage.local.set({workerId:saved.workerId});
+  }
+  return {wsUrl:BOOT.wsUrl,token:BOOT.token,workerId:saved.workerId,proxyLabel:saved.proxyLabel||""};
+}
+function send(obj){if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify(obj));}
+async function activeArenaTab(){
+  let tabs=await chrome.tabs.query({url:["https://arena.ai/*","https://*.arena.ai/*"]});
+  if(tabs.length)return tabs[0];
+  return await chrome.tabs.create({url:"https://arena.ai/",active:true});
+}
+async function connect(){
+  clearTimeout(reconnectTimer);
+  const c=await cfg();
+  const url=c.wsUrl+(c.wsUrl.includes("?")?"&":"?")+"token="+encodeURIComponent(c.token||"");
+  try{ws=new WebSocket(url);}catch(e){reconnectTimer=setTimeout(connect,1500);return;}
+  ws.onopen=()=>{send({type:"hello",worker_id:c.workerId,ready:true,proxy:c.proxyLabel||"",user_agent:navigator.userAgent});
+    clearInterval(pingTimer);pingTimer=setInterval(()=>send({type:"heartbeat",ts:Date.now(),request_id:currentRequest||""}),15000);};
+  ws.onmessage=async(ev)=>{let m;try{m=JSON.parse(ev.data)}catch{return}
+    if(m.type==="send_message"){currentRequest=m.request_id;let tab=await activeArenaTab();
+      try{await chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_SEND",job:m});}
+      catch(e){try{await chrome.tabs.reload(tab.id);setTimeout(()=>chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_SEND",job:m}).catch(x=>send({type:"error",request_id:m.request_id,message:String(x)})),1600);}
+      catch(x){send({type:"error",request_id:m.request_id,message:String(x)});}}}
+    else if(m.type==="cancel"){let tab=await activeArenaTab();chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_CANCEL",request_id:m.request_id}).catch(()=>{});}
+  };
+  ws.onclose=()=>{clearInterval(pingTimer);reconnectTimer=setTimeout(connect,1500);};
+  ws.onerror=()=>{try{ws.close()}catch{}};
+}
+chrome.runtime.onMessage.addListener((msg,sender)=>{if(msg&&msg.type&&msg.type.startsWith("BRIDGENA_")){
+  let out={...msg};delete out.type;send({type:msg.type.replace("BRIDGENA_","").toLowerCase(),...out});
+  if(msg.type==="BRIDGENA_DONE"||msg.type==="BRIDGENA_ERROR")currentRequest=null;}});
+chrome.runtime.onInstalled.addListener(()=>connect());
+chrome.runtime.onStartup.addListener(()=>connect());
+connect();
+"""
+        boot=json.dumps({"wsUrl":ws_url,"token":V4_EXTENSION_TOKEN}, separators=(",",":"))
+        sw_source=sw_template.replace("__BOOT__", boot)
+        with open(sw_path, "w", encoding="utf-8") as fh:
+            fh.write(sw_source)
+
+        token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
@@ -11934,10 +11973,13 @@ async def v4_extension_ws(ws: WebSocket):
     token=ws.query_params.get("token", "")
     peer=getattr(getattr(ws, "client", None), "host", "?")
     origin=str(ws.headers.get("origin") or "")[:160]
+    _loopback_peer = str(peer) in {"127.0.0.1", "::1", "localhost"}
     if V4_EXTENSION_TOKEN and not hmac.compare_digest(token, V4_EXTENSION_TOKEN):
-        log("WARN", f"v4 extension socket rejected · peer={peer} · origin={origin or '-'} · token mismatch")
-        await ws.close(code=4403)
-        return
+        if not _loopback_peer:
+            log("WARN", f"v4 extension socket rejected · peer={peer} · origin={origin or '-'} · token mismatch")
+            await ws.close(code=4403)
+            return
+        log("WARN", f"v4 extension socket accepted from loopback with stale token · peer={peer} · origin={origin or '-'}")
     await ws.accept()
     worker_id=None
     try:
@@ -13813,7 +13855,7 @@ def _cli():
     args = ap.parse_args()
     jars_count = len([j for j in load_jars() if not j.get("expired")])
     print("=" * 62)
-    print("  BRIDGENA v4.1.2 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
+    print("  BRIDGENA v4.1.5 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
     print("=" * 62)
     print(f"  * Live Chat   : {PUBLIC_APP_URL}/chat")
     print(f"  * Dashboard   : {PUBLIC_APP_URL}/dashboard")
