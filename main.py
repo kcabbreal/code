@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.0.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.4-worker-model-refresh-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.3-model-catalog-refresh-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.4-worker-model-refresh-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2467,105 +2467,230 @@ async def get_initial_data() -> list:
     return result["models"]
 
 async def refresh_models_via_worker(worker):
-    """Fetch models from Arena's Next.js page/Flight state using a live keeper."""
-    log("INFO", f"[{worker.name}] Refreshing models via worker navigation...")
+    """Refresh Arena's model catalog from live Next.js/Flight state.
+
+    v4.1.4 deliberately scans several page-state representations instead of
+    assuming `initialModels` lives in one exact serialized location.
+    """
+    log("INFO", f"[{worker.name}] Refreshing models via live browser state...")
     try:
         async with worker._action_lock:
             await worker.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
-            await worker.page.wait_for_load_state("domcontentloaded")
+            try:
+                await worker.page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+
             body = await worker.page.content()
             try:
-                flight = await worker.page.evaluate("() => JSON.stringify(self.__next_f || [])")
+                flight_obj = await worker.page.evaluate("() => self.__next_f || []")
             except Exception:
-                flight = ""
-
-        def _array_after_key(src: str):
-            """Extract nested JSON safely; a non-greedy regex truncates on the
-            first capability array/object inside initialModels."""
-            if not src:
-                return None
-            for needle in ('"initialModels"', "'initialModels'"):
-                pos = src.find(needle)
-                while pos >= 0:
-                    start = src.find("[", pos + len(needle))
-                    if start < 0:
-                        break
-                    depth, quoted, escaped = 0, False, False
-                    for i in range(start, len(src)):
-                        ch = src[i]
-                        if quoted:
-                            if escaped:
-                                escaped = False
-                            elif ch == "\\":
-                                escaped = True
-                            elif ch == '"':
-                                quoted = False
-                        elif ch == '"':
-                            quoted = True
-                        elif ch == "[":
-                            depth += 1
-                        elif ch == "]":
-                            depth -= 1
-                            if depth == 0:
-                                try:
-                                    value = json.loads(src[start:i + 1])
-                                    if isinstance(value, list):
-                                        return value
-                                except Exception:
-                                    break
-                    pos = src.find(needle, pos + len(needle))
-            return None
+                flight_obj = []
+            try:
+                script_texts = await worker.page.evaluate(
+                    "() => Array.from(document.scripts).map(s => s.textContent || '').filter(Boolean)"
+                )
+            except Exception:
+                script_texts = []
 
         import html as _model_html
-        sources = [body, _model_html.unescape(body), flight]
-        sources += [s.replace('\\"', '"').replace('\\\\', '\\')
-                    for s in list(sources) if s]
-        models_data = next((v for v in (_array_after_key(s) for s in sources) if v), None)
-        if models_data:
 
-            # Always dump the raw, unfiltered payload so we can inspect the
-            # exact fields Arena sends for any given model (e.g. to figure
-            # out why an internal/test model like "gpt-5.4-no-system-prompt"
-            # isn't being caught by is_model_selectable()).
+        def _balanced_arrays_after_key(src: str, keys=("initialModels", "models")):
+            if not src:
+                return []
+            found = []
+            for key in keys:
+                for needle in (f'"{key}"', f"'{key}'"):
+                    pos = 0
+                    while True:
+                        pos = src.find(needle, pos)
+                        if pos < 0:
+                            break
+                        start = src.find("[", pos + len(needle))
+                        if start < 0:
+                            break
+                        depth = 0
+                        quoted = False
+                        quote_ch = ""
+                        escaped = False
+                        for i in range(start, len(src)):
+                            ch = src[i]
+                            if quoted:
+                                if escaped:
+                                    escaped = False
+                                elif ch == "\\":
+                                    escaped = True
+                                elif ch == quote_ch:
+                                    quoted = False
+                            elif ch in ('"', "'"):
+                                quoted = True
+                                quote_ch = ch
+                            elif ch == "[":
+                                depth += 1
+                            elif ch == "]":
+                                depth -= 1
+                                if depth == 0:
+                                    raw = src[start:i+1]
+                                    try:
+                                        value = json.loads(raw)
+                                        if isinstance(value, list):
+                                            found.append(value)
+                                    except Exception:
+                                        pass
+                                    break
+                        pos += len(needle)
+            return found
+
+        def _looks_like_model_entry(v):
+            if not isinstance(v, dict):
+                return False
+            ident = v.get("id") or v.get("publicName") or v.get("name")
+            if not isinstance(ident, str) or not ident.strip():
+                return False
+            # Avoid generic page arrays by requiring a second model-ish signal
+            # when possible. Catalog entries vary, so this stays permissive.
+            return any(k in v for k in (
+                "publicName", "organization", "capabilities", "provider",
+                "modelOrganization", "access", "availability", "outputCapabilities"
+            )) or ("model" in str(v.get("type", "")).lower())
+
+        def _candidate_score(arr):
+            if not isinstance(arr, list) or not arr:
+                return 0
+            dicts = [x for x in arr if isinstance(x, dict)]
+            if not dicts:
+                return 0
+            good = sum(1 for x in dicts if _looks_like_model_entry(x))
+            # Weight both absolute size and model-entry density.
+            return good * 1000 + int((good / max(1, len(dicts))) * 100)
+
+        candidates = []
+
+        # Direct Python object from __next_f, recursively inspected.
+        def _walk(obj, depth=0):
+            if depth > 12:
+                return
+            if isinstance(obj, list):
+                if obj:
+                    candidates.append(("flight-object", obj))
+                for x in obj:
+                    _walk(x, depth + 1)
+            elif isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in ("initialModels", "models") and isinstance(v, list):
+                        candidates.append((f"flight-key:{k}", v))
+                    _walk(v, depth + 1)
+            elif isinstance(obj, str) and len(obj) > 80:
+                for arr in _balanced_arrays_after_key(obj):
+                    candidates.append(("flight-string", arr))
+                # Some Flight entries themselves contain JSON strings.
+                try:
+                    parsed = json.loads(obj)
+                except Exception:
+                    parsed = None
+                if parsed is not None and parsed is not obj:
+                    _walk(parsed, depth + 1)
+
+        _walk(flight_obj)
+
+        sources = [("html", body), ("html-unescaped", _model_html.unescape(body))]
+        for i, s in enumerate(script_texts or []):
+            sources.append((f"script-{i}", s))
+
+        for label, src in sources:
+            if not src:
+                continue
+            variants = [src]
+            if '\\"' in src:
+                variants.append(src.replace('\\"', '"').replace('\\\\', '\\'))
+            for variant in variants:
+                for arr in _balanced_arrays_after_key(variant):
+                    candidates.append((label, arr))
+
+        # Last-resort scan of JSON script blocks: recursively discover arrays
+        # containing model-shaped objects even if Arena renamed `initialModels`.
+        for i, s in enumerate(script_texts or []):
+            st = (s or "").strip()
+            if not st or st[0] not in "[{":
+                continue
             try:
-                atomic_write(MODELS_RAW_DEBUG_FILE, models_data)
-            except Exception as e:
-                log("WARN", f"Failed to write raw model debug dump: {e}")
+                parsed = json.loads(st)
+            except Exception:
+                continue
+            def _collect_json(obj, depth=0):
+                if depth > 10:
+                    return
+                if isinstance(obj, list):
+                    if _candidate_score(obj):
+                        candidates.append((f"json-script-{i}", obj))
+                    for x in obj:
+                        _collect_json(x, depth+1)
+                elif isinstance(obj, dict):
+                    for v in obj.values():
+                        _collect_json(v, depth+1)
+            _collect_json(parsed)
 
-            hidden = [m.get("publicName") or m.get("id") for m in models_data if not is_model_selectable(m)]
-            kept = [m.get("publicName") or m.get("id") for m in models_data if is_model_selectable(m)]
-            log("INFO", f"Model filter kept={len(kept)} hidden={len(hidden)} hidden_sample={hidden[:20]}")
-            
-            filtered = []
-            for m in models_data:
-                name = m.get("publicName") or m.get("id") or m.get("name")
-                if not name:
-                    continue
-                if not is_model_selectable(m):
-                    continue
-                caps = (m.get("capabilities") or {}).get("outputCapabilities") or m.get("outputCapabilities") or {}
-                if caps.get("text") is False:
-                    continue
-                filtered.append(m)
-            
-            if _valid_model_catalog(filtered):
-                before = set(_catalog_names(get_models()))
-                after = set(_catalog_names(filtered))
-                save_models(filtered)
-                added = sorted(after - before)
-                removed = sorted(before - after)
-                log("OK", f"Model catalog refreshed via worker ({len(after)} unique models · +{len(added)} / -{len(removed)})")
-                if added:
-                    log("INFO", f"Model catalog added sample: {added[:20]}")
-                if removed:
-                    log("INFO", f"Model catalog removed sample: {removed[:20]}")
-                return filtered
-            elif filtered:
-                log("WARN", f"Model extractor returned only {len(_catalog_names(filtered))} unique model(s); refusing to replace current catalog")
-        log("WARN", "Could not find a balanced initialModels array in page/Flight source.")
+        candidates = [(label, arr) for label, arr in candidates if _candidate_score(arr) > 0]
+        candidates.sort(key=lambda item: _candidate_score(item[1]), reverse=True)
+
+        if not candidates:
+            log("WARN", f"[{worker.name}] Model refresh found no model-shaped arrays in Flight/HTML/scripts")
+            return []
+
+        source_label, models_data = candidates[0]
+        log("INFO", f"[{worker.name}] Model extractor selected {source_label} · raw entries {len(models_data)} · candidates {len(candidates)}")
+
+        try:
+            atomic_write(MODELS_RAW_DEBUG_FILE, models_data)
+        except Exception as e:
+            log("WARN", f"Failed to write raw model debug dump: {e}")
+
+        filtered = []
+        hidden = []
+        for m in models_data:
+            if not isinstance(m, dict):
+                continue
+            name = m.get("publicName") or m.get("id") or m.get("name")
+            if not name:
+                continue
+            if not is_model_selectable(m):
+                hidden.append(name)
+                continue
+            caps = (m.get("capabilities") or {}).get("outputCapabilities") or m.get("outputCapabilities") or {}
+            if isinstance(caps, dict) and caps.get("text") is False:
+                hidden.append(name)
+                continue
+            filtered.append(m)
+
+        # De-duplicate by canonical name while preserving current catalog order.
+        deduped, seen = [], set()
+        for m in filtered:
+            n = model_name(m).strip()
+            if n and n not in seen:
+                seen.add(n)
+                deduped.append(m)
+
+        log("INFO", f"Model filter kept={len(deduped)} hidden={len(hidden)} hidden_sample={hidden[:20]}")
+
+        if not _valid_model_catalog(deduped):
+            log("WARN", f"Model extractor produced only {len(_catalog_names(deduped))} usable unique model(s); current catalog retained")
+            return []
+
+        before = set(_catalog_names(get_models()))
+        after = set(_catalog_names(deduped))
+        save_models(deduped)
+        added = sorted(after - before)
+        removed = sorted(before - after)
+        log("OK", f"Model catalog refreshed via worker ({len(after)} unique models · +{len(added)} / -{len(removed)})")
+        if added:
+            log("INFO", f"Model catalog added sample: {added[:20]}")
+        if removed:
+            log("INFO", f"Model catalog removed sample: {removed[:20]}")
+        return deduped
+
     except Exception as e:
-        log("ERROR", f"Failed to refresh models: {e}")
-    return []
+        log("ERROR", f"Failed to refresh models: {type(e).__name__}: {e}")
+        return []
 
 def _session_secret() -> str:
     """Stable secret derived from dashboard password."""
@@ -11579,9 +11704,9 @@ V4_PROFILE_DIR = os.environ.get("BRIDGENA_V4_PROFILE_DIR", os.path.join(os.path.
 V4_EXTENSION_DIR = os.environ.get("BRIDGENA_V4_EXTENSION_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension"))
 V4_BROWSER_PROXY = os.environ.get("BRIDGENA_V4_BROWSER_PROXY", "").strip()
 
-# v4.1.2: the authenticated keeper fleet *is* the headed extension worker fleet.
-# Keep the bundled worker configuration synchronized with this process before
-# any persistent Chromium context is launched.
+# v4.1.4: the authenticated keeper fleet *is* the headed extension worker fleet.
+# Force the bundled extension path before any bootstrap work. A bootstrap
+# preparation error must never resurrect a stale legacy extension path.
 def _v4_prepare_bundled_extension():
     manifest_path=os.path.join(V4_EXTENSION_DIR, "manifest.json")
     sw_path=os.path.join(V4_EXTENSION_DIR, "service-worker.js")
@@ -11589,7 +11714,6 @@ def _v4_prepare_bundled_extension():
         log("WARN", f"v4 bundled extension manifest missing: {V4_EXTENSION_DIR}")
         return False
     try:
-        # Give the MV3 worker explicit permission for its local control socket.
         with open(manifest_path, "r", encoding="utf-8") as fh:
             manifest=json.load(fh)
         hp=list(manifest.get("host_permissions") or [])
@@ -11597,28 +11721,39 @@ def _v4_prepare_bundled_extension():
             if pat not in hp:
                 hp.append(pat)
         manifest["host_permissions"]=hp
-        manifest["version"]="4.1.2"
+        manifest["version"]="4.1.4"
         with open(manifest_path, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
             fh.write("\n")
 
-        # Inject the exact local WS URL and token into the worker defaults.
         if os.path.isfile(sw_path):
-            sw=Path(sw_path).read_text(encoding="utf-8")
+            with open(sw_path, "r", encoding="utf-8") as fh:
+                sw=fh.read()
             ws_url=os.environ.get("BRIDGENA_V4_EXTENSION_WS_URL", "ws://127.0.0.1:8000/v4/extension/ws").strip()
-            replacement='const DEFAULTS='+json.dumps({"wsUrl":ws_url,"token":V4_EXTENSION_TOKEN,"workerId":"","proxyLabel":""},separators=(",",":"))+';'
-            sw=re.sub(r'^const DEFAULTS=.*?;$', replacement, sw, count=1, flags=re.M)
-            Path(sw_path).write_text(sw, encoding="utf-8")
-            log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token=ephemeral" if not os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else f"v4 worker bootstrap synchronized · ws={ws_url} · token=configured")
+            replacement='const DEFAULTS='+json.dumps(
+                {"wsUrl":ws_url,"token":V4_EXTENSION_TOKEN,"workerId":"","proxyLabel":""},
+                separators=(",",":")
+            )+';'
+            patched, n = re.subn(r'^const DEFAULTS=.*?;$', replacement, sw, count=1, flags=re.M)
+            if n == 0:
+                # Keep startup observable instead of silently writing an unconfigured worker.
+                log("WARN", "v4 worker bootstrap: DEFAULTS declaration not found in service-worker.js")
+            else:
+                with open(sw_path, "w", encoding="utf-8") as fh:
+                    fh.write(patched)
+                token_mode = "configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
+                log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode}")
+        else:
+            log("WARN", f"v4 worker bootstrap service worker missing: {sw_path}")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
         return False
 
 if V4_TRANSPORT == "extension" and V4_AUTO_ATTACH_KEEPERS:
-    if _v4_prepare_bundled_extension():
-        os.environ["BRIDGENA_CAPTCHA_EXT"] = V4_EXTENSION_DIR
-        log("INFO", f"v4 extension injection path forced to bundled worker: {V4_EXTENSION_DIR}")
+    os.environ["BRIDGENA_CAPTCHA_EXT"] = V4_EXTENSION_DIR
+    log("INFO", f"v4 extension injection path forced to bundled worker: {V4_EXTENSION_DIR}")
+    _v4_prepare_bundled_extension()
 
 _v4_workers: Dict[str, dict] = {}
 _v4_jobs: Dict[str, asyncio.Queue] = {}
