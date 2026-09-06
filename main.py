@@ -312,9 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.5-readiness-truth")
-_PROCESS_STARTED_WALL = time.time()
-_PROCESS_STARTED_MONO = time.monotonic()
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.6-mint-diagnostics")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2165,22 +2163,6 @@ def _mark_api_keeper_unready(sid: Optional[str], reason: str = "") -> None:
     _wake_verification_scheduler()
     if reason and sid:
         log("WARN", f"[{sid}] API readiness revoked · {reason}")
-
-def _api_keeper_readiness_snapshot(sid: Optional[str]) -> dict:
-    """Truthful per-keeper readiness: browser liveness and verification admission are distinct."""
-    sid = str(sid or "")
-    session = keeper.sessions.get(sid) if sid else None
-    now = time.monotonic()
-    quarantine_until = _api_keeper_quarantine_until.get(sid, 0.0) if sid else 0.0
-    return {
-        "browser_ready": keeper_session_ready(session),
-        "verification_ready": _api_keeper_verified(sid) if sid else False,
-        "quarantine_remaining_seconds": max(0, math.ceil(quarantine_until - now)),
-        "verification_lease_age_seconds": (
-            None if not sid or sid not in _api_verified_keepers
-            else round(_api_keeper_lease_age(sid), 1)
-        ),
-    }
 
 def keeper_session_ready(session, *, warmed: bool = True) -> bool:
     """True only when a keeper is safe to receive API/token work."""
@@ -6261,12 +6243,31 @@ def _find_session(jar_id=None):
     return None, None
 
 
+_V3_MINT_FAILURES: Dict[str, dict] = {}
+
+def _set_v3_mint_failure(jar_id, reason: str, *, stage: str = "unknown") -> None:
+    key = str(jar_id or "")
+    _V3_MINT_FAILURES[key] = {
+        "reason": str(reason or "unknown")[:500],
+        "stage": str(stage or "unknown")[:80],
+        "ts": time.time(),
+    }
+
+def _clear_v3_mint_failure(jar_id) -> None:
+    _V3_MINT_FAILURES.pop(str(jar_id or ""), None)
+
+def _get_v3_mint_failure(jar_id) -> dict:
+    return dict(_V3_MINT_FAILURES.get(str(jar_id or ""), {}))
+
+
 async def mint_v3(jar_id=None):
     """Primary token: evaluate grecaptcha v3 on a live keeper page. If v3 bypass
     fails or produces no token, automatically falls back to visual image challenge solving."""
     global _mint_last_no_session
     sid, s = _find_session(jar_id)
+    _clear_v3_mint_failure(jar_id)
     if not s:
+        _set_v3_mint_failure(jar_id, "no live keeper session", stage="session_lookup")
         now = time.time()
         if now - _mint_last_no_session > 60:
             _mint_last_no_session = now
@@ -6279,6 +6280,7 @@ async def mint_v3(jar_id=None):
                 "enterprise_v3", s, ARENA_RECAPTCHA_SITEKEY, RECAPTCHA_ACTION
             )
             if adapter_token:
+                _clear_v3_mint_failure(jar_id)
                 return adapter_token
 
             # Avoid unnecessary navigation: if this keeper already has a live
@@ -6296,6 +6298,7 @@ async def mint_v3(jar_id=None):
                     await s.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=15000)
                 except Exception as nav_exc:
                     if "ERR_NETWORK_CHANGED" not in str(nav_exc):
+                        _set_v3_mint_failure(jar_id, f"keeper navigation failed: {type(nav_exc).__name__}: {nav_exc}", stage="navigation")
                         raise
                     log("WARN", f"[{sid}] keeper navigation saw network change; retrying once after route settles")
                     await asyncio.sleep(0.75)
@@ -6332,15 +6335,21 @@ async def mint_v3(jar_id=None):
                     v3_token = res["token"]
                 else:
                     why = res.get("err") if isinstance(res, dict) else "evaluate returned nothing"
-                    log("WARN", f"recaptcha v3 bypass unavailable ({why}) — triggering image solver fallback")
+                    _set_v3_mint_failure(jar_id, str(why), stage="enterprise_execute")
+                    log("WARN", f"recaptcha v3 unavailable ({why})")
             except Exception as v3_err:
-                log("WARN", f"recaptcha v3 evaluate timed out/failed: {v3_err} — triggering image solver fallback")
+                _set_v3_mint_failure(jar_id, f"{type(v3_err).__name__}: {v3_err}", stage="enterprise_execute")
+                log("WARN", f"recaptcha v3 evaluate timed out/failed: {v3_err}")
 
             if v3_token:
+                _clear_v3_mint_failure(jar_id)
                 return v3_token
+            if not _get_v3_mint_failure(jar_id):
+                _set_v3_mint_failure(jar_id, "enterprise execute produced no usable token", stage="enterprise_execute")
             return None
 
     except Exception as e:
+        _set_v3_mint_failure(jar_id, f"{type(e).__name__}: {e}", stage="browser_transaction")
         log("WARN", f"recaptcha token: browser transaction failed: {type(e).__name__}: {e}")
     return None
 
@@ -8370,8 +8379,12 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                 _attach_v3(base, tok)
 
         if not tok and not base.get("recaptchaV2Token") and not base.get("recaptchaV3Token"):
-            yield ("error", "503: The same-exit keeper could not mint a fresh Enterprise V3 token. "
-                            "No request was sent and no unsolicited V2 challenge was started; retry on a healthy keeper.")
+            mint_diag = _get_v3_mint_failure(jar.get("id"))
+            mint_stage = mint_diag.get("stage") or "unknown"
+            mint_reason = mint_diag.get("reason") or "no detailed mint failure was captured"
+            log("WARN", f"[{jar.get('name')}] V3 mint failed before dispatch · stage {mint_stage} · {mint_reason}")
+            yield ("error", "503: Verification token preparation failed before upstream dispatch. "
+                            f"stage={mint_stage}; reason={mint_reason}. No Arena request was sent.")
             return
         # Live wire invariant: normal requests contain V3 only; challenge retries
         # contain V2 only. Never send both fields together.
@@ -8817,18 +8830,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                     continue
                         if mc:
                             clear_conversation_model(chat_id, model_name)
-                        readiness = _api_keeper_readiness_snapshot(failed_jar_id)
-                        retry_in = int(readiness.get("quarantine_remaining_seconds") or 0)
-                        log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation did not complete; "
-                                    f"browser_ready={readiness['browser_ready']} verification_ready={readiness['verification_ready']} "
-                                    f"quarantine_remaining={retry_in}s")
-                        # Do not misclassify an upstream verification rejection as a keeper
-                        # startup/readiness timeout. A process can have been healthy for hours
-                        # and still receive this per-request upstream verdict.
-                        suffix = (f" Keeper recheck is eligible in about {retry_in}s." if retry_in else "")
-                        yield ("error", "503: Arena rejected verification for this request. "
-                                        "The keeper browser is live, but its verification admission lease was revoked after the upstream rejection."
-                                        + suffix)
+                        log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}) and escalation did not complete; failing fast")
+                        yield ("error", "503: Verification is not ready on the selected keeper. Bridgena quarantined it instead of retrying the same prompt across accounts; retry after readiness returns.")
                         return
 
                     if e.status == 400 and "user message is invalid" in (e.body or "").lower():
@@ -11491,10 +11494,7 @@ async def healthz():
                                 for j in load_jars()))
     bootable_count = len(_bootable_keeper_jars())
     preferred_keepers, preferred_exits = _api_preferred_targets() if bootable_count else (0, 0)
-    verified_keepers = _verified_keeper_count()
-    verified_exits = _verified_exit_count()
-    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.5",
-                         "uptime_seconds": max(0, int(time.monotonic() - _PROCESS_STARTED_MONO)),
+    return JSONResponse({"ok": True, "build": BUILD_STAMP, "version": "3.7.4",
                          "models": len(get_models()),
                          "bootable_accounts": bootable_count,
                          "keeper_fleet_target": bootable_count,
@@ -11507,15 +11507,8 @@ async def healthz():
                          "jars_ok": sum(1 for j in load_jars() if jar_has_auth(j) and not j.get("expired")),
                          "keepers_live": sum(1 for session in keeper.sessions.values()
                                              if keeper_session_ready(session)),
-                         # Browser liveness is not API admission readiness. The latter
-                         # requires a currently valid verification-client lease and respects
-                         # temporary quarantine. Keeping these separate prevents a green
-                         # dashboard from contradicting the request path.
-                         "api_ready": _api_ready_event.is_set(),
-                         "browser_ready_authenticated_keepers": ready_keepers,
-                         "verification_ready_keepers": verified_keepers,
-                         "verification_ready_exits": verified_exits,
-                         "ready_authenticated_keepers": verified_keepers,
+                         "api_ready": bool(get_models()) and ready_keepers > 0,
+                         "ready_authenticated_keepers": ready_keepers,
                          "global_concurrency": API_TURN_CONCURRENCY,
                          "per_api_concurrency": "unlimited",
                          "configured_proxies": len(get_proxy_pool()),
