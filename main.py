@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # ================================================================
-#  BRIDGENA v3 — production control plane + compatibility engine
+#  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: run bridgena-v3.py. Existing state, jars and API clients stay valid.
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.0.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.8.1-nondestructive-keeper-recovery")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.1-extension-path-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -5079,8 +5079,6 @@ class KeeperSession:
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-software-rasterizer",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--window-size=1920,1080",
@@ -5110,7 +5108,7 @@ class KeeperSession:
                     # "--headless=new" ourselves as a raw arg. Visibly-headed keepers
                     # just skip that arg and get a normal window as before.
                     self._set_step(
-                        f"Launching persistent context with Captcha Extension"
+                        f"Launching persistent headed context with Bridgena v4 Extension"
                         f"{' (headless=new)' if self.headless else ''}..."
                     )
                     ext_args = common_args + [
@@ -5133,7 +5131,7 @@ class KeeperSession:
                     self.browser = None
                     self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
                     launched = True
-                    log("OK", f"[{self.name}] Captcha extension loaded from {ext_path}"
+                    log("OK", f"[{self.name}] Bridgena v4 extension loaded from {ext_path}"
                               f"{' in new-headless mode' if self.headless else ' (headed window)'}")
                 else:
                     if ext_path:
@@ -5489,10 +5487,18 @@ class SessionKeeper:
         for jid, jar in wanted.items():
             s = self.sessions.get(jid)
             if s is None:
-                s = KeeperSession(jar, headless=jar.get("keeper_headless", None))
+                _v4_headed = bool(globals().get("V4_TRANSPORT") == "extension"
+                                  and globals().get("V4_AUTO_ATTACH_KEEPERS", False))
+                s = KeeperSession(jar, headless=False if _v4_headed else jar.get("keeper_headless", None))
                 self.sessions[jid] = s
                 self._spawn(s.start(), f"start:{jid[:8]}")
             else:
+                if (globals().get("V4_TRANSPORT") == "extension"
+                        and globals().get("V4_AUTO_ATTACH_KEEPERS", False)
+                        and s.headless):
+                    log("INFO", f"[{s.name}] v4 extension transport requires headed keeper · restarting visible")
+                    s.headless = False
+                    self._spawn(s.restart(), f"v4-headed:{jid[:8]}")
                 if (s.email != (jar.get("email") or "") or s.password != (jar.get("password") or "")
                         or s.login_method != (jar.get("login_method") or "email")):
                     s.email = jar.get("email") or ""
@@ -10552,7 +10558,7 @@ from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
 from fastapi.security import APIKeyHeader
 
-app = FastAPI(title="Bridgena", version="3.2.4")
+app = FastAPI(title="Bridgena", version="4.0.0")
 
 # ---------- v3 optional VNC integration ----------
 _V3_VNC_PROCS=[]
@@ -11506,6 +11512,311 @@ def _release_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> No
         _duplicate_notices.pop(fp, None)
 
 
+
+# ============================================================================
+# Bridgena v4 browser-extension transport
+# ============================================================================
+# The headed browser owns Arena UI interaction and response rendering. Python
+# owns API compatibility, scheduling and SSE translation. The extension never
+# needs to understand provider-specific private stream frames.
+V4_TRANSPORT = os.environ.get("BRIDGENA_V4_TRANSPORT", "extension").strip().lower()
+V4_FALLBACK_LEGACY = os.environ.get("BRIDGENA_V4_FALLBACK_LEGACY", "0").strip().lower() in {"1","true","yes","on"}
+V4_EXTENSION_TOKEN = os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN", "").strip()
+V4_FIRST_TOKEN_SEC = max(5.0, min(180.0, float(os.environ.get("BRIDGENA_V4_FIRST_TOKEN_SEC", "45"))))
+V4_IDLE_STREAM_SEC = max(5.0, min(180.0, float(os.environ.get("BRIDGENA_V4_IDLE_STREAM_SEC", "30"))))
+V4_JOB_MAX_SEC = max(30.0, min(900.0, float(os.environ.get("BRIDGENA_V4_JOB_MAX_SEC", "300"))))
+V4_AUTOLAUNCH = os.environ.get("BRIDGENA_V4_AUTOLAUNCH", "0").strip().lower() in {"1","true","yes","on"}
+V4_AUTO_ATTACH_KEEPERS = os.environ.get("BRIDGENA_V4_AUTO_ATTACH_KEEPERS", "1").strip().lower() in {"1","true","yes","on"}
+V4_CHROME_BIN = os.environ.get("BRIDGENA_V4_CHROME_BIN", "").strip()
+V4_PROFILE_DIR = os.environ.get("BRIDGENA_V4_PROFILE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser-profile"))
+V4_EXTENSION_DIR = os.environ.get("BRIDGENA_V4_EXTENSION_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension"))
+V4_BROWSER_PROXY = os.environ.get("BRIDGENA_V4_BROWSER_PROXY", "").strip()
+
+# v4.1: the authenticated keeper fleet *is* the headed extension worker fleet.
+# KeeperSession.start() already restores jar cookies, assigns a stable proxy,
+# launches a persistent Chromium profile and supervises browser health. Reuse
+# that machinery instead of creating a second, unauthenticated browser fleet.
+if V4_TRANSPORT == "extension" and V4_AUTO_ATTACH_KEEPERS:
+    if os.path.isfile(os.path.join(V4_EXTENSION_DIR, "manifest.json")):
+        # v4 browser transport must load the bundled Bridgena worker extension.
+        # Override any stale legacy extension path from .env/config.
+        os.environ["BRIDGENA_CAPTCHA_EXT"] = V4_EXTENSION_DIR
+        log("INFO", f"v4 extension injection path forced to bundled worker: {V4_EXTENSION_DIR}")
+    else:
+        log("WARN", f"v4 bundled extension manifest missing: {V4_EXTENSION_DIR}")
+
+_v4_workers: Dict[str, dict] = {}
+_v4_jobs: Dict[str, asyncio.Queue] = {}
+_v4_worker_lock = asyncio.Lock()
+_v4_model_stats: Dict[str, dict] = {}
+_v4_browser_process = None
+
+
+def _v4_stat(model: str) -> dict:
+    key = str(model or "auto")
+    return _v4_model_stats.setdefault(key, {"ok":0,"fail":0,"ttfb":deque(maxlen=40),"duration":deque(maxlen=40)})
+
+
+def _v4_worker_score(worker: dict, model: str) -> float:
+    if not worker.get("ready") or worker.get("busy") or worker.get("ws") is None:
+        return -1e9
+    if worker.get("challenge") or worker.get("login_required"):
+        return -1e9
+    score = 100.0
+    score -= min(30.0, float(worker.get("latency_ms") or 0) / 100.0)
+    score -= min(25.0, float(worker.get("recent_errors") or 0) * 5.0)
+    seen = (worker.get("models") or {}).get(str(model), {})
+    if seen:
+        ok=float(seen.get("ok") or 0); fail=float(seen.get("fail") or 0)
+        total=ok+fail
+        if total:
+            score += 20.0*(ok/total) - 15.0*(fail/total)
+        score -= min(20.0, float(seen.get("avg_ttfb_ms") or 0)/1000.0)
+    # Prefer the longest-idle healthy worker to distribute wear/load.
+    score += min(10.0, max(0.0, time.monotonic()-float(worker.get("last_used") or 0))/30.0)
+    return score
+
+
+async def _v4_pick_worker(model: str, wait_sec: float = 20.0) -> Optional[dict]:
+    deadline=time.monotonic()+max(0.1, wait_sec)
+    while time.monotonic() < deadline:
+        async with _v4_worker_lock:
+            candidates=sorted(_v4_workers.values(), key=lambda w:_v4_worker_score(w, model), reverse=True)
+            if candidates and _v4_worker_score(candidates[0], model) > -1e8:
+                worker=candidates[0]
+                worker["busy"]=True
+                worker["last_used"]=time.monotonic()
+                return worker
+        await asyncio.sleep(0.15)
+    return None
+
+
+async def _v4_release_worker(worker_id: str, *, success: bool, model: str, ttfb: Optional[float]=None, duration: Optional[float]=None):
+    async with _v4_worker_lock:
+        worker=_v4_workers.get(worker_id)
+        if not worker: return
+        worker["busy"]=False
+        worker["last_success"] = time.time() if success else worker.get("last_success",0)
+        worker["recent_errors"] = max(0, int(worker.get("recent_errors") or 0) - 1) if success else min(20, int(worker.get("recent_errors") or 0)+1)
+        ms=worker.setdefault("models",{}).setdefault(str(model), {"ok":0,"fail":0,"avg_ttfb_ms":0.0})
+        ms["ok" if success else "fail"] += 1
+        if success and ttfb is not None:
+            old=float(ms.get("avg_ttfb_ms") or 0.0)
+            ms["avg_ttfb_ms"] = (old*0.8 + ttfb*1000*0.2) if old else ttfb*1000
+    stat=_v4_stat(model)
+    stat["ok" if success else "fail"] += 1
+    if ttfb is not None: stat["ttfb"].append(ttfb)
+    if duration is not None: stat["duration"].append(duration)
+
+
+async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
+                                 attachments=None, system_prompt: str="",
+                                 tenant_id: str="", handoff_prompt: str=""):
+    worker=await _v4_pick_worker(model_name, wait_sec=20.0)
+    if not worker:
+        if V4_FALLBACK_LEGACY:
+            async for item in run_turn(chat_id, prompt, model_name, attachments=attachments,
+                                       system_prompt=system_prompt, tenant_id=tenant_id,
+                                       handoff_prompt=handoff_prompt):
+                yield item
+            return
+        yield ("error", "503: no healthy headed-browser extension worker became available within 20s")
+        return
+
+    worker_id=str(worker["id"])
+    request_id="v4-"+uuid7()
+    q=asyncio.Queue(maxsize=512)
+    _v4_jobs[request_id]=q
+    started=time.monotonic(); first=None; success=False; accumulated=""
+    try:
+        payload={
+            "type":"send_message", "request_id":request_id,
+            "chat_id":chat_id, "model":model_name,
+            "prompt":prompt, "system_prompt":system_prompt or "",
+            "fresh_chat":True, "disposable":True,
+        }
+        await worker["ws"].send_json(payload)
+        first_deadline=started+V4_FIRST_TOKEN_SEC
+        hard_deadline=started+V4_JOB_MAX_SEC
+        last_activity=started
+        while True:
+            now=time.monotonic()
+            if now >= hard_deadline:
+                try: await worker["ws"].send_json({"type":"cancel","request_id":request_id})
+                except Exception: pass
+                yield ("error", f"504: headed-browser job exceeded {V4_JOB_MAX_SEC:.0f}s")
+                return
+            timeout=min(1.0, hard_deadline-now)
+            try:
+                event=await asyncio.wait_for(q.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                now=time.monotonic()
+                if first is None and now >= first_deadline:
+                    try: await worker["ws"].send_json({"type":"cancel","request_id":request_id})
+                    except Exception: pass
+                    yield ("error", f"504: headed-browser worker produced no assistant output within {V4_FIRST_TOKEN_SEC:.0f}s")
+                    return
+                if first is not None and now-last_activity >= V4_IDLE_STREAM_SEC:
+                    try: await worker["ws"].send_json({"type":"cancel","request_id":request_id})
+                    except Exception: pass
+                    yield ("error", f"504: headed-browser response stalled for {V4_IDLE_STREAM_SEC:.0f}s")
+                    return
+                continue
+            et=str(event.get("type") or "")
+            last_activity=time.monotonic()
+            if et in {"accepted","state","heartbeat"}:
+                continue
+            if et == "challenge":
+                # The extension pauses the job and reports the browser state. It
+                # does not implement challenge-solving logic here.
+                yield ("error", "503: headed browser requires interactive verification before this request can continue")
+                return
+            if et == "login_required":
+                yield ("error", "503: headed browser profile is not logged in to Arena")
+                return
+            if et == "delta":
+                piece=str(event.get("text") or "")
+                if piece:
+                    if first is None: first=time.monotonic()
+                    accumulated += piece
+                    yield ("content", piece)
+                continue
+            if et == "reasoning_delta":
+                piece=str(event.get("text") or "")
+                if piece:
+                    if first is None: first=time.monotonic()
+                    yield ("reasoning", piece)
+                continue
+            if et == "done":
+                final=str(event.get("text") or "")
+                if final.startswith(accumulated) and len(final)>len(accumulated):
+                    tail=final[len(accumulated):]
+                    accumulated+=tail
+                    yield ("content", tail)
+                success=True
+                yield ("done", accumulated or final)
+                return
+            if et == "error":
+                yield ("error", "502: headed-browser worker: "+str(event.get("message") or "unknown extension error")[:500])
+                return
+    except (WebSocketDisconnect, RuntimeError) as exc:
+        yield ("error", f"502: headed-browser worker disconnected: {type(exc).__name__}")
+    except Exception as exc:
+        yield ("error", f"502: headed-browser transport error: {type(exc).__name__}: {redact(str(exc))[:240]}")
+    finally:
+        _v4_jobs.pop(request_id, None)
+        await _v4_release_worker(worker_id, success=success, model=model_name,
+                                 ttfb=(first-started) if first else None,
+                                 duration=time.monotonic()-started)
+
+
+async def _api_run_turn(chat_id: str, prompt: str, model_name: str, **kwargs):
+    if V4_TRANSPORT == "extension":
+        async for item in _v4_extension_run_turn(chat_id, prompt, model_name, **kwargs):
+            yield item
+    else:
+        async for item in run_turn(chat_id, prompt, model_name, **kwargs):
+            yield item
+
+
+@app.websocket("/v4/extension/ws")
+async def v4_extension_ws(ws: WebSocket):
+    token=ws.query_params.get("token", "")
+    if V4_EXTENSION_TOKEN and not hmac.compare_digest(token, V4_EXTENSION_TOKEN):
+        await ws.close(code=4403)
+        return
+    await ws.accept()
+    worker_id=None
+    try:
+        hello=await asyncio.wait_for(ws.receive_json(), timeout=10.0)
+        if hello.get("type") != "hello":
+            await ws.close(code=4400); return
+        worker_id=str(hello.get("worker_id") or ("browser-"+uuid7()[:8]))
+        async with _v4_worker_lock:
+            _v4_workers[worker_id]={
+                "id":worker_id,"ws":ws,"ready":bool(hello.get("ready",True)),"busy":False,
+                "challenge":False,"login_required":False,"recent_errors":0,"last_used":0.0,
+                "last_seen":time.monotonic(),"latency_ms":float(hello.get("latency_ms") or 0),
+                "proxy":str(hello.get("proxy") or ""),"models":{},
+                "user_agent":str(hello.get("user_agent") or "")[:240],
+            }
+        log("OK", f"v4 extension worker connected · {worker_id}")
+        await ws.send_json({"type":"hello_ack","worker_id":worker_id,"build":BUILD_STAMP})
+        while True:
+            msg=await ws.receive_json()
+            et=str(msg.get("type") or "")
+            async with _v4_worker_lock:
+                worker=_v4_workers.get(worker_id)
+                if worker:
+                    worker["last_seen"]=time.monotonic()
+                    if et == "worker_state":
+                        worker["ready"]=bool(msg.get("ready", worker.get("ready")))
+                        worker["challenge"]=bool(msg.get("challenge",False))
+                        worker["login_required"]=bool(msg.get("login_required",False))
+                        worker["latency_ms"]=float(msg.get("latency_ms") or worker.get("latency_ms") or 0)
+            rid=str(msg.get("request_id") or "")
+            q=_v4_jobs.get(rid)
+            if q:
+                try: q.put_nowait(msg)
+                except asyncio.QueueFull:
+                    log("WARN", f"v4 job queue full · {rid[-8:]}")
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+    except Exception as exc:
+        log("WARN", f"v4 extension socket ended · {worker_id or '?'} · {type(exc).__name__}: {redact(str(exc))[:160]}")
+    finally:
+        if worker_id:
+            async with _v4_worker_lock:
+                current=_v4_workers.get(worker_id)
+                if current and current.get("ws") is ws:
+                    _v4_workers.pop(worker_id,None)
+            log("WARN", f"v4 extension worker disconnected · {worker_id}")
+
+
+@app.get("/v4/workers")
+async def v4_workers(request: Request):
+    await _require_admin(request)
+    async with _v4_worker_lock:
+        rows=[]
+        for w in _v4_workers.values():
+            rows.append({k:v for k,v in w.items() if k not in {"ws"}})
+    stats={}
+    for model,s in _v4_model_stats.items():
+        stats[model]={"ok":s["ok"],"fail":s["fail"],
+                      "median_ttfb":sorted(s["ttfb"])[len(s["ttfb"])//2] if s["ttfb"] else None,
+                      "median_duration":sorted(s["duration"])[len(s["duration"])//2] if s["duration"] else None}
+    return JSONResponse({"build":BUILD_STAMP,"transport":V4_TRANSPORT,"workers":rows,"models":stats})
+
+
+def _v4_find_chrome() -> Optional[str]:
+    if V4_CHROME_BIN and os.path.isfile(V4_CHROME_BIN): return V4_CHROME_BIN
+    for name in ("google-chrome-stable","google-chrome","chromium","chromium-browser"):
+        found=shutil.which(name)
+        if found: return found
+    return None
+
+
+def _v4_launch_browser_once():
+    global _v4_browser_process
+    if _v4_browser_process and _v4_browser_process.poll() is None:
+        return _v4_browser_process
+    chrome=_v4_find_chrome()
+    if not chrome:
+        log("WARN","v4 autolaunch requested but Chrome/Chromium was not found")
+        return None
+    os.makedirs(V4_PROFILE_DIR,exist_ok=True)
+    args=[chrome, f"--user-data-dir={V4_PROFILE_DIR}", f"--load-extension={V4_EXTENSION_DIR}",
+          f"--disable-extensions-except={V4_EXTENSION_DIR}", "--no-first-run", "--no-default-browser-check",
+          "--start-maximized", "https://arena.ai/"]
+    # Proxy assignment is browser-lifetime scoped. Never switch it under an
+    # active job; drain/restart the worker to rotate exits cleanly.
+    if V4_BROWSER_PROXY:
+        args.insert(-1, f"--proxy-server={V4_BROWSER_PROXY}")
+    env=os.environ.copy()
+    _v4_browser_process=subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    log("OK", f"v4 headed browser launched · pid {_v4_browser_process.pid} · profile {V4_PROFILE_DIR}")
+    return _v4_browser_process
+
 async def openai_stream(body: dict, keyinfo: dict):
     prompt = _format_conversation_prompt(body)
     if not prompt:
@@ -11538,7 +11849,7 @@ async def openai_stream(body: dict, keyinfo: dict):
         outcome = "complete"
         try:
             yield chunk({"role": "assistant"})
-            async for kind, payload in run_turn(chat_id, prompt, model,
+            async for kind, payload in _api_run_turn(chat_id, prompt, model,
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
@@ -11731,6 +12042,28 @@ async def _force_capacity_recovery_cycle(deadline: float, *, aggressive: bool = 
 
 
 async def _require_api_ready():
+    # v4 extension transport has its own capacity signal. Do not gate headed-browser
+    # jobs on legacy Playwright keeper readiness. Wait up to the same bounded 20s
+    # admission window for a connected, ready extension worker instead.
+    if V4_TRANSPORT == "extension":
+        deadline = time.monotonic() + min(_API_READY_RECOVERY_WAIT_SEC, 20.0)
+        while time.monotonic() < deadline:
+            if get_models():
+                async with _v4_worker_lock:
+                    if any(_v4_worker_score(w, "auto") > -1e8 for w in _v4_workers.values()):
+                        return
+            await asyncio.sleep(0.15)
+        async with _v4_worker_lock:
+            connected = len(_v4_workers)
+            ready = sum(1 for w in _v4_workers.values() if _v4_worker_score(w, "auto") > -1e8)
+        raise HTTPException(
+            status_code=503,
+            detail=(f"Bridgena v4 headed-browser capacity unavailable after "
+                    f"{min(_API_READY_RECOVERY_WAIT_SEC, 20.0):.0f}s: "
+                    f"connected workers={connected}, ready workers={ready}."),
+            headers={"Retry-After": "1"},
+        )
+
     models_ready = bool(get_models())
 
     # During cold startup, briefly wait for the first usable keeper instead of
@@ -11841,7 +12174,7 @@ async def chat_completions(request: Request):
         acc = ""
         try:
             chat_id = _disposable_chat_id("api")
-            async for kind, payload in run_turn(chat_id, prompt,
+            async for kind, payload in _api_run_turn(chat_id, prompt,
                                                 body.get("model", "auto"),
                                                 attachments=body.get("attachments"),
                                                 system_prompt=_openai_system_context(body),
@@ -11987,7 +12320,7 @@ async def anthropic_messages(request: Request):
     if not body.get("stream", False):
         acc = ""
         try:
-            async for kind, payload in run_turn(chat_id, prompt, model,
+            async for kind, payload in _api_run_turn(chat_id, prompt, model,
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
@@ -12018,7 +12351,7 @@ async def anthropic_messages(request: Request):
             }})
             yield _anthropic_sse("content_block_start", {"type": "content_block_start", "index": 0,
                                                           "content_block": {"type": "text", "text": ""}})
-            async for kind, payload in run_turn(chat_id, prompt, model,
+            async for kind, payload in _api_run_turn(chat_id, prompt, model,
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
@@ -13175,7 +13508,15 @@ async def _lifespan(app):
         tasks.append(asyncio.create_task(_api_verification_readiness_loop(), name="verification-readiness"))
     app.state.background_tasks = tasks
     app.state.ready_at = time.time()
-    log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
+    log("INFO", f"BRIDGENA build {BUILD_STAMP} · v4 browser-extension control plane · legacy fallback retained")
+    log("INFO", f"v4 transport · {V4_TRANSPORT} · legacy fallback {'on' if V4_FALLBACK_LEGACY else 'off'}")
+    if V4_TRANSPORT == "extension" and V4_AUTO_ATTACH_KEEPERS:
+        log("OK", f"v4 keeper mode · autonomous headed browsers ON · bundled extension {V4_EXTENSION_DIR}")
+        log("INFO", "v4 keeper mode · existing account cookies + sticky proxy assignment reused automatically")
+
+    if V4_AUTOLAUNCH and not V4_AUTO_ATTACH_KEEPERS:
+        try: _v4_launch_browser_once()
+        except Exception as exc: log("WARN", f"v4 browser autolaunch failed · {type(exc).__name__}: {redact(str(exc))[:160]}")
     log("INFO", "Conversation mode · disposable Arena evaluation per API message · bounded client-history capsule")
     log("INFO", "Keeper rejection policy · non-destructive local recovery · no 45s API exile")
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
@@ -13236,13 +13577,13 @@ app.router.lifespan_context = _lifespan  # starlette late-bind
 # ================================================================
 def _cli():
     import argparse
-    ap = argparse.ArgumentParser(description="Bridgena v3")
+    ap = argparse.ArgumentParser(description="Bridgena v4.1 autonomous headed keeper bridge")
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--workers", type=int, default=int(os.environ.get("BRIDGENA_WORKERS", "1")))
     args = ap.parse_args()
     jars_count = len([j for j in load_jars() if not j.get("expired")])
     print("=" * 62)
-    print("  BRIDGENA v3 — Arena Bridge (" + BUILD_STAMP + ")")
+    print("  BRIDGENA v4.1.1 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
     print("=" * 62)
     print(f"  * Live Chat   : {PUBLIC_APP_URL}/chat")
     print(f"  * Dashboard   : {PUBLIC_APP_URL}/dashboard")
