@@ -312,7 +312,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.20-stream-forensics")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.7.21-followup-delivery-truth")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -1973,6 +1973,7 @@ ARENA_SALVAGE_QUICK_SEC = max(1.0, min(8.0, float(os.environ.get("BRIDGENA_ARENA
 ARENA_POST_RESTART_SALVAGE_SEC = max(5.0, min(45.0, float(os.environ.get("BRIDGENA_ARENA_POST_RESTART_SALVAGE_SEC", "22"))))
 ARENA_DELIVERED_WAIT_SEC = max(8.0, min(90.0, float(os.environ.get("BRIDGENA_ARENA_DELIVERED_WAIT_SEC", "40"))))
 DUPLICATE_ACK_RECOVERY_BUDGET_SEC = max(8.0, min(45.0, float(os.environ.get("BRIDGENA_DUPLICATE_ACK_RECOVERY_BUDGET_SEC", "24"))))
+FOLLOWUP_HTTP0_FINAL_RECOVERY_SEC = max(4.0, min(30.0, float(os.environ.get("BRIDGENA_FOLLOWUP_HTTP0_FINAL_RECOVERY_SEC", "12"))))
 ARENA_SALVAGE_RECOVERY_WAIT_SEC = max(5.0, min(40.0, float(os.environ.get("BRIDGENA_ARENA_SALVAGE_RECOVERY_WAIT_SEC", "18"))))
 UNDELIVERED_ENVELOPE_RETRY_MAX = max(0, min(2, int(os.environ.get("BRIDGENA_UNDELIVERED_ENVELOPE_RETRY_MAX", "1"))))
 BOUND_VERIFICATION_READY_WAIT_SEC = max(5.0, min(90.0, float(os.environ.get("BRIDGENA_BOUND_VERIFICATION_READY_WAIT_SEC", "40"))))
@@ -8980,21 +8981,71 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
 
                     trace_found = salvage.get("trace_found")
                     if trace_found is False and not response_text and not reasoning_text:
-                        # We now have the strongest safe-to-retry case available:
-                        #   - fetch produced no HTTP response,
-                        #   - zero stream content,
-                        #   - keeper route was repaired,
-                        #   - authenticated Arena history/UI found no trace of
-                        #     this exact evaluation/message/prompt.
+                        # History absence after an HTTP-0 is NOT authoritative for
+                        # existing Arena threads. In repeated production traces,
+                        # bound follow-ups were absent from history long enough for
+                        # this branch to fire, yet an exact-ID resend immediately
+                        # received "Message already exists". That proves the history
+                        # test can lag behind accepted follow-up delivery.
                         #
-                        # Reuse the SAME IDs rather than minting new message IDs.
-                        # If the original POST was accepted but indexing lagged,
-                        # duplicate IDs give the upstream the best chance to
-                        # deduplicate/reject instead of creating two turns.
+                        # Therefore:
+                        #   * bound follow-up -> NEVER replay solely on history absence;
+                        #     do one final exact-thread recovery pass, then return an
+                        #     ambiguous-delivery error with the binding preserved.
+                        #   * fresh create -> retain the existing exact-ID retry, where
+                        #     Arena's duplicate evaluation ID is a clean dedupe signal.
+                        if follow_url:
+                            log("WARN", f"[{jar.get('name')}] HTTP-0 follow-up history miss is non-authoritative; "
+                                        "replay suppressed · final exact-thread recovery")
+                            browser_session = keeper.sessions.get(jar.get("id")) or browser_session
+                            final_salvage = await _attempt_ui_stream_salvage(
+                                session=browser_session,
+                                chat_id=chat_id,
+                                model_name=model_name,
+                                arena_id=str((mc or {}).get("arena_id") or base.get("id") or ""),
+                                model_message_id=str(base.get("modelAMessageId") or ""),
+                                user_prompt=prompt,
+                                partial_text=response_text or reasoning_text or "",
+                                jar=jar,
+                                proxy=proxy,
+                                cached_url=str(salvage.get("url") or (mc or {}).get("ui_url") or ""),
+                                timeout_sec=FOLLOWUP_HTTP0_FINAL_RECOVERY_SEC,
+                                stage="followup-http0-final",
+                            )
+                            if final_salvage.get("ok"):
+                                final_text = str(final_salvage.get("text") or "")
+                                suffix = str(final_salvage.get("suffix") or "")
+                                if suffix:
+                                    response_text += suffix
+                                    yield ("content", suffix)
+                                elif not response_text and final_text:
+                                    response_text = final_text
+                                    yield ("content", final_text)
+                                else:
+                                    response_text = final_text or response_text
+                                log("OK", f"[{jar.get('name')}] HTTP-0 follow-up recovered without replay · "
+                                          f"{len(response_text)} chars · source {final_salvage.get('source') or 'history/UI'}")
+                                yield ("done", response_text)
+                                return
+
+                            # Persist the already-bound thread exactly as-is. Do not
+                            # convert a delayed history index into a duplicate POST.
+                            log("WARN", f"[{jar.get('name')}] HTTP-0 follow-up remained absent from history after "
+                                        f"{FOLLOWUP_HTTP0_FINAL_RECOVERY_SEC:.1f}s final recovery; replay suppressed")
+                            yield ("error", "502: The bound Arena follow-up lost its browser transport before an HTTP "
+                                            "response was observed. Arena history had not indexed the exact message before "
+                                            "the bounded recovery deadline, so Bridgena preserved the existing thread and "
+                                            "suppressed replay rather than risking a duplicate follow-up.")
+                            return
+
+                        # Fresh create only: reuse the SAME IDs rather than minting
+                        # new message IDs. If the original create POST was accepted
+                        # but indexing lagged, the duplicate evaluation ID gives the
+                        # upstream a deterministic dedupe signal.
                         yield ("retry-undelivered", {
                             "jar_id": jar.get("id"),
                             "jar_name": jar.get("name"),
-                            "reason": "no Arena history trace after same-keeper route recovery",
+                            "reason": "no Arena history trace after same-keeper route recovery (fresh create only)",
                             "envelope_ids": {
                                 "id": str(base.get("id") or ""),
                                 "userMessageId": str(base.get("userMessageId") or ""),
