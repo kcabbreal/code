@@ -2,7 +2,7 @@
 # ================================================================
 #  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.7-challenge-detection-fix.py).
+#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.1.8-ui-execution-stream-fix.py).
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.7-challenge-detection-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.1.8-ui-execution-stream-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11793,80 +11793,285 @@ function visible(el){
   if(!el)return false;
   const r=el.getBoundingClientRect(),s=getComputedStyle(el);
   if(s.visibility==="hidden"||s.display==="none"||Number(s.opacity||1)===0)return false;
-  return r.width>=8&&r.height>=8;
+  return r.width>=4&&r.height>=4;
 }
-function text(el){return (el?.innerText||el?.textContent||"").trim()}
+function txt(el){return (el?.innerText||el?.textContent||"").trim()}
 function emit(type,request_id,extra={}){chrome.runtime.sendMessage({type:"BRIDGENA_"+type.toUpperCase(),request_id,...extra}).catch(()=>{})}
+function trace(id,stage,extra={}){emit("trace",id,{stage,...extra})}
 
 function challengePresent(){
-  // Ignore normal invisible Enterprise anchor/helper frames. Only treat a
-  // captcha/challenge iframe as active when it is actually visible and large
-  // enough to be an interactive user-facing challenge.
   const frameChallenge=[...document.querySelectorAll("iframe")].some(f=>{
     const src=(f.src||"").toLowerCase(),title=(f.title||"").toLowerCase();
-    if(!/(recaptcha|captcha|challenge|turnstile)/i.test(src+" "+title))return false;
-    if(!visible(f))return false;
+    if(!/(recaptcha|captcha|challenge|turnstile)/i.test(src+" "+title)||!visible(f))return false;
     const r=f.getBoundingClientRect();
     if(r.width<180||r.height<80)return false;
-    // reCAPTCHA anchor/check-box/helper frames can exist during normal page
-    // operation. Prefer explicit challenge/bframe/dialog signals.
-    return /bframe|challenge|verify|captcha/i.test(src+" "+title) ||
-           r.height>=180;
+    return /bframe|challenge|verify|captcha/i.test(src+" "+title)||r.height>=180;
   });
-
-  const textChallenge=[...document.querySelectorAll(
-    '[role="dialog"],[aria-modal="true"],main,section,form,body>div'
-  )].some(el=>{
+  const textChallenge=[...document.querySelectorAll('[role="dialog"],[aria-modal="true"],main,section,form,body>div')].some(el=>{
     if(!visible(el))return false;
-    const t=text(el).replace(/\s+/g," ").trim();
-    if(!t||t.length>700)return false;
-    return /verify you are human|verification required|complete the security check|prove you are human|checking your browser/i.test(t);
+    const t=txt(el).replace(/\s+/g," ").trim();
+    return !!t&&t.length<700&&/verify you are human|verification required|complete the security check|prove you are human|checking your browser/i.test(t);
   });
-
   return frameChallenge||textChallenge;
 }
 
 function loginRequired(){
-  // Only use visible, explicit account-auth controls; generic "Sign in" text
-  // buried in menus/footer should not de-schedule an authenticated keeper.
   return [...document.querySelectorAll('button,a,[role="button"]')].some(x=>{
     if(!visible(x))return false;
-    const t=text(x).replace(/\s+/g," ").trim();
-    const aria=(x.getAttribute("aria-label")||"").trim();
-    return /^(sign in|log in|login)$/i.test(t)||/^(sign in|log in|login)$/i.test(aria);
+    const t=txt(x).replace(/\s+/g," ").trim(),a=(x.getAttribute("aria-label")||"").trim();
+    return /^(sign in|log in|login)$/i.test(t)||/^(sign in|log in|login)$/i.test(a);
   });
 }
-function composer(){let all=[...document.querySelectorAll('textarea,[contenteditable="true"]')].filter(visible);return all.sort((a,b)=>b.getBoundingClientRect().top-a.getBoundingClientRect().top)[0]||null}
-function sendButton(){let btns=[...document.querySelectorAll('button')].filter(visible);return btns.find(b=>/send|submit/i.test((b.getAttribute('aria-label')||'')+' '+text(b)))||btns.find(b=>b.type==='submit')||null}
-function stopButton(){return [...document.querySelectorAll('button')].find(b=>visible(b)&&/stop|cancel generation/i.test((b.getAttribute('aria-label')||'')+' '+text(b)))}
-function assistants(){let sels=['[data-message-author-role="assistant"]','[data-role="assistant"]','[data-author="assistant"]','article'];for(let s of sels){let a=[...document.querySelectorAll(s)].filter(visible).filter(x=>text(x));if(a.length)return a}return []}
-function latestAssistant(){let a=assistants();return a.length?text(a[a.length-1]):''}
-function setValue(el,value){el.focus();if(el.tagName==='TEXTAREA'||el.tagName==='INPUT'){let p=Object.getPrototypeOf(el),d=Object.getOwnPropertyDescriptor(p,'value');if(d?.set)d.set.call(el,value);else el.value=value;el.dispatchEvent(new Event('input',{bubbles:true}));}else{el.textContent=value;el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));}}
-async function clickNewChat(){let c=[...document.querySelectorAll('button,a')].find(x=>visible(x)&&/new chat|new conversation/i.test(text(x)));if(c){c.click();await sleep(500);return true}return false}
-async function selectModel(model){if(!model||model==='auto')return true;let exact=[...document.querySelectorAll('button,[role="button"]')].find(x=>visible(x)&&text(x).toLowerCase()===model.toLowerCase());if(exact)return true;let trigger=[...document.querySelectorAll('button,[role="button"]')].find(x=>visible(x)&&/model|select model/i.test((x.getAttribute('aria-label')||'')+' '+text(x)));if(trigger){trigger.click();await sleep(300);let opt=[...document.querySelectorAll('[role="option"],button,li')].find(x=>visible(x)&&text(x).toLowerCase().includes(model.toLowerCase()));if(opt){opt.click();await sleep(250);return true}}return false}
-async function run(job){if(active){emit('error',job.request_id,{message:'worker already has an active job'});return}active={id:job.request_id,last:'',cancel:false};try{
- if(loginRequired()){emit('login_required',job.request_id);return}
- if(challengePresent()){emit('challenge',job.request_id);return}
- if(job.fresh_chat)await clickNewChat();
- await selectModel(job.model);
- let c=null;for(let i=0;i<50&&!c;i++){c=composer();if(!c)await sleep(100)}
- if(!c)throw new Error('Arena composer not found');
- let payload=(job.system_prompt?('System instructions:\n'+job.system_prompt+'\n\n'):'')+job.prompt;
- setValue(c,payload);await sleep(80);
- let b=sendButton();if(b&&!b.disabled)b.click();else c.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',bubbles:true}));
- emit('accepted',job.request_id);
- let stable=0,lastChange=Date.now(),seen=false;
- while(!active.cancel){
-   if(challengePresent()){emit('challenge',job.request_id);return}
-   let cur=latestAssistant();
-   if(cur){seen=true;if(cur.startsWith(active.last)){let d=cur.slice(active.last.length);if(d){active.last=cur;lastChange=Date.now();stable=0;emit('delta',job.request_id,{text:d});}}else if(cur!==active.last){active.last=cur;lastChange=Date.now();stable=0;}}
-   let generating=!!stopButton();
-   if(seen&&!generating&&Date.now()-lastChange>900){stable++;if(stable>=2){emit('done',job.request_id,{text:active.last});return}}else stable=0;
-   await sleep(180);
- }
- throw new Error('job cancelled');
- }catch(e){emit('error',job.request_id,{message:String(e?.message||e)})}finally{active=null}}
-chrome.runtime.onMessage.addListener((m)=>{if(m?.type==='BRIDGENA_SEND')run(m.job);else if(m?.type==='BRIDGENA_CANCEL'&&active?.id===m.request_id)active.cancel=true});
+
+function composer(){
+  const selectors=[
+    'textarea[placeholder*="message" i]',
+    'textarea[placeholder*="prompt" i]',
+    'textarea',
+    '[contenteditable="true"][role="textbox"]',
+    '[contenteditable="true"]'
+  ];
+  let all=[];
+  for(const s of selectors)all.push(...document.querySelectorAll(s));
+  all=[...new Set(all)].filter(visible);
+  all.sort((a,b)=>b.getBoundingClientRect().top-a.getBoundingClientRect().top);
+  return all[0]||null;
+}
+
+function submitControl(c){
+  const form=c?.closest("form");
+  if(form){
+    const b=[...form.querySelectorAll('button,input[type="submit"]')].find(x=>
+      visible(x)&&!x.disabled&&(x.type==="submit"||/send|submit/i.test((x.getAttribute("aria-label")||"")+" "+txt(x)))
+    );
+    if(b)return b;
+  }
+  const buttons=[...document.querySelectorAll('button,[role="button"]')].filter(x=>visible(x)&&!x.disabled);
+  return buttons.find(b=>/send|submit/i.test((b.getAttribute("aria-label")||"")+" "+(b.getAttribute("data-testid")||"")+" "+txt(b)));
+}
+
+function stopButton(){
+  return [...document.querySelectorAll('button,[role="button"]')].find(b=>
+    visible(b)&&/stop|cancel generation|stop generating/i.test(
+      (b.getAttribute('aria-label')||'')+' '+(b.getAttribute('data-testid')||'')+' '+txt(b)
+    )
+  );
+}
+
+function setValue(el,value){
+  el.focus();
+  if(el.tagName==='TEXTAREA'||el.tagName==='INPUT'){
+    let p=Object.getPrototypeOf(el),d=Object.getOwnPropertyDescriptor(p,'value');
+    if(d?.set)d.set.call(el,value);else el.value=value;
+    el.dispatchEvent(new Event('input',{bubbles:true}));
+    el.dispatchEvent(new Event('change',{bubbles:true}));
+  }else{
+    try{
+      const sel=getSelection(),range=document.createRange();
+      range.selectNodeContents(el);sel.removeAllRanges();sel.addRange(range);
+      document.execCommand("insertText",false,value);
+    }catch{
+      el.textContent=value;
+    }
+    el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));
+  }
+}
+
+async function clickNewChat(){
+  const c=[...document.querySelectorAll('button,a,[role="button"]')].find(x=>
+    visible(x)&&/new chat|new conversation|start new/i.test((x.getAttribute("aria-label")||"")+" "+txt(x))
+  );
+  if(c){c.click();await sleep(650);return true}
+  return false;
+}
+
+async function selectModel(model){
+  if(!model||model==='auto')return true;
+  const current=[...document.querySelectorAll('button,[role="button"]')].find(x=>
+    visible(x)&&txt(x).trim().toLowerCase()===model.toLowerCase()
+  );
+  if(current)return true;
+  const trigger=[...document.querySelectorAll('button,[role="button"]')].find(x=>
+    visible(x)&&/model|select model/i.test((x.getAttribute('aria-label')||'')+' '+(x.getAttribute('data-testid')||'')+' '+txt(x))
+  );
+  if(!trigger)return false;
+  trigger.click();await sleep(350);
+  const opt=[...document.querySelectorAll('[role="option"],[role="menuitem"],button,li,div')].find(x=>
+    visible(x)&&txt(x).trim().toLowerCase()===model.toLowerCase()
+  )||[...document.querySelectorAll('[role="option"],[role="menuitem"],button,li')].find(x=>
+    visible(x)&&txt(x).toLowerCase().includes(model.toLowerCase())
+  );
+  if(opt){opt.click();await sleep(350);return true}
+  return false;
+}
+
+function assistantCandidates(){
+  const selectors=[
+    '[data-message-author-role="assistant"]',
+    '[data-role="assistant"]',
+    '[data-author="assistant"]',
+    '[data-testid*="assistant" i]',
+    '[data-testid*="message" i] .prose',
+    '[class*="assistant" i]',
+    'article .prose',
+    'article [class*="markdown" i]',
+    '[class*="message" i] [class*="markdown" i]',
+    'main article'
+  ];
+  const out=[],seen=new Set();
+  for(const s of selectors){
+    for(const el of document.querySelectorAll(s)){
+      if(seen.has(el)||!visible(el))continue;
+      const v=txt(el);
+      if(!v)continue;
+      seen.add(el);out.push({el,text:v});
+    }
+  }
+  return out;
+}
+function assistantSnapshot(){
+  const a=assistantCandidates();
+  return a.length?a[a.length-1].text:"";
+}
+function bodyHasPrompt(prompt){
+  const p=String(prompt||"").trim();
+  if(!p)return false;
+  const probe=p.slice(0,Math.min(120,p.length));
+  return (document.body?.innerText||"").includes(probe);
+}
+function composerValue(c){return (c?.value??c?.innerText??c?.textContent??"").trim()}
+
+async function submitPrompt(c,payload,id){
+  setValue(c,payload);await sleep(180);
+  trace(id,"prompt-inserted",{composer:c.tagName,chars:payload.length,value_chars:composerValue(c).length});
+
+  const b=submitControl(c);
+  if(b){
+    trace(id,"submit-click",{label:(b.getAttribute("aria-label")||txt(b)).slice(0,100)});
+    b.click();
+  }else{
+    const form=c.closest("form");
+    if(form&&typeof form.requestSubmit==="function"){
+      trace(id,"submit-requestSubmit");
+      form.requestSubmit();
+    }else{
+      trace(id,"submit-enter");
+      c.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
+      c.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
+    }
+  }
+
+  for(let i=0;i<20;i++){
+    await sleep(150);
+    const cleared=composerValue(c).length===0;
+    const visiblePrompt=bodyHasPrompt(payload);
+    const generating=!!stopButton();
+    if(cleared||visiblePrompt||generating){
+      trace(id,"submission-confirmed",{cleared,visiblePrompt,generating});
+      return true;
+    }
+  }
+
+  const form=c.closest("form");
+  if(form&&typeof form.requestSubmit==="function"){
+    trace(id,"submit-fallback-form");
+    try{form.requestSubmit()}catch{}
+  }else{
+    const b2=submitControl(c);
+    if(b2){trace(id,"submit-fallback-click");b2.click()}
+  }
+  for(let i=0;i<15;i++){
+    await sleep(150);
+    if(composerValue(c).length===0||bodyHasPrompt(payload)||stopButton()){
+      trace(id,"submission-confirmed-fallback");
+      return true;
+    }
+  }
+  trace(id,"submission-unconfirmed");
+  return false;
+}
+
+async function run(job){
+  if(active){emit('error',job.request_id,{message:'worker already has an active job'});return}
+  active={id:job.request_id,last:'',cancel:false};
+  try{
+    trace(job.request_id,"job-received",{model:job.model||"auto"});
+    if(loginRequired()){trace(job.request_id,"login-required");emit('login_required',job.request_id);return}
+    if(challengePresent()){trace(job.request_id,"challenge-visible");emit('challenge',job.request_id);return}
+
+    if(job.fresh_chat){
+      const nc=await clickNewChat();
+      trace(job.request_id,"fresh-chat",{clicked:nc});
+    }
+
+    const modelOk=await selectModel(job.model);
+    trace(job.request_id,"model-selection",{ok:modelOk,model:job.model||"auto"});
+
+    let c=null;
+    for(let i=0;i<60&&!c;i++){c=composer();if(!c)await sleep(100)}
+    if(!c){trace(job.request_id,"composer-missing");throw new Error('Arena composer not found')}
+    trace(job.request_id,"composer-found",{tag:c.tagName,placeholder:c.getAttribute("placeholder")||""});
+
+    const baseline=assistantSnapshot();
+    const payload=(job.system_prompt?('System instructions:\n'+job.system_prompt+'\n\n'):'')+job.prompt;
+    const submitted=await submitPrompt(c,payload,job.request_id);
+    if(!submitted)throw new Error("Arena prompt could not be confirmed as submitted");
+
+    emit('accepted',job.request_id);
+    trace(job.request_id,"accepted",{baseline_chars:baseline.length});
+
+    let stable=0,lastChange=Date.now(),seen=false,startedGenerating=false;
+    while(!active.cancel){
+      if(challengePresent()){trace(job.request_id,"challenge-during-job");emit('challenge',job.request_id);return}
+
+      const generating=!!stopButton();
+      if(generating&&!startedGenerating){startedGenerating=true;trace(job.request_id,"generation-started")}
+
+      const cur=assistantSnapshot();
+      if(cur&&cur!==baseline){
+        if(!seen){seen=true;trace(job.request_id,"assistant-found",{chars:cur.length,candidates:assistantCandidates().length})}
+        if(cur.startsWith(active.last)){
+          const d=cur.slice(active.last.length);
+          if(d){
+            active.last=cur;lastChange=Date.now();stable=0;
+            emit('delta',job.request_id,{text:d});
+          }
+        }else if(!active.last){
+          active.last=cur;lastChange=Date.now();stable=0;
+          emit('delta',job.request_id,{text:cur});
+        }else if(cur!==active.last){
+          let n=0,lim=Math.min(active.last.length,cur.length);
+          while(n<lim&&active.last[n]===cur[n])n++;
+          if(n>=Math.min(24,active.last.length)){
+            const d=cur.slice(n);
+            active.last=cur;lastChange=Date.now();stable=0;
+            if(d)emit('delta',job.request_id,{text:d});
+          }
+        }
+      }
+
+      if(seen&&!generating&&Date.now()-lastChange>1000){
+        stable++;
+        if(stable>=2){
+          trace(job.request_id,"done",{chars:active.last.length});
+          emit('done',job.request_id,{text:active.last});
+          return
+        }
+      }else stable=0;
+
+      await sleep(180);
+    }
+    throw new Error('job cancelled');
+  }catch(e){
+    trace(job.request_id,"job-error",{message:String(e?.message||e).slice(0,250)});
+    emit('error',job.request_id,{message:String(e?.message||e)})
+  }finally{active=null}
+}
+
+chrome.runtime.onMessage.addListener((m)=>{
+  if(m?.type==='BRIDGENA_SEND')run(m.job);
+  else if(m?.type==='BRIDGENA_CANCEL'&&active?.id===m.request_id)active.cancel=true
+});
 
 function publishState(){
   const challenge=challengePresent(),login=loginRequired(),ready=!challenge&&!login&&!!composer();
@@ -11879,7 +12084,7 @@ setInterval(publishState,5000);
             fh.write(content_source)
 
         token_mode="configured" if os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN") else "ephemeral"
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · visible-challenge detector")
+        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={token_mode} · storage-safe · verified-submit + DOM stream v4.1.8")
         return True
     except Exception as exc:
         log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
@@ -11989,6 +12194,7 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
             "prompt":prompt, "system_prompt":system_prompt or "",
             "fresh_chat":True, "disposable":True,
         }
+        log("INFO", f"v4 job dispatch · {request_id[-12:]} · worker={worker_id} · model={model_name}")
         await worker["ws"].send_json(payload)
         first_deadline=started+V4_FIRST_TOKEN_SEC
         hard_deadline=started+V4_JOB_MAX_SEC
@@ -12018,7 +12224,15 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
                 continue
             et=str(event.get("type") or "")
             last_activity=time.monotonic()
-            if et in {"accepted","state","heartbeat"}:
+            if et == "trace":
+                stage=str(event.get("stage") or "?")
+                extras={k:v for k,v in event.items() if k not in {"type","request_id","stage"}}
+                log("INFO", f"v4 job trace · {request_id[-12:]} · {stage}" + (f" · {redact(str(extras))[:260]}" if extras else ""))
+                continue
+            if et == "accepted":
+                log("INFO", f"v4 job accepted · {request_id[-12:]} · worker={worker_id}")
+                continue
+            if et in {"state","heartbeat"}:
                 continue
             if et == "challenge":
                 # The extension pauses the job and reports the browser state. It
@@ -12031,7 +12245,9 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
             if et == "delta":
                 piece=str(event.get("text") or "")
                 if piece:
-                    if first is None: first=time.monotonic()
+                    if first is None:
+                        first=time.monotonic()
+                        log("OK", f"v4 first assistant output · {request_id[-12:]} · {first-started:.2f}s")
                     accumulated += piece
                     yield ("content", piece)
                 continue
@@ -12048,6 +12264,7 @@ async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
                     accumulated+=tail
                     yield ("content", tail)
                 success=True
+                log("OK", f"v4 job complete · {request_id[-12:]} · chars={len(accumulated or final)} · {time.monotonic()-started:.2f}s")
                 yield ("done", accumulated or final)
                 return
             if et == "error":
@@ -13972,7 +14189,7 @@ def _cli():
     args = ap.parse_args()
     jars_count = len([j for j in load_jars() if not j.get("expired")])
     print("=" * 62)
-    print("  BRIDGENA v4.1.7 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
+    print("  BRIDGENA v4.1.8 — Autonomous Headed Browser Bridge (" + BUILD_STAMP + ")")
     print("=" * 62)
     print(f"  * Live Chat   : {PUBLIC_APP_URL}/chat")
     print(f"  * Dashboard   : {PUBLIC_APP_URL}/dashboard")
