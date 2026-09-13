@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ================================================================
-#  BRIDGENA v3 â€” production control plane + compatibility engine
-#  modules: core Â· identity Â· pool Â· keepers Â· verification Â· UI Â· API Â· VNC
+#  BRIDGENA v3 — production control plane + compatibility engine
+#  modules: core · identity · pool · keepers · verification · UI · API · VNC
 #  Deploy: run bridgena-v3.py. Existing state, jars and API clients stay valid.
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
@@ -168,17 +168,17 @@ if os.environ.get("BRIDGENA_VERIFICATION_ADAPTER_ENABLED", "1").lower() in {"0",
     _VERIFICATION_IMPORT_ERROR = "Adapter explicitly disabled by operator"
     _VERIFICATION_FACTORY_SPEC = None
 
-# legacy global keeper UA: chrome131 on Windows â€” matches curl_cffi impersonate
+# legacy global keeper UA: chrome131 on Windows — matches curl_cffi impersonate
 # default so cf_clearance (UA+IP-bound) stays coherent for persona-less jars.
 KEEPER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ module: core.py â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────────── module: core.py ──────────────────────────────
 
 # ============================================================
-# v2 CORE â€” config, constants, log bus. Stores/auth/models arrive with
+# v2 CORE — config, constants, log bus. Stores/auth/models arrive with
 # the primitives bundle (same file names, same keys: VPS drops in cleanly).
 # ============================================================
 import os
@@ -247,6 +247,120 @@ PROBE_BUDGET = 40
 PROBE_MAX_PARALLEL = 8
 STRIKES_MAX = 3
 MAX_CONVERSATIONS = 500
+
+# =============================================================================
+# CENTRAL HTTP HEADER REGISTRY
+# =============================================================================
+# Static header policy lives here. Runtime-only values use {placeholders}.
+#
+# Notes:
+#   * arena_browser_fetch contains only headers JavaScript fetch() is allowed
+#     to set directly. User-Agent, Cookie, Origin, Referer and Sec-Fetch-* are
+#     browser-managed in the preferred browser-origin transport.
+#   * arena_fallback_* is used by the curl_cffi fallback transport.
+#   * response_* controls Bridgena's own dashboard/API response headers.
+#   * dynamic values (cookies, provider keys, request ids, server timing) are
+#     still filled at runtime and are never stored here as credentials.
+#
+# Add/remove ordinary static headers in these groups instead of editing request
+# code throughout the file.
+KEEPERS_HEADED_DEFAULT = os.environ.get(
+    "BRIDGENA_KEEPERS_HEADED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+KEEPERS_AUTO_XVFB = os.environ.get(
+    "BRIDGENA_KEEPERS_AUTO_XVFB", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+BROWSER_NATIVE_INTERACTIONS = os.environ.get(
+    "BRIDGENA_BROWSER_NATIVE_INTERACTIONS", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+BROWSER_PERSISTENT_CONTEXT = os.environ.get(
+    "BRIDGENA_BROWSER_PERSISTENT_CONTEXT", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+BROWSER_SERVICE_WORKERS = os.environ.get(
+    "BRIDGENA_BROWSER_SERVICE_WORKERS", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+BRIDGENA_HEADERS = {
+    "arena_browser_fetch": {
+        "Content-Type": "application/json",
+    },
+
+    "arena_fallback_common": {
+        "User-Agent": "{user_agent}",
+        "Accept": "{accept}",
+        "Accept-Language": "{accept_language}",
+        "Origin": "{origin}",
+        "Referer": "{referer}",
+        "Cookie": "{cookie}",
+    },
+    "arena_fallback_json": {
+        "Content-Type": "application/json",
+    },
+    "arena_fallback_chrome": {
+        "sec-ch-ua": "{sec_ch_ua}",
+        "sec-ch-ua-mobile": "{sec_ch_ua_mobile}",
+        "sec-ch-ua-platform": "{sec_ch_ua_platform}",
+    },
+
+    # Browser context headers that Playwright may safely set before navigation.
+    "browser_context": {
+        "Accept-Language": "{accept_language}",
+    },
+
+    # Bridgena responses.
+    "response_html": {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "CDN-Cache-Control": "no-store",
+        "Cloudflare-CDN-Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    },
+    "response_sse": {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "CDN-Cache-Control": "no-store",
+        "Cloudflare-CDN-Cache-Control": "no-store",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    },
+    "response_security": {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "SAMEORIGIN",
+        "Referrer-Policy": "same-origin",
+        "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    },
+
+    # Native Anthropic passthrough. provider_key is injected at runtime.
+    "anthropic_native": {
+        "x-api-key": "{provider_key}",
+        "anthropic-version": "{anthropic_version}",
+        "content-type": "application/json",
+    },
+}
+
+
+def _header_group(name: str, **values) -> dict:
+    """Render one configured header group without evaluating arbitrary code."""
+    src = BRIDGENA_HEADERS.get(name) or {}
+    out = {}
+    for key, raw in src.items():
+        if raw is None:
+            continue
+        value = str(raw)
+        for token, replacement in values.items():
+            value = value.replace("{" + str(token) + "}", str(replacement))
+        out[str(key)] = value
+    return out
+
+
+def _merge_header_groups(*names: str, **values) -> dict:
+    out = {}
+    for name in names:
+        out.update(_header_group(name, **values))
+    return out
+
 
 ARENA_RECAPTCHA_SITEKEY = os.environ.get("BRIDGENA_RECAPTCHA_SITEKEY",
                                          "6LeTGMcsAAAAALuIlkVwIxaAuZA8VledA6d3Nnb0")
@@ -326,7 +440,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.8.4-randomized-stable-proxy-failover")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.8.8-headed-keeper-default")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -530,10 +644,10 @@ class FileLock:
         return wrapped
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ module: recaptcha_vision.py â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────── module: recaptcha_vision.py ─────────────────────────
 
 # ============================================================
-# v2 VISION SOLVER â€” local ONNX neural inference engine for visual
+# v2 VISION SOLVER — local ONNX neural inference engine for visual
 # reCAPTCHA image challenges (type.onnx for 3x3/individual tiles,
 # grid.onnx for 4x4 challenges). Auto-creates models directory
 # and copies from root if needed.
@@ -790,7 +904,7 @@ class RecaptchaSolver:
                 return Image.open(BytesIO(base64.b64decode(base64_str)))
             if source.startswith("http://") or source.startswith("https://"):
                 import urllib.request
-                req = urllib.request.Request(source, headers={"User-Agent": OAI_SEARCHBOT_UA if USE_OAI_SEARCHBOT else KEEPER_UA})
+                req = urllib.request.Request(source, headers={"User-Agent": KEEPER_UA})
                 with urllib.request.urlopen(req, timeout=12) as resp:
                     return Image.open(BytesIO(resp.read()))
             if os.path.exists(source):
@@ -964,10 +1078,10 @@ def resolve_model_id(public_name: str, jar: Optional[dict] = None) -> str:
 HEALTH_TRUST_SEC = 6 * 3600  # how long a persisted sweep verdict stays believable across restarts
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ module: identity.py â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────────── module: identity.py ──────────────────────────────
 
 # ============================================================
-# v2 IDENTITY â€” device personas, bound PER JAR, coherent across every
+# v2 IDENTITY — device personas, bound PER JAR, coherent across every
 # layer that touches the network: curl headers, keeper browser, recaptcha
 # mint. Rotating identity per-REQUEST is how accounts die (cf_clearance and
 # Google both correlate UA across the session); rotating per-IDENTITY is
@@ -996,32 +1110,32 @@ _CHROME_VER = "131.0.0.0"
 
 PERSONAS = {
     "iphone15": Persona(
-        "iphone15", "iPhone 15 Â· Safari", "safari",
+        "iphone15", "iPhone 15 · Safari", "safari",
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
         "iOS", viewport=(393, 852), dpr=3.0, touch=True, mobile=True, accept_lang="en-US,en;q=0.9"),
     "macbook": Persona(
-        "macbook", "MacBook Pro Â· Safari", "safari",
+        "macbook", "MacBook Pro · Safari", "safari",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
         "macOS", viewport=(1512, 982), dpr=2.0, accept_lang="en-US,en;q=0.9",
         webgl="Apple M2 GPU"),
     "win11": Persona(
-        "win11", "Windows 11 Â· Chrome", "chrome",
+        "win11", "Windows 11 · Chrome", "chrome",
         f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{_CHROME_VER} Safari/537.36",
         "Windows", ch_ua=f'"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
         viewport=(1920, 1080), dpr=1.0),
     "ubuntu": Persona(
-        "ubuntu", "Ubuntu 24.04 Â· Chromium", "chrome",
+        "ubuntu", "Ubuntu 24.04 · Chromium", "chrome",
         f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{_CHROME_VER} Safari/537.36",
         "Linux", ch_ua=f'"Chromium";v="131", "Not_A Brand";v="24"',
         viewport=(1600, 900), dpr=1.0, accept_lang="en-US,en;q=0.9",
         webgl="ANGLE (Mesa, llvmpipe (LLVM 16.0.6 256 bits), OpenGL 4.5)"),
     "pixel8": Persona(
-        "pixel8", "Pixel 8 Â· Chrome", "chrome",
+        "pixel8", "Pixel 8 · Chrome", "chrome",
         f"Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{_CHROME_VER} Mobile Safari/537.36",
         "Android", ch_ua=f'"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="24"',
         viewport=(412, 915), dpr=2.625, touch=True, mobile=True),
     "ipad": Persona(
-        "ipad", "iPad Pro Â· Safari", "safari",
+        "ipad", "iPad Pro · Safari", "safari",
         "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
         "iOS", viewport=(1024, 1366), dpr=2.0, touch=True, tablet=True),
 }
@@ -1043,27 +1157,36 @@ def persona_for(jar: dict) -> Persona:
 
 
 def curl_headers(p: Persona, *, cookie: str, json_body: bool = False) -> dict:
-    """Header set for the request transport. Chrome family gets sec-ch-ua
-    triplets; safari/firefox families must NOT (presence alone is a tell)."""
-    h = {
-        "User-Agent": (OAI_SEARCHBOT_UA if USE_OAI_SEARCHBOT else p.ua),
-        "Accept": "application/json, text/plain, */*" if json_body else p.accept,
-        "Accept-Language": p.accept_lang,
-        "Origin": "",   # filled by caller (arena base)
-        "Referer": "",  # ditto
-        "Cookie": cookie,
+    """Compatibility header builder backed by BRIDGENA_HEADERS."""
+    h = _merge_header_groups(
+        "arena_fallback_common",
+        user_agent=p.ua,
+        accept=("application/json, text/plain, */*" if json_body else p.accept),
+        accept_language=p.accept_lang,
+        origin="",
+        referer="",
+        cookie=cookie,
+    )
+    if json_body:
+        h.update(_header_group("arena_fallback_json"))
+
+    # Historical helper-only transport hints retained for compatibility.
+    h.update({
         "Connection": "keep-alive",
         "sec-fetch-dest": "empty" if json_body else "document",
         "sec-fetch-mode": "cors" if json_body else "navigate",
         "sec-fetch-site": "same-origin",
         "priority": "u=1, i",
-    }
+    })
     if p.family == "chrome":
-        brand = "Chromium"
-        h["sec-ch-ua"] = p.ch_ua or f'"Chromium";v="131", "Not_A Brand";v="24"'
-        h["sec-ch-ua-mobile"] = "?1" if p.mobile else "?0"
-        h["sec-ch-ua-platform"] = f'"{p.platform}"'
-        h["sec-ch-ua-full-version-list"] = h["sec-ch-ua"]
+        ch = p.ch_ua or '"Chromium";v="131", "Not_A Brand";v="24"'
+        h.update(_header_group(
+            "arena_fallback_chrome",
+            sec_ch_ua=ch,
+            sec_ch_ua_mobile="?1" if p.mobile else "?0",
+            sec_ch_ua_platform=f'"{p.platform}"',
+        ))
+        h["sec-ch-ua-full-version-list"] = ch
     elif p.family == "safari":
         h["Sec-Fetch-User"] = "?1"
     return h
@@ -1080,7 +1203,9 @@ def playwright_context_args(p: Persona) -> dict:
         "is_tablet": p.tablet,
         "locale": p.locale,
         "timezone_id": p.tz,
-        "extra_http_headers": {"Accept-Language": p.accept_lang},
+        "extra_http_headers": _header_group(
+            "browser_context", accept_language=p.accept_lang
+        ),
     }
     return args
 
@@ -1089,7 +1214,7 @@ def stealth_init_js(p: Persona) -> str:
     """Run at document start in every keeper context: remove headless tells and
     align what JS-visible APIs say with the persona's UA (languages, vendor,
     plugins count, WebGL renderer/name). Not evasion of a check you're banned
-    for â€” it's making an automated browser look like a normal one."""
+    for — it's making an automated browser look like a normal one."""
     return """(() => {
       Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
       Object.defineProperty(navigator, 'platform', {get: () => %r});
@@ -1125,10 +1250,10 @@ def persona_summaries() -> dict:
     return {k: {"label": v.label, "family": v.family} for k, v in PERSONAS.items()}
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ module: _primitives.py â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────────── module: _primitives.py ──────────────────────────────
 
 # ============================================================
-# v2 PRIMITIVES â€” extracted verbatim from the battle-tested build.
+# v2 PRIMITIVES — extracted verbatim from the battle-tested build.
 # These carry the R22/R26/R28/R29 semantics (truthful probe verdicts,
 # chromium SOCKS-auth shim, flag-vs-exile discipline, keeper session core).
 # Low-level correctness lives here; ALL policy is rewritten in pool/tokens/arena.
@@ -1142,19 +1267,19 @@ _SHIM_SCHEMES = ("socks5", "socks5h", "socks4", "socks4a")
 
 _shim_state: dict = {"loop": None, "ports": {}, "servers": {}}
 
-_probe_fail_reason: Dict[str, str] = {}   # url â†’ human 'where it died', shown on dead rows
+_probe_fail_reason: Dict[str, str] = {}   # url → human 'where it died', shown on dead rows
 
-_QUARANTINED_KEYS: set = set()   # host:port â€” this process
+_QUARANTINED_KEYS: set = set()   # host:port — this process
 
-_proxy_health: Dict[str, dict] = {}       # host:port â†’ {ok, latency, checked, source}
+_proxy_health: Dict[str, dict] = {}       # host:port → {ok, latency, checked, source}
 
 _proxy_health_loaded = False
 
-_flagged_exits: Dict[str, float] = {}      # host:port â†’ expiry
+_flagged_exits: Dict[str, float] = {}      # host:port → expiry
 
 _proxy_probe_cache: Dict[str, Tuple[bool, float]] = {}
 
-_proxy_latency: Dict[str, int] = {}   # host â†’ handshake RTT (ms)
+_proxy_latency: Dict[str, int] = {}   # host → handshake RTT (ms)
 
 DEFAULT_KNOWN_MODELS = [
     {"id": "claude-3-7-sonnet-20250219", "publicName": "claude-3-7-sonnet", "organization": "Anthropic", "capabilities": {"inputCapabilities": {"image": True, "text": True}, "outputCapabilities": {"text": True}}},
@@ -1226,7 +1351,7 @@ def _probe_hostport() -> Tuple[str, int]:
 def _socks_client_handshake(s, scheme: str, host: str, port: int, u, why=None) -> bool:
     """SOCKS4/4a/5 client handshake through an already-connected socket.
     Pass why=[] to collect a human 'where it died' line (tcp vs greeting vs
-    auth vs connect) â€” the pool page shows it on dead rows instead of bare
+    auth vs connect) — the pool page shows it on dead rows instead of bare
     'dead', because 'provider rejected my creds' and 'your ISP ate the
     handshake' need two different fixes and one label was lying about both."""
     import socket as _sk
@@ -1260,26 +1385,26 @@ def _socks_client_handshake(s, scheme: str, host: str, port: int, u, why=None) -
         try:
             g = s.recv(2)
         except (_sk.timeout, TimeoutError):
-            return fail("gateway answered TCP but never spoke SOCKS â€” a middlebox/ISP is killing the handshake; the provider itself never rejected anything")
+            return fail("gateway answered TCP but never spoke SOCKS — a middlebox/ISP is killing the handshake; the provider itself never rejected anything")
         if not g or len(g) < 2:
-            return fail("gateway closed mid-greeting (its edge firewall dropped us â€” check plan/IP-allowlist at the provider)")
+            return fail("gateway closed mid-greeting (its edge firewall dropped us — check plan/IP-allowlist at the provider)")
         if g[0] != 0x05:
-            return fail("non-SOCKS reply 0x%02x â€” something else owns this port" % g[0])
+            return fail("non-SOCKS reply 0x%02x — something else owns this port" % g[0])
         if g[1] == 0xFF:
             return fail("server rejected every auth method we offered")
         if g[1] == 0x02:
             if not (u.username or u.password):
-                return fail("server demands username/password auth â€” no creds in the pool line")
+                return fail("server demands username/password auth — no creds in the pool line")
             user = (_unq(u.username or "")).encode("utf-8", "ignore")[:255]
             pw = (_unq(u.password or "")).encode("utf-8", "ignore")[:255]
             s.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(pw)]) + pw)
             a = s.recv(2)
             if len(a) < 2 or a[0] != 0x01 or a[1] != 0x00:
-                return fail("auth REJECTED â€” wrong creds, or this server's IP is not in the provider's allowlist")
+                return fail("auth REJECTED — wrong creds, or this server's IP is not in the provider's allowlist")
         elif g[1] != 0x00:
             return fail("unexpected method selection 0x%02x" % g[1])
         # CONNECT: socks5h resolves remotely (domain ATYPE); plain socks5 tries
-        # local DNS like curl â€” but a DNS hiccup must not stamp a healthy exit
+        # local DNS like curl — but a DNS hiccup must not stamp a healthy exit
         # dead, so fall back to domain CONNECT on failure.
         ip4 = None
         if scheme != "socks5h":
@@ -1316,10 +1441,10 @@ def _socks_client_handshake(s, scheme: str, host: str, port: int, u, why=None) -
         return fail("handshake error (%s)" % type(e).__name__)
 
 def _proxy_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> Tuple[bool, int]:
-    """(alive, latency_ms) â€” a REAL handshake per scheme: http/https via CONNECT,
+    """(alive, latency_ms) — a REAL handshake per scheme: http/https via CONNECT,
     socks4/4a/5 via native SOCKS4/SOCKS5 connect to localhost:6767. Every failure
     records WHERE it died in _probe_fail_reason so the pool page can tell an ISP
-    black-hole from a bad-creds rejection from a billing refusal â€” each needs a
+    black-hole from a bad-creds rejection from a billing refusal — each needs a
     different fix, and bare 'dead' blamed the wrong party for months."""
     import base64
     import socket
@@ -1342,10 +1467,10 @@ def _proxy_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> Tuple[bool, 
         _probe_fail_reason[proxy_url] = "proxy hostname did not resolve ON THIS SERVER (local DNS; the provider never saw a packet)"
         return False, -1
     except (socket.timeout, TimeoutError):
-        _probe_fail_reason[proxy_url] = "TCP to %s:%s black-holed (no SYN-ACK) â€” a firewall/ISP between this server and the gateway; the proxy itself is healthy" % (ph, pp)
+        _probe_fail_reason[proxy_url] = "TCP to %s:%s black-holed (no SYN-ACK) — a firewall/ISP between this server and the gateway; the proxy itself is healthy" % (ph, pp)
         return False, -1
     except ConnectionRefusedError:
-        _probe_fail_reason[proxy_url] = "TCP %s:%s refused â€” host is up, port closed for this source (plan/IP-allowlist on the provider side)" % (ph, pp)
+        _probe_fail_reason[proxy_url] = "TCP %s:%s refused — host is up, port closed for this source (plan/IP-allowlist on the provider side)" % (ph, pp)
         return False, -1
     except Exception as e:
         _probe_fail_reason[proxy_url] = "TCP unreachable from this server (%s)" % type(e).__name__
@@ -1379,16 +1504,16 @@ def _proxy_probe(proxy_url: str, timeout: float = PROBE_TIMEOUT) -> Tuple[bool, 
                 if not m or m.group(1) != "200":
                     code = m.group(1) if m else "?"
                     if code == "407":
-                        _probe_fail_reason[proxy_url] = "proxy auth rejected (HTTP 407) â€” wrong creds, or this server's IP is not allowed"
+                        _probe_fail_reason[proxy_url] = "proxy auth rejected (HTTP 407) — wrong creds, or this server's IP is not allowed"
                     elif code == "402":
-                        _probe_fail_reason[proxy_url] = "provider says payment required (HTTP 402) â€” billing/quota, not a tunnel fault"
+                        _probe_fail_reason[proxy_url] = "provider says payment required (HTTP 402) — billing/quota, not a tunnel fault"
                     else:
                         _probe_fail_reason[proxy_url] = "CONNECT refused by proxy (HTTP %s)" % code
-                    hint = " â€” PAYMENT REQUIRED (provider billing/quota)" if code == "402" else \
-                           (" â€” auth failed (creds/allowlist)" if code == "407" else "")
+                    hint = " — PAYMENT REQUIRED (provider billing/quota)" if code == "402" else \
+                           (" — auth failed (creds/allowlist)" if code == "407" else "")
                     log("WARN", f"proxy probe {ph}:{pp} refused CONNECT: {code}{hint}")
                     if code in ("402", "407"):
-                        quarantine_proxy(proxy_url, f"CONNECT refused {code} â€” billing/auth, not transient")
+                        quarantine_proxy(proxy_url, f"CONNECT refused {code} — billing/auth, not transient")
                     return False, -1
 
             # CONNECT alone only proves that the gateway accepted a tunnel.
@@ -1445,15 +1570,15 @@ def _normalize_proxy(raw: str) -> Optional[str]:
       socks5://user:pass@host:port
       socks4://host:port
       user:pass@host:port
-      host:port:user:pass          â† common provider format
-      host:port:user:pass:http    â† with scheme suffix
+      host:port:user:pass          ← common provider format
+      host:port:user:pass:http    ← with scheme suffix
       host:port
     """
     if not raw or not isinstance(raw, str):
         return None
     p = raw.strip().lstrip("\ufeff").strip().strip('"\'')
-    # free-proxy-list CSV rows: "IP,Port,Country,Protocol,Type,Latency,â€¦" e.g.
-    #   98.188.47.150,4145,United States,SOCKS4,Anonymous,259,Unknown,"Wed, 02 Sep 2026 â€¦"
+    # free-proxy-list CSV rows: "IP,Port,Country,Protocol,Type,Latency,…" e.g.
+    #   98.188.47.150,4145,United States,SOCKS4,Anonymous,259,Unknown,"Wed, 02 Sep 2026 …"
     if "," in p and "://" not in p and "@" not in p:
         try:
             import csv as _csv
@@ -1483,12 +1608,12 @@ def _normalize_proxy(raw: str) -> Optional[str]:
         p = f"[{_parts0[0]}]:{_parts0[1]}"
 
     # socks5h:// is PRESERVED. The suffix is the ONE signal that means
-    # "resolve the target at the gateway" â€” libcurl and the raw probe honor it,
+    # "resolve the target at the gateway" — libcurl and the raw probe honor it,
     # and it is what protects authenticated-proxy users from a poisoned local
     # resolver (an app host resolving localhost:6767 itself can hand the gateway a
     # sinkhole IP, which comes back as a fatal-looking (97)/(4) that was never
     # the proxy's fault). Only the Playwright dict re-maps it; Chromium's
-    # socks5:// already sends domains â€” see playwright_proxy_from_url.
+    # socks5:// already sends domains — see playwright_proxy_from_url.
 
     if "://" in p:
         return p  # already a URL
@@ -1619,7 +1744,7 @@ def _shim_ensure_loop():
 
 def _shim_upstream_connect(up_url: str, host: str, port: int):
     """blocking: connect + full SOCKS handshake toward host:port; return the
-    connected, ready-to-relay socket (or raise â€” the browser gets a clean
+    connected, ready-to-relay socket (or raise — the browser gets a clean
     failure reply and the pool row gets a human reason)."""
     import socket as _sk
     from urllib.parse import urlparse
@@ -1630,7 +1755,7 @@ def _shim_upstream_connect(up_url: str, host: str, port: int):
         s.settimeout(15)
         eff = (u.scheme or "socks5").lower()
         if eff in ("socks5", "socks5h"):
-            # browser gave us a hostname? keep it remote (domain CONNECT) â€”
+            # browser gave us a hostname? keep it remote (domain CONNECT) —
             # this host's resolver is exactly what we do NOT trust. literal
             # IPs take the fast IPv4 path (no resolver round-trip).
             import ipaddress
@@ -1674,7 +1799,7 @@ async def _shim_handle(rd, wr, up_url):
         if hdr[0] != 0x05:
             wr.close()
             return
-        await rd.readexactly(hdr[1])               # methods â€” we answer no-auth;
+        await rd.readexactly(hdr[1])               # methods — we answer no-auth;
         wr.write(b"\x05\x00")                     #   real auth happens upstream
         await wr.drain()
         req = await rd.readexactly(4)              # VER CMD RSV ATYP
@@ -1699,7 +1824,7 @@ async def _shim_handle(rd, wr, up_url):
         try:
             s = await loop.run_in_executor(None, _shim_upstream_connect, up_url, host, port)
         except Exception as e:
-            _probe_fail_reason[up_url] = "shim: upstream refused CONNECT (%s) â€” line intact, not a tunnel death" % type(e).__name__
+            _probe_fail_reason[up_url] = "shim: upstream refused CONNECT (%s) — line intact, not a tunnel death" % type(e).__name__
             wr.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
             await wr.drain()
             wr.close()
@@ -1725,7 +1850,7 @@ async def _shim_open_listener(pu):
 
 def shim_proxy_for(proxy_url: str) -> Optional[str]:
     """Browser-safe localhost relay URL for an authenticated socks line;
-    None when no shim is needed (unauth / http) â€” caller then proceeds as
+    None when no shim is needed (unauth / http) — caller then proceeds as
     before."""
     try:
         from urllib.parse import urlparse
@@ -1850,7 +1975,7 @@ def _normalize_api_key_records(config: dict) -> bool:
             record["id"] = "key_" + secrets.token_hex(8)
             changed = True
         if not record.get("prefix"):
-            record["prefix"] = "sk-void-â€¦"
+            record["prefix"] = "sk-void-…"
             changed = True
     return changed
 
@@ -1914,8 +2039,13 @@ _API_ADMISSION_MIN_EXITS = max(1, min(2, int(os.environ.get("BRIDGENA_ADMISSION_
 _API_READY_RECOVERY_WAIT_SEC = max(5.0, min(20.0, float(os.environ.get("BRIDGENA_API_READY_RECOVERY_WAIT_SEC", "20"))))
 
 _API_FAILURE_QUARANTINE_S = max(15.0, float(os.environ.get("BRIDGENA_FAILURE_QUARANTINE_S", "90")))
+EDGE_CHALLENGE_HOLD_SEC = max(
+    30.0, min(1800.0, float(os.environ.get("BRIDGENA_EDGE_CHALLENGE_HOLD_SEC", "180")))
+)
 _api_verified_keepers: Dict[str, float] = {}
 _api_keeper_quarantine_until: Dict[str, float] = {}
+_api_keeper_challenge_until: Dict[str, float] = {}
+_api_keeper_challenge_count: Dict[str, int] = {}
 _api_ready_event = asyncio.Event()
 _verification_wakeup_event = asyncio.Event()
 _initial_verification_sweep_done = asyncio.Event()
@@ -1936,7 +2066,13 @@ TRANSPORT_PROBE_EVERY_REQUEST = os.environ.get("BRIDGENA_TRANSPORT_PROBE_EVERY_R
 TRANSPORT_PROBE_FRESH_SEC = max(0.0, min(60.0, float(os.environ.get("BRIDGENA_TRANSPORT_PROBE_FRESH_SEC", "4"))))
 PREDISPATCH_RECOVERY_WAIT_SEC = max(4.0, min(30.0, float(os.environ.get("BRIDGENA_PREDISPATCH_RECOVERY_WAIT_SEC", "16"))))
 ACCOUNT_FAILOVER_MAX = max(0, min(6, int(os.environ.get("BRIDGENA_ACCOUNT_FAILOVER_MAX", "3"))))
-FIRST_ASSISTANT_RESPONSE_SEC = max(1.0, min(30.0, float(os.environ.get("BRIDGENA_FIRST_ASSISTANT_RESPONSE_SEC", "5"))))
+FIRST_ASSISTANT_RESPONSE_SEC = max(
+    1.0, min(60.0, float(os.environ.get("BRIDGENA_FIRST_ASSISTANT_RESPONSE_SEC", "8")))
+)
+TOOL_FIRST_ASSISTANT_RESPONSE_SEC = max(
+    FIRST_ASSISTANT_RESPONSE_SEC,
+    min(120.0, float(os.environ.get("BRIDGENA_TOOL_FIRST_ASSISTANT_RESPONSE_SEC", "25"))),
+)
 from contextlib import asynccontextmanager
 
 # Keeper lanes and proxy-exit lanes are separate capacity constraints. Several
@@ -1970,8 +2106,8 @@ async def _browser_transport_guard(session, proxy, jar_name=""):
             )
         waited = time.monotonic() - t0
         if waited >= 0.05:
-            log("INFO", f"[{jar_name}] shared-exit stream lane acquired Â· exit {key} Â· "
-                        f"wait {waited:.2f}s Â· limit {EXIT_STREAM_CONCURRENCY}")
+            log("INFO", f"[{jar_name}] shared-exit stream lane acquired · exit {key} · "
+                        f"wait {waited:.2f}s · limit {EXIT_STREAM_CONCURRENCY}")
         async with session._action_lock:
             yield key
     finally:
@@ -2060,8 +2196,8 @@ def _record_reliability_outcome(success: bool, reason: str = "") -> dict:
     rate = (passed / total) if total else 0.0
     if total >= 5:
         level = "OK" if rate >= _RELIABILITY_TARGET else "WARN"
-        log(level, f"Reliability SLO Â· last {total} request(s) Â· success {rate*100:.1f}% Â· "
-                   f"target {_RELIABILITY_TARGET*100:.0f}% Â· {'PASS' if rate >= _RELIABILITY_TARGET else 'BELOW TARGET'}")
+        log(level, f"Reliability SLO · last {total} request(s) · success {rate*100:.1f}% · "
+                   f"target {_RELIABILITY_TARGET*100:.0f}% · {'PASS' if rate >= _RELIABILITY_TARGET else 'BELOW TARGET'}")
     return {"sample": total, "successes": passed, "success_rate": round(rate, 4), "target": _RELIABILITY_TARGET}
 
 def _reliability_snapshot() -> dict:
@@ -2164,6 +2300,59 @@ def _api_keeper_needs_refresh(sid: Optional[str]) -> bool:
     return _api_keeper_lease_age(sid) >= _verification_refresh_age(sid)
 
 
+def _api_keeper_challenge_remaining(sid: Optional[str]) -> float:
+    if not sid:
+        return 0.0
+    return max(
+        0.0,
+        float(_api_keeper_challenge_until.get(str(sid), 0.0)) - time.monotonic(),
+    )
+
+
+def _api_keeper_challenge_held(sid: Optional[str]) -> bool:
+    return _api_keeper_challenge_remaining(sid) > 0.0
+
+
+def _hold_challenged_keeper(
+    sid: Optional[str],
+    reason: str,
+    seconds: Optional[float] = None,
+) -> None:
+    if not sid:
+        return
+    sid = str(sid)
+    hold = float(seconds or EDGE_CHALLENGE_HOLD_SEC)
+    now = time.monotonic()
+    _api_verified_keepers.pop(sid, None)
+    _api_keeper_challenge_until[sid] = max(
+        float(_api_keeper_challenge_until.get(sid, 0.0)),
+        now + hold,
+    )
+    _api_keeper_challenge_count[sid] = int(_api_keeper_challenge_count.get(sid, 0)) + 1
+
+    # Do not let the generic verification scheduler immediately soft-refresh or
+    # restart the same browser back into the edge challenge.
+    _verification_preflight_retry_after[sid] = _api_keeper_challenge_until[sid]
+    _refresh_api_ready_event()
+    _wake_verification_scheduler()
+
+    log(
+        "WARN",
+        f"[{sid}] edge challenge hold · {int(hold)}s · "
+        f"count={_api_keeper_challenge_count[sid]} · {reason}",
+    )
+
+
+def _clear_challenge_hold(sid: Optional[str], reason: str = "") -> None:
+    if not sid:
+        return
+    sid = str(sid)
+    existed = sid in _api_keeper_challenge_until
+    _api_keeper_challenge_until.pop(sid, None)
+    if existed and reason:
+        log("OK", f"[{sid}] edge challenge hold cleared · {reason}")
+
+
 def _wake_verification_scheduler() -> None:
     try:
         _verification_wakeup_event.set()
@@ -2176,6 +2365,8 @@ def _api_keeper_verified(sid: Optional[str]) -> bool:
         return False
     sid = str(sid)
     if time.monotonic() < _api_keeper_quarantine_until.get(sid, 0.0):
+        return False
+    if _api_keeper_challenge_held(sid):
         return False
     ts = _api_verified_keepers.get(sid, 0.0)
     return bool(ts and (time.monotonic() - ts) <= _API_VERIFICATION_TTL)
@@ -2196,7 +2387,7 @@ def _quarantine_api_keeper(sid: Optional[str], reason: str, seconds: Optional[fl
     _api_keeper_quarantine_until[sid] = time.monotonic() + float(seconds or _API_FAILURE_QUARANTINE_S)
     _refresh_api_ready_event()
     _wake_verification_scheduler()
-    log("WARN", f"[{sid}] API keeper quarantined Â· {reason} Â· {int(seconds or _API_FAILURE_QUARANTINE_S)}s")
+    log("WARN", f"[{sid}] API keeper quarantined · {reason} · {int(seconds or _API_FAILURE_QUARANTINE_S)}s")
 
 def _verified_keeper_count() -> int:
     now = time.monotonic()
@@ -2222,7 +2413,7 @@ def _mark_api_keeper_unready(sid: Optional[str], reason: str = "") -> None:
     _refresh_api_ready_event()
     _wake_verification_scheduler()
     if reason and sid:
-        log("WARN", f"[{sid}] API readiness revoked Â· {reason}")
+        log("WARN", f"[{sid}] API readiness revoked · {reason}")
 
 def keeper_session_ready(session, *, warmed: bool = True) -> bool:
     """True only when a keeper is safe to receive API/token work."""
@@ -2236,7 +2427,7 @@ def keeper_session_ready(session, *, warmed: bool = True) -> bool:
 def jar_available(jar: dict, now: float = None) -> bool:
     """Usable if enabled and has auth cookies OR a live keeper session.
 
-    limited_until is ONLY a soft preference in acquire_jar scoring â€” it must
+    limited_until is ONLY a soft preference in acquire_jar scoring — it must
     never hard-block an account that still has valid cookies / a live browser.
     """
     now = now or time.time()
@@ -2347,7 +2538,7 @@ def _new_jar(name: str, cookies: list, email: str = "", password: str = "",
         "expired": False, "limited_until": 0, "usage_count": 0,
         "last_used": 0, "created": int(time.time()),
         "login_method": login_method, "email": email, "password": password,
-        "keeper_enabled": keeper_enabled, "keeper_headless": True,
+        "keeper_enabled": keeper_enabled, "keeper_headless": False,
         "keeper_humanize": False,
         "proxy": "",  # optional per-account: http://user:pass@host:port
     }
@@ -2378,7 +2569,7 @@ def playwright_proxy_from_url(proxy_url: str) -> Optional[dict]:
                 if LOCAL_UPSTREAM:
                     out["bypass"] = "localhost,127.0.0.1,[::1]"
                 return out
-            log("WARN", f"socks shim unavailable for {u.hostname}:{u.port} â€” browser goes direct (curl path still uses the proxy)")
+            log("WARN", f"socks shim unavailable for {u.hostname}:{u.port} — browser goes direct (curl path still uses the proxy)")
             return None
         # Chromium speaks "socks5://" (which for Chromium = send the hostname,
         # resolve at gateway) and knows no "socks5h". Map the scheme name here,
@@ -2605,7 +2796,7 @@ def _bump_cursor(chosen: Optional[str]) -> None:
 
 def _rotation_mode() -> str:
     """config.json "proxy_rotation": "assignment" (default, CF-safe) | "request".
-    "request" rotates the exit on EVERY pick â€” maximum IP spread, but it invalidates
+    "request" rotates the exit on EVERY pick — maximum IP spread, but it invalidates
     cf_clearance each time and the keeper must re-clear (up to one ~1-min cycle per
     request). Only flip it if Arena is IP-limiting you harder than CF is."""
     try:
@@ -2757,8 +2948,8 @@ def arm_throttle_thread_rehome(chat_id: str, model_name: str, jar_id: str,
     try:
         mutate_state(fn)
         _bump_thread_rehome("armed")
-        log("WARN", f"Thread rehome armed Â· {str(chat_id)[:10]}â€¦ Â· model {model_name} Â· "
-                    f"same account {str(jar_id)[:10]}â€¦ Â· eligible in {max(0.0, delay_sec):.1f}s")
+        log("WARN", f"Thread rehome armed · {str(chat_id)[:10]}… · model {model_name} · "
+                    f"same account {str(jar_id)[:10]}… · eligible in {max(0.0, delay_sec):.1f}s")
         return True
     except Exception as exc:
         log("WARN", f"Thread rehome arm failed: {type(exc).__name__}: {exc}")
@@ -2810,7 +3001,7 @@ def mark_jar_status(jar_id: str, status_type: str) -> None:
                 if status_type == "limited":
                     j["limited_until"] = time.time() + COOLDOWN_SEC
                     j["status"] = "limited"
-                    log("WARN", f"Jar '{j.get('name')}' rate-limited â€” cooling {COOLDOWN_SEC // 60}min")
+                    log("WARN", f"Jar '{j.get('name')}' rate-limited — cooling {COOLDOWN_SEC // 60}min")
                 elif status_type == "expired":
                     j["expired"] = True
                     j["status"] = "expired"
@@ -2868,7 +3059,12 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
         )
 
     def pick(jars: list):
-        candidates = [j for j in jars if j.get("enabled", True) and (not exclude or j.get("id") not in exclude)]
+        candidates = [
+            j for j in jars
+            if j.get("enabled", True)
+            and (not exclude or j.get("id") not in exclude)
+            and not _api_keeper_challenge_held(j.get("id"))
+        ]
         if not candidates:
             return
         # Sort by score descending
@@ -2921,6 +3117,8 @@ def acquire_ready_jar(exclude: Optional[set] = None) -> Optional[dict]:
         if getattr(session, "_action_lock", None) and session._action_lock.locked():
             continue
         if time.monotonic() < _api_keeper_quarantine_until.get(str(sid), 0.0):
+            continue
+        if _api_keeper_challenge_held(sid):
             continue
         if not _api_keeper_verified(sid):
             continue
@@ -2985,8 +3183,8 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None, *, r
     }
 
     if not keepers or not normalized_pool:
-        log("WARN", f"Proxy allocator Â· configured {len(raw_pool)} Â· unique {len(normalized_pool)} Â· "
-                    f"keepers {len(keepers)} Â· nothing to allocate")
+        log("WARN", f"Proxy allocator · configured {len(raw_pool)} · unique {len(normalized_pool)} · "
+                    f"keepers {len(keepers)} · nothing to allocate")
         return stats
 
     # Probe the whole configured pool once at startup. This is intentionally
@@ -3011,7 +3209,7 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None, *, r
     try:
         probe_results = await loop.run_in_executor(None, _probe_all)
     except Exception as exc:
-        log("WARN", f"Proxy allocator Â· full-pool probe failed: {redact(str(exc))}")
+        log("WARN", f"Proxy allocator · full-pool probe failed: {redact(str(exc))}")
         probe_results = []
 
     now = time.time()
@@ -3029,7 +3227,7 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None, *, r
 
     # Build a stability-ranked list first. Cold-start randomization happens
     # only inside the healthier part of the live pool: we get genuinely random
-    # keeperâ†’exit mappings without intentionally pinning browsers to the worst
+    # keeper→exit mappings without intentionally pinning browsers to the worst
     # latency/failure outliers.
     _proxy_health_load()
     def _stable_proxy_key(proxy):
@@ -3046,14 +3244,14 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None, *, r
     stats["live"] = len(live)
 
     if not live:
-        log("WARN", f"Proxy allocator Â· configured {len(raw_pool)} Â· unique {len(normalized_pool)} Â· "
-                    f"live 0 Â· keepers {len(keepers)}")
+        log("WARN", f"Proxy allocator · configured {len(raw_pool)} · unique {len(normalized_pool)} · "
+                    f"live 0 · keepers {len(keepers)}")
         return stats
 
     assigned: Dict[str, str] = {}
     used = set()
 
-    # On cold startup, deliberately break yesterday's deterministic jarâ†’proxy
+    # On cold startup, deliberately break yesterday's deterministic jar→proxy
     # mapping. Randomize among the healthier fraction of the currently-live
     # pool, while still keeping one stable proxy per keeper for the lifetime of
     # that browser context.
@@ -3074,8 +3272,8 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None, *, r
         allocation_pool = preferred + tail
         stats["randomized"] = True
         stats["random_window"] = healthy_window
-        log("INFO", f"Proxy allocator Â· randomized cold-start mapping ON Â· "
-                    f"healthy random window {healthy_window}/{len(live)} Â· "
+        log("INFO", f"Proxy allocator · randomized cold-start mapping ON · "
+                    f"healthy random window {healthy_window}/{len(live)} · "
                     f"keepers {len(keepers)}")
     else:
         stats["randomized"] = False
@@ -3119,8 +3317,8 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None, *, r
 
     distinct = len(set(assigned.values()))
     stats["distinct_assigned"] = distinct
-    log("INFO", f"Proxy allocator Â· configured {len(raw_pool)} Â· unique {len(normalized_pool)} Â· "
-                f"live {len(live)} Â· keepers {len(keepers)} Â· distinct assigned {distinct}")
+    log("INFO", f"Proxy allocator · configured {len(raw_pool)} · unique {len(normalized_pool)} · "
+                f"live {len(live)} · keepers {len(keepers)} · distinct assigned {distinct}")
 
     # Log only opaque upstream identity + eventual local shim endpoint.
     for jar in keepers:
@@ -3134,13 +3332,13 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None, *, r
             shim = shim_proxy_for(proxy) or "direct-upstream"
         except Exception:
             shim = "shim-unavailable"
-        log("INFO", f"[{redact(str(label))}] proxy allocation Â· upstream {opaque}â€¦ Â· route {redact(str(shim))}")
+        log("INFO", f"[{redact(str(label))}] proxy allocation · upstream {opaque}… · route {redact(str(shim))}")
 
     if len(live) >= len(keepers) and distinct < len(keepers):
-        log("WARN", f"Proxy allocator invariant failed Â· {len(live)} live exits for {len(keepers)} keepers "
+        log("WARN", f"Proxy allocator invariant failed · {len(live)} live exits for {len(keepers)} keepers "
                     f"but only {distinct} distinct assignments")
     elif len(live) < len(keepers):
-        log("WARN", f"Proxy allocator capacity shortfall Â· {len(live)} live exits for {len(keepers)} keepers; "
+        log("WARN", f"Proxy allocator capacity shortfall · {len(live)} live exits for {len(keepers)} keepers; "
                     "some sharing is unavoidable")
 
     return stats
@@ -3170,13 +3368,13 @@ async def rebind_keeper_fleet_to_proxy_pool(reason: str = "proxy pool changed") 
             unchanged.append(jid)
 
     if not changed:
-        log("INFO", f"Proxy rebind Â· {reason} Â· no keeper restart required Â· "
+        log("INFO", f"Proxy rebind · {reason} · no keeper restart required · "
                     f"distinct assigned {stats.get('distinct_assigned', 0)}")
         stats["keepers_restarting"] = 0
         stats["keepers_unchanged"] = len(unchanged)
         return stats
 
-    log("INFO", f"Proxy rebind Â· {reason} Â· applying {len(changed)} changed keeper route(s)")
+    log("INFO", f"Proxy rebind · {reason} · applying {len(changed)} changed keeper route(s)")
 
     # Restarts are intentionally bounded. Persistent Chromium startup is heavy
     # and restarting the whole fleet in one burst makes auth hydration flaky.
@@ -3188,8 +3386,8 @@ async def rebind_keeper_fleet_to_proxy_pool(reason: str = "proxy pool changed") 
             try:
                 session._tried_proxies.clear()
                 session._direct_tried = False
-                log("INFO", f"[{session.name}] proxy route changed Â· "
-                            f"{_proxy_hkey(current) if current else 'direct'} â†’ {_proxy_hkey(desired)} Â· restarting keeper")
+                log("INFO", f"[{session.name}] proxy route changed · "
+                            f"{_proxy_hkey(current) if current else 'direct'} → {_proxy_hkey(desired)} · restarting keeper")
                 await session.restart()
                 return True
             except Exception as exc:
@@ -3203,7 +3401,7 @@ async def rebind_keeper_fleet_to_proxy_pool(reason: str = "proxy pool changed") 
     stats["keepers_rebound"] = applied
     stats["keepers_unchanged"] = len(unchanged)
 
-    log("OK", f"Proxy rebind complete Â· {applied}/{len(changed)} keeper route changes applied Â· "
+    log("OK", f"Proxy rebind complete · {applied}/{len(changed)} keeper route changes applied · "
               f"distinct assigned {stats.get('distinct_assigned', 0)}")
     return stats
 
@@ -3219,7 +3417,7 @@ async def auto_login_on_boot():
 
     starts, logins = _configure_keeper_concurrency(len(bootable))
     log("INFO", f"Auto-login: fleet target {len(bootable)} keeper(s) from "
-                f"{len(bootable)} bootable account(s) Â· parallel starts {starts} Â· "
+                f"{len(bootable)} bootable account(s) · parallel starts {starts} · "
                 f"parallel logins {logins}")
 
     # Cookie imports are authenticated sessions too; keep them alive after reboot.
@@ -3238,7 +3436,7 @@ async def auto_login_on_boot():
     # session immediately; sync() starts browsers as background tasks.
     await keeper.sync()
     _keeper_fleet_launch_event.set()
-    log("INFO", f"Auto-login: {len(bootable)} keeper session(s) launched Â· startup verification barrier released")
+    log("INFO", f"Auto-login: {len(bootable)} keeper session(s) launched · startup verification barrier released")
 
 def uuid7() -> str:
     ts = int(time.time() * 1000)
@@ -3317,8 +3515,8 @@ def note_upstream_degraded(reason: str = "") -> None:
         new_until = now + UPSTREAM_DEGRADE_COOLDOWN
         if new_until > _upstream_degraded_until:
             _upstream_degraded_until = new_until
-            log("WARN", f"Arena origin degraded ({len(_upstream_hits)}Ã— 5xx/52x in "
-                        f"{UPSTREAM_DEGRADE_WINDOW:.0f}s) â€” pausing new requests ~"
+            log("WARN", f"Arena origin degraded ({len(_upstream_hits)}× 5xx/52x in "
+                        f"{UPSTREAM_DEGRADE_WINDOW:.0f}s) — pausing new requests ~"
                         f"{UPSTREAM_DEGRADE_COOLDOWN:.0f}s; accounts & proxies stay healthy")
 
 async def anchor_proxy_to_keeper(jar_id, proxy):
@@ -3335,14 +3533,14 @@ async def anchor_proxy_to_keeper(jar_id, proxy):
     if not used or used == proxy:
         return proxy, False
     if _proxy_hkey(used) in _flagged_active():
-        return proxy, False   # keeper rides a CF-flagged exit â€” do NOT pin curl onto it
+        return proxy, False   # keeper rides a CF-flagged exit — do NOT pin curl onto it
     if await asyncio.to_thread(proxy_alive, used):
         if jar_id:
             assign_jar_proxy(jar_id, used)   # curl follows the browser; don't disturb the clearance
         return used, False
     if proxy is None:
-        return None, False   # nothing healthy anywhere â€” direct; browser tunnel may still linger
-    log("WARN", f"[{jar_id}] keeper's proxy {used.split('@')[-1]} is dead â€” cycling keeper onto "
+        return None, False   # nothing healthy anywhere — direct; browser tunnel may still linger
+    log("WARN", f"[{jar_id}] keeper's proxy {used.split('@')[-1]} is dead — cycling keeper onto "
                 f"{proxy.split('@')[-1]} to realign IP+cookies")
     try:
         await s.restart()
@@ -3404,13 +3602,13 @@ def note_probe_failure(proxy_url: str) -> None:
         return
     n = _proxy_strikes[proxy_url] = _proxy_strikes.get(proxy_url, 0) + 1
     if n >= PROBE_EXILE_AFTER:
-        quarantine_proxy(proxy_url, f"CONNECT probe failed {n}Ã— in a row")
+        quarantine_proxy(proxy_url, f"CONNECT probe failed {n}× in a row")
 
 def block_model(name: str) -> None:
     def fn(state: dict):
         if name not in state["blocked_models"]:
             state["blocked_models"].append(name)
-            log("WARN", f"Model '{name}' hidden â€” gated on this account")
+            log("WARN", f"Model '{name}' hidden — gated on this account")
     mutate_state(fn)
 
 def record_usage(model_name: str) -> None:
@@ -3425,10 +3623,10 @@ def proxy_candidates(jar: Optional[dict], *, prefer_sticky: bool = True,
                      include_flagged: bool = False) -> List[str]:
     """Sweep order: the jar's live pin first (keeps cf_clearance valid), then the
     pool starting at the shared RR cursor. The old per-jar md5 offset collided
-    (2 accounts on the same slot, pool entries left idle) â€” the cursor can't:
+    (2 accounts on the same slot, pool entries left idle) — the cursor can't:
     every hand-out advances it exactly one step.
     include_flagged=True is the LAST-RESORT view: CF flags are fluid (a challenge
-    now â‰  a challenge in 30s), so when nothing un-flagged remains we still rotate
+    now ≠ a challenge in 30s), so when nothing un-flagged remains we still rotate
     over flagged exits instead of surrendering to the direct server IP. Quarantined
     (tunnel-dead) nodes are NEVER re-admitted."""
     _q = _QUARANTINED_KEYS | (set() if include_flagged else _flagged_active())
@@ -3442,7 +3640,7 @@ def proxy_candidates(jar: Optional[dict], *, prefer_sticky: bool = True,
     if pool:
         st = _proxy_assign_cursor % len(pool)
         ordered = [pool[(st + i) % len(pool)] for i in range(len(pool))]
-        # Speed matters â€” but not more than IP spread. Reorder ONLY the head
+        # Speed matters — but not more than IP spread. Reorder ONLY the head
         # window the picker will actually take from (fastest-of-the-next-8),
         # then let the cursor park after it. A GLOBAL latency sort used to
         # float the single fastest exit to the front of EVERY candidate list,
@@ -3536,14 +3734,14 @@ def is_model_selectable(model: dict) -> bool:
 
 async def refresh_model_catalog() -> dict:
     """Attempt to refresh the model catalog and return a structured result
-    describing whether it actually worked and, if not, why â€” instead of
+    describing whether it actually worked and, if not, why — instead of
     silently falling back to the stale catalog with zero visibility."""
     state = load_state()
     now = time.time()
     if now - state.get("refresh_started", 0) < 30:
         return {
             "ok": False, "models": get_models(),
-            "reason": "A refresh is already in progress (debounced ~30s) â€” try again shortly.",
+            "reason": "A refresh is already in progress (debounced ~30s) — try again shortly.",
         }
 
     def mark_start(s):
@@ -3574,7 +3772,7 @@ async def refresh_model_catalog() -> dict:
         mutate_state(mark_done)
         return {
             "ok": True, "models": fetched_models,
-            "reason": f"Refreshed successfully â€” {len(fetched_models)} models loaded.",
+            "reason": f"Refreshed successfully — {len(fetched_models)} models loaded.",
         }
 
     def mark_fail(s):
@@ -3584,7 +3782,7 @@ async def refresh_model_catalog() -> dict:
     if not tried_any_worker:
         reason = "No live keeper session with an open browser page was available to fetch the catalog."
     else:
-        reason = "Fetched the page but couldn't extract a valid model list (regex/parse failure) â€” catalog left unchanged."
+        reason = "Fetched the page but couldn't extract a valid model list (regex/parse failure) — catalog left unchanged."
     return {"ok": False, "models": get_models(), "reason": reason}
 
 class BridgeHTTPError(Exception):
@@ -3607,8 +3805,8 @@ class ConversationLost(Exception):
 
 class KeeperSession:
     """Persistent browser session for one Arena account.
-    Cross-platform stealth engine compatible with Windows, macOS, Linux, and Pterodactyl/Docker containers.
-    Supports Edge (fastest), Chrome, Chromium, and bundled headless binaries with humanized mouse/keyboard trajectories."""
+    Cross-platform persistent browser engine compatible with Windows, macOS, Linux, and container deployments.
+    Supports Edge, Chrome, Chromium, and headed/headless browser presentation modes."""
 
     def __init__(self, jar: dict, headless: Optional[bool] = None, keep_forever: bool = False):
         self.jar_id = jar["id"]
@@ -3620,8 +3818,13 @@ class KeeperSession:
         self.password = jar.get("password") or ""
         self.user_agent = jar.get("user_agent") or None
         self.persona = PERSONAS.get(jar.get("persona")) or persona_for(jar)
-        if headless is not None:
-            self.headless = headless
+        # Fleet-level headed mode intentionally overrides historical per-jar
+        # keeper_headless flags, so an upgrade does not leave old accounts in
+        # headless mode. Set BRIDGENA_KEEPERS_HEADED=0 to restore per-jar control.
+        if KEEPERS_HEADED_DEFAULT:
+            self.headless = False
+        elif headless is not None:
+            self.headless = bool(headless)
         elif "keeper_headless" in jar:
             self.headless = bool(jar["keeper_headless"])
         elif os.environ.get("BRIDGENA_HEADLESS", "").lower() in ("1", "true", "yes"):
@@ -3728,29 +3931,29 @@ class KeeperSession:
         self._set_step("Keeper stopped")
 
     async def _human_click(self, page, locator, timeout_ms: int = 4000) -> bool:
-        """Move cursor to element and click naturally."""
+        """Reliably activate a real UI control using native browser semantics.
+
+        Kept under the historical method name for compatibility with the rest
+        of Bridgena. This intentionally avoids randomized input choreography.
+        """
         try:
             if await locator.count() == 0:
                 return False
-            box = await locator.bounding_box()
-            if not box:
-                await locator.scroll_into_view_if_needed()
-                box = await locator.bounding_box()
-            if box:
-                tx = box["x"] + box["width"] * random.uniform(0.35, 0.65)
-                ty = box["y"] + box["height"] * random.uniform(0.35, 0.65)
-                await self._human_move(page, tx, ty)
-                await asyncio.sleep(random.uniform(0.05, 0.12))
-                await page.mouse.down()
-                await asyncio.sleep(random.uniform(0.04, 0.09))
-                await page.mouse.up()
-                return True
-            else:
-                await locator.click(timeout=timeout_ms)
-                return True
+            target = locator.first
+            await target.scroll_into_view_if_needed(timeout=timeout_ms)
+            try:
+                await target.hover(timeout=timeout_ms)
+            except Exception:
+                pass
+            await target.click(timeout=timeout_ms)
+            self.last_activity = time.time()
+            return True
         except Exception:
             try:
-                await locator.click(timeout=timeout_ms, force=True)
+                target = locator.first
+                await target.scroll_into_view_if_needed(timeout=timeout_ms)
+                await target.click(timeout=timeout_ms, force=True)
+                self.last_activity = time.time()
                 return True
             except Exception:
                 return False
@@ -3770,6 +3973,26 @@ class KeeperSession:
         # Always use instant fill for login fields - more reliable
         await locator.fill(text)
         await asyncio.sleep(0.2)
+
+    async def _native_scroll_into_view(self, locator, timeout_ms: int = 4000) -> bool:
+        """Scroll only as needed to bring an application control into view."""
+        try:
+            if await locator.count() == 0:
+                return False
+            await locator.first.scroll_into_view_if_needed(timeout=timeout_ms)
+            self.last_activity = time.time()
+            return True
+        except Exception:
+            return False
+
+    async def _native_scroll_page(self, page, delta_y: int = 700) -> bool:
+        """Perform a normal browser wheel scroll for application navigation."""
+        try:
+            await page.mouse.wheel(0, int(delta_y))
+            self.last_activity = time.time()
+            return True
+        except Exception:
+            return False
 
     # --- Browser Helpers ---
 
@@ -3798,7 +4021,7 @@ class KeeperSession:
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=min(6000, timeout))
         except Exception:
-            log("WARN", f"[{self.name}] Navigation committed; domcontentloaded still pending â€” continuing startup")
+            log("WARN", f"[{self.name}] Navigation committed; domcontentloaded still pending — continuing startup")
         return True
 
     async def _handle_turnstile(self, page):
@@ -3824,7 +4047,7 @@ class KeeperSession:
         """
         solver = get_solver()
         if not solver or not solver.available():
-            log("WARN", f"[{self.name}] ONNX captcha solver not available â€” skip image solve")
+            log("WARN", f"[{self.name}] ONNX captcha solver not available — skip image solve")
             return False
         page = self.page
         if not page or page.is_closed():
@@ -4175,7 +4398,7 @@ class KeeperSession:
                         continue
 
                 if not login_visible:
-                    # Sidebar might be collapsed â€” try toggling it open
+                    # Sidebar might be collapsed — try toggling it open
                     try:
                         await page.locator("button[aria-label*='sidebar' i]").first.click(timeout=3000)
                         await asyncio.sleep(1.5)
@@ -4426,7 +4649,7 @@ class KeeperSession:
                 await asyncio.sleep(1.0)
 
             await self._screenshot(page, "auth_timeout")
-            err = "Authentication timed out â€” password may be wrong or session didn't validate"
+            err = "Authentication timed out — password may be wrong or session didn't validate"
             self._set_step(f"[FAILED at Step 6] {err}")
             return False, err
 
@@ -4630,13 +4853,13 @@ class KeeperSession:
             try:
                 page = self.page
                 if not page or page.is_closed():
-                    self.error = "Page is closed â€” restarting browser"
+                    self.error = "Page is closed — restarting browser"
                     self._set_step("Browser page was closed, restarting browser...")
                     self._schedule_retry()
                     return False
 
                 if not (self.email and self.password):
-                    self.error = "No credentials configured â€” enter email:password in dashboard"
+                    self.error = "No credentials configured — enter email:password in dashboard"
                     self._set_step(f"[ERROR] {self.error}")
                     log("ERROR", f"[{self.name}] {self.error}")
                     self._schedule_retry()
@@ -4655,7 +4878,7 @@ class KeeperSession:
                     self.fail_count = 0
                     self.next_retry = 0
                     self.ready_at = time.monotonic() + KEEPER_WARMUP_SEC
-                    log("OK", f"[{self.name}] âœ“ Reconnected successfully via {self.login_method}")
+                    log("OK", f"[{self.name}] ✓ Reconnected successfully via {self.login_method}")
                     return True
 
                 self.error = msg
@@ -4697,7 +4920,7 @@ class KeeperSession:
                 if not busy and pg and not pg.is_closed():
                     self._page_pool[i] = (pg, True)
                     return pg, i
-            # No idle pages â€” create a new tab if under limit
+            # No idle pages — create a new tab if under limit
             if len(self._page_pool) < self._max_pool_pages and self.context:
                 try:
                     new_page = await self.context.new_page()
@@ -4839,7 +5062,7 @@ class KeeperSession:
         page.on("console", on_console)
         self.active_requests += 1
         try:
-            script = """async ([url, payload, rid, action, tailGraceMs]) => {
+            script = """async ([url, payload, rid, action, tailGraceMs, configuredHeaders]) => {
                 const P = s => console.log('__NX' + rid + s);
                 const captured = [];
                 let responseStatus = 0;
@@ -4854,9 +5077,7 @@ class KeeperSession:
                 try {
                     const r = await fetch(url, {
                         method: 'POST', credentials: 'include',
-                        headers: {
-                          'Content-Type': 'application/json'
-                        },
+                        headers: configuredHeaders || {},
                         body: JSON.stringify(payload)
                     });
                     responseStarted = true;
@@ -4925,7 +5146,10 @@ class KeeperSession:
             }"""
             _bridge_started_at = time.monotonic()
             eval_task = asyncio.create_task(asyncio.wait_for(page.evaluate(
-                script, [url, payload, req_id, RECAPTCHA_ACTION, STREAM_TAIL_GRACE_MS]
+                script, [
+                    url, payload, req_id, RECAPTCHA_ACTION, STREAM_TAIL_GRACE_MS,
+                    _header_group("arena_browser_fetch"),
+                ]
             ), timeout=180.0))
             # Navigation can destroy evaluate before its console sentinel.
             # Always wake the consumer; the result supplies any missing frames.
@@ -4960,16 +5184,16 @@ class KeeperSession:
                     _page_url = str(page.url or "")[:180]
                 except Exception:
                     _page_url = "<unavailable>"
-                log("WARN", f"[{self.name}] bridge evaluate terminated Â· elapsed {_elapsed:.2f}s Â· "
-                            f"page_closed={_page_closed} Â· page={_page_url} Â· "
-                            f"active_requests={self.active_requests} Â· "
+                log("WARN", f"[{self.name}] bridge evaluate terminated · elapsed {_elapsed:.2f}s · "
+                            f"page_closed={_page_closed} · page={_page_url} · "
+                            f"active_requests={self.active_requests} · "
                             f"{type(_bridge_eval_exc).__name__}: {str(_bridge_eval_exc)[:220]}")
                 raise
             if eval_task.exception():
                 raise RuntimeError(f"Bridge evaluate exception: {eval_task.exception()}")
             # Console delivery can drop messages under load. The page retains
             # the exact same response lines, so fill any index gaps and flush
-            # them in original orderâ€”no second POST and no duplicated chunks.
+            # them in original order—no second POST and no duplicated chunks.
             if isinstance(result, dict):
                 for index, line in enumerate(result.get("lines") or []):
                     if index >= next_index:
@@ -5026,27 +5250,27 @@ class KeeperSession:
                     _page_url = "<unavailable>"
 
                 if status_code == 200 and (stream_error or not finish_seen):
-                    log("WARN", f"[{self.name}] stream forensics Â· elapsed {_elapsed:.2f}s Â· "
-                                f"stop={stop_reason} Â· error={stream_error} Â· finish={finish_seen} Â· "
-                                f"page_closed={_page_closed} Â· page={_page_url} Â· "
-                                f"kinds[{_kind_summary}] Â· tail[{_tail_summary}]")
+                    log("WARN", f"[{self.name}] stream forensics · elapsed {_elapsed:.2f}s · "
+                                f"stop={stop_reason} · error={stream_error} · finish={finish_seen} · "
+                                f"page_closed={_page_closed} · page={_page_url} · "
+                                f"kinds[{_kind_summary}] · tail[{_tail_summary}]")
 
                 if status_code == 200 and stream_error and finish_seen:
                     # The provider already emitted its semantic terminal frame.
                     # A TCP/browser error while draining the post-finish quiet
                     # window must not turn a completed answer into a 502.
-                    log("WARN", f"[{self.name}] stream audit Â· HTTP 200 Â· frames {frame_count} Â· "
-                                f"finish yes Â· transport dropped after protocol finish Â· accepting completed stream")
+                    log("WARN", f"[{self.name}] stream audit · HTTP 200 · frames {frame_count} · "
+                                f"finish yes · transport dropped after protocol finish · accepting completed stream")
                 elif status_code == 200 and stream_error:
-                    log("WARN", f"[{self.name}] stream audit Â· HTTP 200 Â· frames {frame_count} Â· "
-                                f"finish no Â· stream interrupted: {error_body[:220]}")
+                    log("WARN", f"[{self.name}] stream audit · HTTP 200 · frames {frame_count} · "
+                                f"finish no · stream interrupted: {error_body[:220]}")
                 elif status_code == 200:
-                    log("INFO", f"[{self.name}] stream audit Â· HTTP 200 Â· frames {frame_count} Â· "
-                                f"finish {'yes' if finish_seen else 'no'} Â· stop {stop_reason}")
+                    log("INFO", f"[{self.name}] stream audit · HTTP 200 · frames {frame_count} · "
+                                f"finish {'yes' if finish_seen else 'no'} · stop {stop_reason}")
                 else:
                     phase = "after response" if response_started else "before response"
-                    log("WARN", f"[{self.name}] stream audit Â· HTTP {status_code or 0} Â· {phase} Â· "
-                                f"frames {frame_count} Â· body: {error_body[:300]}")
+                    log("WARN", f"[{self.name}] stream audit · HTTP {status_code or 0} · {phase} · "
+                                f"frames {frame_count} · body: {error_body[:300]}")
 
                 if status_code == 200 and stream_error and not finish_seen:
                     raise BridgeHTTPError(
@@ -5063,11 +5287,11 @@ class KeeperSession:
                     # output before it can report success. Interrupted/error drains remain
                     # failures and continue through the salvage path below.
                     if stop_reason == "eof" and not stream_error:
-                        log("WARN", f"[{self.name}] stream audit Â· HTTP 200 clean EOF without explicit provider finish Â· "
-                                    f"frames {frame_count} Â· accepting transport terminal; semantic-output guard remains active")
+                        log("WARN", f"[{self.name}] stream audit · HTTP 200 clean EOF without explicit provider finish · "
+                                    f"frames {frame_count} · accepting transport terminal; semantic-output guard remains active")
                     else:
-                        log("WARN", f"[{self.name}] stream audit Â· HTTP 200 ended without provider finish Â· "
-                                    f"frames {frame_count} Â· stop {stop_reason}")
+                        log("WARN", f"[{self.name}] stream audit · HTTP 200 ended without provider finish · "
+                                    f"frames {frame_count} · stop {stop_reason}")
                         raise BridgeHTTPError(
                             200, "Arena response ended without a provider finish event",
                             frame_count=frame_count, response_started=True,
@@ -5143,7 +5367,7 @@ class KeeperSession:
                 _proxy_url = await apick_live_proxy(_jar_for_proxy, purpose="keeper",
                                                      exclude=self._tried_proxies)
                 if not _proxy_url and get_proxy_pool():
-                    self._set_step("No proxy tunnels â€” browser starting on DIRECT egress (IP exposed)")
+                    self._set_step("No proxy tunnels — browser starting on DIRECT egress (IP exposed)")
                 _pw_proxy = playwright_proxy_from_url(_proxy_url) if _proxy_url else None
                 self._used_proxy = _proxy_url or ""
                 if _pw_proxy:
@@ -5152,7 +5376,7 @@ class KeeperSession:
 
                 if has_ext:
                     # Extensions require a persistent context AND cannot load under
-                    # classic (old) headless mode â€” Chromium disables the extension
+                    # classic (old) headless mode — Chromium disables the extension
                     # system there. Chrome's "new" headless mode (--headless=new)
                     # *does* support extensions, so when a headless keeper is wanted
                     # we stay technically non-headless to Playwright (headless=False,
@@ -5169,13 +5393,19 @@ class KeeperSession:
                     ]
                     if self.headless:
                         ext_args.append("--headless=new")
+                    else:
+                        # Headed keeper: no Chromium headless switch is injected.
+                        pass
                     _pc_kw = dict(
                         user_data_dir=profile_dir,
                         headless=False,  # always False here: headlessness is via --headless=new above
                         ignore_default_args=["--disable-extensions"],
                         args=ext_args,
                         viewport={"width": 1920, "height": 1080},
-                        user_agent=(OAI_SEARCHBOT_UA if USE_OAI_SEARCHBOT else (self.user_agent or KEEPER_UA)),  # persona-bound; cf_clearance is UA+IP-bound
+                        user_agent=self.user_agent or KEEPER_UA,
+                        java_script_enabled=True,
+                        service_workers="allow" if BROWSER_SERVICE_WORKERS else "block",
+                        accept_downloads=True,
                     )
                     if _pw_proxy:
                         _pc_kw["proxy"] = _pw_proxy
@@ -5192,14 +5422,37 @@ class KeeperSession:
                     channels_to_try = ["chromium", None, "chrome", "msedge"]
                     for channel in channels_to_try:
                         try:
-                            launch_kw = {"headless": self.headless, "args": common_args}
-                            if channel:
-                                launch_kw["channel"] = channel
-                            if _pw_proxy:
-                                launch_kw["proxy"] = _pw_proxy
-                            self.browser = await self.playwright.chromium.launch(**launch_kw)
-                            launched = True
-                            self._set_step(f"Stealth engine started ({channel or 'bundled chromium'})")
+                            if BROWSER_PERSISTENT_CONTEXT:
+                                launch_kw = {
+                                    "user_data_dir": profile_dir,
+                                    "headless": self.headless,
+                                    "args": common_args,
+                                    "viewport": {"width": 1920, "height": 1080},
+                                    "user_agent": self.user_agent or KEEPER_UA,
+                                    "java_script_enabled": True,
+                                    "service_workers": "allow" if BROWSER_SERVICE_WORKERS else "block",
+                                    "accept_downloads": True,
+                                }
+                                if channel:
+                                    launch_kw["channel"] = channel
+                                if _pw_proxy:
+                                    launch_kw["proxy"] = _pw_proxy
+                                self.context = await self.playwright.chromium.launch_persistent_context(**launch_kw)
+                                self.browser = None
+                                self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+                                launched = True
+                                self._set_step(
+                                    f"Persistent browser context started ({channel or 'bundled chromium'})"
+                                )
+                            else:
+                                launch_kw = {"headless": self.headless, "args": common_args}
+                                if channel:
+                                    launch_kw["channel"] = channel
+                                if _pw_proxy:
+                                    launch_kw["proxy"] = _pw_proxy
+                                self.browser = await self.playwright.chromium.launch(**launch_kw)
+                                launched = True
+                                self._set_step(f"Browser engine started ({channel or 'bundled chromium'})")
                             break
                         except Exception:
                             continue
@@ -5243,13 +5496,19 @@ class KeeperSession:
                         log("ERROR", f"[{self.name}] {self.error}")
                         return False
 
-                    self.context = await self.browser.new_context(
-                        viewport={"width": 1920, "height": 1080}, screen={"width": 1920, "height": 1080},
-                        user_agent=(OAI_SEARCHBOT_UA if USE_OAI_SEARCHBOT else (self.user_agent or KEEPER_UA)),  # persona-bound; cf_clearance is UA+IP-bound
-                        storage_state=os.path.join(profile_dir, "state.json") if os.path.exists(os.path.join(profile_dir, "state.json")) else None,
-                    )
-                self.page = await self.context.new_page()
-                await self.page.add_init_script(stealth_init_js(self.persona))
+                    if self.context is None:
+                        self.context = await self.browser.new_context(
+                            viewport={"width": 1920, "height": 1080},
+                            screen={"width": 1920, "height": 1080},
+                            user_agent=self.user_agent or KEEPER_UA,
+                            storage_state=os.path.join(profile_dir, "state.json")
+                            if os.path.exists(os.path.join(profile_dir, "state.json")) else None,
+                            java_script_enabled=True,
+                            service_workers="allow" if BROWSER_SERVICE_WORKERS else "block",
+                            accept_downloads=True,
+                        )
+                if self.page is None or self.page.is_closed():
+                    self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
             elif AsyncCamoufox is not None:
                 cm = AsyncCamoufox(headless=self.headless, humanize=False)
                 self.browser = await cm.__aenter__()
@@ -5291,6 +5550,7 @@ class KeeperSession:
             if await self._verify_auth_state(self.page):
                 self.last_public_auth_check = time.time()
                 await self._harvest_cookies()
+                await self._persist_browser_state()
                 if not await self._activate_local_mirror():
                     self.status = "degraded"
                     log("WARN", f"[{self.name}] Public session valid but local cookie injection failed")
@@ -5298,7 +5558,7 @@ class KeeperSession:
                     self.ready_at = time.monotonic() + KEEPER_WARMUP_SEC
                     self.status = "running"
             else:
-                log("WARN", f"[{self.name}] Initial health check negative â€” triggering relogin")
+                log("WARN", f"[{self.name}] Initial health check negative — triggering relogin")
                 await self.relogin()
 
             if self.status != "running":
@@ -5314,8 +5574,8 @@ class KeeperSession:
             _up = txt.upper()
             _retryable = any(k in _up for k in ("TUNNEL", "PROXY", "TIMEOUT", "ERR_", "NET::", "CONNECTION"))
             used = getattr(self, "_used_proxy", "") or ""
-            # A browser CAPABILITY error ("does not support socks5 proxy authâ€¦")
-            # means our launch shape was wrong, not that the exit is dead â€”
+            # A browser CAPABILITY error ("does not support socks5 proxy auth…")
+            # means our launch shape was wrong, not that the exit is dead —
             # exiling on it once ate an entire authenticated pool in 9 seconds.
             _cap_err = "does not support socks5 proxy authentication" in txt.lower()
             _local_route_err = bool(LOCAL_UPSTREAM and
@@ -5328,7 +5588,7 @@ class KeeperSession:
                     self._tried_proxies.add(used)
                 if _cap_err:
                     _probe_fail_reason[used] = "keeper shim bypassed: browser capability error (proxy NOT exiled)"
-                    log("WARN", f"[{self.name}] {used.split('@')[-1]} kept in pool â€” Chromium capability error, not a dead proxy")
+                    log("WARN", f"[{self.name}] {used.split('@')[-1]} kept in pool — Chromium capability error, not a dead proxy")
                 elif not _local_route_err:
                     # ERR_NETWORK_CHANGED is a Chromium/network-stack transition,
                     # not proof that the shared upstream proxy is dead. Exiling a
@@ -5360,7 +5620,7 @@ class KeeperSession:
                         strike_proxy(used, f"keeper transient browser network failure: {txt[:90]}")
                         _probe_fail_reason[used] = "transient keeper network change; exit retained pending strike threshold"
                         log("WARN", f"[{self.name}] transient network change on shared exit "
-                                    f"{used.split('@')[-1]} â€” strike recorded, proxy retained")
+                                    f"{used.split('@')[-1]} — strike recorded, proxy retained")
                     elif _hard_proxy:
                         quarantine_proxy(used, f"keeper hard proxy/tunnel failure: {txt[:90]}")
                     else:
@@ -5368,13 +5628,13 @@ class KeeperSession:
                         # evidence to globally exile a shared exit. Record a strike.
                         strike_proxy(used, f"keeper startup failure: {txt[:90]}")
                         log("WARN", f"[{self.name}] ambiguous keeper startup failure on "
-                                    f"{used.split('@')[-1]} â€” strike recorded, proxy retained")
+                                    f"{used.split('@')[-1]} — strike recorded, proxy retained")
             pool = get_proxy_pool() or []
             left = [c for c in pool if c not in self._tried_proxies]
             if _retryable and left:
-                log("WARN", f"[{self.name}] start failed via {used.split('@')[-1]} ({txt[:110]}) â€” "
+                log("WARN", f"[{self.name}] start failed via {used.split('@')[-1]} ({txt[:110]}) — "
                             f"auto-retrying on next live proxy ({len(left)} left)")
-                self._set_step(f"Proxy {used.split('@')[-1]} failed â€” trying next of {len(left)}â€¦")
+                self._set_step(f"Proxy {used.split('@')[-1]} failed — trying next of {len(left)}…")
                 self.status = "starting"
                 try:
                     await self.stop()
@@ -5384,9 +5644,9 @@ class KeeperSession:
                 return await self.start()
             if _retryable and pool and not getattr(self, "_direct_tried", False):
                 self._direct_tried = True
-                log("WARN", f"[{self.name}] all {len(self._tried_proxies)} proxies failed to tunnel â€” "
+                log("WARN", f"[{self.name}] all {len(self._tried_proxies)} proxies failed to tunnel — "
                             f"one final attempt on DIRECT egress")
-                self._set_step("Every proxy failed â€” one direct attempt (IP exposed)â€¦")
+                self._set_step("Every proxy failed — one direct attempt (IP exposed)…")
                 self.status = "starting"
                 try:
                     await self.stop()
@@ -5461,29 +5721,29 @@ class KeeperSession:
                     except Exception as e:
                         self._nav_fail_count += 1
                         if self._nav_fail_count >= 3:
-                            # Not just a one-off blip anymore â€” the page is
+                            # Not just a one-off blip anymore — the page is
                             # genuinely stuck (e.g. wedged on a Cloudflare
                             # check or a dead navigation). A single restart
                             # recovers this; tolerating it forever would leave
                             # the browser silently broken (grecaptcha never
                             # loads, chat requests fail with missing token).
-                            log("WARN", f"[{self.name}] Keep-alive navigation failed {self._nav_fail_count}x in a row ({type(e).__name__}: {e}) â€” restarting browser")
+                            log("WARN", f"[{self.name}] Keep-alive navigation failed {self._nav_fail_count}x in a row ({type(e).__name__}: {e}) — restarting browser")
                             self._nav_fail_count = 0
                             await self.restart()
                             continue
                         else:
-                            log("WARN", f"[{self.name}] Keep-alive navigation failed ({type(e).__name__}: {e}) â€” will retry next cycle ({self._nav_fail_count}/3)")
+                            log("WARN", f"[{self.name}] Keep-alive navigation failed ({type(e).__name__}: {e}) — will retry next cycle ({self._nav_fail_count}/3)")
                 if time.time() - self.last_health_ok > KEEPER_HEALTH_INTERVAL:
                     if not await self.check_health():
                         if time.time() >= self.next_retry:
-                            log("WARN", f"[{self.name}] Session disconnected â€” attempting relogin")
+                            log("WARN", f"[{self.name}] Session disconnected — attempting relogin")
                             await self.relogin()
                 await asyncio.sleep(random.uniform(KEEPER_ACTIVITY_MIN, KEEPER_ACTIVITY_MAX))
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
-                log("ERROR", f"[{self.name}] Loop exception: {self.error} â€” restarting")
+                log("ERROR", f"[{self.name}] Loop exception: {self.error} — restarting")
                 try:
                     await self.restart()
                 except Exception:
@@ -5580,19 +5840,19 @@ class SessionKeeper:
 keeper = SessionKeeper()
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ module: pool.py â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────────── module: pool.py ──────────────────────────────
 
 # ============================================================
-# v2 POOL â€” proxy policy layer (rewritten).
+# v2 POOL — proxy policy layer (rewritten).
 # Principles (each earned in production, preserved here):
-#  â€¢ CONNECT-level liveness is not truth: probes go all the way to ARENA.
-#  â€¢ Destination weather â‰  death: arena-blocked exits are FLAGGED (~3h,
-#    self-expiring, cleared early by a delivered 200) â€” never exiled.
-#  â€¢ Tunnel-dead lines get STRIKES (timeouts vary), auth/conn-refusal die
+#  • CONNECT-level liveness is not truth: probes go all the way to ARENA.
+#  • Destination weather ≠ death: arena-blocked exits are FLAGGED (~3h,
+#    self-expiring, cleared early by a delivered 200) — never exiled.
+#  • Tunnel-dead lines get STRIKES (timeouts vary), auth/conn-refusal die
 #    immediately with a human reason recorded (never a bare "dead").
-#  â€¢ Dead lines are REMOVED from proxies.txt into proxies.dead.txt (not TTL).
-#  â€¢ A 200 from real traffic is the best probe there is â€” it heals caches.
-#  â€¢ Fairness: one shared rotation cursor; nobody hogs the only live exit.
+#  • Dead lines are REMOVED from proxies.txt into proxies.dead.txt (not TTL).
+#  • A 200 from real traffic is the best probe there is — it heals caches.
+#  • Fairness: one shared rotation cursor; nobody hogs the only live exit.
 # ============================================================
 import concurrent.futures as _cf
 import os, time
@@ -5650,7 +5910,7 @@ def quarantine_proxy(proxy_url: str, reason: str = "") -> None:
                 PROXY_RECOVERY_INTERVAL_SEC * (2 ** min(failures, 4)))
     _proxy_recovery_due[key] = time.time() + delay
     _proxy_probe_cache[norm] = (False, time.time() + min(delay, 30.0))
-    log("WARN", f"proxy circuit opened: {key} â€” retained in pool Â· recovery probe in {delay:.0f}s Â· "
+    log("WARN", f"proxy circuit opened: {key} — retained in pool · recovery probe in {delay:.0f}s · "
                 f"{_proxy_quarantine_reason[key]}")
 
 
@@ -5752,7 +6012,7 @@ def _recover_proxy_once(proxy_url: str) -> bool:
         _proxy_recovery_failures.pop(key, None)
         _proxy_quarantine_reason.pop(key, None)
         _flagged_exits.pop(key, None)
-        log("OK", f"proxy recovered automatically: {key} Â· Arena probe {max(int(ms or 0), 1)}ms Â· re-admitted")
+        log("OK", f"proxy recovered automatically: {key} · Arena probe {max(int(ms or 0), 1)}ms · re-admitted")
         return True
 
     failures = _proxy_recovery_failures.get(key, 0) + 1
@@ -5762,15 +6022,15 @@ def _recover_proxy_once(proxy_url: str) -> bool:
     _proxy_recovery_due[key] = now + delay
     _proxy_probe_cache[norm] = (False, now + min(delay, 30.0))
     why = _probe_fail_reason.get(norm, "Arena probe failed")
-    log("WARN", f"proxy recovery pending: {key} Â· attempt {failures} failed Â· "
-                f"next probe in {delay:.0f}s Â· {redact(why)[:100]}")
+    log("WARN", f"proxy recovery pending: {key} · attempt {failures} failed · "
+                f"next probe in {delay:.0f}s · {redact(why)[:100]}")
     return False
 
 
 async def proxy_recovery_loop() -> None:
     """Continuously heal circuit-open proxies. Never deletes pool entries."""
-    log("INFO", f"Proxy auto-recovery Â· interval {PROXY_RECOVERY_INTERVAL_SEC:.0f}s Â· "
-                f"max backoff {PROXY_RECOVERY_MAX_BACKOFF_SEC:.0f}s Â· non-destructive")
+    log("INFO", f"Proxy auto-recovery · interval {PROXY_RECOVERY_INTERVAL_SEC:.0f}s · "
+                f"max backoff {PROXY_RECOVERY_MAX_BACKOFF_SEC:.0f}s · non-destructive")
     while True:
         try:
             now = time.time()
@@ -5941,9 +6201,9 @@ def _sweep_all_impl() -> dict:
                 _proxy_quarantine_reason.pop(key, None)
                 if key in _QUARANTINED_KEYS:
                     _QUARANTINED_KEYS.discard(key)
-                    log("OK", f"proxy sweep recovered circuit-open exit: {key} Â· re-admitted")
+                    log("OK", f"proxy sweep recovered circuit-open exit: {key} · re-admitted")
                 if key in _flagged_exits:
-                    _flagged_exits.pop(key, None)   # alive on arena again â€” un-flag
+                    _flagged_exits.pop(key, None)   # alive on arena again — un-flag
             else:
                 why = _probe_fail_reason.get(norm, "")
                 _proxy_probe_cache[norm] = (False, time.time() + 300)
@@ -5977,7 +6237,7 @@ def _parse_proxy_line_loose(raw: str) -> Optional[str]:
     line = str(raw).strip().lstrip("\ufeff").strip().strip('"\'')
     if not line or line.startswith("#") or line.startswith("//"):
         return None
-    line = re.sub(r"^\s*(?:[-*â€¢]\s+|\d+[.)]\s+)", "", line).strip()
+    line = re.sub(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)", "", line).strip()
     n = _normalize_proxy(line)
     if n:
         return n
@@ -6115,7 +6375,7 @@ def prune_bad() -> int:
             if k not in _QUARANTINED_KEYS:
                 quarantine_proxy(norm, "marked bad by proxy manager")
             affected += 1
-    log("OK", f"proxy prune 'bad': {affected} circuit-open Â· 0 deleted Â· auto-recovery active")
+    log("OK", f"proxy prune 'bad': {affected} circuit-open · 0 deleted · auto-recovery active")
     return affected
 
 
@@ -6151,7 +6411,7 @@ def delete_all_proxies() -> dict:
     _proxy_strikes.clear()
     _flagged_exits.clear()
     log("WARN", f"proxy manager: deleted all {len(lines)} active proxies"
-        + (f" Â· backup {os.path.basename(backup)}" if backup else ""))
+        + (f" · backup {os.path.basename(backup)}" if backup else ""))
     return {"removed": len(lines), "backup": os.path.basename(backup) if backup else None}
 
 
@@ -6227,7 +6487,7 @@ def snapshot_rows() -> List[dict]:
             if _fresh:
                 verdict = "alive" if h.get("ok") else "unreachable"
                 if not h.get("ok"):
-                    why = f"failed {h.get('source', 'last')} sweep Â· strikes {h.get('fails', 0)}"
+                    why = f"failed {h.get('source', 'last')} sweep · strikes {h.get('fails', 0)}"
         rows.append({"key": k, "display": k, "scheme": (urlparse(norm).scheme if "://" in norm else "?"),
                      "verdict": verdict, "why": redact(why)[:140],
                      "latency": _proxy_latency.get(norm) or _proxy_latency.get(k) or (h.get("latency") if h.get("ok") else None),
@@ -6237,18 +6497,18 @@ def snapshot_rows() -> List[dict]:
     return rows
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ module: tokens.py â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────────── module: tokens.py ──────────────────────────────
 
 # ============================================================
-# v2 TOKENS â€” reCAPTCHA protocol layer.
+# v2 TOKENS — reCAPTCHA protocol layer.
 # The wire truth (mined from arena's live bundle 2026-09-03):
-#   â€¢ body keys are recaptchaV3Token / recaptchaV2Token (NOT "recaptchaToken")
-#   â€¢ V3: grecaptcha.enterprise.ready(() => execute(SITEKEY, {action})) â€”
+#   • body keys are recaptchaV3Token / recaptchaV2Token (NOT "recaptchaToken")
+#   • V3: grecaptcha.enterprise.ready(() => execute(SITEKEY, {action})) —
 #     POSITIONAL call shape; object form throws 'No reCAPTCHA clients exist.'
-#   â€¢ on recaptcha_validation_failed the SITE escalates to a V2 checkbox
+#   • on recaptcha_validation_failed the SITE escalates to a V2 checkbox
 #     challenge; the client then retries with recaptchaV2Token and V3 nulled.
 # Minting happens ONLY on a keeper page (same origin + same exit IP as the
-# eventual request â€” Google correlates IP and UA between mint and verify).
+# eventual request — Google correlates IP and UA between mint and verify).
 # ============================================================
 import asyncio, time  # noqa
 
@@ -6257,7 +6517,7 @@ RC_MINT_JS = r"""async (OPTS) => {
                 const ALLOW_FALLBACK = !!OPTS?.allowConfiguredFallback;
                 const ACTION = String(OPTS?.action || 'chat_submit');
                 const validKey = (v) => typeof v === 'string' && /^6[0-9A-Za-z_-]{30,}$/.test(v);
-                const hint = (v) => validKey(v) ? `${v.slice(0, 8)}â€¦${v.slice(-4)}` : 'none';
+                const hint = (v) => validKey(v) ? `${v.slice(0, 8)}…${v.slice(-4)}` : 'none';
                 const g = window.grecaptcha;
                 if (!g) return {err: 'no grecaptcha object on keeper page (arena widget script not on this URL?)'};
                 // Never read a token from response fields/getResponse here.
@@ -6333,7 +6593,7 @@ RC_MINT_JS = r"""async (OPTS) => {
                     // form throws 'No reCAPTCHA clients exist.' on this widget build.
                     const tok = await ex(KEY, {action: ACTION});
                     if (tok && tok.length > 20) return {token: tok, source, keyHint: hint(KEY), action: ACTION};
-                    return {err: 'enterprise.execute resolved empty (Google scored this session low â€” image challenge may follow)', source, keyHint: hint(KEY), action: ACTION};
+                    return {err: 'enterprise.execute resolved empty (Google scored this session low — image challenge may follow)', source, keyHint: hint(KEY), action: ACTION};
                 } catch (e1) {
                     // The object-form enterprise call is known-bad on the current
                     // live widget and only adds another full timeout. Skip it.
@@ -6515,9 +6775,9 @@ async def _solve_with_verification_adapter(challenge_type: str, session,
 
         proxy_kind = ("local-route" if proxy and _is_loopback_proxy(proxy)
                       else "upstream" if proxy else "direct")
-        log("INFO", f"verification adapter request Â· type {challenge_type}"
-            f" Â· origin {urlparse(page_url).hostname or 'unknown'}"
-            f" Â· proxy {proxy_kind} Â· cookies {len(cookie_map)}")
+        log("INFO", f"verification adapter request · type {challenge_type}"
+            f" · origin {urlparse(page_url).hostname or 'unknown'}"
+            f" · proxy {proxy_kind} · cookies {len(cookie_map)}")
 
         solve_result = solver.solve(
             challenge_type=challenge_type,
@@ -6536,9 +6796,9 @@ async def _solve_with_verification_adapter(challenge_type: str, session,
         if _verification_token_ok(token):
             _verification_adapter_bad_shapes = 0
             log("OK", "verification adapter completed"
-                + f" Â· provider {result.get('provider', 'wrapper')}"
-                + f" Â· task {str(result.get('task_id') or '-')[:12]}"
-                + f" Â· {int(result.get('elapsed_ms') or 0)}ms")
+                + f" · provider {result.get('provider', 'wrapper')}"
+                + f" · task {str(result.get('task_id') or '-')[:12]}"
+                + f" · {int(result.get('elapsed_ms') or 0)}ms")
             return token
         if isinstance(token, str):
             _verification_adapter_bad_shapes += 1
@@ -6607,7 +6867,7 @@ async def mint_v3(jar_id=None):
         now = time.time()
         if now - _mint_last_no_session > 60:
             _mint_last_no_session = now
-            log("WARN", "recaptcha token: no live keeper session â€” tokens are minted from a browser "
+            log("WARN", "recaptcha token: no live keeper session — tokens are minted from a browser "
                         "on the SAME exit; enable keepers (Pool page) or open Live Browser")
         return None
     try:
@@ -6666,8 +6926,8 @@ async def mint_v3(jar_id=None):
                     v3_token = res
                 elif isinstance(res, dict) and _verification_token_ok(res.get("token")):
                     log("OK", "recaptcha v3 token minted via " + str(res.get("source", "unknown"))
-                        + " Â· key " + str(res.get("keyHint", "unknown"))
-                        + " Â· action " + str(res.get("action", RECAPTCHA_ACTION)))
+                        + " · key " + str(res.get("keyHint", "unknown"))
+                        + " · action " + str(res.get("action", RECAPTCHA_ACTION)))
                     v3_token = res["token"]
                 else:
                     why = res.get("err") if isinstance(res, dict) else "evaluate returned nothing"
@@ -6698,7 +6958,7 @@ async def mint_v2_escalation(jar_id=None, settle_s: float = 20.0):
     """
     sid, s = _find_session(jar_id)
     if not s:
-        log("WARN", "verification V2 escalation skipped â€” no live keeper session")
+        log("WARN", "verification V2 escalation skipped — no live keeper session")
         return None
 
     try:
@@ -6863,20 +7123,20 @@ async def _mint_v2_escalation_legacy_inner(jar_id=None, settle_s: float = 20.0):
     return None
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ module: arena.py â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────────── module: arena.py ──────────────────────────────
 
 # ============================================================
-# v2 ARENA ENGINE â€” one request pipeline, a real verdict taxonomy, and the
+# v2 ARENA ENGINE — one request pipeline, a real verdict taxonomy, and the
 # token protocol that the LIVE schema demands (recaptchaV3Token /
-# recaptchaV2Token â€” 'recaptchaToken' is not a field this API reads).
+# recaptchaV2Token — 'recaptchaToken' is not a field this API reads).
 #
 # Failure classes are handled by WHOSE FAULT it is:
-#   TUNNEL     exit connected but arena refused CONNECT   â†’ flag exit, rotate, jar untouched
-#   CHALLENGE  cloudflare interstitial                    â†’ one keeper re-clear, then rotate exit
-#   RECAPTCHA  validation failed                          â†’ keep jar HEALTHY; escalate V2; stop clean
-#   RATELIMIT  429                                        â†’ same-jar backoff, soft, never hard-lock
-#   UPSTREAM   5xx/52x                                    â†’ backoff; origin's problem, nobody's fault
-#   SESSION    401/403 auth-only                           â†’ the ONE path allowed to expire a jar
+#   TUNNEL     exit connected but arena refused CONNECT   → flag exit, rotate, jar untouched
+#   CHALLENGE  edge/browser verification                 → isolate keeper; no proxy churn/replay
+#   RECAPTCHA  validation failed                          → keep jar HEALTHY; escalate V2; stop clean
+#   RATELIMIT  429                                        → same-jar backoff, soft, never hard-lock
+#   UPSTREAM   5xx/52x                                    → backoff; origin's problem, nobody's fault
+#   SESSION    401/403 auth-only                           → the ONE path allowed to expire a jar
 # ============================================================
 import asyncio, json, time
 from typing import Optional
@@ -6909,16 +7169,24 @@ def _cookie_header(jar: dict) -> str:
 
 
 def _headers_for(jar: dict, p, json_body: bool) -> dict:
-    h = {"User-Agent": (OAI_SEARCHBOT_UA if USE_OAI_SEARCHBOT else p.ua), "Accept": "application/json, text/plain, */*" if json_body else p.accept,
-         "Accept-Language": p.accept_lang, "Origin": ARENA_BASE,
-         "Referer": f"{ARENA_BASE}/text/direct", "Content-Type": "application/json" if json_body else None,
-         "Cookie": _cookie_header(jar)}
+    h = _merge_header_groups(
+        "arena_fallback_common",
+        user_agent=p.ua,
+        accept=("application/json, text/plain, */*" if json_body else p.accept),
+        accept_language=p.accept_lang,
+        origin=ARENA_BASE,
+        referer=f"{ARENA_BASE}/text/direct",
+        cookie=_cookie_header(jar),
+    )
+    if json_body:
+        h.update(_header_group("arena_fallback_json"))
     if p.family == "chrome":
-        h["sec-ch-ua"] = p.ch_ua
-        h["sec-ch-ua-mobile"] = "?1" if p.mobile else "?0"
-        h["sec-ch-ua-platform"] = f'"{p.platform}"'
-    for k in [k for k, v in h.items() if v is None]:
-        h.pop(k)
+        h.update(_header_group(
+            "arena_fallback_chrome",
+            sec_ch_ua=p.ch_ua,
+            sec_ch_ua_mobile="?1" if p.mobile else "?0",
+            sec_ch_ua_platform=f'"{p.platform}"',
+        ))
     return h
 
 
@@ -7382,7 +7650,7 @@ async def _wait_if_model_rate_limited(model_name: str):
     if remaining <= 0:
         return
     if remaining <= UPSTREAM_429_INLINE_WAIT_MAX_SEC:
-        log("INFO", f"Model throttle wait Â· {model_name} Â· sleeping {remaining:.1f}s before dispatch")
+        log("INFO", f"Model throttle wait · {model_name} · sleeping {remaining:.1f}s before dispatch")
         await asyncio.sleep(remaining + 0.05)
         return
     retry_after = max(1, int(remaining + 0.999))
@@ -7422,7 +7690,7 @@ async def _pace_api_request(tenant_id: str) -> float:
                 headers={"Retry-After": str(max(1, int(wait)))},
             )
         if wait:
-            log("INFO", f"API admission pacing Â· tenant {key[:10]}â€¦ Â· delaying {wait:.2f}s")
+            log("INFO", f"API admission pacing · tenant {key[:10]}… · delaying {wait:.2f}s")
             await asyncio.sleep(wait)
         _tenant_pace_next[key] = time.monotonic() + API_PACE_INTERVAL_SEC
         return wait
@@ -7468,7 +7736,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
             due = _conversation_next_start.get(str(chat_id), now)
             if due > now:
                 wait = due - now
-                log("INFO", f"conversation pacing Â· {str(chat_id)[:10]}â€¦ Â· delaying {wait:.2f}s")
+                log("INFO", f"conversation pacing · {str(chat_id)[:10]}… · delaying {wait:.2f}s")
                 await asyncio.sleep(wait)
             _conversation_next_start[str(chat_id)] = time.monotonic() + CONVERSATION_MIN_GAP_SEC
 
@@ -7497,8 +7765,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         migrated_thread = True
                         throttle_rehome_active = True
                         _bump_thread_rehome("activated")
-                        log("WARN", f"Thread rehome activated Â· rebuilding {str(chat_id)[:10]}â€¦ "
-                                    f"as a fresh Arena chat Â· same model {model_name} Â· same account")
+                        log("WARN", f"Thread rehome activated · rebuilding {str(chat_id)[:10]}… "
+                                    f"as a fresh Arena chat · same model {model_name} · same account")
                     else:
                         _bump_thread_rehome("missing_context")
 
@@ -7538,7 +7806,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     if throttle_rehome_active and saw_done:
                         clear_throttle_thread_rehome(chat_id, model_name)
                         _bump_thread_rehome("completed")
-                        log("OK", f"Thread rehome completed Â· {str(chat_id)[:10]}â€¦ Â· "
+                        log("OK", f"Thread rehome completed · {str(chat_id)[:10]}… · "
                                   f"same model {model_name}")
                     return
 
@@ -7560,8 +7828,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     next_hint = failed_id or next_hint
 
                     log("WARN", f"[{failed_name}] confirmed-absence retry "
-                                f"{undelivered_envelope_retries}/{UNDELIVERED_ENVELOPE_RETRY_MAX} Â· "
-                                f"reusing exact message IDs Â· {reason}")
+                                f"{undelivered_envelope_retries}/{UNDELIVERED_ENVELOPE_RETRY_MAX} · "
+                                f"reusing exact message IDs · {reason}")
                     # The same keeper may still be coming back from the HTTP-0
                     # repair that triggered this retry. Nudge the readiness loop;
                     # _run_turn_impl will wait for verification admission before
@@ -7596,8 +7864,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     same_account_429_retries += 1
                     rehome_thread = bool(retry_info.get("rehome_thread"))
                     log("WARN", f"[{failed_name}] same-account throttle recovery "
-                                f"{same_account_429_retries}/{UPSTREAM_429_SAME_ACCOUNT_RETRIES} Â· "
-                                f"waiting {delay:.1f}s Â· {'new thread after cooldown Â· ' if rehome_thread else ''}{reason}")
+                                f"{same_account_429_retries}/{UPSTREAM_429_SAME_ACCOUNT_RETRIES} · "
+                                f"waiting {delay:.1f}s · {'new thread after cooldown · ' if rehome_thread else ''}{reason}")
                     if delay > 0:
                         await asyncio.sleep(delay + 0.05)
 
@@ -7612,8 +7880,8 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                             throttle_rehome_active = True
                             clear_throttle_thread_rehome(chat_id, model_name)
                             _bump_thread_rehome("inline")
-                            log("WARN", f"[{failed_name}] throttle cooldown elapsed Â· "
-                                        f"starting fresh Arena chat with preserved context Â· same model {model_name}")
+                            log("WARN", f"[{failed_name}] throttle cooldown elapsed · "
+                                        f"starting fresh Arena chat with preserved context · same model {model_name}")
                         else:
                             _bump_thread_rehome("missing_context")
                     continue
@@ -7629,7 +7897,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
 
                 if migrate_thread:
                     if not handoff_prompt:
-                        log("WARN", f"Thread handoff unavailable Â· no client transcript Â· {failed_name}: {reason}")
+                        log("WARN", f"Thread handoff unavailable · no client transcript · {failed_name}: {reason}")
                         yield ("error", "503: This Arena thread's account failed, and the client did not provide "
                                         "enough conversation history to rebuild it safely on another account.")
                         return
@@ -7637,19 +7905,19 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                     active_prompt = handoff_prompt
                     active_system_prompt = system_prompt
                     migrated_thread = True
-                    log("WARN", f"Thread handoff armed Â· rebuilding {str(chat_id)[:10]}â€¦ as a new Arena conversation "
-                                f"on another healthy account Â· {reason}")
+                    log("WARN", f"Thread handoff armed · rebuilding {str(chat_id)[:10]}… as a new Arena conversation "
+                                f"on another healthy account · {reason}")
 
                 # Internal failover events are only valid before user-visible
                 # stream output. Be defensive if a future code path violates it.
                 if emitted_user_output:
-                    log("ERROR", f"Account failover suppressed after output began Â· {failed_name} Â· {reason}")
+                    log("ERROR", f"Account failover suppressed after output began · {failed_name} · {reason}")
                     yield ("error", "502: Account failover was suppressed because the upstream response had already started.")
                     return
 
                 if failovers >= ACCOUNT_FAILOVER_MAX:
                     _bump_account_failover("exhausted")
-                    log("WARN", f"Account failover exhausted Â· tried {len(excluded)} account(s) Â· last {failed_name}: {reason}")
+                    log("WARN", f"Account failover exhausted · tried {len(excluded)} account(s) · last {failed_name}: {reason}")
                     yield ("error", f"503: No healthy configured account was available after {len(excluded)} attempt(s). "
                                     "Failed keepers are being recovered in the background.")
                     return
@@ -7657,7 +7925,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 nxt = acquire_ready_jar(exclude=excluded)
                 if not nxt:
                     _bump_account_failover("exhausted")
-                    log("WARN", f"Account failover stopped Â· no alternate ready keeper Â· last {failed_name}: {reason}")
+                    log("WARN", f"Account failover stopped · no alternate ready keeper · last {failed_name}: {reason}")
                     yield ("error", "503: The selected account failed and no other verified keeper is ready right now. "
                                     "Recovery is running in the background.")
                     return
@@ -7666,9 +7934,9 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 _bump_account_failover("attempted")
                 _bump_account_failover("successful_handoff")
                 next_hint = nxt.get("id")
-                log("WARN", f"Account failover {failovers}/{ACCOUNT_FAILOVER_MAX} Â· "
-                            f"{failed_name} â†’ {nxt.get('name')} Â· "
-                            f"{'thread handoff Â· ' if migrate_thread else ''}{reason}")
+                log("WARN", f"Account failover {failovers}/{ACCOUNT_FAILOVER_MAX} · "
+                            f"{failed_name} → {nxt.get('name')} · "
+                            f"{'thread handoff · ' if migrate_thread else ''}{reason}")
 
 
 
@@ -8145,8 +8413,8 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                     if not history_match_logged:
                         history_match_logged = True
                         _bump_arena_ui_recovery("history_api_match")
-                        log("INFO", f"[{name}] Arena history recovery Â· matching chat appeared Â· "
-                                    f"score {probe.get('score')} Â· candidates {probe.get('candidateCount')}")
+                        log("INFO", f"[{name}] Arena history recovery · matching chat appeared · "
+                                    f"score {probe.get('score')} · candidates {probe.get('candidateCount')}")
                     route = str(probe.get("route") or "")
                     if route:
                         best_route = route
@@ -8167,8 +8435,8 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                         if (not partial_text or confidence >= 0.90) and (explicit_complete or stable_complete):
                             _bump_arena_ui_recovery("recovered")
                             _bump_arena_ui_recovery("history_api_recovered")
-                            log("OK", f"[{name}] Arena history API recovery Â· recovered {len(current)} chars Â· "
-                                      f"stable polls {hist_stable_polls} Â· explicit complete {explicit_complete}")
+                            log("OK", f"[{name}] Arena history API recovery · recovered {len(current)} chars · "
+                                      f"stable polls {hist_stable_polls} · explicit complete {explicit_complete}")
                             return {
                                 "ok": True,
                                 "text": current,
@@ -8374,8 +8642,8 @@ async def _arena_ui_stream_recover(session, *, arena_id: str, model_message_id: 
                         if stale_generating_complete:
                             log("WARN", f"[{name}] Arena UI generating marker remained set, but exact assistant text "
                                         f"was unchanged for {stable_for:.1f}s; accepting stabilized recovery")
-                        log("OK", f"[{name}] Arena UI stream recovery Â· recovered {len(current)} chars Â· "
-                                  f"stable {stable_for:.1f}s Â· {best_url}")
+                        log("OK", f"[{name}] Arena UI stream recovery · recovered {len(current)} chars · "
+                                  f"stable {stable_for:.1f}s · {best_url}")
                         return {
                             "ok": True,
                             "text": current,
@@ -8421,7 +8689,7 @@ async def _attempt_ui_stream_salvage(*, session, chat_id: str, model_name: str,
     if not ARENA_UI_STREAM_RECOVERY:
         return {"ok": False, "reason": "disabled"}
 
-    log("WARN", f"[{jar.get('name')}] stream salvage Â· stage {stage} Â· "
+    log("WARN", f"[{jar.get('name')}] stream salvage · stage {stage} · "
                 f"history/UI timeout {float(timeout_sec if timeout_sec is not None else ARENA_UI_RECOVERY_TIMEOUT_SEC):.1f}s")
     result = await _arena_ui_stream_recover(
         session,
@@ -8452,11 +8720,11 @@ async def _attempt_ui_stream_salvage(*, session, chat_id: str, model_name: str,
         if result.get("url"):
             save_conversation_ui_url(chat_id, model_name, result["url"])
         if result.get("trace_found") and not result.get("ok"):
-            log("INFO", f"[{jar.get('name')}] Arena delivery confirmed; persisted in-progress evaluation binding {str(arena_id)[:12]}â€¦")
+            log("INFO", f"[{jar.get('name')}] Arena delivery confirmed; persisted in-progress evaluation binding {str(arena_id)[:12]}…")
     if not result.get("ok"):
-        log("WARN", f"[{jar.get('name')}] Arena stream salvage failed Â· "
-                    f"{result.get('reason') or 'unknown'} Â· "
-                    f"best chars {len(str(result.get('text') or ''))} Â· "
+        log("WARN", f"[{jar.get('name')}] Arena stream salvage failed · "
+                    f"{result.get('reason') or 'unknown'} · "
+                    f"best chars {len(str(result.get('text') or ''))} · "
                     f"url {str(result.get('url') or '')[:180]}")
 
     return result
@@ -8492,7 +8760,7 @@ async def _recover_keeper_before_salvage(sid: str, *, reason: str,
             _bump_arena_ui_recovery("recovery_wait_timeout")
             log("WARN", f"[{sid}] salvage recovery wait timed out after {wait_for:.1f}s")
         except Exception as exc:
-            log("WARN", f"[{sid}] salvage recovery task failed Â· "
+            log("WARN", f"[{sid}] salvage recovery task failed · "
                         f"{type(exc).__name__}: {redact(str(exc))[:180]}")
 
     session = keeper.sessions.get(sid)
@@ -8504,16 +8772,16 @@ async def _recover_keeper_before_salvage(sid: str, *, reason: str,
     try:
         route_ok, route_status, route_detail = await session.probe_transport(force=True)
     except Exception as exc:
-        log("WARN", f"[{getattr(session, 'name', sid)}] post-restart salvage probe failed Â· "
+        log("WARN", f"[{getattr(session, 'name', sid)}] post-restart salvage probe failed · "
                     f"{type(exc).__name__}: {redact(str(exc))[:160]}")
         return False
 
     if not route_ok:
-        log("WARN", f"[{getattr(session, 'name', sid)}] post-restart salvage route still unhealthy Â· "
+        log("WARN", f"[{getattr(session, 'name', sid)}] post-restart salvage route still unhealthy · "
                     f"{redact(route_detail)[:160]}")
         return False
 
-    log("OK", f"[{getattr(session, 'name', sid)}] salvage browser recovered Â· route HTTP {route_status}")
+    log("OK", f"[{getattr(session, 'name', sid)}] salvage browser recovered · route HTTP {route_status}")
     return True
 
 
@@ -8535,8 +8803,8 @@ async def _ensure_predispatch_transport(jar: dict, *, wait_for_recovery: bool = 
         return True
 
     _bump_transport_guard("probe_fail")
-    log("WARN", f"[{jar.get('name')}] pre-dispatch transport probe failed Â· "
-                f"status {status_code or 0} Â· {redact(detail)[:160]} Â· recovering before POST")
+    log("WARN", f"[{jar.get('name')}] pre-dispatch transport probe failed · "
+                f"status {status_code or 0} · {redact(detail)[:160]} · recovering before POST")
     _quarantine_api_keeper(sid, "pre-dispatch route probe failed", TRANSPORT_FAILURE_QUARANTINE_SEC)
     _schedule_transport_recovery(sid, "pre-dispatch route probe failed")
 
@@ -8553,14 +8821,14 @@ async def _ensure_predispatch_transport(jar: dict, *, wait_for_recovery: bool = 
             ok2, status2, detail2 = await session.probe_transport(force=True)
             if ok2:
                 _bump_transport_guard("recovered_before_post")
-                log("OK", f"[{jar.get('name')}] pre-dispatch transport recovered Â· "
-                          f"HTTP {status2} route probe Â· continuing original request")
+                log("OK", f"[{jar.get('name')}] pre-dispatch transport recovered · "
+                          f"HTTP {status2} route probe · continuing original request")
                 return True
             detail = detail2
         await asyncio.sleep(0.5)
 
     _bump_transport_guard("recovery_timeout")
-    log("WARN", f"[{jar.get('name')}] pre-dispatch transport recovery timed out Â· "
+    log("WARN", f"[{jar.get('name')}] pre-dispatch transport recovery timed out · "
                 f"request was never sent upstream")
     return False
 
@@ -8573,8 +8841,18 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
     One bounded attempt budget over the PROVEN exit pool; jars survive every
     failure class except true session death."""
     if AsyncSession is None:
-        yield ("error", "500: curl_cffi missing in this environment â€” pip install curl_cffi")
+        yield ("error", "500: curl_cffi missing in this environment — pip install curl_cffi")
         return
+
+    _is_agent_tool_turn = (
+        "tool-capable API client" in str(system_prompt or "")
+        or "AVAILABLE TOOLS (JSON):" in str(system_prompt or "")
+    )
+    _first_semantic_timeout = (
+        TOOL_FIRST_ASSISTANT_RESPONSE_SEC
+        if _is_agent_tool_turn else FIRST_ASSISTANT_RESPONSE_SEC
+    )
+
     conv = get_conversation(chat_id) or {}
     mc = conv.get("arena", {}).get(model_name) if conv.get("model") == model_name else None
     max_attempts = REQUEST_MAX_ATTEMPTS
@@ -8601,7 +8879,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
     if not jar and jar_hint and not bound_jar_id:
         jar = acquire_jar(prefer_live=True, exclude=excluded)
     if not jar:
-        yield ("error", "502: No jar with valid cookies/session â€” upload cookies or enable a keeper")
+        yield ("error", "502: No jar with valid cookies/session — upload cookies or enable a keeper")
         return
     tried.add(jar["id"])
 
@@ -8612,6 +8890,17 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
     if bound_jar_id:
         sid = str(jar.get("id") or "")
         quarantine_until = _api_keeper_quarantine_until.get(sid, 0.0)
+        challenge_remaining = _api_keeper_challenge_remaining(sid)
+        if sid and challenge_remaining > 0:
+            log("WARN", f"[{jar.get('name')}] bound conversation blocked by edge challenge hold · "
+                        f"{challenge_remaining:.0f}s remaining · no prompt replay")
+            yield ("retry-account", {
+                "jar_id": jar.get("id"), "jar_name": jar.get("name"),
+                "reason": "bound keeper is temporarily isolated after an edge challenge",
+                "migrate_thread": True,
+            })
+            return
+
         if sid and time.monotonic() < quarantine_until:
             _schedule_transport_recovery(sid, "bound conversation requested during quarantine")
             deadline = time.monotonic() + BOUND_KEEPER_RECOVERY_WAIT_SEC
@@ -8699,9 +8988,9 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             transport_busy = bool(transport_task and not transport_task.done())
             relogin_lock = getattr(session, "_relogin_lock", None) if session else None
             relogin_busy = bool(relogin_lock and relogin_lock.locked())
-            log("WARN", f"[{jar.get('name')}] {wait_reason} withheld before token mint Â· "
-                        f"verification_ready={_api_keeper_verified(sid)} Â· status={state} Â· "
-                        f"transport_recovery={transport_busy} Â· relogin={relogin_busy}")
+            log("WARN", f"[{jar.get('name')}] {wait_reason} withheld before token mint · "
+                        f"verification_ready={_api_keeper_verified(sid)} · status={state} · "
+                        f"transport_recovery={transport_busy} · relogin={relogin_busy}")
             if retry_envelope_ids:
                 yield ("error", "503: The original turn was not replayed because its bound keeper is still "
                                 "recovering verification readiness. Bridgena preserved the exact evaluation/message IDs; "
@@ -8809,26 +9098,26 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             "metadata": {},
         }
         base["userMessage"] = user_message
-        log("INFO", f"[{jar.get('name')}] outbound {'follow-up' if follow_url else 'create'} envelope Â· "
-                    f"content string {len(content)} chars Â· attachments {len(attachments or [])}")
+        log("INFO", f"[{jar.get('name')}] outbound {'follow-up' if follow_url else 'create'} envelope · "
+                    f"content string {len(content)} chars · attachments {len(attachments or [])}")
         if retry_envelope_ids:
-            log("WARN", f"[{jar.get('name')}] outbound envelope is a confirmed-absence retry Â· "
-                        f"reusing id {str(base.get('id'))[:12]}â€¦ Â· "
-                        f"userMessageId {str(base.get('userMessageId'))[:12]}â€¦ Â· "
-                        f"modelMessageId {str(base.get('modelAMessageId'))[:12]}â€¦")
+            log("WARN", f"[{jar.get('name')}] outbound envelope is a confirmed-absence retry · "
+                        f"reusing id {str(base.get('id'))[:12]}… · "
+                        f"userMessageId {str(base.get('userMessageId'))[:12]}… · "
+                        f"modelMessageId {str(base.get('modelAMessageId'))[:12]}…")
 
         if pending_v2_token:
             _attach_v2(base, pending_v2_token)
             tok = pending_v2_token
             pending_v2_token = None
-            log("INFO", f"[{jar.get('name')}] Using harvested V2 escalation token ({len(tok)} chars) â€” skipping V3 minting")
+            log("INFO", f"[{jar.get('name')}] Using harvested V2 escalation token ({len(tok)} chars) — skipping V3 minting")
         else:
             tok = await mint_v3(jar.get("id"))
             if not tok:
                 # The live Arena client does NOT proactively render V2 when
                 # enterprise.execute() fails. V2 is mounted only after an
                 # upstream verification-escalation response.
-                log("WARN", f"[{jar.get('name')}] V3 token unavailable â€” no request sent; "
+                log("WARN", f"[{jar.get('name')}] V3 token unavailable — no request sent; "
                             "V2 escalation is server-triggered and was not launched proactively")
             else:
                 _attach_v3(base, tok)
@@ -8837,7 +9126,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             mint_diag = _get_v3_mint_failure(jar.get("id"))
             mint_stage = mint_diag.get("stage") or "unknown"
             mint_reason = mint_diag.get("reason") or "no detailed mint failure was captured"
-            log("WARN", f"[{jar.get('name')}] V3 mint failed before dispatch Â· stage {mint_stage} Â· {mint_reason}")
+            log("WARN", f"[{jar.get('name')}] V3 mint failed before dispatch · stage {mint_stage} · {mint_reason}")
             yield ("error", "503: Verification token preparation failed before upstream dispatch. "
                             f"stage={mint_stage}; reason={mint_reason}. No Arena request was sent.")
             return
@@ -8873,12 +9162,12 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         if cycled:
             jar = await _live_cookies(jar)
         if proxy:
-            log("INFO", f"[{jar.get('name')}] via {p.key} persona Â· exit {_proxy_hkey(proxy)} Â· "
-                        f"model {str(model_id)[:8]}â€¦ Â· token {'yes' if tok else 'no'}")
+            log("INFO", f"[{jar.get('name')}] via {p.key} persona · exit {_proxy_hkey(proxy)} · "
+                        f"model {str(model_id)[:8]}… · token {'yes' if tok else 'no'}")
         elif LOCAL_UPSTREAM:
-            log("INFO", f"[{jar.get('name')}] local mirror transport Â· outbound egress is owned by {ARENA_BASE}")
+            log("INFO", f"[{jar.get('name')}] local mirror transport · outbound egress is owned by {ARENA_BASE}")
         else:
-            log("WARN", f"[{jar.get('name')}] No live proxy â€” request will use server egress")
+            log("WARN", f"[{jar.get('name')}] No live proxy — request will use server egress")
 
         # Preferred transport: execute the POST inside the already-authenticated
         # keeper origin. This preserves the exact browser cookie jar, TLS/browser
@@ -8895,7 +9184,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                 _stream_norm = _StreamDeltaNormalizer()
                 _decoded_events = 0
                 _unknown_frames = 0
-                _semantic_deadline = _transport_t0 + FIRST_ASSISTANT_RESPONSE_SEC
+                _semantic_deadline = _transport_t0 + _first_semantic_timeout
 
                 async with _browser_transport_guard(browser_session, proxy, jar.get("name") or jar.get("id") or "keeper"):
                     _bridge_iter = browser_session.bridge_fetch(url, base)
@@ -8915,8 +9204,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                 break
                             except asyncio.TimeoutError:
                                 elapsed = time.monotonic() - _transport_t0
-                                log("WARN", f"[{jar.get('name')}] first assistant response SLA missed Â· "
-                                            f"no decodable content/reasoning within {FIRST_ASSISTANT_RESPONSE_SEC:.1f}s Â· "
+                                log("WARN", f"[{jar.get('name')}] first assistant response SLA missed · "
+                                            f"no decodable content/reasoning within {_first_semantic_timeout:.1f}s · "
                                             f"raw frames {_raw_frames_seen}")
                                 _quarantine_api_keeper(
                                     jar.get("id"), "first assistant response timeout",
@@ -8927,13 +9216,13 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                 )
                                 yield ("error",
                                        f"504: Arena did not begin a decodable assistant response within "
-                                       f"{FIRST_ASSISTANT_RESPONSE_SEC:.0f}s. The keeper is being recovered.")
+                                       f"{_first_semantic_timeout:.0f}s. The keeper is being recovered.")
                                 return
 
                             _raw_frames_seen += 1
                             if _first_stream_frame_at is None:
                                 _first_stream_frame_at = time.monotonic()
-                                log("INFO", f"[{jar.get('name')}] first upstream stream frame Â· "
+                                log("INFO", f"[{jar.get('name')}] first upstream stream frame · "
                                             f"{(_first_stream_frame_at - _transport_t0):.2f}s after POST")
 
                             events = _parse_stream_events(str(line).strip())
@@ -8949,7 +9238,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
 
                                 if kind in ("content", "reasoning") and _first_semantic_at is None:
                                     _first_semantic_at = time.monotonic()
-                                    log("INFO", f"[{jar.get('name')}] first assistant semantic output Â· "
+                                    log("INFO", f"[{jar.get('name')}] first assistant semantic output · "
                                                 f"{(_first_semantic_at - _transport_t0):.2f}s after POST")
 
                                 if kind == "content" and isinstance(payload, str):
@@ -8980,7 +9269,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     # completed reasoning once into assistant content.
                     response_text = reasoning_text
                     yield ("content", reasoning_text)
-                    log("INFO", f"[{jar.get('name')}] stream compatibility Â· reasoning-only model mirrored to final content")
+                    log("INFO", f"[{jar.get('name')}] stream compatibility · reasoning-only model mirrored to final content")
                 if not response_text:
                     log("WARN", f"[{jar.get('name')}] Arena returned HTTP 200 but no decodable text frames for {model_name}")
                     yield ("error", "502: Arena completed the stream without a text response. The model may be unavailable or using an unsupported event format.")
@@ -8994,21 +9283,21 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         "jar_id": jar.get("id"), "proxy": proxy,
                     }
                     save_conversation(chat_id, conv2)
-                log("INFO", f"[{jar.get('name')}] browser stream complete Â· "
-                            f"{(time.monotonic() - _transport_t0):.2f}s transport total Â· "
-                            f"{len(response_text)} text chars Â· {_decoded_events} decoded events Â· "
+                log("INFO", f"[{jar.get('name')}] browser stream complete · "
+                            f"{(time.monotonic() - _transport_t0):.2f}s transport total · "
+                            f"{len(response_text)} text chars · {_decoded_events} decoded events · "
                             f"{_unknown_frames} metadata/unknown frames")
                 _clear_model_rate_limit(model_name)
                 if retry_envelope_ids:
                     _bump_undelivered_retry("succeeded")
-                    log("OK", f"[{jar.get('name')}] confirmed-absence retry succeeded Â· "
+                    log("OK", f"[{jar.get('name')}] confirmed-absence retry succeeded · "
                               f"{len(response_text)} chars")
                 yield ("done", response_text)
                 return
             except BridgeHTTPError as e:
                 if e.stream_error and e.response_started:
                     log("WARN", f"[{jar.get('name')}] browser response stream interrupted after "
-                                f"{e.frame_count} frame(s) Â· finish {'yes' if e.finish_seen else 'no'}")
+                                f"{e.frame_count} frame(s) · finish {'yes' if e.finish_seen else 'no'}")
                     _quarantine_api_keeper(
                         jar.get("id"), "browser-origin mid-stream network failure",
                         TRANSPORT_FAILURE_QUARANTINE_SEC,
@@ -9098,7 +9387,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             response_text = final_text or response_text
 
                         log("OK", f"[{jar.get('name')}] interrupted stream recovered after "
-                                  f"{salvage.get('source') or 'history/UI'} salvage Â· "
+                                  f"{salvage.get('source') or 'history/UI'} salvage · "
                                   f"{len(response_text)} final chars")
                         yield ("done", response_text)
                         return
@@ -9199,8 +9488,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         else:
                             response_text = final_text or response_text
 
-                        log("OK", f"[{jar.get('name')}] HTTP-0 request recovered after route repair Â· "
-                                  f"{len(response_text)} chars Â· source {salvage.get('source') or 'history/UI'}")
+                        log("OK", f"[{jar.get('name')}] HTTP-0 request recovered after route repair · "
+                                  f"{len(response_text)} chars · source {salvage.get('source') or 'history/UI'}")
                         yield ("done", response_text)
                         return
 
@@ -9221,7 +9510,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         #     Arena's duplicate evaluation ID is a clean dedupe signal.
                         if follow_url:
                             log("WARN", f"[{jar.get('name')}] HTTP-0 follow-up history miss is non-authoritative; "
-                                        "replay suppressed Â· final exact-thread recovery")
+                                        "replay suppressed · final exact-thread recovery")
                             browser_session = keeper.sessions.get(jar.get("id")) or browser_session
                             final_salvage = await _attempt_ui_stream_salvage(
                                 session=browser_session,
@@ -9248,8 +9537,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                     yield ("content", final_text)
                                 else:
                                     response_text = final_text or response_text
-                                log("OK", f"[{jar.get('name')}] HTTP-0 follow-up recovered without replay Â· "
-                                          f"{len(response_text)} chars Â· source {final_salvage.get('source') or 'history/UI'}")
+                                log("OK", f"[{jar.get('name')}] HTTP-0 follow-up recovered without replay · "
+                                          f"{len(response_text)} chars · source {final_salvage.get('source') or 'history/UI'}")
                                 yield ("done", response_text)
                                 return
 
@@ -9281,13 +9570,13 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
 
                     if trace_found:
                         _bump_undelivered_retry("suppressed_trace_found")
-                        log("WARN", f"[{jar.get('name')}] resend suppressed Â· Arena history/UI contains "
+                        log("WARN", f"[{jar.get('name')}] resend suppressed · Arena history/UI contains "
                                     "evidence of the turn even though no completed answer was recovered")
 
                     # Keep the existing 5-second minimum for very fast failures;
                     # normally the foreground repair+salvage path is longer.
                     elapsed = time.monotonic() - _transport_t0
-                    remaining = FIRST_ASSISTANT_RESPONSE_SEC - elapsed
+                    remaining = _first_semantic_timeout - elapsed
                     if remaining > 0:
                         await asyncio.sleep(remaining)
 
@@ -9322,8 +9611,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     if _duplicate_create_ack or _duplicate_message_ack:
                         existing_id = str(base.get("id") or (mc or {}).get("arena_id") or "")
                         ack_kind = "follow-up message" if _duplicate_message_ack else "create ID"
-                        log("OK", f"[{jar.get('name')}] duplicate {ack_kind} acknowledged by Arena Â· "
-                                  f"evaluation {existing_id[:12]}â€¦ Â· reconciling existing turn")
+                        log("OK", f"[{jar.get('name')}] duplicate {ack_kind} acknowledged by Arena · "
+                                  f"evaluation {existing_id[:12]}… · reconciling existing turn")
                         _bump_undelivered_retry("duplicate_message_ack" if _duplicate_message_ack else "duplicate_ack")
 
                         # The HTTP 400 duplicate ACK came back through this exact
@@ -9351,9 +9640,9 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         # duplicate ACK itself proves delivery, there is no reason to
                         # spend the full post-restart salvage timeout here.
                         first_wait = min(8.0, max(1.0, ack_deadline - time.monotonic()))
-                        log("INFO", f"[{jar.get('name')}] duplicate ACK proves delivery Â· "
-                                    f"single reconciliation budget {DUPLICATE_ACK_RECOVERY_BUDGET_SEC:.1f}s Â· "
-                                    f"evaluation {existing_id[:12]}â€¦")
+                        log("INFO", f"[{jar.get('name')}] duplicate ACK proves delivery · "
+                                    f"single reconciliation budget {DUPLICATE_ACK_RECOVERY_BUDGET_SEC:.1f}s · "
+                                    f"evaluation {existing_id[:12]}…")
                         salvage = await _attempt_ui_stream_salvage(
                             session=browser_session,
                             chat_id=chat_id,
@@ -9404,8 +9693,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                 yield ("content", final_text)
                             else:
                                 response_text = final_text or response_text
-                            log("OK", f"[{jar.get('name')}] duplicate {'message' if _duplicate_message_ack else 'ID'} turn recovered Â· "
-                                      f"{len(response_text)} chars Â· source {salvage.get('source') or 'history/UI'}")
+                            log("OK", f"[{jar.get('name')}] duplicate {'message' if _duplicate_message_ack else 'ID'} turn recovered · "
+                                      f"{len(response_text)} chars · source {salvage.get('source') or 'history/UI'}")
                             yield ("done", response_text)
                             return
 
@@ -9447,7 +9736,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         return
 
                     if verdict == "PROMPT":
-                        log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming (HTTP {e.status}) â€” no retry or rotation")
+                        log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming (HTTP {e.status}) — no retry or rotation")
                         yield ("error", "422: Arena rejected this prompt before generation. Bridgena did not retry or rotate accounts; shorten the request or remove unsupported tool/system payloads.")
                         return
 
@@ -9455,9 +9744,9 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         explicit_retry = _parse_retry_after_seconds(getattr(e, "retry_after", ""))
                         cooldown = _mark_model_rate_limited(model_name, explicit_retry)
                         retry_after = max(1, int(cooldown + 0.999))
-                        log("WARN", f"[{jar.get('name')}] upstream throttle (HTTP {e.status}) Â· "
-                                    f"cooldown {cooldown:.1f}s Â· retry-after "
-                                    f"{getattr(e, 'retry_after', '') or 'adaptive'} Â· same-account only")
+                        log("WARN", f"[{jar.get('name')}] upstream throttle (HTTP {e.status}) · "
+                                    f"cooldown {cooldown:.1f}s · retry-after "
+                                    f"{getattr(e, 'retry_after', '') or 'adaptive'} · same-account only")
                         if int(getattr(e, "frame_count", 0) or 0) == 0:
                             continuity = load_context_capsule(chat_id, model_name)
                             arm_throttle_thread_rehome(
@@ -9482,23 +9771,20 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
 
                     if verdict == "CHALLENGE":
                         failed_jar_id = jar.get("id")
-                        _mark_api_keeper_unready(
-                            failed_jar_id,
-                            "browser-origin upstream challenge; same-exit recovery requested",
-                        )
-                        # Important: a challenge page is NOT ordinary proxy
-                        # network death. Preserve the browser's current proxy and
-                        # recover the same keeper/session locally.
-                        _schedule_transport_recovery(
+                        _hold_challenged_keeper(
                             failed_jar_id,
                             "browser-origin upstream challenge",
-                            rotate_proxy=False,
                         )
-                        log("WARN", f"[{jar.get('name')}] browser-origin upstream challenge Â· "
-                                    "proxy kept sticky Â· same-keeper recovery scheduled")
+                        # Challenge != dead proxy. Keep route/session identity
+                        # intact, stop scheduling new requests onto this keeper,
+                        # and let the rest of the healthy fleet carry traffic.
+                        log("WARN", f"[{jar.get('name')}] browser-origin upstream challenge · "
+                                    f"keeper isolated {EDGE_CHALLENGE_HOLD_SEC:.0f}s · "
+                                    "proxy kept sticky · no immediate restart")
                         yield ("error",
                                "503: Arena/edge requested browser verification for this keeper. "
-                               "The proxy was kept sticky and local keeper recovery was scheduled.")
+                               "That keeper was temporarily isolated from scheduling; "
+                               "other healthy keepers remain available.")
                         return
 
                     if verdict == "RECAPTCHA":
@@ -9524,11 +9810,11 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             reason = ("server requested V2 escalation"
                                       if e.status == 429 and "prompt failed" in (e.body or "").lower()
                                       else "V3 verification rejected")
-                            log("WARN", f"[{jar.get('name')}] {reason} (HTTP {e.status}) â€” starting Enterprise V2 challenge")
+                            log("WARN", f"[{jar.get('name')}] {reason} (HTTP {e.status}) — starting Enterprise V2 challenge")
                             esc = await mint_v2_escalation(failed_jar_id, settle_s=20.0)
                             if esc:
                                 pending_v2_token = esc
-                                log("OK", f"[{jar.get('name')}] V2 escalation token attached â€” retrying SAME jar via dedicated verification continuation")
+                                log("OK", f"[{jar.get('name')}] V2 escalation token attached — retrying SAME jar via dedicated verification continuation")
                                 # Do not tie this continuation to the generic request
                                 # attempt budget. The loop reserves one V2-only slot.
                                 continue
@@ -9546,7 +9832,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             )
                             _wake_verification_scheduler()
                         except Exception as recovery_exc:
-                            log("WARN", f"[{jar.get('name')}] post-rejection recovery scheduling failed Â· "
+                            log("WARN", f"[{jar.get('name')}] post-rejection recovery scheduling failed · "
                                         f"{type(recovery_exc).__name__}: {redact(str(recovery_exc))[:160]}")
 
                         if mc:
@@ -9595,7 +9881,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     )
 
                 log("WARN", f"[{jar.get('name')}] browser-origin failed "
-                            f"({failure_text}); delivery uncertain Â· "
+                            f"({failure_text}); delivery uncertain · "
                             f"proxy_health_failover={'scheduled' if rotate_for_health else 'not-needed'}")
                 yield ("error", "502: Browser request was interrupted before a reliable HTTP response. Retry the request.")
                 return
@@ -9611,7 +9897,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             except Exception:
                 if p.family not in _impersonate_warned:
                     _impersonate_warned.add(p.family)
-                    log("WARN", f"curl_cffi has no '{impersonate_for(p)}' alias here â€” chrome131 fallback for {p.family}")
+                    log("WARN", f"curl_cffi has no '{impersonate_for(p)}' alias here — chrome131 fallback for {p.family}")
                 sess = AsyncSession(impersonate="chrome131")
             async with sess as client:
                 try:
@@ -9625,13 +9911,13 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             note_cf_blocked_exit(proxy, f"socks reply while routing to arena: {msg[-60:].split('@')[-1]}")
                             route_fails.append((_proxy_hkey(proxy), msg[-60:].split("@")[-1]))
                             if attempt + 1 < max_attempts:
-                                log("WARN", f"[{jar.get('name')}] exit can't route to arena (socks reply) â€” rotating; proxy NOT exiled")
+                                log("WARN", f"[{jar.get('name')}] exit can't route to arena (socks reply) — rotating; proxy NOT exiled")
                                 continue
-                            hosts = " Â· ".join(dict.fromkeys(h for h, _ in route_fails)) or "the pool"
+                            hosts = " · ".join(dict.fromkeys(h for h, _ in route_fails)) or "the pool"
                             warp_only = bool(route_fails) and all(h.startswith(("127.0.0.1:", "[::1]:", "localhost:")) for h, _ in route_fails)
-                            why = ("WARP-only pool: localhost:6767's edge routinely rejects Cloudflare's own egress IPs â€” expected, not fixable from here"
-                                   if warp_only else "the gateways answered 'can't route' â€” localhost:6767 is rejecting these exits' egress IPs right now")
-                            yield ("error", f"503: {hosts} â€” {len(route_fails)} exit(s) connected+authed but none could route ({why}). "
+                            why = ("WARP-only pool: localhost:6767's edge routinely rejects Cloudflare's own egress IPs — expected, not fixable from here"
+                                   if warp_only else "the gateways answered 'can't route' — localhost:6767 is rejecting these exits' egress IPs right now")
+                            yield ("error", f"503: {hosts} — {len(route_fails)} exit(s) connected+authed but none could route ({why}). "
                                             "Nothing exiled; flags self-expire (~3h). 'Scan pool' re-probes now.")
                             return
                         failure_kind = _proxy_network_failure_kind(msg)
@@ -9678,7 +9964,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         conv = {}
                         response_text = ""
                         reasoning_text = ""
-                        log("WARN", f"[{jar.get('name')}] stale Arena thread/model binding cleared â€” rebuilding as create-evaluation")
+                        log("WARN", f"[{jar.get('name')}] stale Arena thread/model binding cleared — rebuilding as create-evaluation")
                         if attempt + 1 < max_attempts:
                             continue
 
@@ -9688,7 +9974,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         conv = {}
                         response_text = ""
                         reasoning_text = ""
-                        log("WARN", f"[{jar.get('name')}] follow-up envelope rejected â€” rebuilding once as create-evaluation")
+                        log("WARN", f"[{jar.get('name')}] follow-up envelope rejected — rebuilding once as create-evaluation")
                         if attempt + 1 < max_attempts:
                             continue
 
@@ -9709,7 +9995,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                 yield ("error", "403: This thread's bound exit is Arena-blocked. Start a new Bridgena thread to select another healthy exit.")
                                 return
                             continue
-                        yield ("error", "502: Arena's Cloudflare flagged every exit we tried â€” retry shortly or add residential lines.")
+                        yield ("error", "502: Arena's Cloudflare flagged every exit we tried — retry shortly or add residential lines.")
                         return
 
                     if verdict == "RECAPTCHA":
@@ -9720,11 +10006,11 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             reason = ("server requested V2 escalation"
                                       if resp.status_code == 429 and "prompt failed" in body.lower()
                                       else "V3 verification rejected")
-                            log("WARN", f"[{jar.get('name')}] {reason} (HTTP {resp.status_code}) â€” starting Enterprise V2 challenge")
+                            log("WARN", f"[{jar.get('name')}] {reason} (HTTP {resp.status_code}) — starting Enterprise V2 challenge")
                             esc = await mint_v2_escalation(failed_jar_id, settle_s=20.0)
                             if esc:
                                 _attach_v2(base, esc)
-                                log("OK", f"[{jar.get('name')}] V2 token harvested ({len(esc)} chars) â€” retrying SAME jar with V2 only")
+                                log("OK", f"[{jar.get('name')}] V2 token harvested ({len(esc)} chars) — retrying SAME jar with V2 only")
                                 continue
                         if mc:
                             clear_conversation_model(chat_id, model_name)
@@ -9749,14 +10035,14 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             _wake_verification_scheduler()
                         except Exception:
                             pass
-                        log("WARN", f"[{jar.get('name')}] verification unresolved â€” keeper retained; local recovery started")
+                        log("WARN", f"[{jar.get('name')}] verification unresolved — keeper retained; local recovery started")
                         yield ("error", "503: Arena rejected verification for this request. "
                                         "The keeper was retained and local readiness recovery was started; "
                                         "no cross-account replay was attempted.")
                         return
 
                     if verdict == "PROMPT":
-                        log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming â€” no retry or rotation")
+                        log("WARN", f"[{jar.get('name')}] Arena rejected prompt before streaming — no retry or rotation")
                         yield ("error", "422: Arena rejected this prompt before generation. Bridgena did not retry or rotate accounts; shorten the request or remove unsupported tool/system payloads.")
                         return
 
@@ -9767,8 +10053,8 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         )
                         cooldown = _mark_model_rate_limited(model_name, explicit_retry)
                         retry_after = max(1, int(cooldown + 0.999))
-                        log("WARN", f"[{jar.get('name')}] upstream prompt throttle Â· "
-                                    f"cooldown {cooldown:.1f}s Â· same-account only")
+                        log("WARN", f"[{jar.get('name')}] upstream prompt throttle · "
+                                    f"cooldown {cooldown:.1f}s · same-account only")
                         continuity = load_context_capsule(chat_id, model_name)
                         arm_throttle_thread_rehome(
                             chat_id, model_name, str(jar.get("id") or ""),
@@ -9798,10 +10084,10 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             return
                         nxt = acquire_jar(prefer_live=True, exclude=tried)
                         if nxt and nxt["id"] not in tried:
-                            log("WARN", f"session expired â€” rotating to '{nxt.get('name')}'")
+                            log("WARN", f"session expired — rotating to '{nxt.get('name')}'")
                             jar, _ = nxt, tried.add(nxt["id"])
                             continue
-                        yield ("error", "502: Arena session expired â€” no other healthy accounts left")
+                        yield ("error", "502: Arena session expired — no other healthy accounts left")
                         return
 
                     yield ("error", f"{resp.status_code}: {body[:400] or '(empty body)'}")
@@ -9878,13 +10164,13 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             log("ERROR", f"arena engine unexpected: {type(e).__name__}: {e}")
             yield ("error", f"500: bridge error: {type(e).__name__}: {e}")
             return
-    yield ("error", "503: exhausted attempt budget across exits â€” nothing exiled; try 'Scan pool'")
+    yield ("error", "503: exhausted attempt budget across exits — nothing exiled; try 'Scan pool'")
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ module: pages.py â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────────── module: pages.py ──────────────────────────────
 
 # ============================================================
-# v2 PAGES â€” the "Bridgena Operations" design system.
+# v2 PAGES — the "Bridgena Operations" design system.
 # Authored here (no framework, no blob): build-time CSS, injected inline,
 # works on partial deploys and offline browsers. Dark-first, light via
 # [data-theme=light]. Grid texture + hairline glow, Space Grotesk display,
@@ -10065,7 +10351,7 @@ th{font:500 11px var(--disp);letter-spacing:0;text-transform:none;color:var(--in
 @media(max-width:560px){.metrics{grid-template-columns:1fr}.topbar .chip,.topbar .brand small{display:none}.pagehead{align-items:flex-start;flex-direction:column}}
 """
 
-# v2.16 visual pass â€” quieter Vercel-like surfaces, stronger hierarchy and
+# v2.16 visual pass — quieter Vercel-like surfaces, stronger hierarchy and
 # denser operational information without changing any dashboard behavior.
 CSS += """
 :root{--shadow-sm:0 1px 2px rgba(0,0,0,.18);--shadow-lg:0 20px 55px rgba(0,0,0,.24)}
@@ -10134,14 +10420,14 @@ def page(title: str, body: str, active: str = "", *, raw_js: str = "", wide=Fals
     wide_style = ' style="margin:0 auto;padding-top:26px;max-width:1280px"' if (not nav and not wide) else ""
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(title)} Â· Bridgena</title>
+<title>{esc(title)} · Bridgena</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>{CSS}</style></head><body>
 <header class="topbar"><div class="brand"><span class="dot"></span>Bridgena <small id="build">{esc(BUILD_STAMP)}</small></div>
 <div class="spacer"></div>
 <span class="chip live"><span class="dotlive"></span>&nbsp;live</span>
-<button class="btn sm ghost" onclick="bgnToggleTheme()" title="Toggle theme">â— theme</button>
+<button class="btn sm ghost" onclick="bgnToggleTheme()" title="Toggle theme">◐ theme</button>
 <a class="btn sm ghost" href="/logout">sign out</a></header>
 <div{wide_style}>
 {content}
@@ -10152,7 +10438,7 @@ def page(title: str, body: str, active: str = "", *, raw_js: str = "", wide=Fals
 
 def login_page(err: str = "") -> str:
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign in Â· Bridgena</title>
+<title>Sign in · Bridgena</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>{CSS}</style></head><body><div class="authwrap">
 <div class="authplate"><div class="brand"><span class="dot"></span>Bridgena <small>operations</small></div>
@@ -10161,10 +10447,10 @@ def login_page(err: str = "") -> str:
   <p class="muted mono" style="font-size:11px">{esc(BUILD_STAMP)}</p></div>
 <div class="authside"><form class="card authcard" method="post" action="/login">
   <h3>Sign in</h3><label for="p">Password</label>
-  <input id="p" name="password" type="password" autocomplete="current-password" placeholder="â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢">
-  <button class="btn primary" style="width:100%;justify-content:center;margin-top:18px">Enter â†’</button>
+  <input id="p" name="password" type="password" autocomplete="current-password" placeholder="••••••••">
+  <button class="btn primary" style="width:100%;justify-content:center;margin-top:18px">Enter →</button>
   <div class="err">{esc(err)}</div>
-  <button type="button" class="btn sm ghost" style="position:absolute;top:14px;right:14px" onclick="bgnToggleTheme()">â—</button>
+  <button type="button" class="btn sm ghost" style="position:absolute;top:14px;right:14px" onclick="bgnToggleTheme()">◐</button>
 </form></div></div><script>{JS_THEME}</script></body></html>"""
 
 
@@ -10176,11 +10462,11 @@ def _verdict_pill(v: str) -> str:
 def dashboard_page(overview: dict) -> str:
     rows_pool = "".join(
         f"<tr><td class=mono>{esc(r['display'])}</td><td>{_verdict_pill(r['verdict'])}</td>"
-        f"<td>{esc(r['why']) or '<span class=muted>â€”</span>'}</td>"
+        f"<td>{esc(r['why']) or '<span class=muted>—</span>'}</td>"
         f"<td><div class=bar><i style='width:{min(100, int((r['latency'] or 1200)/12))}%'></i></div></td></tr>"
-        for r in overview["pool"][:8]) or '<tr><td colspan=4 class=muted>No pool lines â€” go to Proxy Pool.</td></tr>'
+        for r in overview["pool"][:8]) or '<tr><td colspan=4 class=muted>No pool lines — go to Proxy Pool.</td></tr>'
     jrows = "".join(
-        f"<tr><td>{esc(j['name'])}</td><td><span class='mono' style='font-size:12px'>{esc(j.get('persona','â€”'))}</span></td>"
+        f"<tr><td>{esc(j['name'])}</td><td><span class='mono' style='font-size:12px'>{esc(j.get('persona','—'))}</span></td>"
         f"<td>{'<span class=pill ok>live</span>' if j['id'] in overview['live_ids'] else '<span class=pill idle>dark</span>'}</td>"
         f"<td>{_verdict_pill('alive' if j['ok'] else ('warn' and 'arena-blocked' if j.get('limited') else 'dead'))}</td></tr>"
         for j in overview["jars"]) or '<tr><td colspan=4 class=muted>No jars yet.</td></tr>'
@@ -10189,16 +10475,16 @@ def dashboard_page(overview: dict) -> str:
     return page("Dashboard", f"""
 <div class="pagehead"><div><span class="pill ok" style="margin-bottom:12px">All systems monitored</span><h1>Bridgena Control Plane</h1><p>Live infrastructure, keeper health, model availability, and verified exit telemetry in one workspace.</p></div>
 <div class="row"><button class="btn" onclick="act('/proxies/api/check','POST')">Run network scan</button>
-<button class="btn primary" onclick="location='/chat'">Launch chat&nbsp; â†—</button></div></div>
+<button class="btn primary" onclick="location='/chat'">Launch chat&nbsp; ↗</button></div></div>
 <div class="grid metrics">
  <div class="card metric"><div class="k">Verified exits</div><div class="v" style="color:var(--teal)">{m['alive']}<span class="muted" style="font-size:18px"> / {m['pool_total']}</span></div><div class="s">TLS and upstream response confirmed</div></div>
  <div class="card metric"><div class="k">Restricted exits</div><div class="v" style="color:var(--amber)">{m['flagged']}</div><div class="s">Temporarily held outside rotation</div></div>
  <div class="card metric"><div class="k">Account fleet</div><div class="v">{m['jars_ok']}<span class="muted" style="font-size:18px"> / {m['jars_total']}</span></div><div class="s">{m['keepers_live']} browser keepers currently live</div></div>
  <div class="card metric"><div class="k">Available models</div><div class="v">{m['models']}</div><div class="s">Published through the unified API</div></div></div>
 <div class="split" style="margin-top:16px">
- <div class="card"><h3>Network health <span class="spacer"></span><a class="small" href="/pool">View all â†—</a></h3>
+ <div class="card"><h3>Network health <span class="spacer"></span><a class="small" href="/pool">View all ↗</a></h3>
   <table><thead><tr><th>exit</th><th>verdict</th><th>why</th><th>latency</th></tr></thead><tbody>{rows_pool}</tbody></table></div>
- <div class="card"><h3>Keeper fleet <a class="spacer" style="flex:1"></a><a class="small" href="/jars">Manage â†—</a></h3>
+ <div class="card"><h3>Keeper fleet <a class="spacer" style="flex:1"></a><a class="small" href="/jars">Manage ↗</a></h3>
   <table><thead><tr><th>jar</th><th>device persona</th><th>keeper</th><th>health</th></tr></thead><tbody>{jrows}</tbody></table></div>
 </div>
 <div class="card" style="margin-top:16px"><h3>Runtime activity <span class="spacer" style="flex:1"></span><span class="mono small muted">live tail</span></h3>
@@ -10212,9 +10498,9 @@ setInterval(consRefresh,4000);""")
 def api_keys_page(records: list) -> str:
     rows = "".join(
         f"<tr><td><b>{esc(record.get('name') or 'Unnamed key')}</b></td>"
-        f"<td class=mono>{esc(record.get('prefix') or 'sk-void-â€¦')}â€¢â€¢â€¢â€¢â€¢â€¢</td>"
+        f"<td class=mono>{esc(record.get('prefix') or 'sk-void-…')}••••••</td>"
         f"<td>{int(record.get('rpm') or 60)} RPM</td>"
-        f"<td>{time.strftime('%Y-%m-%d %H:%M', time.localtime(record.get('created') or 0)) if record.get('created') else 'â€”'}</td>"
+        f"<td>{time.strftime('%Y-%m-%d %H:%M', time.localtime(record.get('created') or 0)) if record.get('created') else '—'}</td>"
         f"<td><form method=post action=/delete-key onsubmit=\"return confirm('Revoke this API key?')\">"
         f"<input type=hidden name=key_id value=\"{esc(record.get('id') or '')}\">"
         f"<button class='btn sm' type=submit>Revoke</button></form></td></tr>"
@@ -10248,13 +10534,13 @@ def api_key_created_page(name: str, raw_key: str) -> str:
  <div class=row style='margin-top:18px'><button class='btn primary' onclick='copyCreatedKey()'>Copy key</button><a class=btn href=/api-keys>Done</a></div>
  </div>
 </div>
-""", "keys", raw_js=f"""async function copyCreatedKey(){{try{{await navigator.clipboard.writeText({token_json});toast('API key copied')}}catch(e){{toast('Copy failed â€” select it manually')}}}}""")
+""", "keys", raw_js=f"""async function copyCreatedKey(){{try{{await navigator.clipboard.writeText({token_json});toast('API key copied')}}catch(e){{toast('Copy failed — select it manually')}}}}""")
 
 
 def pool_page(rows: list, stats: dict) -> str:
-    body=''.join(f"<tr><td class='mono'>{esc(r['display'])}</td><td class='muted'>{esc(r.get('scheme',''))}</td><td>{_verdict_pill(r['verdict'])}</td><td class='muted' style='max-width:360px'>{esc(r['why']) or 'â€”'}</td><td>{esc(r['latency']) if r['latency'] else '<span class=muted>â€”</span>'}{'ms' if r['latency'] else ''}</td><td><form method='post' action='/proxies/api/remove-one'><input type='hidden' name='key' value='{esc(r['key'])}'><button class='btn sm ghost'>Remove</button></form></td></tr>" for r in rows) or "<tr><td colspan='6' class='empty'>No proxies configured yet.</td></tr>"
-    content=f'''<div class="pagehead"><div><div class="eyebrow">Network</div><h1>Proxy pool</h1><p>Manage configured upstream routes and see current transport health.</p></div><div class="actionbar"><span class="badge-num">{stats['total']} configured</span><span class="pill ok">{stats['alive']} alive</span><span class="pill warn">{stats['flagged']} restricted</span><button class="btn" onclick="scan()">Scan pool</button></div></div><div class="proxy-add"><section class="card"><div class="row"><div><div class="eyebrow">Inventory</div><h3 style="margin:2px 0 14px">Configured exits</h3></div><span class="spacer"></span><input id="proxyFilter" placeholder="Filter exitsâ€¦" style="width:220px" oninput="filterRows()"></div><div class="table-wrap"><table id="proxyTable"><thead><tr><th>Exit</th><th>Scheme</th><th>State</th><th>Diagnosis</th><th>RTT</th><th></th></tr></thead><tbody>{body}</tbody></table></div></section><aside class="card"><div class="tabs" role="tablist"><button class="tab on" type="button" data-tab="add" onclick="switchProxyTab('add')">Add</button><button class="tab" type="button" data-tab="formats" onclick="switchProxyTab('formats')">Formats</button><button class="tab" type="button" data-tab="maint" onclick="switchProxyTab('maint')">Maintenance</button></div><div class="tab-panel" data-panel="add"><div class="eyebrow" style="margin-top:18px">Add capacity</div><h3 style="margin:2px 0 14px">Add proxies</h3><form id="proxyAddForm" data-native="1"><div class="dropbox"><label for="proxyText" style="margin-top:0">Paste proxies</label><textarea id="proxyText" name="text" placeholder="1.2.3.4:8080&#10;socks5://1.2.3.4:1080&#10;host:port:user:pass&#10;&#10;Or CSV: Host,Port,Username,Password,Type"></textarea><div class="helper">Credentials are optional. Accepts host:port, scheme://host:port, host:port:user:pass, full URLs, whitespace exports, or headered CSV.</div></div><label for="proxyFile">Or upload a text / CSV file</label><input id="proxyFile" type="file" accept=".txt,.csv,text/plain,text/csv"><div class="actionbar" style="margin-top:12px"><button class="btn primary" type="submit">Add proxies</button><button class="btn ghost" type="button" onclick="clearProxyForm()">Clear</button></div></form></div><div class="tab-panel" data-panel="formats" hidden><div class="eyebrow" style="margin-top:18px">Accepted input</div><h3 style="margin:2px 0 12px">Flexible parser</h3><div class="console" style="height:auto;max-height:none;padding:12px">1.2.3.4:8080<br>socks5://1.2.3.4:1080<br>SOCKS5 1.2.3.4 1080<br>1.2.3.4 1080 SOCKS5<br>1.2.3.4,1080,SOCKS5</div></div><div class="tab-panel" data-panel="maint" hidden><div class="eyebrow" style="margin-top:18px">Maintenance</div><h3 style="margin:2px 0 14px">Pool actions</h3><div class="actionbar"><button class="btn sm" onclick="poolAction('/proxies/api/prune','Pruning unhealthy exitsâ€¦')">Prune dead</button><button class="btn sm ghost" onclick="poolAction('/proxies/api/revive','Reviving saved exitsâ€¦')">Revive all</button><button class="btn sm danger" onclick="deleteAll()">Delete all</button></div></div></aside></div>'''
-    js=r'''function switchProxyTab(name){document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('on',b.dataset.tab===name));document.querySelectorAll('[data-panel]').forEach(p=>p.hidden=p.dataset.panel!==name)}function filterRows(){const q=document.getElementById('proxyFilter').value.toLowerCase();document.querySelectorAll('#proxyTable tbody tr').forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?'':'none')}function clearProxyForm(){document.getElementById('proxyText').value='';document.getElementById('proxyFile').value=''}document.getElementById('proxyAddForm').addEventListener('submit',async e=>{e.preventDefault();const text=document.getElementById('proxyText').value,file=document.getElementById('proxyFile').files[0];if(!text.trim()&&!file){bgnToast('Paste proxies or choose a file first','warn');return}const t=bgnToast('Parsing and merging proxiesâ€¦','loading');try{const fd=new FormData();fd.append('text',text);if(file)fd.append('file',file);const r=await fetch('/proxies/api/upload',{method:'POST',body:fd,credentials:'same-origin'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Upload failed'));const message='Added '+d.added+' Â· parsed '+d.parsed+' Â· local shims '+(d.local_shims||0)+' Â· distinct assigned '+(d.distinct_assigned||0)+' Â· keepers rebound '+(d.keepers_rebound||0)+' Â· skipped '+d.skipped;bgnToastUpdate(t,message,d.added>0?'ok':'warn',d.added>0?'Proxies added':'Nothing new added');if(d.added>0)bgnReload(message,'ok','Proxies added',1800)}catch(err){bgnToastUpdate(t,err.message||String(err),'error')}});async function scan(){const t=bgnToast('Scanning the proxy poolâ€¦','loading');try{const r=await fetch('/proxies/api/check',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Scan failed'));if(d.running){bgnToastUpdate(t,'A scan is already running','warn');return}bgnToastUpdate(t,d.alive+' of '+d.total+' exits are healthy','ok','Scan complete');bgnReload(d.alive+' of '+d.total+' exits are healthy','ok','Scan complete',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function poolAction(url,msg){const t=bgnToast(msg,'loading');try{const r=await fetch(url,{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Action failed'));bgnToastUpdate(t,bgnResultMessage(d),'ok');bgnReload(bgnResultMessage(d),'ok','Done',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function deleteAll(){if(!confirm('Delete every active proxy? A recovery snapshot will be retained.'))return;const t=bgnToast('Deleting active proxiesâ€¦','loading');try{const r=await fetch('/proxies/api/delete-all',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Delete failed'));bgnToastUpdate(t,'Deleted '+d.removed+' proxies','ok');bgnReload('Deleted '+d.removed+' proxies','ok','Pool cleared',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}'''
+    body=''.join(f"<tr><td class='mono'>{esc(r['display'])}</td><td class='muted'>{esc(r.get('scheme',''))}</td><td>{_verdict_pill(r['verdict'])}</td><td class='muted' style='max-width:360px'>{esc(r['why']) or '—'}</td><td>{esc(r['latency']) if r['latency'] else '<span class=muted>—</span>'}{'ms' if r['latency'] else ''}</td><td><form method='post' action='/proxies/api/remove-one'><input type='hidden' name='key' value='{esc(r['key'])}'><button class='btn sm ghost'>Remove</button></form></td></tr>" for r in rows) or "<tr><td colspan='6' class='empty'>No proxies configured yet.</td></tr>"
+    content=f'''<div class="pagehead"><div><div class="eyebrow">Network</div><h1>Proxy pool</h1><p>Manage configured upstream routes and see current transport health.</p></div><div class="actionbar"><span class="badge-num">{stats['total']} configured</span><span class="pill ok">{stats['alive']} alive</span><span class="pill warn">{stats['flagged']} restricted</span><button class="btn" onclick="scan()">Scan pool</button></div></div><div class="proxy-add"><section class="card"><div class="row"><div><div class="eyebrow">Inventory</div><h3 style="margin:2px 0 14px">Configured exits</h3></div><span class="spacer"></span><input id="proxyFilter" placeholder="Filter exits…" style="width:220px" oninput="filterRows()"></div><div class="table-wrap"><table id="proxyTable"><thead><tr><th>Exit</th><th>Scheme</th><th>State</th><th>Diagnosis</th><th>RTT</th><th></th></tr></thead><tbody>{body}</tbody></table></div></section><aside class="card"><div class="tabs" role="tablist"><button class="tab on" type="button" data-tab="add" onclick="switchProxyTab('add')">Add</button><button class="tab" type="button" data-tab="formats" onclick="switchProxyTab('formats')">Formats</button><button class="tab" type="button" data-tab="maint" onclick="switchProxyTab('maint')">Maintenance</button></div><div class="tab-panel" data-panel="add"><div class="eyebrow" style="margin-top:18px">Add capacity</div><h3 style="margin:2px 0 14px">Add proxies</h3><form id="proxyAddForm" data-native="1"><div class="dropbox"><label for="proxyText" style="margin-top:0">Paste proxies</label><textarea id="proxyText" name="text" placeholder="1.2.3.4:8080&#10;socks5://1.2.3.4:1080&#10;host:port:user:pass&#10;&#10;Or CSV: Host,Port,Username,Password,Type"></textarea><div class="helper">Credentials are optional. Accepts host:port, scheme://host:port, host:port:user:pass, full URLs, whitespace exports, or headered CSV.</div></div><label for="proxyFile">Or upload a text / CSV file</label><input id="proxyFile" type="file" accept=".txt,.csv,text/plain,text/csv"><div class="actionbar" style="margin-top:12px"><button class="btn primary" type="submit">Add proxies</button><button class="btn ghost" type="button" onclick="clearProxyForm()">Clear</button></div></form></div><div class="tab-panel" data-panel="formats" hidden><div class="eyebrow" style="margin-top:18px">Accepted input</div><h3 style="margin:2px 0 12px">Flexible parser</h3><div class="console" style="height:auto;max-height:none;padding:12px">1.2.3.4:8080<br>socks5://1.2.3.4:1080<br>SOCKS5 1.2.3.4 1080<br>1.2.3.4 1080 SOCKS5<br>1.2.3.4,1080,SOCKS5</div></div><div class="tab-panel" data-panel="maint" hidden><div class="eyebrow" style="margin-top:18px">Maintenance</div><h3 style="margin:2px 0 14px">Pool actions</h3><div class="actionbar"><button class="btn sm" onclick="poolAction('/proxies/api/prune','Pruning unhealthy exits…')">Prune dead</button><button class="btn sm ghost" onclick="poolAction('/proxies/api/revive','Reviving saved exits…')">Revive all</button><button class="btn sm danger" onclick="deleteAll()">Delete all</button></div></div></aside></div>'''
+    js=r'''function switchProxyTab(name){document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('on',b.dataset.tab===name));document.querySelectorAll('[data-panel]').forEach(p=>p.hidden=p.dataset.panel!==name)}function filterRows(){const q=document.getElementById('proxyFilter').value.toLowerCase();document.querySelectorAll('#proxyTable tbody tr').forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?'':'none')}function clearProxyForm(){document.getElementById('proxyText').value='';document.getElementById('proxyFile').value=''}document.getElementById('proxyAddForm').addEventListener('submit',async e=>{e.preventDefault();const text=document.getElementById('proxyText').value,file=document.getElementById('proxyFile').files[0];if(!text.trim()&&!file){bgnToast('Paste proxies or choose a file first','warn');return}const t=bgnToast('Parsing and merging proxies…','loading');try{const fd=new FormData();fd.append('text',text);if(file)fd.append('file',file);const r=await fetch('/proxies/api/upload',{method:'POST',body:fd,credentials:'same-origin'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Upload failed'));const message='Added '+d.added+' · parsed '+d.parsed+' · local shims '+(d.local_shims||0)+' · distinct assigned '+(d.distinct_assigned||0)+' · keepers rebound '+(d.keepers_rebound||0)+' · skipped '+d.skipped;bgnToastUpdate(t,message,d.added>0?'ok':'warn',d.added>0?'Proxies added':'Nothing new added');if(d.added>0)bgnReload(message,'ok','Proxies added',1800)}catch(err){bgnToastUpdate(t,err.message||String(err),'error')}});async function scan(){const t=bgnToast('Scanning the proxy pool…','loading');try{const r=await fetch('/proxies/api/check',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Scan failed'));if(d.running){bgnToastUpdate(t,'A scan is already running','warn');return}bgnToastUpdate(t,d.alive+' of '+d.total+' exits are healthy','ok','Scan complete');bgnReload(d.alive+' of '+d.total+' exits are healthy','ok','Scan complete',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function poolAction(url,msg){const t=bgnToast(msg,'loading');try{const r=await fetch(url,{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Action failed'));bgnToastUpdate(t,bgnResultMessage(d),'ok');bgnReload(bgnResultMessage(d),'ok','Done',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function deleteAll(){if(!confirm('Delete every active proxy? A recovery snapshot will be retained.'))return;const t=bgnToast('Deleting active proxies…','loading');try{const r=await fetch('/proxies/api/delete-all',{method:'POST'}),d=await bgnJson(r);if(!r.ok)throw new Error(bgnResultMessage(d,'Delete failed'));bgnToastUpdate(t,'Deleted '+d.removed+' proxies','ok');bgnReload('Deleted '+d.removed+' proxies','ok','Pool cleared',1200)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}'''
     return page('Network', content, 'pool', js)
 
 def jars_page(jars: list) -> str:
@@ -10266,14 +10552,14 @@ def jars_page(jars: list) -> str:
         if j.get("expired"):
             pills.append('<span class="pill bad">expired</span>')
         cards += f"""<div class="card" style="padding:16px"><div class="row"><b>{esc(j['name'])}</b><span class=spacer style="flex:1"></span>{''.join(pills)}</div>
-<div class="kv"><span>persona</span><b>{esc(j.get('persona') or 'â€”')}</b></div>
-<div class="kv"><span>last used</span><b>{esc(j.get('last_used_str') or 'â€”')}</b></div>
+<div class="kv"><span>persona</span><b>{esc(j.get('persona') or '—')}</b></div>
+<div class="kv"><span>last used</span><b>{esc(j.get('last_used_str') or '—')}</b></div>
 <div class="row" style="margin-top:12px"><form method=post action=/jars/reset style=margin:0><input type=hidden name=jar_id value="{esc(j['id'])}"><button class="btn sm">Reset</button></form>
 <form method=post action=/keeper/live style=margin:0><input type=hidden name=jar_id value="{esc(j['id'])}"><input type=hidden name=on value="{ '0' if j.get('keeper_enabled') else '1'}"><button class="btn sm">{'Stop keeper' if j.get('keeper_enabled') else 'Start keeper'}</button></form>
 <form method=post action=/jars/toggle style=margin:0><input type=hidden name=jar_id value="{esc(j['id'])}"><button class="btn sm ghost">{'Disable' if j.get('enabled', True) else 'Enable'}</button></form>
 <form method=post action=/jars/persona style=margin:0><input type=hidden name=jar_id value="{esc(j['id'])}"><select name=key style="width:auto;padding:5px 8px;font-size:12px">{''.join(f'<option value="{esc(k)}" ' + ('selected' if j.get('persona')==k else '') + f'>{esc(l)}</option>' for k,l in j.get('_personas'))}</select><button class="btn sm ghost">bind</button></form></div></div>"""
-    return page("Accounts", f"""<div class="pagehead"><div><h1>Accounts</h1><p>one device persona per account â€” headers, keeper and token minting stay coherent</p></div>
-<div class="row"><a class="btn" href="/jars/upload">ï¼‹ Add account</a></div></div>
+    return page("Accounts", f"""<div class="pagehead"><div><h1>Accounts</h1><p>one device persona per account — headers, keeper and token minting stay coherent</p></div>
+<div class="row"><a class="btn" href="/jars/upload">＋ Add account</a></div></div>
 <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(340px,1fr))">{cards or '<div class="card muted">No jars yet.</div>'}</div>""", active="jars")
 
 
@@ -10286,7 +10572,7 @@ def jars_upload_page() -> str:
     <h1>Add account</h1>
     <p>Import an authenticated Arena cookie export, or add an account with email/password credentials.</p>
   </div>
-  <div class="row"><a class="btn ghost" href="/jars">â† Accounts</a></div>
+  <div class="row"><a class="btn ghost" href="/jars">← Accounts</a></div>
 </div>
 
 <div class="tabbar" style="margin-bottom:18px">
@@ -10419,7 +10705,7 @@ async function lookupError(forced=''){
   const input=document.getElementById('errorLookup'),id=(forced||input.value||'').trim();
   if(!id){bgnToast('Enter an Error ID first','warn');return}
   input.value=id;
-  const pending=bgnToast('Looking up '+id+'â€¦','loading');
+  const pending=bgnToast('Looking up '+id+'…','loading');
   try{
     const r=await fetch('/errors/api/'+encodeURIComponent(id),{cache:'no-store',credentials:'same-origin'});
     const d=await r.json();
@@ -10433,7 +10719,7 @@ async function lookupError(forced=''){
       '<span class="spacer"></span><span class="pill '+((x.status||500)>=500?'bad':'warn')+'">HTTP '+eEsc(x.status)+'</span></div>'+
       '<div class="kv"><span>Time</span><b>'+eEsc(x.time)+'</b></div>'+
       '<div class="kv"><span>Source</span><b class="mono">'+eEsc(x.source)+'</b></div>'+
-      '<div class="kv"><span>Protocol</span><b>'+eEsc(x.protocol||'â€”')+'</b></div>'+
+      '<div class="kv"><span>Protocol</span><b>'+eEsc(x.protocol||'—')+'</b></div>'+
       '<div class="kv"><span>Request</span><b class="mono">'+eEsc((x.method||'')+' '+(x.path||''))+'</b></div>'+
       (x.exception_type?'<div class="kv"><span>Exception</span><b class="mono">'+eEsc(x.exception_type)+'</b></div>':'')+
       '<div style="margin-top:16px"><div class="eyebrow">Internal detail</div><pre><code>'+eEsc(x.detail||'')+'</code></pre></div>'+
@@ -10456,7 +10742,7 @@ if(q){document.getElementById('errorLookup').value=q;lookupError(q)}
 
 def logs_page(tail: list) -> str:
     lines = "".join(f'<div class="{esc(x["lvl"])}">{esc(x["line"])}</div>' for x in tail)
-    return page("Logs", f"""<div class="pagehead"><div><h1>System Log</h1><p>ring buffer Â· auto-scroll</p></div>
+    return page("Logs", f"""<div class="pagehead"><div><h1>System Log</h1><p>ring buffer · auto-scroll</p></div>
 <div class=row><button class="btn danger" onclick="fetch('/clear-logs',{{method:'POST'}}).then(()=>location.reload())">Clear</button></div></div>
 <div class="card"><div class="console" id="c" style="height:calc(100vh - 240px)">{lines}</div></div>""", active="logs", raw_js="""
 function f(){fetch('/debug-logs/data').then(r=>r.json()).then(d=>{var c=document.getElementById('c');c.innerHTML=d.map(x=>'<div class="'+(x.lvl||'INFO')+'">'+(x.line||'')+'</div>').join('');c.scrollTop=c.scrollHeight})}setInterval(f,2500);""")
@@ -10475,9 +10761,9 @@ def models_page(models: list, blocked: list) -> str:
                 "<button class='btn sm ghost'>" + act + "</button></form></td></tr>")
     rows = "".join(_row(m) for m in models[:400])
     return page("Models", '<div class="pagehead"><div><h1>Model Catalog</h1><p>' + str(len(models)) +
-                " known Â· " + str(len(blocked)) + ' blocked on this account set</p></div>' +
-                """<div class="row"><button class="btn" onclick="fetch('/keeper/config',{method:'POST'}).then(()=>toast('refresh queued'))">â†» Refresh</button></div></div>
-<div class="card"><input id="q" placeholder="filterâ€¦" oninput="flt()" style="margin-bottom:12px">
+                " known · " + str(len(blocked)) + ' blocked on this account set</p></div>' +
+                """<div class="row"><button class="btn" onclick="fetch('/keeper/config',{method:'POST'}).then(()=>toast('refresh queued'))">↻ Refresh</button></div></div>
+<div class="card"><input id="q" placeholder="filter…" oninput="flt()" style="margin-bottom:12px">
 <table><thead><tr><th>name</th><th>arena id</th><th>state</th><th></th></tr></thead><tbody id="tb">""" +
                 rows + """</tbody></table></div>""", active="models", raw_js="""
 function flt(){var q=document.getElementById('q').value.toLowerCase();
@@ -10487,24 +10773,24 @@ document.querySelectorAll('#tb tr').forEach(r=>{r.style.display=r.textContent.to
 def _legacy_chat_page(models: list, default_model: str) -> str:
     opts = "".join(f'<option value="{esc(m["name"])}"{" selected" if m["name"]==default_model else ""}>{esc(m["name"])}</option>' for m in models[:300]) or '<option>gpt-4.1</option>'
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Bridgena Â· Live Chat</title>
+<title>Bridgena · Live Chat</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>{CSS}</style></head><body>
 <header class="topbar"><div class="brand"><span class="dot"></span>Bridgena <small>live</small></div><div class="spacer"></div>
 <select class="btn sm model" id="model" style="width:auto">{opts}</select>
 <span class="chip" id="jar">jar: auto</span>
-<button class="btn sm ghost" onclick="bgnToggleTheme()">â—</button><a class="btn sm ghost" href="/dashboard">â† ops</a></header>
+<button class="btn sm ghost" onclick="bgnToggleTheme()">◐</button><a class="btn sm ghost" href="/dashboard">← ops</a></header>
 <div class="chatgrid">
-<aside class="chatside"><div class="row"><b class="small" style="flex:1">Threads</b><button class="btn sm ghost" onclick="newChat()">ï¼‹</button></div>
+<aside class="chatside"><div class="row"><b class="small" style="flex:1">Threads</b><button class="btn sm ghost" onclick="newChat()">＋</button></div>
 <div id="chats"></div></aside>
 <main class="chatmain"><div class="transcript" id="t">
- <div class="bubble ai"><span class="who">bridgena</span>Fleet chat â€” messages route through a live jar, a proven exit and a keeper-minted recaptcha token. Say something.</div>
+ <div class="bubble ai"><span class="who">bridgena</span>Fleet chat — messages route through a live jar, a proven exit and a keeper-minted recaptcha token. Say something.</div>
 </div>
-<div class="composer"><textarea id="in" placeholder="Message the arenaâ€¦  (âŒ˜/Ctrl+Enter to send)" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter')send()"></textarea>
+<div class="composer"><textarea id="in" placeholder="Message the arena…  (⌘/Ctrl+Enter to send)" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter')send()"></textarea>
 <button class="btn primary" id="go" onclick="send()">Send</button></div></main>
 <aside class="chatrail"><div class="card" style="padding:14px"><h3 style="margin-bottom:8px">Session</h3>
-<div class="kv"><span>status</span><b id="st">idle</b></div><div class="kv"><span>exit</span><b id="ex">â€”</b></div>
-<div class="kv"><span>token</span><b id="tk">â€”</b></div><div class="kv"><span>persona</span><b id="ps">â€”</b></div></div>
+<div class="kv"><span>status</span><b id="st">idle</b></div><div class="kv"><span>exit</span><b id="ex">—</b></div>
+<div class="kv"><span>token</span><b id="tk">—</b></div><div class="kv"><span>persona</span><b id="ps">—</b></div></div>
 <div class="card" style="padding:14px;flex:1;min-height:120px"><h3 style="margin-bottom:8px">Signal</h3>
 <div class="console" id="lc" style="height:100%;max-height:calc(100vh - 420px)"></div></div></aside></div>
 <div id="toast-stack" class="toast-stack"></div>
@@ -10526,7 +10812,7 @@ function newChat(){{chat_id='c-'+Math.random().toString(36).slice(2,10);localSto
  document.getElementById('t').innerHTML='';refreshChats()}}
 async function send(){{if(busy)return;const inp=document.getElementById('in');const text=inp.value.trim();if(!text)return;
  busy=true;inp.value='';document.getElementById('go').disabled=true;document.getElementById('st').textContent='streaming';
- add('user',text);saveLocal('user',text);const holder=add('ai','â€¦');let acc='';
+ add('user',text);saveLocal('user',text);const holder=add('ai','…');let acc='';
  try{{const r=await fetch('/v1/chat/completions',{{method:'POST',headers:{{'Content-Type':'application/json'}},
   body:JSON.stringify({{model:document.getElementById('model').value,messages:[{{role:'user',content:text}}],stream:true,chat_id:chat_id}})}});
   if(!r.ok){{throw new Error('HTTP '+r.status+': '+await r.text())}}
@@ -10542,7 +10828,7 @@ async function send(){{if(busy)return;const inp=document.getElementById('in');co
  busy=false;document.getElementById('go').disabled=false;refreshChats()}}
 setInterval(()=>{{fetch('/debug-logs/data').then(r=>r.json()).then(d=>{{const c=document.getElementById('lc');
  c.innerHTML=d.slice(-40).map(x=>'<div class="'+(x.lvl||'INFO')+'">'+(x.line||'')+'</div>').join('');c.scrollTop=c.scrollHeight;
- const last=d.filter(x=>/via .* persona/.test(x.m||'')).pop();if(last){{const m=(last.m||'').match(/via (\\S+) persona Â· exit (\\S+) Â· token (\\w+)/);
+ const last=d.filter(x=>/via .* persona/.test(x.m||'')).pop();if(last){{const m=(last.m||'').match(/via (\\S+) persona · exit (\\S+) · token (\\w+)/);
   if(m){{document.getElementById('ps').textContent=m[1];document.getElementById('ex').textContent=m[2];document.getElementById('tk').textContent=m[3]}}}}}}).catch(()=>{{}})}},3000);
 refreshChats();openChat(chat_id);
 </script></body></html>"""
@@ -10608,11 +10894,11 @@ button,input,textarea{font:inherit}button{color:inherit}.icon{width:17px;height:
 .runtime-drawer.open{opacity:1;pointer-events:auto;transform:none}.drawerhead{height:34px;display:flex;align-items:center;justify-content:space-between;font-weight:650}.drawerhead .ghost{width:30px;height:30px}.runtime-drawer pre{height:calc(100% - 42px);margin:8px 0 0;padding:12px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:10px;color:var(--muted);white-space:pre-wrap;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
 @media(max-width:760px){.app{grid-template-columns:1fr}.dock{left:0}.promptgrid{grid-template-columns:1fr}.msg.user{margin-left:8%}.conversation{padding-inline:16px}}
 </style></head><body><div class="app">
-<aside class="sidebar" id="sidebar"><div class="sidehead"><div class="mark">B</div><div class="wordmark">Bridgena</div></div><div class="sidebody"><button class="newbtn" onclick="newChat()">ï¼‹ New chat</button><div class="sectionlabel">Recent</div><div id="threads"></div></div><div class="sidefoot"><a class="ops" href="/dashboard">âš™ Operations</a></div></aside>
-<main class="main"><header class="top"><button class="ghost mobile" onclick="toggleSidebar()">â˜°</button><div class="modelwrap"><button class="modelbtn" id="modelBtn" onclick="togglePicker()"><span id="modelLabel"></span><span class="chev">âŒ„</span></button><div class="picker" id="picker"><div class="searchbox"><input id="modelSearch" placeholder="Search modelsâ€¦" autocomplete="off"></div><div class="modellist" id="modelList"></div></div></div><div class="status"><i class="statusdot" id="statusDot"></i><span id="statusText">Ready</span></div><button class="ghost" onclick="toggleRuntime()" title="Runtime signal">âŒ</button><button class="ghost" onclick="toggleTheme()" title="Toggle theme">â—</button></header>
+<aside class="sidebar" id="sidebar"><div class="sidehead"><div class="mark">B</div><div class="wordmark">Bridgena</div></div><div class="sidebody"><button class="newbtn" onclick="newChat()">＋ New chat</button><div class="sectionlabel">Recent</div><div id="threads"></div></div><div class="sidefoot"><a class="ops" href="/dashboard">⚙ Operations</a></div></aside>
+<main class="main"><header class="top"><button class="ghost mobile" onclick="toggleSidebar()">☰</button><div class="modelwrap"><button class="modelbtn" id="modelBtn" onclick="togglePicker()"><span id="modelLabel"></span><span class="chev">⌄</span></button><div class="picker" id="picker"><div class="searchbox"><input id="modelSearch" placeholder="Search models…" autocomplete="off"></div><div class="modellist" id="modelList"></div></div></div><div class="status"><i class="statusdot" id="statusDot"></i><span id="statusText">Ready</span></div><button class="ghost" onclick="toggleRuntime()" title="Runtime signal">⌁</button><button class="ghost" onclick="toggleTheme()" title="Toggle theme">◐</button></header>
 <div class="scroll" id="scroll"><div class="conversation" id="conversation"><div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:42px;height:42px">B</div><h1>What are we building?</h1><p>Choose a model and start a conversation with your Bridgena workspace.</p><div class="promptgrid"><button class="promptchip" onclick="usePrompt('Explain this code and identify reliability risks')">Review code</button><button class="promptchip" onclick="usePrompt('Help me debug a failed API request')">Debug a request</button><button class="promptchip" onclick="usePrompt('Design a production rollout plan')">Plan a rollout</button><button class="promptchip" onclick="usePrompt('Summarize the latest runtime signals')">Inspect runtime</button></div></div></div></div></div>
-<div class="dock"><div class="compose"><textarea id="input" rows="1" placeholder="Message Bridgena"></textarea><div class="composefoot"><span class="hint">Enter to send Â· Shift+Enter for newline</span><button class="send" id="send" onclick="sendMessage()" aria-label="Send">â†‘</button></div></div></div></main></div>
-<aside class="runtime-drawer" id="runtimeDrawer"><div class="drawerhead"><span>Runtime signal</span><button class="ghost" onclick="toggleRuntime()" aria-label="Close runtime">Ã—</button></div><pre id="signal">Waiting for activityâ€¦</pre></aside>
+<div class="dock"><div class="compose"><textarea id="input" rows="1" placeholder="Message Bridgena"></textarea><div class="composefoot"><span class="hint">Enter to send · Shift+Enter for newline</span><button class="send" id="send" onclick="sendMessage()" aria-label="Send">↑</button></div></div></div></main></div>
+<aside class="runtime-drawer" id="runtimeDrawer"><div class="drawerhead"><span>Runtime signal</span><button class="ghost" onclick="toggleRuntime()" aria-label="Close runtime">×</button></div><pre id="signal">Waiting for activity…</pre></aside>
 <script>
 const MODELS=__MODELS_JSON__, DEFAULT_MODEL=__DEFAULT_MODEL__;
 let model=localStorage.getItem('bgn.model')||DEFAULT_MODEL, chatId=localStorage.getItem('bgn.chat')||makeId(), busy=false;
@@ -10638,7 +10924,7 @@ function openChat(id){chatId=id;localStorage.setItem('bgn.chat',id);$('conversat
 function showWelcome(){$('conversation').innerHTML='<div class="welcome" id="welcome"><div><div class="mark" style="margin:0 auto 18px;width:42px;height:42px">B</div><h1>What are we building?</h1><p>Choose a model and start a conversation with your Bridgena workspace.</p><div class="promptgrid"><button class="promptchip" onclick="usePrompt(\'Explain this code and identify reliability risks\')">Review code</button><button class="promptchip" onclick="usePrompt(\'Help me debug a failed API request\')">Debug a request</button></div></div></div>'}
 function usePrompt(text){$('input').value=text;$('input').dispatchEvent(new Event('input'));$('input').focus()}
 function newChat(){chatId=makeId();localStorage.setItem('bgn.chat',chatId);showWelcome();loadThreads();$('sidebar').classList.remove('open');$('input').focus()}
-async function sendMessage(){if(busy)return;const input=$('input'),text=input.value.trim();if(!text)return;busy=true;input.value='';input.style.height='44px';$('send').disabled=true;setStatus('Generating','busy');addMessage('user',text);saveLocalMessage('user',text);const out=addMessage('ai','Thinkingâ€¦','thinking');let acc='';try{const history=((localChats()[chatId]||{}).messages||[]).slice(-16).map(m=>({role:m.role,content:m.content}));const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,messages:history.length?history:[{role:'user',content:text}],stream:true,chat_id:chatId})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let nl;while((nl=buf.indexOf('\n'))>=0){const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);if(!line.startsWith('data: '))continue;const p=line.slice(6);if(p==='[DONE]')continue;let j;try{j=JSON.parse(p)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta?.content;if(d){acc+=d;out.classList.remove('thinking');out.innerHTML=md(acc);$('scroll').scrollTop=$('scroll').scrollHeight}}}if(!acc)throw new Error('Arena returned an empty response');saveLocalMessage('assistant',acc);setStatus('Ready','ok')}catch(e){out.classList.remove('thinking');const err='<div class="errorbox">'+escHtml(e.message||e)+'</div>';out.innerHTML=acc?md(acc)+err:err;if(acc)saveLocalMessage('assistant',acc);setStatus('Error','err')}finally{busy=false;$('send').disabled=false;loadThreads()}}
+async function sendMessage(){if(busy)return;const input=$('input'),text=input.value.trim();if(!text)return;busy=true;input.value='';input.style.height='44px';$('send').disabled=true;setStatus('Generating','busy');addMessage('user',text);saveLocalMessage('user',text);const out=addMessage('ai','Thinking…','thinking');let acc='';try{const history=((localChats()[chatId]||{}).messages||[]).slice(-16).map(m=>({role:m.role,content:m.content}));const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,messages:history.length?history:[{role:'user',content:text}],stream:true,chat_id:chatId})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let nl;while((nl=buf.indexOf('\n'))>=0){const line=buf.slice(0,nl).trim();buf=buf.slice(nl+1);if(!line.startsWith('data: '))continue;const p=line.slice(6);if(p==='[DONE]')continue;let j;try{j=JSON.parse(p)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta?.content;if(d){acc+=d;out.classList.remove('thinking');out.innerHTML=md(acc);$('scroll').scrollTop=$('scroll').scrollHeight}}}if(!acc)throw new Error('Arena returned an empty response');saveLocalMessage('assistant',acc);setStatus('Ready','ok')}catch(e){out.classList.remove('thinking');const err='<div class="errorbox">'+escHtml(e.message||e)+'</div>';out.innerHTML=acc?md(acc)+err:err;if(acc)saveLocalMessage('assistant',acc);setStatus('Error','err')}finally{busy=false;$('send').disabled=false;loadThreads()}}
 const input=$('input');input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px'});input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}});
 setInterval(()=>fetch('/debug-logs/data').then(r=>r.json()).then(d=>{$('signal').textContent=d.slice(-18).map(x=>x.line||x.m||'').join('\n')}).catch(()=>{}),3000);
 loadThreads();openChat(chatId);
@@ -10662,53 +10948,53 @@ V3_CSS = r'''
 input,textarea,select{width:100%;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--text);padding:8px 10px;font-size:12px;box-shadow:0 1px 2px rgba(0,0,0,.08)}input{height:36px}textarea{min-height:110px;resize:vertical}select{height:36px}.tabs{display:inline-flex;align-items:center;height:36px;padding:3px;background:var(--surface3);border-radius:8px;border:1px solid var(--line);gap:2px}.tab{height:28px;padding:0 11px;border:0;border-radius:6px;background:transparent;color:var(--muted);font-size:11px;font-weight:560;cursor:pointer}.tab:hover{color:var(--text)}.tab.on{background:var(--bg);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.22)}.tab-panel[hidden]{display:none!important}
 '''
 V3_THEME_JS = r'''function bgnToggleTheme(){const r=document.documentElement,n=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=n;localStorage.setItem('bgn.theme',n)}document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||'dark';
-function bgnToast(message,type='ok',title=''){const stack=document.getElementById('toast-stack')||(()=>{const s=document.createElement('div');s.id='toast-stack';s.className='toast-stack';document.body.appendChild(s);return s})();const t=document.createElement('div'),msg=String(message??'').trim()||'Done',label=title||({ok:'Done',error:'Something went wrong',warn:'Notice',loading:'Workingâ€¦'}[type]||'Notice');t.className='toast '+type;t.innerHTML='<i class="toast-dot"></i><div><div class="toast-title"></div><div class="toast-msg"></div></div><button class="toast-close" aria-label="Dismiss">Ã—</button>';t.querySelector('.toast-title').textContent=label;t.querySelector('.toast-msg').textContent=msg;t.querySelector('.toast-close').onclick=()=>{t.classList.remove('show');setTimeout(()=>t.remove(),180)};stack.appendChild(t);requestAnimationFrame(()=>t.classList.add('show'));if(type!=='loading'){const ttl=type==='error'?12000:type==='warn'?9000:8000;setTimeout(()=>{if(t.isConnected){t.classList.remove('show');setTimeout(()=>t.remove(),180)}},ttl)}return t}
+function bgnToast(message,type='ok',title=''){const stack=document.getElementById('toast-stack')||(()=>{const s=document.createElement('div');s.id='toast-stack';s.className='toast-stack';document.body.appendChild(s);return s})();const t=document.createElement('div'),msg=String(message??'').trim()||'Done',label=title||({ok:'Done',error:'Something went wrong',warn:'Notice',loading:'Working…'}[type]||'Notice');t.className='toast '+type;t.innerHTML='<i class="toast-dot"></i><div><div class="toast-title"></div><div class="toast-msg"></div></div><button class="toast-close" aria-label="Dismiss">×</button>';t.querySelector('.toast-title').textContent=label;t.querySelector('.toast-msg').textContent=msg;t.querySelector('.toast-close').onclick=()=>{t.classList.remove('show');setTimeout(()=>t.remove(),180)};stack.appendChild(t);requestAnimationFrame(()=>t.classList.add('show'));if(type!=='loading'){const ttl=type==='error'?12000:type==='warn'?9000:8000;setTimeout(()=>{if(t.isConnected){t.classList.remove('show');setTimeout(()=>t.remove(),180)}},ttl)}return t}
 function toast(m,type='ok'){return bgnToast(m,type)}function bgnToastUpdate(t,message,type='ok',title=''){if(!t||!t.isConnected)return bgnToast(message,type,title);t.className='toast '+type;t.querySelector('.toast-title').textContent=title||({ok:'Done',error:'Something went wrong',warn:'Notice'}[type]||'Done');t.querySelector('.toast-msg').textContent=String(message||'Done');if(type!=='loading'){const ttl=type==='error'?12000:type==='warn'?9000:8000;setTimeout(()=>{if(t.isConnected){t.classList.remove('show');setTimeout(()=>t.remove(),180)}},ttl)}return t}
 function bgnFlash(message,type='ok',title=''){try{sessionStorage.setItem('bgn.flash',JSON.stringify({message:String(message||''),type,title,at:Date.now()}))}catch(e){}}
 function bgnReload(message,type='ok',title='',delay=900){bgnFlash(message,type,title);setTimeout(()=>location.reload(),Math.max(1800,delay))}
 document.addEventListener('DOMContentLoaded',()=>{try{const raw=sessionStorage.getItem('bgn.flash');if(!raw)return;sessionStorage.removeItem('bgn.flash');const f=JSON.parse(raw);if(Date.now()-(f.at||0)<15000)bgnToast(f.message,f.type||'ok',f.title||'')}catch(e){}});
-async function bgnJson(r){const ct=r.headers.get('content-type')||'';if(ct.includes('application/json'))return await r.json();return {message:(await r.text()).trim()}}function bgnResultMessage(d,fallback='Saved'){if(!d)return fallback;if(d.detail)return typeof d.detail==='string'?d.detail:JSON.stringify(d.detail);if(d.message)return d.message;const parts=[];for(const [k,v] of Object.entries(d)){if(v===null||v===undefined||typeof v==='object')continue;parts.push(k.replaceAll('_',' ')+' '+v)}return parts.join(' Â· ')||fallback}
-document.addEventListener('submit',async e=>{const f=e.target;if(!(f instanceof HTMLFormElement)||f.dataset.native==='1'||(f.method||'get').toLowerCase()==='get')return;if(!f.action.startsWith(location.origin))return;e.preventDefault();const submit=e.submitter;if(submit)submit.disabled=true;const pending=bgnToast('Sending requestâ€¦','loading');try{const r=await fetch(f.action,{method:(f.method||'POST').toUpperCase(),body:new FormData(f),credentials:'same-origin'});if(!r.ok){const d=await bgnJson(r);throw new Error(bgnResultMessage(d,'HTTP '+r.status))}if(r.redirected){bgnToastUpdate(pending,'Changes saved','ok');bgnFlash('Changes saved','ok');setTimeout(()=>{location.href=r.url},900);return}const d=await bgnJson(r);bgnToastUpdate(pending,bgnResultMessage(d),'ok');if(f.dataset.reload!=='0')bgnReload(bgnResultMessage(d),'ok','',900)}catch(err){bgnToastUpdate(pending,err.message||String(err),'error')}finally{if(submit)submit.disabled=false}});window.addEventListener('unhandledrejection',e=>{if(e.reason&&e.reason.message)bgnToast(e.reason.message,'error')});'''
+async function bgnJson(r){const ct=r.headers.get('content-type')||'';if(ct.includes('application/json'))return await r.json();return {message:(await r.text()).trim()}}function bgnResultMessage(d,fallback='Saved'){if(!d)return fallback;if(d.detail)return typeof d.detail==='string'?d.detail:JSON.stringify(d.detail);if(d.message)return d.message;const parts=[];for(const [k,v] of Object.entries(d)){if(v===null||v===undefined||typeof v==='object')continue;parts.push(k.replaceAll('_',' ')+' '+v)}return parts.join(' · ')||fallback}
+document.addEventListener('submit',async e=>{const f=e.target;if(!(f instanceof HTMLFormElement)||f.dataset.native==='1'||(f.method||'get').toLowerCase()==='get')return;if(!f.action.startsWith(location.origin))return;e.preventDefault();const submit=e.submitter;if(submit)submit.disabled=true;const pending=bgnToast('Sending request…','loading');try{const r=await fetch(f.action,{method:(f.method||'POST').toUpperCase(),body:new FormData(f),credentials:'same-origin'});if(!r.ok){const d=await bgnJson(r);throw new Error(bgnResultMessage(d,'HTTP '+r.status))}if(r.redirected){bgnToastUpdate(pending,'Changes saved','ok');bgnFlash('Changes saved','ok');setTimeout(()=>{location.href=r.url},900);return}const d=await bgnJson(r);bgnToastUpdate(pending,bgnResultMessage(d),'ok');if(f.dataset.reload!=='0')bgnReload(bgnResultMessage(d),'ok','',900)}catch(err){bgnToastUpdate(pending,err.message||String(err),'error')}finally{if(submit)submit.disabled=false}});window.addEventListener('unhandledrejection',e=>{if(e.reason&&e.reason.message)bgnToast(e.reason.message,'error')});'''
 
 def page(title: str, content: str, active: str = "", raw_js: str = "", wide: bool = False) -> str:
     nav=[('dash','/dashboard','Overview'),('chat','/chat','Chat'),('browser','/browser-view','Browser'),('pool','/pool','Network'),('jars','/jars','Accounts'),('models','/models-page','Models'),('keys','/api-keys','API keys'),('errors','/errors','Errors'),('logs','/logs','Logs')]
     links=''.join(f'<a class="{"on" if active==k else ""}" href="{h}">{esc(l)}</a>' for k,h,l in nav)
-    return f'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark light"><title>{esc(title)} Â· Bridgena</title><style>{V3_CSS}</style></head><body><header class="topbar"><a class="brand" href="/dashboard"><span class="dot"></span><span>Bridgena</span><small>{esc(BUILD_STAMP)}</small></a><div class="spacer"></div><div class="v3-health"><i></i><span>control plane online</span></div><button class="btn sm ghost" onclick="bgnToggleTheme()">â—</button><a class="btn sm ghost" href="/logout">Sign out</a></header><div class="shell"><aside class="rail"><div class="rail-label">Workspace</div>{links}</aside><main class="main">{content}</main></div><div id="toast-stack" class="toast-stack"></div><script>{V3_THEME_JS}{raw_js}</script></body></html>'''
+    return f'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark light"><title>{esc(title)} · Bridgena</title><style>{V3_CSS}</style></head><body><header class="topbar"><a class="brand" href="/dashboard"><span class="dot"></span><span>Bridgena</span><small>{esc(BUILD_STAMP)}</small></a><div class="spacer"></div><div class="v3-health"><i></i><span>control plane online</span></div><button class="btn sm ghost" onclick="bgnToggleTheme()">◐</button><a class="btn sm ghost" href="/logout">Sign out</a></header><div class="shell"><aside class="rail"><div class="rail-label">Workspace</div>{links}</aside><main class="main">{content}</main></div><div id="toast-stack" class="toast-stack"></div><script>{V3_THEME_JS}{raw_js}</script></body></html>'''
 
 def login_page(err: str = "") -> str:
-    return f'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in Â· Bridgena</title><style>{V3_CSS}</style></head><body><div class="auth"><div class="authbox"><div class="authlogo">B</div><h1>Bridgena</h1><p>Sign in to the v3 control plane.</p><form class="card" method="post" action="/login" data-native="1"><label for="p">Dashboard password</label><input id="p" name="password" type="password" autocomplete="current-password" autofocus><button class="btn primary" style="width:100%;margin-top:14px">Continue</button><div class="err">{esc(err)}</div></form><div style="text-align:center;margin-top:14px"><button class="btn sm ghost" onclick="bgnToggleTheme()">â— Theme</button></div></div></div><script>{V3_THEME_JS}</script></body></html>'''
+    return f'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Bridgena</title><style>{V3_CSS}</style></head><body><div class="auth"><div class="authbox"><div class="authlogo">B</div><h1>Bridgena</h1><p>Sign in to the v3 control plane.</p><form class="card" method="post" action="/login" data-native="1"><label for="p">Dashboard password</label><input id="p" name="password" type="password" autocomplete="current-password" autofocus><button class="btn primary" style="width:100%;margin-top:14px">Continue</button><div class="err">{esc(err)}</div></form><div style="text-align:center;margin-top:14px"><button class="btn sm ghost" onclick="bgnToggleTheme()">◐ Theme</button></div></div></div><script>{V3_THEME_JS}</script></body></html>'''
 
 def dashboard_page(overview: dict) -> str:
     m=overview['metrics']; pool=overview.get('pool') or []; jars=overview.get('jars') or []
     distinct_routes=len({_normalize_proxy(j.get('proxy') or '') for j in jars if _normalize_proxy(j.get('proxy') or '')})
-    prow=''.join(f"<tr><td class='mono'>{esc(r.get('display') or 'â€”')}</td><td>{_verdict_pill(r.get('verdict','unknown'))}</td><td class='muted'>{esc(r.get('latency') or 'â€”')}{'ms' if r.get('latency') else ''}</td><td class='muted'>{esc((r.get('why') or 'â€”')[:90])}</td></tr>" for r in pool[:8]) or "<tr><td colspan='4' class='empty'>No proxy telemetry yet.</td></tr>"
-    jrows=''.join("<tr><td><b>"+esc(j.get('name') or j.get('email') or 'Account')+"</b></td><td class='muted'>"+esc(j.get('persona') or 'default')+"</td><td>"+("<span class='pill ok'>authenticated</span>" if jar_has_auth(j) and not j.get('expired') else "<span class='pill bad'>attention</span>")+"</td><td class='mono muted'>"+esc((_proxy_hkey(_normalize_proxy(j.get('proxy') or ''))[:9]+'â€¦') if j.get('proxy') else 'â€”')+"</td></tr>" for j in jars[:8]) or "<tr><td colspan='4' class='empty'>No accounts configured.</td></tr>"
+    prow=''.join(f"<tr><td class='mono'>{esc(r.get('display') or '—')}</td><td>{_verdict_pill(r.get('verdict','unknown'))}</td><td class='muted'>{esc(r.get('latency') or '—')}{'ms' if r.get('latency') else ''}</td><td class='muted'>{esc((r.get('why') or '—')[:90])}</td></tr>" for r in pool[:8]) or "<tr><td colspan='4' class='empty'>No proxy telemetry yet.</td></tr>"
+    jrows=''.join("<tr><td><b>"+esc(j.get('name') or j.get('email') or 'Account')+"</b></td><td class='muted'>"+esc(j.get('persona') or 'default')+"</td><td>"+("<span class='pill ok'>authenticated</span>" if jar_has_auth(j) and not j.get('expired') else "<span class='pill bad'>attention</span>")+"</td><td class='mono muted'>"+esc((_proxy_hkey(_normalize_proxy(j.get('proxy') or ''))[:9]+'…') if j.get('proxy') else '—')+"</td></tr>" for j in jars[:8]) or "<tr><td colspan='4' class='empty'>No accounts configured.</td></tr>"
     logl=''.join(f"<div class='{esc(x.get('lvl','INFO'))}'>{esc(x.get('line') or x.get('message') or '')}</div>" for x in overview.get('logtail',[])[-35:])
     content = f'''<div class="hero"><div class="eyebrow">Operations workspace</div><h1>Bridgena control plane</h1><p>Request health, keeper fleet, network capacity, models and API access in one operational workspace.</p><div class="hero-actions"><a class="btn primary" href="/chat">Open chat</a><a class="btn" href="/pool">Manage network</a><a class="btn" href="/browser-view">Inspect browsers</a><button class="btn ghost" onclick="refreshOverview()">Refresh telemetry</button></div></div>
-<div class="status-strip"><div class="status-card"><div class="label"><span>Healthy exits</span><span class="pill ok">network</span></div><div class="num">{m['alive']}</div><div class="meta">{m['pool_total']} configured Â· {m['flagged']} restricted</div></div><div class="status-card"><div class="label"><span>Keeper fleet</span><span class="pill {'ok' if m['keepers_live'] else 'warn'}">browser</span></div><div class="num">{m['keepers_live']}</div><div class="meta">{m['jars_ok']} authenticated of {m['jars_total']} accounts</div></div><div class="status-card"><div class="label"><span>Distinct routes</span><span class="pill ok">allocation</span></div><div class="num">{distinct_routes}</div><div class="meta">assigned across current accounts</div></div><div class="status-card"><div class="label"><span>Models</span><span class="pill ok">catalog</span></div><div class="num">{m['models']}</div><div class="meta">published through the compatibility API</div></div></div>
-<div class="section-grid"><section class="card"><div class="row"><div><div class="eyebrow">Network</div><h3 style="margin:2px 0 14px">Exit health</h3></div><span class="spacer"></span><a class="btn sm ghost" href="/pool">View all â†’</a></div><div class="table-wrap"><table><thead><tr><th>Exit</th><th>State</th><th>RTT</th><th>Diagnosis</th></tr></thead><tbody>{prow}</tbody></table></div></section><section class="card"><div class="eyebrow">Shortcuts</div><h3 style="margin:2px 0 14px">Quick actions</h3><div class="quick-grid"><a class="quick" href="/pool"><b>Add proxies</b><span>Paste, upload and validate exits</span></a><a class="quick" href="/jars"><b>Accounts</b><span>Manage keepers and personas</span></a><a class="quick" href="/api-keys"><b>API keys</b><span>Create and revoke credentials</span></a><a class="quick" href="/models-page"><b>Models</b><span>Inspect compatibility catalog</span></a></div><div class="kv" style="margin-top:14px"><span>Healthy ratio</span><b>{m['alive']}/{m['pool_total']}</b></div><div class="kv"><span>Authenticated accounts</span><b>{m['jars_ok']}/{m['jars_total']}</b></div><div class="kv"><span>Distinct routes</span><b>{distinct_routes}</b></div></section></div>
-<div class="section-grid"><section class="card"><div class="row"><div><div class="eyebrow">Accounts</div><h3 style="margin:2px 0 14px">Keeper fleet</h3></div><span class="spacer"></span><a class="btn sm ghost" href="/jars">Manage â†’</a></div><div class="table-wrap"><table><thead><tr><th>Account</th><th>Persona</th><th>Auth</th><th>Route ID</th></tr></thead><tbody>{jrows}</tbody></table></div></section><section class="card"><div class="row"><div><div class="eyebrow">Runtime</div><h3 style="margin:2px 0 14px">Recent activity</h3></div><span class="spacer"></span><a class="btn sm ghost" href="/logs">Logs â†’</a></div><div class="console" id="cons" style="height:300px">{logl}</div></section></div>'''
-    js=r'''async function refreshOverview(){const t=bgnToast('Refreshing telemetryâ€¦','loading');try{const r=await fetch('/proxies/api/snapshot',{cache:'no-store'});if(!r.ok)throw new Error('Telemetry refresh failed');const d=await r.json();bgnToastUpdate(t,'Received '+d.length+' network rows','ok');setTimeout(()=>location.reload(),500)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function consRefresh(){try{const r=await fetch('/debug-logs/data',{cache:'no-store'});if(!r.ok)return;const d=await r.json(),c=document.getElementById('cons');c.innerHTML=d.slice(-35).map(x=>'<div class="'+(x.lvl||'INFO')+'">'+String(x.line||x.message||'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))+'</div>').join('');c.scrollTop=c.scrollHeight}catch(e){}}setInterval(consRefresh,3500);'''
+<div class="status-strip"><div class="status-card"><div class="label"><span>Healthy exits</span><span class="pill ok">network</span></div><div class="num">{m['alive']}</div><div class="meta">{m['pool_total']} configured · {m['flagged']} restricted</div></div><div class="status-card"><div class="label"><span>Keeper fleet</span><span class="pill {'ok' if m['keepers_live'] else 'warn'}">browser</span></div><div class="num">{m['keepers_live']}</div><div class="meta">{m['jars_ok']} authenticated of {m['jars_total']} accounts</div></div><div class="status-card"><div class="label"><span>Distinct routes</span><span class="pill ok">allocation</span></div><div class="num">{distinct_routes}</div><div class="meta">assigned across current accounts</div></div><div class="status-card"><div class="label"><span>Models</span><span class="pill ok">catalog</span></div><div class="num">{m['models']}</div><div class="meta">published through the compatibility API</div></div></div>
+<div class="section-grid"><section class="card"><div class="row"><div><div class="eyebrow">Network</div><h3 style="margin:2px 0 14px">Exit health</h3></div><span class="spacer"></span><a class="btn sm ghost" href="/pool">View all →</a></div><div class="table-wrap"><table><thead><tr><th>Exit</th><th>State</th><th>RTT</th><th>Diagnosis</th></tr></thead><tbody>{prow}</tbody></table></div></section><section class="card"><div class="eyebrow">Shortcuts</div><h3 style="margin:2px 0 14px">Quick actions</h3><div class="quick-grid"><a class="quick" href="/pool"><b>Add proxies</b><span>Paste, upload and validate exits</span></a><a class="quick" href="/jars"><b>Accounts</b><span>Manage keepers and personas</span></a><a class="quick" href="/api-keys"><b>API keys</b><span>Create and revoke credentials</span></a><a class="quick" href="/models-page"><b>Models</b><span>Inspect compatibility catalog</span></a></div><div class="kv" style="margin-top:14px"><span>Healthy ratio</span><b>{m['alive']}/{m['pool_total']}</b></div><div class="kv"><span>Authenticated accounts</span><b>{m['jars_ok']}/{m['jars_total']}</b></div><div class="kv"><span>Distinct routes</span><b>{distinct_routes}</b></div></section></div>
+<div class="section-grid"><section class="card"><div class="row"><div><div class="eyebrow">Accounts</div><h3 style="margin:2px 0 14px">Keeper fleet</h3></div><span class="spacer"></span><a class="btn sm ghost" href="/jars">Manage →</a></div><div class="table-wrap"><table><thead><tr><th>Account</th><th>Persona</th><th>Auth</th><th>Route ID</th></tr></thead><tbody>{jrows}</tbody></table></div></section><section class="card"><div class="row"><div><div class="eyebrow">Runtime</div><h3 style="margin:2px 0 14px">Recent activity</h3></div><span class="spacer"></span><a class="btn sm ghost" href="/logs">Logs →</a></div><div class="console" id="cons" style="height:300px">{logl}</div></section></div>'''
+    js=r'''async function refreshOverview(){const t=bgnToast('Refreshing telemetry…','loading');try{const r=await fetch('/proxies/api/snapshot',{cache:'no-store'});if(!r.ok)throw new Error('Telemetry refresh failed');const d=await r.json();bgnToastUpdate(t,'Received '+d.length+' network rows','ok');setTimeout(()=>location.reload(),500)}catch(e){bgnToastUpdate(t,e.message||String(e),'error')}}async function consRefresh(){try{const r=await fetch('/debug-logs/data',{cache:'no-store'});if(!r.ok)return;const d=await r.json(),c=document.getElementById('cons');c.innerHTML=d.slice(-35).map(x=>'<div class="'+(x.lvl||'INFO')+'">'+String(x.line||x.message||'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))+'</div>').join('');c.scrollTop=c.scrollHeight}catch(e){}}setInterval(consRefresh,3500);'''
     return page('Overview', content, 'dash', js)
 
 def chat_page(models: list, default_model: str) -> str:
     names=[m.get('name','') for m in models if isinstance(m,dict) and m.get('name')]
     mj=_json.dumps(names,ensure_ascii=False).replace('</','<\\/')
     dj=_json.dumps(default_model or (names[0] if names else 'auto'),ensure_ascii=False)
-    template=r'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chat Â· Bridgena</title><style>
+    template=r'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chat · Bridgena</title><style>
 :root{--bg:#09090b;--side:#0d0d0f;--soft:#18181b;--line:#27272a;--text:#fafafa;--muted:#a1a1aa;--dim:#71717a;--ok:#4ade80;--bad:#fb7185;--warn:#fbbf24}[data-theme=light]{--bg:#fff;--side:#fafafa;--soft:#f4f4f5;--line:#e4e4e7;--text:#09090b;--muted:#71717a;--dim:#a1a1aa;--ok:#16a34a;--bad:#e11d48;--warn:#b45309}*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font:14px/1.6 Inter,ui-sans-serif,system-ui,sans-serif}button,input,textarea{font:inherit}.app{height:100%;display:grid;grid-template-columns:260px minmax(0,1fr)}.side{display:flex;flex-direction:column;border-right:1px solid var(--line);background:var(--side);min-width:0}.sidehead{height:60px;display:flex;align-items:center;gap:10px;padding:0 14px}.logo{width:30px;height:30px;border-radius:9px;background:var(--text);color:var(--bg);display:grid;place-items:center;font-size:11px;font-weight:800}.sidebody{flex:1;overflow:auto;padding:8px}.new,.thread,.ghost,.modelbtn,.chipbtn{border:0;color:inherit;cursor:pointer}.new{width:100%;height:39px;border-radius:8px;text-align:left;padding:0 11px;background:transparent}.new:hover,.thread:hover,.ghost:hover,.modelbtn:hover,.chipbtn:hover{background:var(--soft)}.label{padding:22px 10px 8px;color:var(--dim);text-transform:uppercase;font-size:10px;font-weight:650;letter-spacing:.07em}.thread{width:100%;display:flex;background:transparent;border-radius:8px;padding:9px 10px;color:var(--muted);text-align:left}.thread span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.thread.on{background:var(--soft);color:var(--text)}.sidefoot{padding:9px;border-top:1px solid var(--line)}.sidefoot a{display:block;color:var(--muted);text-decoration:none;padding:9px 10px;border-radius:8px}.sidefoot a:hover{background:var(--soft);color:var(--text)}.main{min-width:0;min-height:0;display:flex;flex-direction:column}.top{height:60px;display:flex;align-items:center;gap:8px;padding:0 16px;border-bottom:1px solid var(--line)}.modelwrap{position:relative}.modelbtn{height:36px;max-width:min(480px,60vw);border-radius:8px;padding:0 10px;background:transparent;font-weight:620;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{margin-left:auto;display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px}.status i{width:7px;height:7px;border-radius:50%;background:var(--ok)}.ghost{width:35px;height:35px;border-radius:8px;background:transparent}.picker{display:none;position:absolute;top:42px;left:0;z-index:40;width:min(500px,calc(100vw - 30px));background:var(--bg);border:1px solid var(--line);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.35);overflow:hidden}.picker.open{display:block}.picker input{width:100%;height:42px;border:0;border-bottom:1px solid var(--line);outline:0;background:transparent;color:var(--text);padding:0 12px}.modellist{max-height:360px;overflow:auto;padding:5px}.modelopt{width:100%;border:0;border-radius:7px;background:transparent;color:var(--text);padding:9px 10px;text-align:left;cursor:pointer}.modelopt:hover,.modelopt.on{background:var(--soft)}.scroll{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}.conversation{width:min(900px,100%);margin:0 auto;padding:42px 24px 205px}.welcome{min-height:58vh;display:grid;place-items:center;text-align:center}.welcome h1{font-size:32px;letter-spacing:-.045em;margin:0 0 8px}.welcome p{margin:0;color:var(--muted)}.suggestions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:24px;width:min(580px,100%)}.chipbtn{padding:11px 13px;text-align:left;border:1px solid var(--line);border-radius:10px;background:transparent;color:var(--muted)}.msg{display:grid;grid-template-columns:32px minmax(0,1fr);gap:13px;margin-bottom:34px}.avatar{width:31px;height:31px;border-radius:9px;background:var(--soft);display:grid;place-items:center;font-size:10px;font-weight:800}.msg.user{display:flex;justify-content:flex-end;margin-left:18%}.msg.user .avatar,.msg.user .head{display:none}.msg.user .body{max-width:82%;padding:10px 14px;border-radius:17px;background:var(--soft)}.head{font-size:11px;color:var(--dim);margin-bottom:5px;font-weight:650}.body{font-size:15px;line-height:1.78;word-break:break-word}.body pre{overflow:auto;background:#050505;border:1px solid var(--line);border-radius:9px;padding:12px;font:12px/1.6 ui-monospace,monospace}.body code{font-family:ui-monospace,monospace;background:var(--soft);border-radius:5px;padding:1px 4px}.body pre code{background:none;padding:0}.reason{margin:0 0 12px;color:var(--muted);font-size:12px;border-left:2px solid var(--line);padding-left:10px;white-space:pre-wrap}.error{color:var(--bad)}.dock{position:fixed;left:260px;right:0;bottom:0;padding:54px 18px 18px;background:linear-gradient(transparent,var(--bg) 48%);pointer-events:none}.compose{pointer-events:auto;width:min(900px,100%);margin:0 auto;border:1px solid var(--line);border-radius:20px;background:var(--bg);padding:12px;box-shadow:0 10px 36px rgba(0,0,0,.2)}.compose textarea{width:100%;min-height:44px;max-height:190px;resize:none;border:0;outline:0;background:transparent;color:var(--text);padding:4px}.composefoot{display:flex;align-items:center;color:var(--dim);font-size:10px}.send{margin-left:auto;width:34px;height:34px;border:0;border-radius:50%;background:var(--text);color:var(--bg);cursor:pointer}.send.stop{background:var(--bad);color:#fff}.runtime{position:fixed;z-index:70;top:72px;right:14px;bottom:14px;width:min(520px,calc(100vw - 28px));background:var(--side);border:1px solid var(--line);border-radius:13px;box-shadow:0 24px 70px rgba(0,0,0,.4);padding:12px;display:none}.runtime.open{display:flex;flex-direction:column}.runtime pre{flex:1;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;color:var(--muted);white-space:pre-wrap;font:11px/1.5 ui-monospace,monospace}.mobile{display:none}@media(max-width:760px){.app{grid-template-columns:1fr}.side{position:fixed;inset:0 auto 0 0;width:260px;z-index:90;transform:translateX(-100%);transition:.18s}.side.open{transform:none}.mobile{display:block}.dock{left:0}.conversation{padding:28px 15px 190px}.suggestions{grid-template-columns:1fr}.msg.user{margin-left:5%}}
-</style></head><body><div class=app><aside class=side id=side><div class=sidehead><div class=logo>B</div><b>Bridgena</b></div><div class=sidebody><button class=new onclick="newChat()">ï¼‹ New chat</button><div class=label>Recent</div><div id=threads></div></div><div class=sidefoot><a href="/dashboard">â† Control plane</a></div></aside><main class=main><header class=top><button class="ghost mobile" onclick="side.classList.toggle('open')">â˜°</button><div class=modelwrap><button class=modelbtn id=modelBtn onclick="togglePicker()">Model</button><div class=picker id=picker><input id=modelSearch placeholder="Search models"><div class=modellist id=modelList></div></div></div><div class=status><i id=statusDot></i><span id=statusText>Ready</span></div><button class=ghost onclick="toggleRuntime()">âŒ</button><button class=ghost onclick="toggleTheme()">â—</button></header><div class=scroll id=scroll><div class=conversation id=conversation></div></div><div class=dock><div class=compose><textarea id=input placeholder="Message Bridgena"></textarea><div class=composefoot><span>Enter to send Â· Shift+Enter newline</span><button class=send id=send onclick="sendOrStop()">â†‘</button></div></div></div></main></div><aside class=runtime id=runtime><div style="display:flex;align-items:center"><b>Runtime signal</b><button class=ghost style="margin-left:auto" onclick="toggleRuntime()">Ã—</button></div><pre id=signal>Waiting for activityâ€¦</pre></aside><script>
-const MODELS=__MODELS__,DEFAULT_MODEL=__DEFAULT__,$=id=>document.getElementById(id),side=$('side');let controller=null,busy=false,model=localStorage.getItem('bgn.v3.model')||DEFAULT_MODEL,chatId=localStorage.getItem('bgn.v3.chat')||newId();function newId(){return 'c-'+crypto.getRandomValues(new Uint32Array(2)).join('-')}function store(){try{return JSON.parse(localStorage.getItem('bgn.v3.chats')||'{}')}catch(e){return {}}}function saveStore(v){localStorage.setItem('bgn.v3.chats',JSON.stringify(v))}function current(){const s=store();return s[chatId]||{id:chatId,title:'New chat',messages:[],updated:Date.now()}}function saveCurrent(c){const s=store();s[chatId]=c;saveStore(s);localStorage.setItem('bgn.v3.chat',chatId);renderThreads()}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function md(s){let x=esc(s);x=x.replace(/```([\s\S]*?)```/g,(_,b)=>'<pre><code>'+b+'</code></pre>');x=x.replace(/`([^`]+)`/g,'<code>$1</code>');x=x.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');return x.replace(/\n/g,'<br>')}function renderThreads(){const s=store(),items=Object.values(s).sort((a,b)=>(b.updated||0)-(a.updated||0)).slice(0,60);$('threads').innerHTML=items.map(c=>'<button class="thread '+(c.id===chatId?'on':'')+'" onclick="openChat(\''+c.id.replace(/'/g,'')+'\')"><span>'+esc(c.title||'New chat')+'</span></button>').join('')}function openChat(id){chatId=id;localStorage.setItem('bgn.v3.chat',id);renderConversation();renderThreads();side.classList.remove('open')}function newChat(){chatId=newId();saveCurrent({id:chatId,title:'New chat',messages:[],updated:Date.now()});renderConversation()}function renderConversation(){const c=current(),root=$('conversation');root.innerHTML='';if(!c.messages.length){root.innerHTML='<div class=welcome><div><div class=logo style="margin:0 auto 16px;width:42px;height:42px">B</div><h1>How can I help?</h1><p>Chat through the same v3 compatibility surface your clients use.</p><div class=suggestions><button class=chipbtn onclick="usePrompt(\'Review this code and identify reliability risks\')">Review code</button><button class=chipbtn onclick="usePrompt(\'Help me diagnose a failed request\')">Diagnose a request</button></div></div></div>';return}c.messages.forEach(m=>appendRendered(m.role,m.content,m.reasoning||''));scrollBottom(false)}function appendRendered(role,content,reasoning=''){const root=$('conversation'),w=root.querySelector('.welcome');if(w)w.remove();const d=document.createElement('div');d.className='msg '+role;d.innerHTML='<div class=avatar>'+(role==='user'?'U':'B')+'</div><div><div class=head>'+(role==='user'?'You':'Bridgena')+'</div><div class=body>'+(reasoning?'<div class=reason>'+esc(reasoning)+'</div>':'')+md(content)+'</div></div>';root.appendChild(d);return d.querySelector('.body')}function setStatus(t,state='ok'){$('statusText').textContent=t;$('statusDot').style.background=state==='bad'?'var(--bad)':state==='busy'?'var(--warn)':'var(--ok)'}function scrollBottom(s=true){$('scroll').scrollTo({top:$('scroll').scrollHeight,behavior:s?'smooth':'auto'})}function toggleTheme(){const r=document.documentElement,n=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=n;localStorage.setItem('bgn.theme',n)}document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||'dark';function togglePicker(){$('picker').classList.toggle('open');if($('picker').classList.contains('open')){$('modelSearch').value='';renderModels('');$('modelSearch').focus()}}function renderModels(q=''){const x=q.toLowerCase(),arr=MODELS.filter(m=>m.toLowerCase().includes(x)).slice(0,250);$('modelList').innerHTML=arr.map(m=>'<button class="modelopt '+(m===model?'on':'')+'" data-m="'+esc(m)+'">'+esc(m)+'</button>').join('')||'<div style="padding:20px;color:var(--muted)">No matching models</div>';document.querySelectorAll('.modelopt').forEach(b=>b.onclick=()=>{model=b.dataset.m;localStorage.setItem('bgn.v3.model',model);$('modelBtn').textContent=model;$('picker').classList.remove('open')})}$('modelSearch').addEventListener('input',e=>renderModels(e.target.value));$('modelBtn').textContent=model;renderModels('');function usePrompt(s){$('input').value=s;$('input').focus();autoSize()}function autoSize(){const t=$('input');t.style.height='44px';t.style.height=Math.min(190,t.scrollHeight)+'px'}$('input').addEventListener('input',autoSize);$('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendOrStop()}});function toggleRuntime(){$('runtime').classList.toggle('open')}async function refreshSignal(){try{const r=await fetch('/debug-logs/data',{cache:'no-store'});if(!r.ok)return;const d=await r.json();$('signal').textContent=d.slice(-120).map(x=>x.line||x.message||'').join('\n')}catch(e){}}setInterval(refreshSignal,2500);function saveMsg(role,content,reasoning=''){const c=current();c.messages.push({role,content,reasoning,ts:Date.now()});if(c.title==='New chat'&&role==='user')c.title=content.replace(/\s+/g,' ').slice(0,48)||'New chat';c.updated=Date.now();saveCurrent(c)}function sendOrStop(){if(busy){controller?.abort();return}sendMessage()}async function sendMessage(){const input=$('input'),text=input.value.trim();if(!text)return;busy=true;controller=new AbortController();input.value='';autoSize();$('send').textContent='â– ';$('send').classList.add('stop');setStatus('Generating','busy');saveMsg('user',text);appendRendered('user',text);const body=appendRendered('assistant','');let acc='',reason='';scrollBottom();try{const c=current();const messages=c.messages.slice(-24).map(m=>({role:m.role==='assistant'?'assistant':'user',content:m.content}));const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({model,messages,stream:true,chat_id:chatId,stream_options:{include_usage:true}})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let cut;while((cut=buf.indexOf('\n'))>=0){const line=buf.slice(0,cut).trim();buf=buf.slice(cut+1);if(!line.startsWith('data: '))continue;const raw=line.slice(6);if(raw==='[DONE]')continue;let j;try{j=JSON.parse(raw)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta||{};if(d.reasoning_content)reason+=d.reasoning_content;if(d.content)acc+=d.content;body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc);scrollBottom(false)}}if(!acc)throw new Error('The upstream completed without assistant content.');saveMsg('assistant',acc,reason);setStatus('Ready')}catch(e){if(e.name==='AbortError'){body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc||'Generation stopped.');if(acc)saveMsg('assistant',acc,reason);setStatus('Stopped')}else{const err='<div class=error>'+esc(e.message||e)+'</div>';if(acc||reason){body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc)+err;if(acc)saveMsg('assistant',acc,reason)}else{body.innerHTML=err}setStatus('Error','bad')}}finally{busy=false;controller=null;$('send').textContent='â†‘';$('send').classList.remove('stop');renderThreads()}}renderThreads();renderConversation();refreshSignal();document.addEventListener('click',e=>{if(!$('picker').contains(e.target)&&e.target!==$('modelBtn'))$('picker').classList.remove('open')});
+</style></head><body><div class=app><aside class=side id=side><div class=sidehead><div class=logo>B</div><b>Bridgena</b></div><div class=sidebody><button class=new onclick="newChat()">＋ New chat</button><div class=label>Recent</div><div id=threads></div></div><div class=sidefoot><a href="/dashboard">← Control plane</a></div></aside><main class=main><header class=top><button class="ghost mobile" onclick="side.classList.toggle('open')">☰</button><div class=modelwrap><button class=modelbtn id=modelBtn onclick="togglePicker()">Model</button><div class=picker id=picker><input id=modelSearch placeholder="Search models"><div class=modellist id=modelList></div></div></div><div class=status><i id=statusDot></i><span id=statusText>Ready</span></div><button class=ghost onclick="toggleRuntime()">⌁</button><button class=ghost onclick="toggleTheme()">◐</button></header><div class=scroll id=scroll><div class=conversation id=conversation></div></div><div class=dock><div class=compose><textarea id=input placeholder="Message Bridgena"></textarea><div class=composefoot><span>Enter to send · Shift+Enter newline</span><button class=send id=send onclick="sendOrStop()">↑</button></div></div></div></main></div><aside class=runtime id=runtime><div style="display:flex;align-items:center"><b>Runtime signal</b><button class=ghost style="margin-left:auto" onclick="toggleRuntime()">×</button></div><pre id=signal>Waiting for activity…</pre></aside><script>
+const MODELS=__MODELS__,DEFAULT_MODEL=__DEFAULT__,$=id=>document.getElementById(id),side=$('side');let controller=null,busy=false,model=localStorage.getItem('bgn.v3.model')||DEFAULT_MODEL,chatId=localStorage.getItem('bgn.v3.chat')||newId();function newId(){return 'c-'+crypto.getRandomValues(new Uint32Array(2)).join('-')}function store(){try{return JSON.parse(localStorage.getItem('bgn.v3.chats')||'{}')}catch(e){return {}}}function saveStore(v){localStorage.setItem('bgn.v3.chats',JSON.stringify(v))}function current(){const s=store();return s[chatId]||{id:chatId,title:'New chat',messages:[],updated:Date.now()}}function saveCurrent(c){const s=store();s[chatId]=c;saveStore(s);localStorage.setItem('bgn.v3.chat',chatId);renderThreads()}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function md(s){let x=esc(s);x=x.replace(/```([\s\S]*?)```/g,(_,b)=>'<pre><code>'+b+'</code></pre>');x=x.replace(/`([^`]+)`/g,'<code>$1</code>');x=x.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');return x.replace(/\n/g,'<br>')}function renderThreads(){const s=store(),items=Object.values(s).sort((a,b)=>(b.updated||0)-(a.updated||0)).slice(0,60);$('threads').innerHTML=items.map(c=>'<button class="thread '+(c.id===chatId?'on':'')+'" onclick="openChat(\''+c.id.replace(/'/g,'')+'\')"><span>'+esc(c.title||'New chat')+'</span></button>').join('')}function openChat(id){chatId=id;localStorage.setItem('bgn.v3.chat',id);renderConversation();renderThreads();side.classList.remove('open')}function newChat(){chatId=newId();saveCurrent({id:chatId,title:'New chat',messages:[],updated:Date.now()});renderConversation()}function renderConversation(){const c=current(),root=$('conversation');root.innerHTML='';if(!c.messages.length){root.innerHTML='<div class=welcome><div><div class=logo style="margin:0 auto 16px;width:42px;height:42px">B</div><h1>How can I help?</h1><p>Chat through the same v3 compatibility surface your clients use.</p><div class=suggestions><button class=chipbtn onclick="usePrompt(\'Review this code and identify reliability risks\')">Review code</button><button class=chipbtn onclick="usePrompt(\'Help me diagnose a failed request\')">Diagnose a request</button></div></div></div>';return}c.messages.forEach(m=>appendRendered(m.role,m.content,m.reasoning||''));scrollBottom(false)}function appendRendered(role,content,reasoning=''){const root=$('conversation'),w=root.querySelector('.welcome');if(w)w.remove();const d=document.createElement('div');d.className='msg '+role;d.innerHTML='<div class=avatar>'+(role==='user'?'U':'B')+'</div><div><div class=head>'+(role==='user'?'You':'Bridgena')+'</div><div class=body>'+(reasoning?'<div class=reason>'+esc(reasoning)+'</div>':'')+md(content)+'</div></div>';root.appendChild(d);return d.querySelector('.body')}function setStatus(t,state='ok'){$('statusText').textContent=t;$('statusDot').style.background=state==='bad'?'var(--bad)':state==='busy'?'var(--warn)':'var(--ok)'}function scrollBottom(s=true){$('scroll').scrollTo({top:$('scroll').scrollHeight,behavior:s?'smooth':'auto'})}function toggleTheme(){const r=document.documentElement,n=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=n;localStorage.setItem('bgn.theme',n)}document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||'dark';function togglePicker(){$('picker').classList.toggle('open');if($('picker').classList.contains('open')){$('modelSearch').value='';renderModels('');$('modelSearch').focus()}}function renderModels(q=''){const x=q.toLowerCase(),arr=MODELS.filter(m=>m.toLowerCase().includes(x)).slice(0,250);$('modelList').innerHTML=arr.map(m=>'<button class="modelopt '+(m===model?'on':'')+'" data-m="'+esc(m)+'">'+esc(m)+'</button>').join('')||'<div style="padding:20px;color:var(--muted)">No matching models</div>';document.querySelectorAll('.modelopt').forEach(b=>b.onclick=()=>{model=b.dataset.m;localStorage.setItem('bgn.v3.model',model);$('modelBtn').textContent=model;$('picker').classList.remove('open')})}$('modelSearch').addEventListener('input',e=>renderModels(e.target.value));$('modelBtn').textContent=model;renderModels('');function usePrompt(s){$('input').value=s;$('input').focus();autoSize()}function autoSize(){const t=$('input');t.style.height='44px';t.style.height=Math.min(190,t.scrollHeight)+'px'}$('input').addEventListener('input',autoSize);$('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendOrStop()}});function toggleRuntime(){$('runtime').classList.toggle('open')}async function refreshSignal(){try{const r=await fetch('/debug-logs/data',{cache:'no-store'});if(!r.ok)return;const d=await r.json();$('signal').textContent=d.slice(-120).map(x=>x.line||x.message||'').join('\n')}catch(e){}}setInterval(refreshSignal,2500);function saveMsg(role,content,reasoning=''){const c=current();c.messages.push({role,content,reasoning,ts:Date.now()});if(c.title==='New chat'&&role==='user')c.title=content.replace(/\s+/g,' ').slice(0,48)||'New chat';c.updated=Date.now();saveCurrent(c)}function sendOrStop(){if(busy){controller?.abort();return}sendMessage()}async function sendMessage(){const input=$('input'),text=input.value.trim();if(!text)return;busy=true;controller=new AbortController();input.value='';autoSize();$('send').textContent='■';$('send').classList.add('stop');setStatus('Generating','busy');saveMsg('user',text);appendRendered('user',text);const body=appendRendered('assistant','');let acc='',reason='';scrollBottom();try{const c=current();const messages=c.messages.slice(-24).map(m=>({role:m.role==='assistant'?'assistant':'user',content:m.content}));const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({model,messages,stream:true,chat_id:chatId,stream_options:{include_usage:true}})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let cut;while((cut=buf.indexOf('\n'))>=0){const line=buf.slice(0,cut).trim();buf=buf.slice(cut+1);if(!line.startsWith('data: '))continue;const raw=line.slice(6);if(raw==='[DONE]')continue;let j;try{j=JSON.parse(raw)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta||{};if(d.reasoning_content)reason+=d.reasoning_content;if(d.content)acc+=d.content;body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc);scrollBottom(false)}}if(!acc)throw new Error('The upstream completed without assistant content.');saveMsg('assistant',acc,reason);setStatus('Ready')}catch(e){if(e.name==='AbortError'){body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc||'Generation stopped.');if(acc)saveMsg('assistant',acc,reason);setStatus('Stopped')}else{const err='<div class=error>'+esc(e.message||e)+'</div>';if(acc||reason){body.innerHTML=(reason?'<div class=reason>'+esc(reason)+'</div>':'')+md(acc)+err;if(acc)saveMsg('assistant',acc,reason)}else{body.innerHTML=err}setStatus('Error','bad')}}finally{busy=false;controller=null;$('send').textContent='↑';$('send').classList.remove('stop');renderThreads()}}renderThreads();renderConversation();refreshSignal();document.addEventListener('click',e=>{if(!$('picker').contains(e.target)&&e.target!==$('modelBtn'))$('picker').classList.remove('open')});
 </script></body></html>'''
     return template.replace('__MODELS__',mj).replace('__DEFAULT__',dj)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ module: api.py â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ────────────────────────── module: api.py ──────────────────────────────
 
 # ============================================================
-# v2 API â€” FastAPI surface. Every legacy route kept (the VPS bookmarks
+# v2 API — FastAPI surface. Every legacy route kept (the VPS bookmarks
 # them); chat page talks to /v1/chat/completions exactly like external
-# OpenAI clients do â€” one protocol, one engine behind both.
+# OpenAI clients do — one protocol, one engine behind both.
 # ============================================================
 import asyncio, json, os, time
 from contextlib import asynccontextmanager
@@ -10728,21 +11014,89 @@ _V3_VNC_DISPLAY=os.environ.get('BRIDGENA_VNC_DISPLAY',':99')
 _V3_VNC_PORT=int(os.environ.get('BRIDGENA_VNC_PORT','5900'))
 _V3_VNC_ENABLED=os.environ.get('BRIDGENA_VNC','0').lower() in ('1','true','yes','on')
 _V3_NOVNC_ROOTS=('/usr/share/novnc','/opt/novnc')
+
 async def _v3_vnc_start():
-    if not _V3_VNC_ENABLED:return False,'disabled'
-    import shutil as _shutil,subprocess as _subprocess
-    xvfb,x11vnc=_shutil.which('Xvfb'),_shutil.which('x11vnc')
-    if not xvfb or not x11vnc:
-        log('WARN','v3 VNC requested but Xvfb/x11vnc are not installed');return False,'missing dependencies'
-    display_num=_V3_VNC_DISPLAY.lstrip(':').split('.')[0]
+    # A headed Chromium process needs an X server on Linux even when the
+    # dashboard VNC viewer itself is disabled. Reuse an existing DISPLAY when
+    # provided; otherwise automatically provision Xvfb for the keeper fleet.
+    need_display = bool(KEEPERS_HEADED_DEFAULT and KEEPERS_AUTO_XVFB)
+    if not _V3_VNC_ENABLED and not need_display:
+        return False,'disabled'
+
+    import shutil as _shutil, subprocess as _subprocess
+
+    current_display = os.environ.get('DISPLAY','').strip()
+    display = current_display or _V3_VNC_DISPLAY
+    display_num = display.lstrip(':').split('.')[0]
+
     try:
-        if not os.path.exists(f'/tmp/.X11-unix/X{display_num}'):
-            _V3_VNC_PROCS.append(_subprocess.Popen([xvfb,_V3_VNC_DISPLAY,'-screen','0',os.environ.get('BRIDGENA_VNC_SCREEN','1440x900x24'),'-nolisten','tcp','-ac'],stdout=_subprocess.DEVNULL,stderr=_subprocess.DEVNULL));await asyncio.sleep(.35)
-        os.environ['DISPLAY']=_V3_VNC_DISPLAY
-        _V3_VNC_PROCS.append(_subprocess.Popen([x11vnc,'-display',_V3_VNC_DISPLAY,'-rfbport',str(_V3_VNC_PORT),'-localhost','-forever','-shared','-nopw','-noxdamage'],stdout=_subprocess.DEVNULL,stderr=_subprocess.DEVNULL))
-        log('OK',f'v3 VNC display {_V3_VNC_DISPLAY} ready on localhost:{_V3_VNC_PORT}');return True,'ready'
+        if need_display and not current_display:
+            xvfb = _shutil.which('Xvfb')
+            if not xvfb:
+                log(
+                    'ERROR',
+                    'Headed keeper mode requires Xvfb on this server. '
+                    'Install package xvfb or provide an existing DISPLAY.'
+                )
+                return False,'missing Xvfb'
+
+            if not os.path.exists(f'/tmp/.X11-unix/X{display_num}'):
+                _V3_VNC_PROCS.append(
+                    _subprocess.Popen(
+                        [
+                            xvfb, display,
+                            '-screen','0',
+                            os.environ.get('BRIDGENA_VNC_SCREEN','1440x900x24'),
+                            '-nolisten','tcp','-ac'
+                        ],
+                        stdout=_subprocess.DEVNULL,
+                        stderr=_subprocess.DEVNULL,
+                    )
+                )
+                await asyncio.sleep(.45)
+
+            os.environ['DISPLAY'] = display
+            log('OK', f'Headed keeper X display {display} ready')
+
+        elif current_display:
+            log('INFO', f'Headed keeper mode reusing DISPLAY={current_display}')
+
+        if _V3_VNC_ENABLED:
+            x11vnc = _shutil.which('x11vnc')
+            if not x11vnc:
+                log(
+                    'WARN',
+                    'Dashboard VNC requested but x11vnc is not installed; '
+                    'headed keepers can still run on the X display.'
+                )
+                return True,'headed display ready; VNC unavailable'
+
+            # Avoid spawning duplicate x11vnc listeners during lifespan retries.
+            _V3_VNC_PROCS.append(
+                _subprocess.Popen(
+                    [
+                        x11vnc,
+                        '-display', os.environ.get('DISPLAY', display),
+                        '-rfbport', str(_V3_VNC_PORT),
+                        '-localhost','-forever','-shared','-nopw','-noxdamage'
+                    ],
+                    stdout=_subprocess.DEVNULL,
+                    stderr=_subprocess.DEVNULL,
+                )
+            )
+            log(
+                'OK',
+                f'v3 VNC display {os.environ.get("DISPLAY", display)} '
+                f'ready on localhost:{_V3_VNC_PORT}'
+            )
+            return True,'ready'
+
+        return True,'headed display ready'
+
     except Exception as exc:
-        log('ERROR',f'v3 VNC start failed: {type(exc).__name__}: {exc}');return False,str(exc)
+        log('ERROR',f'Headed display/VNC start failed: {type(exc).__name__}: {exc}')
+        return False,str(exc)
+
 async def _v3_vnc_stop():
     processes=list(reversed(_V3_VNC_PROCS))
     for p in processes:
@@ -10811,7 +11165,7 @@ async def v3_vnc_page(request: Request):
     root=_v3_novnc_root()
     if not _V3_VNC_ENABLED:return HTMLResponse(page('VNC','<div class=pagehead><div><h1>VNC console</h1><p>Optional real VNC for headed keeper sessions.</p></div></div><div class=card><h3>Disabled</h3><p class=muted>Set <code>BRIDGENA_VNC=1</code> and install the bundled VNC dependencies. The Browser Observer works without them.</p><a class="btn primary" href="/browser-view">Open Browser Observer</a></div>','browser'))
     if not root:return HTMLResponse(page('VNC','<div class=pagehead><div><h1>VNC console</h1><p>VNC is enabled, but noVNC web assets were not found.</p></div></div><div class=card><p class=muted>Install the <code>novnc</code> system package and restart Bridgena.</p><a class=btn href="/browser-view">Browser Observer</a></div>','browser'))
-    return HTMLResponse('''<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>VNC Â· Bridgena</title><style>html,body{margin:0;width:100%;height:100%;background:#09090b}iframe{border:0;width:100%;height:100%}</style></head><body><iframe src="/novnc/vnc.html?autoconnect=1&resize=scale&path=vnc%2Fws"></iframe></body></html>''')
+    return HTMLResponse('''<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>VNC · Bridgena</title><style>html,body{margin:0;width:100%;height:100%;background:#09090b}iframe{border:0;width:100%;height:100%}</style></head><body><iframe src="/novnc/vnc.html?autoconnect=1&resize=scale&path=vnc%2Fws"></iframe></body></html>''')
 
 _api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 _dashboard_sessions: dict = {}
@@ -10969,8 +11323,8 @@ def _register_private_error(*, status_code: int, detail: Any, source: str,
     with _error_events_lock:
         _error_events.append(row)
     _persist_error_event(row)
-    log("WARN", f"Customer error {error_id} Â· HTTP {row['status']} Â· {row['source']} Â· "
-                f"{row['method']} {row['path']} Â· internal: {safe_detail[:260]}")
+    log("WARN", f"Customer error {error_id} · HTTP {row['status']} · {row['source']} · "
+                f"{row['method']} {row['path']} · internal: {safe_detail[:260]}")
     return error_id, _public_error_phrase(error_id, row["status"])
 
 
@@ -11112,16 +11466,11 @@ async def bridgena_delivery_headers(request: Request, call_next):
     response = await call_next(request)
     content_type = (response.headers.get("content-type") or "").lower()
     if "text/html" in content_type:
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        response.headers["CDN-Cache-Control"] = "no-store"
-        response.headers["Cloudflare-CDN-Cache-Control"] = "no-store"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
+        for key, value in _header_group("response_html").items():
+            response.headers[key] = value
     elif "text/event-stream" in content_type:
-        response.headers["Cache-Control"] = "no-cache, no-transform"
-        response.headers["CDN-Cache-Control"] = "no-store"
-        response.headers["Cloudflare-CDN-Cache-Control"] = "no-store"
-        response.headers["X-Accel-Buffering"] = "no"
+        for key, value in _header_group("response_sse").items():
+            response.headers[key] = value
     return response
 
 
@@ -11178,7 +11527,9 @@ async def v3_control_plane_middleware(request: Request,call_next):
             origin=request.headers.get('origin')
             if origin:
                 if urlparse(origin).netloc != request.headers.get('host',''):return JSONResponse({'detail':'cross-origin control-plane mutation rejected'},status_code=403)
-    response=await call_next(request);response.headers['X-Bridgena-Request-ID']=rid;response.headers['X-Bridgena-Version']=BUILD_STAMP;response.headers['X-Content-Type-Options']='nosniff';response.headers['X-Frame-Options']='SAMEORIGIN';response.headers['Referrer-Policy']='same-origin';response.headers['Permissions-Policy']='camera=(), microphone=(), geolocation=()';response.headers['Server-Timing']=f"app;dur={(time.perf_counter()-started)*1000:.1f}";return response
+    response=await call_next(request);response.headers['X-Bridgena-Request-ID']=rid;response.headers['X-Bridgena-Version']=BUILD_STAMP
+    for _hk,_hv in _header_group("response_security").items():response.headers[_hk]=_hv
+    response.headers['Server-Timing']=f"app;dur={(time.perf_counter()-started)*1000:.1f}";return response
 
 # ---------- pages ----------
 @app.get("/login", response_class=HTMLResponse)
@@ -11519,7 +11870,7 @@ def _tool_protocol_system(body: dict, protocol: str) -> str:
         return ""
     encoded = json.dumps(defs, ensure_ascii=False, separators=(",", ":"))
     if len(encoded) > 30000:
-        encoded = encoded[:30000] + "â€¦"
+        encoded = encoded[:30000] + "…"
     choice = _tool_choice_text(body, protocol)
     parallel = bool(body.get("parallel_tool_calls", True))
     return (
@@ -11884,9 +12235,9 @@ def _anthropic_tool_calls_payload(calls: list) -> list:
 
 def _tool_output_log(protocol: str, model: str, calls: list, text: str) -> None:
     names = ",".join(str(c.get("name") or "") for c in calls[:8]) or "-"
-    raw_hint = " Â· raw_tool_json_seen=yes" if '"tool_calls"' in str(text or "") else ""
-    log("INFO", f"{protocol} agent turn Â· model {str(model)[:80]} Â· "
-                f"tool_calls {len(calls)} [{names}] Â· buffered {len(text)} chars{raw_hint}")
+    raw_hint = " · raw_tool_json_seen=yes" if '"tool_calls"' in str(text or "") else ""
+    log("INFO", f"{protocol} agent turn · model {str(model)[:80]} · "
+                f"tool_calls {len(calls)} [{names}] · buffered {len(text)} chars{raw_hint}")
 
 
 def _disposable_context_prompt(body: dict) -> str:
@@ -12298,8 +12649,8 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
             _release_api_request(body, keyinfo, prompt)
             _record_reliability_outcome(bool(outcome == "complete" and terminal_sent), outcome)
             log("INFO" if terminal_sent else "WARN",
-                f"OpenAI tool stream {rid[-8:]} Â· outcome {outcome} Â· "
-                f"buffered {len(acc)} chars Â· terminal {'yes' if terminal_sent else 'no'}")
+                f"OpenAI tool stream {rid[-8:]} · outcome {outcome} · "
+                f"buffered {len(acc)} chars · terminal {'yes' if terminal_sent else 'no'}")
 
     return StreamingResponse(
         gen(), media_type="text/event-stream",
@@ -12445,10 +12796,10 @@ async def openai_stream(body: dict, keyinfo: dict):
                 outcome,
             )
             if terminal_sent:
-                log("INFO", f"OpenAI stream {rid[-8:]} delivered Â· outcome {outcome} Â· "
-                            f"content {content_chunks} chunks/{len(acc)} chars Â· terminal yes")
+                log("INFO", f"OpenAI stream {rid[-8:]} delivered · outcome {outcome} · "
+                            f"content {content_chunks} chunks/{len(acc)} chars · terminal yes")
             else:
-                log("WARN", f"OpenAI stream {rid[-8:]} disconnected before terminal Â· outcome {outcome} Â· "
+                log("WARN", f"OpenAI stream {rid[-8:]} disconnected before terminal · outcome {outcome} · "
                             f"content {content_chunks} chunks/{len(acc)} chars")
     return StreamingResponse(
         gen(),
@@ -12500,9 +12851,13 @@ async def _force_capacity_recovery_cycle(deadline: float, *, aggressive: bool = 
         if j.get("id") and j.get("enabled", True) and jar_has_auth(j)
     }
     for sid in jars:
+        # Edge-challenge holds are intentionally stronger than generic API
+        # quarantine and are never cleared by emergency capacity recovery.
+        if _api_keeper_challenge_held(sid):
+            continue
         _verification_preflight_retry_after.pop(sid, None)
-        # Expire only API-level quarantine. Browser/session health is still checked
-        # before any keeper is admitted.
+        # Expire only generic API-level quarantine. Browser/session health is
+        # still checked before any keeper is admitted.
         if _api_keeper_quarantine_until.get(sid, 0.0) > now:
             _api_keeper_quarantine_until.pop(sid, None)
 
@@ -12568,7 +12923,7 @@ async def _require_api_ready():
         if bool(get_models()) and _api_ready_event.is_set():
             verified = _verified_keeper_count()
             exits = _verified_exit_count()
-            log("OK", f"API admission recovered inline Â· verified keepers {verified} Â· exits {exits} Â· "
+            log("OK", f"API admission recovered inline · verified keepers {verified} · exits {exits} · "
                       f"after {force_round} active recovery round(s)")
             return
 
@@ -12589,8 +12944,8 @@ async def _require_api_ready():
             if bool(get_models()) and _api_ready_event.is_set():
                 verified = _verified_keeper_count()
                 exits = _verified_exit_count()
-                log("OK", f"API admission recovered during active repair Â· "
-                          f"verified keepers {verified} Â· exits {exits} Â· round {force_round}")
+                log("OK", f"API admission recovered during active repair · "
+                          f"verified keepers {verified} · exits {exits} · round {force_round}")
                 return
 
         verified = _verified_keeper_count()
@@ -12598,9 +12953,9 @@ async def _require_api_ready():
         if verified != last_verified or exits != last_exits:
             preferred_keepers, preferred_exits = _api_preferred_targets()
             remaining = max(0.0, deadline - time.monotonic())
-            log("INFO", f"API admission active recovery Â· verified {verified} Â· exits {exits} Â· "
-                        f"target {_API_ADMISSION_MIN_KEEPERS}/{_API_ADMISSION_MIN_EXITS} Â· "
-                        f"preferred {preferred_keepers}/{preferred_exits} Â· {remaining:.1f}s left")
+            log("INFO", f"API admission active recovery · verified {verified} · exits {exits} · "
+                        f"target {_API_ADMISSION_MIN_KEEPERS}/{_API_ADMISSION_MIN_EXITS} · "
+                        f"preferred {preferred_keepers}/{preferred_exits} · {remaining:.1f}s left")
             last_verified, last_exits = verified, exits
         await asyncio.sleep(0.25)
 
@@ -12627,17 +12982,17 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="no user message")
     messages = body.get("messages") or []
     await _wait_if_model_rate_limited(body.get("model", "auto"))
-    log("INFO", f"OpenAI request Â· model {str(body.get('model') or 'auto')[:80]} Â· "
-                f"messages {len(messages) if isinstance(messages, list) else 0} Â· "
-                f"tools {len(body.get('tools') or []) if isinstance(body.get('tools') or [], list) else 0} Â· "
-                f"max_tokens {body.get('max_tokens') or body.get('max_completion_tokens') or 'default'} Â· "
+    log("INFO", f"OpenAI request · model {str(body.get('model') or 'auto')[:80]} · "
+                f"messages {len(messages) if isinstance(messages, list) else 0} · "
+                f"tools {len(body.get('tools') or []) if isinstance(body.get('tools') or [], list) else 0} · "
+                f"max_tokens {body.get('max_tokens') or body.get('max_completion_tokens') or 'default'} · "
                 f"usage {'yes' if (body.get('stream_options') or {}).get('include_usage') else 'no'}")
     await _pace_api_request(_tenant_identity(keyinfo))
     reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
     if not reserved:
         if duplicate_count == 1:
-            log("INFO", f"duplicate API retries suppressed Â· model {str(body.get('model') or 'auto')[:80]} Â· "
-                        f"content {len(prompt)} chars Â· window {API_DUPLICATE_WINDOW_SEC}s")
+            log("INFO", f"duplicate API retries suppressed · model {str(body.get('model') or 'auto')[:80]} · "
+                        f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
         raise HTTPException(status_code=429, detail="An identical request is already in flight. Wait for it to finish before retrying.", headers={"Retry-After": "2"})
     if not body.get("stream", True):
         if _openai_has_tool_context(body):
@@ -12689,11 +13044,11 @@ async def _native_anthropic_request(request: Request, endpoint: str):
         import httpx
     except ImportError:
         return _anthropic_error(503, "Native Anthropic routing requires the httpx package.", "api_error", source="native_anthropic_dependency")
-    headers = {
-        "x-api-key": provider_key,
-        "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
-        "content-type": "application/json",
-    }
+    headers = _header_group(
+        "anthropic_native",
+        provider_key=provider_key,
+        anthropic_version=request.headers.get("anthropic-version", "2023-06-01"),
+    )
     if request.headers.get("anthropic-beta"):
         headers["anthropic-beta"] = request.headers["anthropic-beta"]
     client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0),
@@ -12893,8 +13248,8 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
             _release_api_request(body, keyinfo, prompt)
             _record_reliability_outcome(bool(outcome == "complete" and terminal_sent), outcome)
             log("INFO" if terminal_sent else "WARN",
-                f"Anthropic tool stream {message_id[-8:]} Â· outcome {outcome} Â· "
-                f"buffered {len(acc)} chars Â· terminal {'yes' if terminal_sent else 'no'}")
+                f"Anthropic tool stream {message_id[-8:]} · outcome {outcome} · "
+                f"buffered {len(acc)} chars · terminal {'yes' if terminal_sent else 'no'}")
 
     return StreamingResponse(
         gen(), media_type="text/event-stream",
@@ -12934,7 +13289,7 @@ async def anthropic_messages(request: Request):
         reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
         if not reserved:
             if duplicate_count == 1:
-                log("INFO", f"duplicate Anthropic tool retry suppressed Â· model {str(body.get('model') or 'auto')[:80]}")
+                log("INFO", f"duplicate Anthropic tool retry suppressed · model {str(body.get('model') or 'auto')[:80]}")
             raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
         return await _anthropic_tool_response(body, keyinfo)
 
@@ -12958,8 +13313,8 @@ async def anthropic_messages(request: Request):
     reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
     if not reserved:
         if duplicate_count == 1:
-            log("INFO", f"duplicate Anthropic API retries suppressed Â· model {str(body.get('model') or 'auto')[:80]} Â· "
-                        f"content {len(prompt)} chars Â· window {API_DUPLICATE_WINDOW_SEC}s")
+            log("INFO", f"duplicate Anthropic API retries suppressed · model {str(body.get('model') or 'auto')[:80]} · "
+                        f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
         raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
 
     chat_id = _disposable_chat_id("anthropic")
@@ -13090,8 +13445,8 @@ async def anthropic_messages(request: Request):
                 outcome,
             )
             level = "INFO" if terminal_sent or outcome == "upstream-error" else "WARN"
-            log(level, f"Anthropic stream {message_id[-8:]} delivered Â· outcome {outcome} Â· "
-                       f"content {chunks} chunks/{len(acc)} chars Â· terminal {'yes' if terminal_sent else 'no'}")
+            log(level, f"Anthropic stream {message_id[-8:]} delivered · outcome {outcome} · "
+                       f"content {chunks} chunks/{len(acc)} chars · terminal {'yes' if terminal_sent else 'no'}")
 
     return StreamingResponse(
         gen(),
@@ -13405,6 +13760,9 @@ async def readyz():
     verification_ready_ids = [sid for sid in browser_ready_ids if _api_keeper_verified(sid)]
     _refresh_api_ready_event()
     ready = models_ready and bool(_api_ready_event.is_set())
+    challenge_held_ids = [
+        sid for sid in browser_ready_ids if _api_keeper_challenge_held(sid)
+    ]
     return JSONResponse({"ready": ready, "build": BUILD_STAMP,
                          "checks": {"models": models_ready,
                                     "authenticated_keeper": bool(browser_ready_ids),
@@ -13412,6 +13770,7 @@ async def readyz():
                                     "verification_ready_keeper": bool(verification_ready_ids),
                                     "verification_ready_keepers": len(verification_ready_ids),
                                     "verification_ready_exits": len({_api_keeper_exit_key(sid) for sid in verification_ready_ids}),
+                                    "edge_challenge_held_keepers": len(challenge_held_ids),
                                     "global_concurrency": API_TURN_CONCURRENCY,
                                     "per_api_concurrency": "unlimited",
                                     "estimated_browser_lanes":
@@ -13585,7 +13944,7 @@ async def jars_add_credentials(request: Request, name: str = Form(""), credentia
             keeper_enabled=True,
         )
         created.append(jar["id"])
-        log("OK", f"Credential account '{jar['name']}' added Â· email {redact(email)} Â· keeper enabled")
+        log("OK", f"Credential account '{jar['name']}' added · email {redact(email)} · keeper enabled")
 
     # One allocation/sync pass for the whole imported batch.
     try:
@@ -13596,7 +13955,7 @@ async def jars_add_credentials(request: Request, name: str = Form(""), credentia
         for jar_id in created:
             _verification_preflight_retry_after.pop(jar_id, None)
             _keeper_recovery_attempts.pop(jar_id, None)
-        log("OK", f"Credential import complete Â· {len(created)} keeper(s) queued")
+        log("OK", f"Credential import complete · {len(created)} keeper(s) queued")
     except Exception as exc:
         log("WARN", f"Credential accounts saved but keeper activation failed: "
                     f"{type(exc).__name__}: {redact(str(exc))[:160]}")
@@ -13619,7 +13978,7 @@ async def keeper_relogin(request: Request, jar_id: str = Form(...)):
     jar = next((j for j in load_jars() if j["id"] == jar_id), None)
     if not jar:
         return JSONResponse(status_code=404, content={"error": "unknown jar"})
-    s = KeeperSession(jar, headless=jar.get("keeper_headless", True))
+    s = KeeperSession(jar, headless=jar.get("keeper_headless", False))
     keeper.sessions[jar_id] = s
 
     async def start_and_relogin():
@@ -13646,7 +14005,7 @@ async def refresh_tokens(request: Request):
                             status_code=status.HTTP_303_SEE_OTHER)
 
 
-# ---------- oxalpha (legacy direct transport â€” retired in v2) ----------
+# ---------- oxalpha (legacy direct transport — retired in v2) ----------
 @app.post("/oxalpha/upload")
 async def oxalpha_upload(request: Request, cookie_file: UploadFile = File(...)):
     g = await _page_guard(request)
@@ -13665,7 +14024,7 @@ async def oxalpha_upload(request: Request, cookie_file: UploadFile = File(...)):
 @app.post("/oxalpha/refresh")
 async def oxalpha_retired(request: Request):
     return JSONResponse(status_code=410, content={
-        "error": "gone", "detail": "oxalpha direct transport retired in v2 â€” keeper jars own auth now (see /jars)"})
+        "error": "gone", "detail": "oxalpha direct transport retired in v2 — keeper jars own auth now (see /jars)"})
 
 
 
@@ -13679,7 +14038,7 @@ async def browser_view(request: Request):
         return g
     return HTMLResponse("""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Bridgena Â· Browser Observer</title>
+<title>Bridgena · Browser Observer</title>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#09090b;color:#fafafa;font-family:Inter,system-ui,sans-serif}
 header{height:64px;display:flex;align-items:center;gap:12px;padding:0 22px;border-bottom:1px solid #27272a}
@@ -13705,7 +14064,7 @@ async function loadSessions(){
   if(!sessions.length){root.innerHTML='<div class="muted">No live keepers.</div>';return}
   sessions.forEach((s,i)=>{
     const id=s.jar_id||s.id||s.name; const b=document.createElement('button');
-    b.className='session'+(selected===id?' on':''); b.textContent=(s.name||id||('Keeper '+(i+1)))+' Â· '+(s.status||'unknown');
+    b.className='session'+(selected===id?' on':''); b.textContent=(s.name||id||('Keeper '+(i+1)))+' · '+(s.status||'unknown');
     b.onclick=()=>selectKeeper(id,s.name||id); root.appendChild(b);
   });
 }
@@ -13718,7 +14077,7 @@ async function refresh(){
   const img=document.getElementById('screen'), st=document.getElementById('status');
   st.textContent='refreshing';
   img.src='/keeper/screenshot/'+encodeURIComponent(selected)+'?t='+Date.now();
-  img.onload=()=>st.textContent='live Â· '+new Date().toLocaleTimeString();
+  img.onload=()=>st.textContent='live · '+new Date().toLocaleTimeString();
   img.onerror=()=>st.textContent='keeper unavailable';
 }
 setInterval(()=>{if(!document.hidden)loadSessions()},4000); setInterval(refresh,1500); loadSessions();
@@ -13825,11 +14184,13 @@ async def _preflight_one_keeper(sid: str, session, jar: dict) -> tuple:
         if ok:
             _api_verified_keepers[sid] = time.monotonic()
             _api_keeper_quarantine_until.pop(sid, None)
+            _clear_challenge_hold(sid, "verification preflight passed")
+            _api_keeper_challenge_count.pop(sid, None)
             _keeper_recovery_attempts.pop(sid, None)
-            log("OK", f"[{name}] verification client ready Â· Enterprise execute available")
+            log("OK", f"[{name}] verification client ready · Enterprise execute available")
             return sid, True
 
-        log("WARN", f"[{name}] verification client not ready Â· "
+        log("WARN", f"[{name}] verification client not ready · "
                     f"enterprise={bool((state or {}).get('enterprise'))} "
                     f"execute={bool((state or {}).get('execute'))}")
         return sid, False
@@ -13837,7 +14198,7 @@ async def _preflight_one_keeper(sid: str, session, jar: dict) -> tuple:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        log("WARN", f"[{name}] verification client readiness failed Â· "
+        log("WARN", f"[{name}] verification client readiness failed · "
                     f"{type(exc).__name__}: {redact(str(exc))[:160]}")
         return sid, False
 
@@ -13863,7 +14224,7 @@ def _schedule_transport_recovery(
                 await keeper.sync()
                 session = keeper.sessions.get(sid)
             if not session:
-                log("WARN", f"[{sid}] transport recovery Â· keeper session unavailable")
+                log("WARN", f"[{sid}] transport recovery · keeper session unavailable")
                 return
 
             name = getattr(session, "name", sid)
@@ -13876,8 +14237,8 @@ def _schedule_transport_recovery(
                 while getattr(session, "active_requests", 0) and time.monotonic() < wait_deadline:
                     await asyncio.sleep(0.20)
                 if getattr(session, "active_requests", 0):
-                    log("WARN", f"[{name}] transport recovery deferred Â· active request still owns "
-                                f"the browser lane after {PROXY_FAILOVER_IDLE_WAIT_SEC:.0f}s Â· no restart performed")
+                    log("WARN", f"[{name}] transport recovery deferred · active request still owns "
+                                f"the browser lane after {PROXY_FAILOVER_IDLE_WAIT_SEC:.0f}s · no restart performed")
                     _verification_preflight_retry_after[sid] = time.monotonic() + 2.0
                     _wake_verification_scheduler()
                     return
@@ -13921,13 +14282,13 @@ def _schedule_transport_recovery(
                     assign_jar_proxy(sid, replacement)
                     session._tried_proxies.clear()
                     session._direct_tried = False
-                    log("WARN", f"[{name}] proxy failover Â· "
-                                f"{_proxy_hkey(current_proxy)} â†’ {_proxy_hkey(replacement)} Â· "
+                    log("WARN", f"[{name}] proxy failover · "
+                                f"{_proxy_hkey(current_proxy)} → {_proxy_hkey(replacement)} · "
                                 f"{redact(reason)[:150]}")
                 else:
                     replacement = None
                     log("WARN", f"[{name}] proxy failover requested but no alternate healthy exit "
-                                f"was available Â· retaining {_proxy_hkey(current_proxy)}")
+                                f"was available · retaining {_proxy_hkey(current_proxy)}")
 
             route_label = (
                 f"new exit {_proxy_hkey(replacement)}"
@@ -13935,7 +14296,7 @@ def _schedule_transport_recovery(
                 f"same exit {_proxy_hkey(current_proxy)}" if current_proxy else
                 "direct/no pinned exit"
             )
-            log("INFO", f"[{name}] transport recovery Â· restarting keeper on {route_label} Â· {reason}")
+            log("INFO", f"[{name}] transport recovery · restarting keeper on {route_label} · {reason}")
 
             async with _keeper_recovery_gate:
                 _mark_api_keeper_unready(sid, "transport recovery")
@@ -13956,22 +14317,22 @@ def _schedule_transport_recovery(
                 if verification_ok and route_ok:
                     _api_keeper_quarantine_until.pop(sid, None)
                     _refresh_api_ready_event()
-                    log("OK", f"[{getattr(session, 'name', sid)}] transport recovery complete Â· "
-                              f"keeper readmitted Â· route HTTP {route_status}")
+                    log("OK", f"[{getattr(session, 'name', sid)}] transport recovery complete · "
+                              f"keeper readmitted · route HTTP {route_status}")
                     return
                 if not route_ok:
                     _mark_api_keeper_unready(sid, "recovery route probe still failing")
-                    log("WARN", f"[{getattr(session, 'name', sid)}] transport recovery route probe failed Â· "
+                    log("WARN", f"[{getattr(session, 'name', sid)}] transport recovery route probe failed · "
                                 f"{redact(route_detail)[:160]}")
 
-            log("WARN", f"[{getattr(session, 'name', sid)}] transport recovery incomplete Â· "
+            log("WARN", f"[{getattr(session, 'name', sid)}] transport recovery incomplete · "
                         "readiness loop will continue repairing it")
             _verification_preflight_retry_after[sid] = time.monotonic() + 3.0
 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log("WARN", f"[{sid}] transport recovery failed Â· "
+            log("WARN", f"[{sid}] transport recovery failed · "
                         f"{type(exc).__name__}: {redact(str(exc))[:180]}")
             _verification_preflight_retry_after[sid] = time.monotonic() + 5.0
         finally:
@@ -13999,7 +14360,7 @@ async def _recover_unready_keeper(sid: str, session, jar: dict) -> bool:
     async with _keeper_recovery_gate:
         try:
             if not keeper_session_ready(session, warmed=False):
-                log("WARN", f"[{name}] readiness recovery Â· browser not healthy enough; restarting keeper")
+                log("WARN", f"[{name}] readiness recovery · browser not healthy enough; restarting keeper")
                 _mark_api_keeper_unready(sid, "recovery restart")
                 await session.restart()
                 _verification_preflight_retry_after[sid] = time.monotonic() + KEEPER_WARMUP_SEC + 2.0
@@ -14007,7 +14368,7 @@ async def _recover_unready_keeper(sid: str, session, jar: dict) -> bool:
                 return True
 
             if attempt < _keeper_recovery_restart_after:
-                log("INFO", f"[{name}] readiness recovery Â· soft refresh {attempt}/{_keeper_recovery_restart_after - 1}")
+                log("INFO", f"[{name}] readiness recovery · soft refresh {attempt}/{_keeper_recovery_restart_after - 1}")
                 async with session._action_lock:
                     page = session.page
                     if not page or page.is_closed():
@@ -14027,7 +14388,7 @@ async def _recover_unready_keeper(sid: str, session, jar: dict) -> bool:
                         except Exception:
                             pass
                     else:
-                        log("WARN", f"[{name}] readiness recovery Â· auth check failed; scheduling relogin")
+                        log("WARN", f"[{name}] readiness recovery · auth check failed; scheduling relogin")
                         session.next_retry = 0
                 if not auth_ok:
                     await session.relogin()
@@ -14035,16 +14396,16 @@ async def _recover_unready_keeper(sid: str, session, jar: dict) -> bool:
                 # but the browser route cannot reach Arena.
                 route_ok, route_status, route_detail = await session.probe_transport(force=True)
                 if route_ok:
-                    log("INFO", f"[{name}] readiness recovery Â· route probe HTTP {route_status}")
+                    log("INFO", f"[{name}] readiness recovery · route probe HTTP {route_status}")
                 else:
-                    log("WARN", f"[{name}] readiness recovery Â· route probe failed Â· "
+                    log("WARN", f"[{name}] readiness recovery · route probe failed · "
                                 f"{redact(route_detail)[:150]}")
                 _verification_preflight_retry_after[sid] = time.monotonic() + _keeper_recovery_retry_sec
                 return True
 
             # Passive checks + a soft refresh both failed: rebuild the browser
             # context. restart() retains the jar's sticky proxy assignment.
-            log("WARN", f"[{name}] readiness recovery Â· still unready after {attempt} checks Â· restarting keeper")
+            log("WARN", f"[{name}] readiness recovery · still unready after {attempt} checks · restarting keeper")
             _mark_api_keeper_unready(sid, "verification client recovery")
             _verification_preflight_retry_after[sid] = time.monotonic() + KEEPER_WARMUP_SEC + 3.0
             _keeper_recovery_attempts[sid] = 0
@@ -14054,7 +14415,7 @@ async def _recover_unready_keeper(sid: str, session, jar: dict) -> bool:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log("WARN", f"[{name}] readiness recovery failed Â· "
+            log("WARN", f"[{name}] readiness recovery failed · "
                         f"{type(exc).__name__}: {redact(str(exc))[:180]}")
             _verification_preflight_retry_after[sid] = time.monotonic() + max(8.0, _keeper_recovery_retry_sec)
             return False
@@ -14069,7 +14430,7 @@ async def _api_verification_readiness_loop():
     try:
         await asyncio.wait_for(_keeper_fleet_launch_event.wait(), timeout=30.0)
     except asyncio.TimeoutError:
-        log("WARN", "Verification startup Â· keeper registration timed out; using available fleet")
+        log("WARN", "Verification startup · keeper registration timed out; using available fleet")
 
     while True:
         try:
@@ -14088,7 +14449,7 @@ async def _api_verification_readiness_loop():
                         if keeper_session_ready(keeper.sessions.get(sid))
                     ]
                     if len(ready_ids) != last_ready:
-                        log("INFO", f"Verification startup cohort Â· browser-ready {len(ready_ids)}/{len(jars_by_id)}")
+                        log("INFO", f"Verification startup cohort · browser-ready {len(ready_ids)}/{len(jars_by_id)}")
                         last_ready = len(ready_ids)
                     if len(ready_ids) == len(jars_by_id):
                         break
@@ -14102,6 +14463,8 @@ async def _api_verification_readiness_loop():
                 if currently_verified and not needs_refresh:
                     continue
                 if now < _api_keeper_quarantine_until.get(sid, 0.0):
+                    continue
+                if _api_keeper_challenge_held(sid):
                     continue
                 if now < _verification_preflight_retry_after.get(sid, 0.0):
                     continue
@@ -14117,8 +14480,8 @@ async def _api_verification_readiness_loop():
             if eligible:
                 names = ", ".join(getattr(sess, "name", sid) for sid, sess, _, _ in eligible)
                 refreshes = sum(1 for _, _, _, was_valid in eligible if was_valid)
-                log("INFO", f"Verification cohort Â· checking {len(eligible)} keeper(s) concurrently Â· "
-                            f"{refreshes} proactive refresh(es) Â· {names}")
+                log("INFO", f"Verification cohort · checking {len(eligible)} keeper(s) concurrently · "
+                            f"{refreshes} proactive refresh(es) · {names}")
                 results = await asyncio.gather(
                     *(_preflight_one_keeper(sid, session, jar)
                       for sid, session, jar, _ in eligible),
@@ -14146,19 +14509,19 @@ async def _api_verification_readiness_loop():
                         else:
                             failed.append((sid, session, jar))
 
-                log("INFO", f"Verification cohort Â· pass {passed}/{len(results)}"
-                            + (f" Â· soft-renewal misses {len(soft_refresh_failed)}"
+                log("INFO", f"Verification cohort · pass {passed}/{len(results)}"
+                            + (f" · soft-renewal misses {len(soft_refresh_failed)}"
                                if soft_refresh_failed else ""))
 
                 if soft_refresh_failed:
                     names = ", ".join(getattr(session, "name", sid)
                                       for sid, session, _ in soft_refresh_failed)
-                    log("WARN", f"Verification lease refresh missed on still-valid keeper(s) Â· "
-                                f"retrying without restart Â· {names}")
+                    log("WARN", f"Verification lease refresh missed on still-valid keeper(s) · "
+                                f"retrying without restart · {names}")
 
                 if failed:
                     names = ", ".join(getattr(session, "name", sid) for sid, session, _ in failed)
-                    log("WARN", f"Verification recovery Â· actively recovering {len(failed)} keeper(s) Â· {names}")
+                    log("WARN", f"Verification recovery · actively recovering {len(failed)} keeper(s) · {names}")
                     await asyncio.gather(
                         *(_recover_unready_keeper(sid, session, jar)
                           for sid, session, jar in failed),
@@ -14170,7 +14533,7 @@ async def _api_verification_readiness_loop():
             if not initial_done:
                 initial_done = True
                 _initial_verification_sweep_done.set()
-                log("INFO", "Verification startup cohort Â· initial sweep complete Â· background keeper activity enabled")
+                log("INFO", "Verification startup cohort · initial sweep complete · background keeper activity enabled")
 
             verified = _verified_keeper_count()
             ready_count = sum(
@@ -14180,8 +14543,8 @@ async def _api_verification_readiness_loop():
 
             if _api_ready_event.is_set():
                 if not announced_ready:
-                    log("OK", f"API READY Â· verification clients {verified}/{ready_count or len(jars_by_id)}"
-                              f" Â· distinct exits {_verified_exit_count()}")
+                    log("OK", f"API READY · verification clients {verified}/{ready_count or len(jars_by_id)}"
+                              f" · distinct exits {_verified_exit_count()}")
                     announced_ready = True
             else:
                 announced_ready = False
@@ -14235,46 +14598,62 @@ async def _lifespan(app):
         tasks.append(asyncio.create_task(_api_verification_readiness_loop(), name="verification-readiness"))
     app.state.background_tasks = tasks
     app.state.ready_at = time.time()
-    log("INFO", f"BRIDGENA build {BUILD_STAMP} Â· v3 control plane Â· compatibility engine active")
-    log("INFO", "Agent compatibility Â· OpenAI tools/tool_calls + Anthropic tool_use/tool_result ON Â· embedded/bare JSON parser v2")
-    log("INFO", "Conversation mode Â· disposable Arena evaluation per API message Â· bounded client-history capsule")
-    log("INFO", "Keeper rejection policy Â· non-destructive local recovery Â· no 45s API exile")
-    log("INFO", f"Multi-user scheduler Â· global slots {API_TURN_CONCURRENCY} Â· "
-                f"per-API concurrency unlimited Â· upstream attempts {REQUEST_MAX_ATTEMPTS}")
+    log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
+    log("INFO", "Agent compatibility · OpenAI tools/tool_calls + Anthropic tool_use/tool_result ON · embedded/bare JSON parser v2")
+    log("INFO", "Conversation mode · disposable Arena evaluation per API message · bounded client-history capsule")
+    log("INFO", "Keeper rejection policy · non-destructive local recovery · no 45s API exile")
+    log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
+                f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
     _fleet_target = len(_bootable_keeper_jars())
     _preferred_keepers, _preferred_exits = _api_preferred_targets() if _fleet_target else (0, 0)
-    log("INFO", f"Keeper fleet Â· bootable accounts {_fleet_target} Â· target keepers {_fleet_target} Â· "
-                f"parallel starts {KEEPER_START_CONCURRENCY} Â· parallel logins {KEEPER_LOGIN_CONCURRENCY} Â· "
+    log("INFO", f"Keeper fleet · bootable accounts {_fleet_target} · target keepers {_fleet_target} · "
+                f"parallel starts {KEEPER_START_CONCURRENCY} · parallel logins {KEEPER_LOGIN_CONCURRENCY} · "
                 f"hard concurrency cap {KEEPER_CONCURRENCY_HARD_CAP}")
-    log("INFO", f"Keeper recovery Â· soft refresh then restart after {_keeper_recovery_restart_after} failed readiness checks Â· parallel {_keeper_recovery_gate._value}")
-    log("INFO", f"Transport recovery Â· same-keeper restart ON Â· quarantine {TRANSPORT_FAILURE_QUARANTINE_SEC:.0f}s Â· bound wait {BOUND_KEEPER_RECOVERY_WAIT_SEC:.0f}s")
-    log("INFO", f"Pre-dispatch transport guard Â· HEAD probe every request {'ON' if TRANSPORT_PROBE_EVERY_REQUEST else 'OFF'} Â· timeout {TRANSPORT_PROBE_TIMEOUT_MS}ms Â· recovery wait {PREDISPATCH_RECOVERY_WAIT_SEC:.0f}s")
-    log("INFO", f"Account failover Â· max {ACCOUNT_FAILOVER_MAX} alternate keeper(s) Â· thread handoff ON for pre-generation account/session failures Â· 429+verification+partial-stream excluded")
-    log("INFO", f"Stream completion policy Â· first assistant output <= {FIRST_ASSISTANT_RESPONSE_SEC:.1f}s Â· provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} Â· partial UI preservation ON")
-    log("INFO", f"Arena stream salvage Â· {'ON' if ARENA_UI_STREAM_RECOVERY else 'OFF'} Â· "
-                f"quick {ARENA_SALVAGE_QUICK_SEC:.0f}s current-context check â†’ same-keeper route repair â†’ "
-                f"{ARENA_POST_RESTART_SALVAGE_SEC:.0f}s post-restart history/UI salvage Â· no prompt replay")
-    log("INFO", f"Confirmed-absence resend Â· max {UNDELIVERED_ENVELOPE_RETRY_MAX} Â· "
-                "HTTP-0 + zero output + post-restart history trace absent only Â· exact message IDs reused")
-    log("INFO", f"Throttle thread rehome Â· {'ON' if THROTTLE_THREAD_REHOME else 'OFF'} Â· "
-                f"same model/account Â· server-side context capsule <= {CONTEXT_CAPSULE_MAX_CHARS} chars Â· "
+    log("INFO", f"Keeper recovery · soft refresh then restart after {_keeper_recovery_restart_after} failed readiness checks · parallel {_keeper_recovery_gate._value}")
+    log("INFO", f"Transport recovery · same-keeper restart ON · quarantine {TRANSPORT_FAILURE_QUARANTINE_SEC:.0f}s · bound wait {BOUND_KEEPER_RECOVERY_WAIT_SEC:.0f}s")
+    log("INFO", f"Pre-dispatch transport guard · HEAD probe every request {'ON' if TRANSPORT_PROBE_EVERY_REQUEST else 'OFF'} · timeout {TRANSPORT_PROBE_TIMEOUT_MS}ms · recovery wait {PREDISPATCH_RECOVERY_WAIT_SEC:.0f}s")
+    log("INFO", f"Account failover · max {ACCOUNT_FAILOVER_MAX} alternate keeper(s) · thread handoff ON for pre-generation account/session failures · 429+verification+partial-stream excluded")
+    log("INFO", f"Stream completion policy · normal first assistant output <= {FIRST_ASSISTANT_RESPONSE_SEC:.1f}s · provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} · partial UI preservation ON")
+    log("INFO", f"Arena stream salvage · {'ON' if ARENA_UI_STREAM_RECOVERY else 'OFF'} · "
+                f"quick {ARENA_SALVAGE_QUICK_SEC:.0f}s current-context check → same-keeper route repair → "
+                f"{ARENA_POST_RESTART_SALVAGE_SEC:.0f}s post-restart history/UI salvage · no prompt replay")
+    log("INFO", f"Confirmed-absence resend · max {UNDELIVERED_ENVELOPE_RETRY_MAX} · "
+                "HTTP-0 + zero output + post-restart history trace absent only · exact message IDs reused")
+    log("INFO", f"Throttle thread rehome · {'ON' if THROTTLE_THREAD_REHOME else 'OFF'} · "
+                f"same model/account · server-side context capsule <= {CONTEXT_CAPSULE_MAX_CHARS} chars · "
                 "upstream Retry-After is always respected")
-    log("INFO", f"Customer error privacy Â· opaque friendly messages ON Â· private registry {_ERROR_EVENTS_FILE} Â· Errors tab enabled")
-    log("INFO", f"Readiness leases Â· TTL {_API_VERIFICATION_TTL:.0f}s Â· staggered proactive renewal 55-72% Â· "
-                f"admission {_API_ADMISSION_MIN_KEEPERS} keeper/{_API_ADMISSION_MIN_EXITS} exit Â· "
-                f"preferred {_preferred_keepers}/{_preferred_exits} Â· inline wait {_API_READY_RECOVERY_WAIT_SEC:.0f}s")
-    log("INFO", f"Reliability SLO Â· rolling window {_reliability_window.maxlen} Â· target {_RELIABILITY_TARGET*100:.0f}%")
-    log("INFO", f"Admission pacing Â· per-key interval {API_PACE_INTERVAL_SEC:.2f}s Â· conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s Â· max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
-    log("INFO", "Stream decoder Â· Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini Â· snapshot de-dup ON")
-    log("INFO", f"Upstream 429 policy Â· adaptive backoff {UPSTREAM_429_FIRST_BACKOFF_SEC:.0f}sâ†’"
-                f"{UPSTREAM_429_COOLDOWN_SEC:.0f}s Â· inline wait <= {UPSTREAM_429_INLINE_WAIT_MAX_SEC:.0f}s Â· "
-                f"same-account retries {UPSTREAM_429_SAME_ACCOUNT_RETRIES} Â· Retry-After honored Â· no route/account rotation")
-    log("INFO", "Capacity target Â· queued multi-user admission Â· one stable browser transport lane per keeper")
-    log("INFO", f"Proxy allocator Â· full-pool startup scan + random distinct keeper assignment "
-                f"{'ON' if PROXY_RANDOMIZE_STARTUP else 'OFF'} Â· healthy window {PROXY_HEALTHY_RANDOM_FRACTION:.0%}")
-    log("INFO", f"Proxy network failover Â· {'ON' if PROXY_NETWORK_FAILOVER else 'OFF'} Â· "
-                "sticky while healthy Â· controlled rebind only after genuine transport failure")
-    log("INFO", "Proxy lifecycle Â· non-destructive circuit breaker Â· auto-recovery + automatic re-admission Â· no automatic deletion")
+    log("INFO", f"Customer error privacy · opaque friendly messages ON · private registry {_ERROR_EVENTS_FILE} · Errors tab enabled")
+    log("INFO", f"Readiness leases · TTL {_API_VERIFICATION_TTL:.0f}s · staggered proactive renewal 55-72% · "
+                f"admission {_API_ADMISSION_MIN_KEEPERS} keeper/{_API_ADMISSION_MIN_EXITS} exit · "
+                f"preferred {_preferred_keepers}/{_preferred_exits} · inline wait {_API_READY_RECOVERY_WAIT_SEC:.0f}s")
+    log("INFO", f"Reliability SLO · rolling window {_reliability_window.maxlen} · target {_RELIABILITY_TARGET*100:.0f}%")
+    log("INFO", f"Admission pacing · per-key interval {API_PACE_INTERVAL_SEC:.2f}s · conversation gap {CONVERSATION_MIN_GAP_SEC:.2f}s · max queued wait {API_PACE_MAX_WAIT_SEC:.1f}s")
+    log("INFO", "Stream decoder · Arena/Vercel classic + AI SDK UIMessage + OpenAI + Anthropic + Gemini · snapshot de-dup ON")
+    log("INFO", f"Upstream 429 policy · adaptive backoff {UPSTREAM_429_FIRST_BACKOFF_SEC:.0f}s→"
+                f"{UPSTREAM_429_COOLDOWN_SEC:.0f}s · inline wait <= {UPSTREAM_429_INLINE_WAIT_MAX_SEC:.0f}s · "
+                f"same-account retries {UPSTREAM_429_SAME_ACCOUNT_RETRIES} · Retry-After honored · no route/account rotation")
+    log("INFO", "Capacity target · queued multi-user admission · one stable browser transport lane per keeper")
+    log("INFO", f"Proxy allocator · full-pool startup scan + random distinct keeper assignment "
+                f"{'ON' if PROXY_RANDOMIZE_STARTUP else 'OFF'} · healthy window {PROXY_HEALTHY_RANDOM_FRACTION:.0%}")
+    log("INFO", f"Proxy network failover · {'ON' if PROXY_NETWORK_FAILOVER else 'OFF'} · "
+                "sticky while healthy · controlled rebind only after genuine transport failure")
+    log("INFO", f"Edge challenge isolation · hold {EDGE_CHALLENGE_HOLD_SEC:.0f}s · "
+                "challenged keepers unschedulable · emergency recovery cannot clear hold early")
+    log("INFO", f"Header policy · centralized BRIDGENA_HEADERS · browser-origin explicit "
+                f"{len(BRIDGENA_HEADERS.get('arena_browser_fetch', {}))} · "
+                f"curl fallback common {len(BRIDGENA_HEADERS.get('arena_fallback_common', {}))}")
+    log("INFO", f"Text encoding · explicit UTF-8 Content-Type for HTML/SSE ON")
+    log("INFO", f"Agent semantic SLA · normal {FIRST_ASSISTANT_RESPONSE_SEC:.0f}s · "
+                f"tool turns {TOOL_FIRST_ASSISTANT_RESPONSE_SEC:.0f}s")
+    log("INFO", f"Browser-native session mode · persistent contexts "
+                f"{'ON' if BROWSER_PERSISTENT_CONTEXT else 'OFF'} · JavaScript ON · "
+                f"service workers {'ON' if BROWSER_SERVICE_WORKERS else 'OFF'} · "
+                f"native UI interactions {'ON' if BROWSER_NATIVE_INTERACTIONS else 'OFF'}")
+    log("INFO", f"Keeper browser presentation · "
+                f"{'HEADED' if KEEPERS_HEADED_DEFAULT else 'per-account/headless-compatible'} · "
+                f"auto-Xvfb {'ON' if KEEPERS_AUTO_XVFB else 'OFF'} · "
+                f"DISPLAY={os.environ.get('DISPLAY') or _V3_VNC_DISPLAY}")
+    log("INFO", "Proxy lifecycle · non-destructive circuit breaker · auto-recovery + automatic re-admission · no automatic deletion")
     if get_verification_solver:
         log("OK", f"Verification adapter factory loaded: {_VERIFICATION_FACTORY_SPEC}")
     else:
@@ -14296,7 +14675,7 @@ app.router.lifespan_context = _lifespan  # starlette late-bind
 
 
 # ================================================================
-#  ENTRY â€” one file, uvicorn; multi-worker keeps the legacy election via state.json
+#  ENTRY — one file, uvicorn; multi-worker keeps the legacy election via state.json
 # ================================================================
 def _cli():
     import argparse
@@ -14306,7 +14685,7 @@ def _cli():
     args = ap.parse_args()
     jars_count = len([j for j in load_jars() if not j.get("expired")])
     print("=" * 62)
-    print("  BRIDGENA v3 â€” Arena Bridge (" + BUILD_STAMP + ")")
+    print("  BRIDGENA v3 — Arena Bridge (" + BUILD_STAMP + ")")
     print("=" * 62)
     print(f"  * Live Chat   : {PUBLIC_APP_URL}/chat")
     print(f"  * Dashboard   : {PUBLIC_APP_URL}/dashboard")
