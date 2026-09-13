@@ -440,7 +440,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.10.1-action-boundary-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.10.2-fast-tool-continuations")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2113,6 +2113,16 @@ BRIDGENA_ACTION_MAX_CHARS = max(
     min(50000, int(os.environ.get("BRIDGENA_ACTION_MAX_CHARS", "24000"))),
 )
 BRIDGENA_ACTION_MARKER = "<<<BRIDGENA_ACTION_PROTOCOL_V2>>>"
+AGENT_ACTION_DRAIN_WAIT_SEC = max(
+    1.0,
+    min(20.0, float(os.environ.get("BRIDGENA_AGENT_ACTION_DRAIN_WAIT_SEC", "6"))),
+)
+AGENT_ACTION_DRAIN_HARD_SEC = max(
+    AGENT_ACTION_DRAIN_WAIT_SEC,
+    min(45.0, float(os.environ.get("BRIDGENA_AGENT_ACTION_DRAIN_HARD_SEC", "18"))),
+)
+_agent_action_drain_tasks: Dict[str, asyncio.Task] = {}
+_agent_action_drain_started: Dict[str, float] = {}
 
 _agent_challenge_until: Dict[str, float] = {}
 _agent_challenge_count: Dict[str, int] = {}
@@ -12461,6 +12471,14 @@ def _tool_protocol_system(body: dict, protocol: str) -> str:
         "If no tool is needed, answer normally. If TOOL CHOICE is none, never "
         "emit a Bridgena action. If a tool is required, emit a valid action "
         "instead of a final prose answer.\n\n"
+        "EFFICIENCY RULES:\n"
+        "- For a direct create/write request with a clear target and enough content, "
+        "prefer the appropriate write/create tool immediately.\n"
+        "- Do not Glob/Search/Read merely to confirm that a brand-new requested file "
+        "does not exist unless that information is genuinely required.\n"
+        "- After a successful write/edit tool result, finish normally unless another "
+        "tool is actually necessary to satisfy the request.\n\n"
+
         "After a Tool Result arrives, continue the SAME task. If another action "
         "is required, emit one new Bridgena action and stop again. Otherwise "
         "return the final normal-text answer."
@@ -12575,7 +12593,7 @@ def _render_openai_tool_message(message: dict) -> str:
     if role == "assistant":
         rows = []
         if content:
-            rows.append("Assistant:\\n" + content)
+            rows.append("Assistant:\n" + content)
         calls = message.get("tool_calls") or []
         if isinstance(calls, list):
             for call in calls:
@@ -12587,19 +12605,19 @@ def _render_openai_tool_message(message: dict) -> str:
                     continue
                 cid = str(call.get("id") or "").strip()
                 args = _tool_json_string(fn.get("arguments"))
-                prefix = "Assistant Tool Call" + (f" (id={cid})" if cid else "") + ":\\n"
+                prefix = "Assistant Tool Call" + (f" (id={cid})" if cid else "") + ":\n"
                 rows.append(prefix + '{"name":' + json.dumps(name, ensure_ascii=False)
                             + ',"arguments":' + args + '}')
         legacy = message.get("function_call")
         if isinstance(legacy, dict) and legacy.get("name"):
             rows.append(
-                "Assistant Tool Call:\\n"
+                "Assistant Tool Call:\n"
                 + json.dumps({
                     "name": str(legacy.get("name")),
                     "arguments": legacy.get("arguments") or {},
                 }, ensure_ascii=False)
             )
-        return "\\n\\n".join(rows)
+        return "\n\n".join(rows)
     if role in {"tool", "function"}:
         cid = str(message.get("tool_call_id") or "").strip()
         name = str(message.get("name") or "").strip()
@@ -12607,9 +12625,9 @@ def _render_openai_tool_message(message: dict) -> str:
             f"id={cid}" if cid else "",
             f"name={name}" if name else "",
         ] if x)
-        return f"Tool Result{' (' + meta + ')' if meta else ''}:\\n{content}"
+        return f"Tool Result{' (' + meta + ')' if meta else ''}:\n{content}"
     label = "User" if role == "user" else (role.title() or "Message")
-    return f"{label}:\\n{content}" if content else ""
+    return f"{label}:\n{content}" if content else ""
 
 
 def _render_anthropic_tool_messages(body: dict) -> list:
@@ -12629,7 +12647,7 @@ def _render_anthropic_tool_messages(body: dict) -> list:
                 value = str(block.get("text") or "").strip()
                 if value:
                     label = "Assistant" if role == "assistant" else "User"
-                    rows.append(f"{label}:\\n{value}")
+                    rows.append(f"{label}:\n{value}")
             elif typ == "tool_use":
                 cid = str(block.get("id") or "").strip()
                 name = str(block.get("name") or "").strip()
@@ -12638,7 +12656,7 @@ def _render_anthropic_tool_messages(body: dict) -> list:
                 rows.append(
                     "Assistant Tool Call"
                     + (f" (id={cid})" if cid else "")
-                    + ":\\n"
+                    + ":\n"
                     + json.dumps({
                         "name": name,
                         "arguments": block.get("input") if isinstance(block.get("input"), (dict, list)) else {},
@@ -12657,7 +12675,7 @@ def _render_anthropic_tool_messages(body: dict) -> list:
                 suffix = ""
                 if cid:
                     suffix = f" (id={cid}" + (f", name={name}" if name else "") + ")"
-                rows.append("Tool Result" + suffix + ":\\n" + result_text)
+                rows.append("Tool Result" + suffix + ":\n" + result_text)
     return rows
 
 
@@ -12666,10 +12684,10 @@ def _bounded_tool_transcript(rows: list) -> str:
     instruction = (
         "Continue the conversation below. Tool calls and tool results are part of the "
         "same client-side agent loop. Do not repeat a completed tool call unless the "
-        "new result makes another call necessary.\\n\\n"
-        "--- BEGIN CONVERSATION ---\\n"
+        "new result makes another call necessary.\n\n"
+        "--- BEGIN CONVERSATION ---\n"
     )
-    suffix = "\\n--- END CONVERSATION ---\\n\\nContinue from the final conversation event."
+    suffix = "\n--- END CONVERSATION ---\n\nContinue from the final conversation event."
     limit = min(MAX_PROMPT, TOOL_TRANSCRIPT_MAX_CHARS)
     budget = max(1000, limit - len(instruction) - len(suffix))
     kept = []
@@ -12685,7 +12703,7 @@ def _bounded_tool_transcript(rows: list) -> str:
     kept.reverse()
     if omitted:
         kept.insert(0, f"[{omitted} older event(s) omitted to fit the context budget.]")
-    return (instruction + "\\n\\n".join(kept) + suffix)[:limit]
+    return (instruction + "\n\n".join(kept) + suffix)[:limit]
 
 
 def _openai_tool_prompt(body: dict) -> str:
@@ -12702,6 +12720,128 @@ def _anthropic_tool_prompt(body: dict) -> str:
     rows = _render_anthropic_tool_messages(body)
     return _bounded_tool_transcript(rows) if rows else ""
 
+
+
+async def _drain_agent_action_turn(
+    chat_id: str,
+    turn_iter,
+    protocol: str,
+    action_name: str,
+) -> None:
+    """Silently finish an upstream turn after its tool action was already
+    returned to the client.
+
+    Closing the browser stream at the action boundary does not guarantee that
+    Arena stopped generating. Draining prevents a tool-result follow-up from
+    racing the still-active assistant turn.
+    """
+    started = time.monotonic()
+    try:
+        async def _consume():
+            async for kind, payload in turn_iter:
+                if kind == "error":
+                    log(
+                        "WARN",
+                        f"{protocol} action drain · {action_name or 'tool'} · "
+                        f"upstream ended with {str(payload)[:180]}",
+                    )
+                    return
+                if kind == "done":
+                    return
+
+        await asyncio.wait_for(_consume(), timeout=AGENT_ACTION_DRAIN_HARD_SEC)
+    except asyncio.TimeoutError:
+        log(
+            "WARN",
+            f"{protocol} action drain · {action_name or 'tool'} · "
+            f"hard timeout after {AGENT_ACTION_DRAIN_HARD_SEC:.1f}s",
+        )
+        try:
+            if hasattr(turn_iter, "aclose"):
+                await turn_iter.aclose()
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        try:
+            if hasattr(turn_iter, "aclose"):
+                await turn_iter.aclose()
+        except Exception:
+            pass
+        raise
+    except Exception as exc:
+        log(
+            "WARN",
+            f"{protocol} action drain · {action_name or 'tool'} · "
+            f"{type(exc).__name__}: {exc}",
+        )
+    finally:
+        elapsed = time.monotonic() - started
+        current = asyncio.current_task()
+        if _agent_action_drain_tasks.get(chat_id) is current:
+            _agent_action_drain_tasks.pop(chat_id, None)
+            _agent_action_drain_started.pop(chat_id, None)
+        log(
+            "INFO",
+            f"{protocol} action drain complete · {action_name or 'tool'} · "
+            f"{elapsed:.2f}s",
+        )
+
+
+def _handoff_agent_action_drain(
+    chat_id: str,
+    turn_iter,
+    protocol: str,
+    action_name: str,
+) -> None:
+    previous = _agent_action_drain_tasks.get(chat_id)
+    if previous and not previous.done():
+        # A logical chat should have only one in-flight Arena assistant turn.
+        # Do not create a second drainer for the same conversation.
+        return
+
+    task = asyncio.create_task(
+        _drain_agent_action_turn(
+            chat_id,
+            turn_iter,
+            protocol,
+            action_name,
+        ),
+        name=f"agent-action-drain:{chat_id[-12:]}",
+    )
+    _agent_action_drain_tasks[chat_id] = task
+    _agent_action_drain_started[chat_id] = time.monotonic()
+
+
+async def _await_agent_action_drain(
+    chat_id: str,
+    protocol: str,
+) -> bool:
+    task = _agent_action_drain_tasks.get(chat_id)
+    if not task or task.done():
+        if task and task.done():
+            _agent_action_drain_tasks.pop(chat_id, None)
+            _agent_action_drain_started.pop(chat_id, None)
+        return True
+
+    started = _agent_action_drain_started.get(chat_id, time.monotonic())
+    log(
+        "INFO",
+        f"{protocol} tool continuation · waiting for previous Arena action turn "
+        f"to settle · age {time.monotonic() - started:.2f}s",
+    )
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=AGENT_ACTION_DRAIN_WAIT_SEC,
+        )
+        return True
+    except asyncio.TimeoutError:
+        log(
+            "WARN",
+            f"{protocol} tool continuation · previous Arena action turn still "
+            f"active after {AGENT_ACTION_DRAIN_WAIT_SEC:.1f}s",
+        )
+        return False
 
 
 def _conversation_has_model_binding(chat_id: str, model_name: str) -> bool:
@@ -12767,14 +12907,14 @@ def _openai_tool_continuation_prompt(body: dict) -> str:
         "The previously requested tool operation has completed. Use the result "
         "below and do not repeat an already-completed tool call unless another "
         "tool action is genuinely required. If another tool is needed, emit "
-        "one Bridgena action and stop immediately after its closing ].\\n\\n"
+        "one Bridgena action and stop immediately after its closing ].\n\n"
     )
-    rendered = prefix + "\\n\\n".join(rows)
+    rendered = prefix + "\n\n".join(rows)
 
     if len(rendered) <= TOOL_CONTINUATION_MAX_CHARS:
         return rendered
 
-    marker = "\\n\\n[older tool detail compacted]\\n\\n"
+    marker = "\n\n[older tool detail compacted]\n\n"
     keep = max(1, TOOL_CONTINUATION_MAX_CHARS - len(marker))
     return marker + rendered[-keep:]
 
@@ -12844,14 +12984,14 @@ def _anthropic_tool_continuation_prompt(body: dict) -> str:
         "Continue the SAME coding-agent task in this existing conversation. "
         "The client completed the requested tool operation. Use the result below. "
         "If another tool is needed, emit one Bridgena action and stop immediately "
-        "after its closing ].\\n\\n"
-        + "\\n\\n".join(rows)
+        "after its closing ].\n\n"
+        + "\n\n".join(rows)
     )
 
     if len(rendered) <= TOOL_CONTINUATION_MAX_CHARS:
         return rendered
 
-    marker = "\\n\\n[older tool detail compacted]\\n\\n"
+    marker = "\n\n[older tool detail compacted]\n\n"
     keep = max(1, TOOL_CONTINUATION_MAX_CHARS - len(marker))
     return marker + rendered[-keep:]
 
@@ -13619,6 +13759,18 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
 
+    if continuation:
+        settled = await _await_agent_action_drain(chat_id, "OpenAI")
+        if not settled:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Previous upstream tool-action turn is still settling; "
+                    "retry this tool-result continuation shortly."
+                ),
+                headers={"Retry-After": "1"},
+            )
+
     system_context = _tool_runtime_system_context(body, "openai")
     if not continuation:
         system_context, prompt = _fit_tool_envelope(system_context, prompt)
@@ -13632,6 +13784,7 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
     acc = ""
     reasoning_acc = ""
     early_parsed = []
+    action_cut_early = False
     try:
         turn_iter = run_turn(
             chat_id, prompt, model,
@@ -13646,10 +13799,11 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
                     acc += payload
                     early_parsed = _bridgena_action_calls(acc, body, "openai")
                     if early_parsed:
+                        action_cut_early = True
                         log(
                             "INFO",
                             f"OpenAI action boundary · {early_parsed[0].get('name')} · "
-                            f"cut upstream at {len(acc)} chars",
+                            f"client released at {len(acc)} chars; upstream draining",
                         )
                         break
                 elif kind == "reasoning" and isinstance(payload, str):
@@ -13664,7 +13818,14 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
                         detail=payload,
                     )
         finally:
-            if early_parsed and hasattr(turn_iter, "aclose"):
+            if action_cut_early and early_parsed:
+                _handoff_agent_action_drain(
+                    chat_id,
+                    turn_iter,
+                    "OpenAI",
+                    str(early_parsed[0].get("name") or ""),
+                )
+            elif early_parsed and hasattr(turn_iter, "aclose"):
                 try:
                     await turn_iter.aclose()
                 except Exception:
@@ -13711,6 +13872,28 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
     )
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
+
+    if continuation:
+        settled = await _await_agent_action_drain(chat_id, "OpenAI")
+        if not settled:
+            return JSONResponse(
+                status_code=503,
+                headers={
+                    "Retry-After": "1",
+                    "X-Bridgena-Retryable": "true",
+                    "Cache-Control": "no-store",
+                },
+                content={
+                    "error": {
+                        "message": (
+                            "The previous upstream tool-action turn is still "
+                            "settling. Retry this continuation shortly."
+                        ),
+                        "type": "api_error",
+                        "code": "previous_tool_turn_still_active",
+                    }
+                },
+            )
 
     agent_fp = _agent_request_fingerprint(body)
     remaining = _agent_challenge_remaining(agent_fp)
@@ -13768,6 +13951,7 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
     outcome = "complete"
     upstream_error = None
     early_parsed = []
+    action_cut_early = False
 
     try:
         turn_iter = run_turn(
@@ -13786,10 +13970,11 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
                     early_parsed = _bridgena_action_calls(acc, body, "openai")
                     if early_parsed:
                         outcome = "action-boundary"
+                        action_cut_early = True
                         log(
                             "INFO",
                             f"OpenAI action boundary · {early_parsed[0].get('name')} · "
-                            f"cut upstream at {len(acc)} chars",
+                            f"client released at {len(acc)} chars; upstream draining",
                         )
                         break
                 elif kind == "reasoning" and isinstance(payload, str):
@@ -13805,7 +13990,14 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
                     )
                     break
         finally:
-            if early_parsed and hasattr(turn_iter, "aclose"):
+            if action_cut_early and early_parsed:
+                _handoff_agent_action_drain(
+                    chat_id,
+                    turn_iter,
+                    "OpenAI",
+                    str(early_parsed[0].get("name") or ""),
+                )
+            elif early_parsed and hasattr(turn_iter, "aclose"):
                 try:
                     await turn_iter.aclose()
                 except Exception:
@@ -14432,6 +14624,18 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
 
+    if continuation:
+        settled = await _await_agent_action_drain(chat_id, "Anthropic")
+        if not settled:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Previous upstream tool-action turn is still settling; "
+                    "retry this tool-result continuation shortly."
+                ),
+                headers={"Retry-After": "1"},
+            )
+
     tenant_id = _tenant_identity(keyinfo)
     system_prompt = _tool_runtime_system_context(body, "anthropic")
     if not continuation:
@@ -14450,6 +14654,7 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
         acc = ""
         reasoning_acc = ""
         early_parsed = []
+        action_cut_early = False
         try:
             turn_iter = run_turn(
                 chat_id, prompt, model,
@@ -14466,11 +14671,12 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
                             acc, body, "anthropic"
                         )
                         if early_parsed:
+                            action_cut_early = True
                             log(
                                 "INFO",
                                 f"Anthropic action boundary · "
                                 f"{early_parsed[0].get('name')} · "
-                                f"cut upstream at {len(acc)} chars",
+                                f"client released at {len(acc)} chars; upstream draining",
                             )
                             break
                     elif kind == "reasoning" and isinstance(payload, str):
@@ -14484,7 +14690,14 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
                     elif kind == "error":
                         raise HTTPException(status_code=502, detail=payload)
             finally:
-                if early_parsed and hasattr(turn_iter, "aclose"):
+                if action_cut_early and early_parsed:
+                    _handoff_agent_action_drain(
+                        chat_id,
+                        turn_iter,
+                        "Anthropic",
+                        str(early_parsed[0].get("name") or ""),
+                    )
+                elif early_parsed and hasattr(turn_iter, "aclose"):
                     try:
                         await turn_iter.aclose()
                     except Exception:
@@ -14522,6 +14735,7 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
         acc = ""
         reasoning_acc = ""
         early_parsed = []
+        action_cut_early = False
         terminal_sent = False
         outcome = "complete"
 
@@ -14562,11 +14776,12 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
                         )
                         if early_parsed:
                             outcome = "action-boundary"
+                            action_cut_early = True
                             log(
                                 "INFO",
                                 f"Anthropic action boundary · "
                                 f"{early_parsed[0].get('name')} · "
-                                f"cut upstream at {len(acc)} chars",
+                                f"client released at {len(acc)} chars; upstream draining",
                             )
                             break
                     elif kind == "reasoning" and isinstance(payload, str):
@@ -14610,7 +14825,14 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
                         terminal_sent = True
                         return
             finally:
-                if early_parsed and hasattr(turn_iter, "aclose"):
+                if action_cut_early and early_parsed:
+                    _handoff_agent_action_drain(
+                        chat_id,
+                        turn_iter,
+                        "Anthropic",
+                        str(early_parsed[0].get("name") or ""),
+                    )
+                elif early_parsed and hasattr(turn_iter, "aclose"):
                     try:
                         await turn_iter.aclose()
                     except Exception:
@@ -16161,7 +16383,9 @@ async def _lifespan(app):
     log("INFO", "Action boundary · first valid bridgena_*[] action wins · trailing prose discarded")
     log("INFO", "MCP action bridge · bridgena_mcp[{tool,arguments}] → client-exposed MCP tool")
     log("INFO", "Action parser fix · real bridgena_*[] regex + real protocol newlines + terminal done capture")
-    log("INFO", "Action early-cut · upstream generation closes as soon as first valid action is complete")
+    log("INFO", "Action boundary · client tool call is released immediately; Arena remainder drains silently")
+    log("INFO", f"Tool continuation settle gate · wait <= {AGENT_ACTION_DRAIN_WAIT_SEC:.0f}s · "
+                f"hard drain <= {AGENT_ACTION_DRAIN_HARD_SEC:.0f}s")
     log("INFO", f"Browser-native session mode · persistent contexts "
                 f"{'ON' if BROWSER_PERSISTENT_CONTEXT else 'OFF'} · JavaScript ON · "
                 f"service workers {'ON' if BROWSER_SERVICE_WORKERS else 'OFF'} · "
