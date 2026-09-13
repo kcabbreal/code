@@ -440,7 +440,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.9.3-keeper-fix-warm-ui-console")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.9.5-ready-keeper-agent-routing")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2073,6 +2073,13 @@ TOOL_FIRST_ASSISTANT_RESPONSE_SEC = max(
     FIRST_ASSISTANT_RESPONSE_SEC,
     min(120.0, float(os.environ.get("BRIDGENA_TOOL_FIRST_ASSISTANT_RESPONSE_SEC", "25"))),
 )
+UNBOUND_READY_KEEPER_WAIT_SEC = max(
+    0.0, min(30.0, float(os.environ.get("BRIDGENA_UNBOUND_READY_KEEPER_WAIT_SEC", "4")))
+)
+TOOL_READY_KEEPER_WAIT_SEC = max(
+    UNBOUND_READY_KEEPER_WAIT_SEC,
+    min(60.0, float(os.environ.get("BRIDGENA_TOOL_READY_KEEPER_WAIT_SEC", "15"))),
+)
 from contextlib import asynccontextmanager
 
 # Keeper lanes and proxy-exit lanes are separate capacity constraints. Several
@@ -3141,6 +3148,28 @@ def acquire_ready_jar(exclude: Optional[set] = None) -> Optional[dict]:
                 break
     mutate_jars(mark_used)
     return selected
+
+
+async def wait_for_ready_jar(
+    *,
+    exclude: Optional[set] = None,
+    timeout_sec: float = 0.0,
+) -> Optional[dict]:
+    """Return any verified, running, idle keeper admitted for API traffic.
+
+    This is request admission, not request replay: it runs before a model POST.
+    """
+    excluded = set(exclude or ())
+    deadline = time.monotonic() + max(0.0, float(timeout_sec or 0.0))
+    while True:
+        jar = acquire_ready_jar(exclude=excluded)
+        if jar:
+            return jar
+        if time.monotonic() >= deadline:
+            return None
+        _wake_verification_scheduler()
+        await asyncio.sleep(0.25)
+
 
 async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None, *, randomize: bool = False) -> dict:
     """Pre-allocate distinct healthy upstream proxies to keeper accounts.
@@ -8894,11 +8923,22 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
     tried = set(excluded)
     bound_jar_id = (mc or {}).get("jar_id")
     wanted_jar_id = jar_hint or bound_jar_id
-    jar = (next((j for j in load_jars()
-                 if j.get("id") == wanted_jar_id
-                 and j.get("id") not in excluded
-                 and j.get("enabled", True)), None)
-           if wanted_jar_id else acquire_jar(prefer_live=True, exclude=excluded))
+    jar = (
+        next(
+            (
+                j for j in load_jars()
+                if j.get("id") == wanted_jar_id
+                and j.get("id") not in excluded
+                and j.get("enabled", True)
+            ),
+            None,
+        )
+        if wanted_jar_id
+        else (
+            acquire_ready_jar(exclude=excluded)
+            or acquire_jar(prefer_live=True, exclude=excluded)
+        )
+    )
     if bound_jar_id and not jar:
         yield ("retry-account", {
             "jar_id": bound_jar_id, "jar_name": bound_jar_id,
@@ -8912,6 +8952,53 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         yield ("error", "502: No jar with valid cookies/session — upload cookies or enable a keeper")
         return
     tried.add(jar["id"])
+
+    # Fresh tool/agent requests are latency-tolerant but extremely sensitive to
+    # receiving a broken streaming contract. Do not dispatch them through a
+    # keeper that is merely present; require one that is currently admitted.
+    if not bound_jar_id:
+        sid = str(jar.get("id") or "")
+        session = keeper.sessions.get(sid)
+        current_ready = bool(
+            sid
+            and _api_keeper_verified(sid)
+            and not _api_keeper_challenge_held(sid)
+            and time.monotonic() >= _api_keeper_quarantine_until.get(sid, 0.0)
+            and keeper_session_ready(session)
+            and getattr(session, "status", "") == "running"
+            and not (
+                getattr(session, "_action_lock", None)
+                and session._action_lock.locked()
+            )
+        )
+
+        if not current_ready:
+            wait_sec = (
+                TOOL_READY_KEEPER_WAIT_SEC
+                if _is_agent_tool_turn
+                else UNBOUND_READY_KEEPER_WAIT_SEC
+            )
+            replacement = await wait_for_ready_jar(
+                exclude=excluded | ({sid} if sid else set()),
+                timeout_sec=wait_sec,
+            )
+            if replacement:
+                old_name = jar.get("name") or sid or "unknown"
+                jar = replacement
+                tried.add(jar["id"])
+                log(
+                    "INFO",
+                    f"API admission · {old_name} was not request-ready · "
+                    f"using verified keeper {jar.get('name')} instead",
+                )
+            elif _is_agent_tool_turn:
+                _bump_account_failover("keeper_unready")
+                yield (
+                    "error",
+                    "503: No verified idle keeper is ready for this agent request right now. "
+                    "Bridgena did not dispatch the prompt through an unready browser worker.",
+                )
+                return
 
     # Existing Arena conversations must stay on their original authenticated
     # keeper/route. If that keeper is quarantined, actively repair it and wait
@@ -11201,8 +11288,29 @@ def dashboard_page(overview: dict) -> str:
 
 def chat_page(models: list, default_model: str) -> str:
     import json as _json
-    mj = _json.dumps(models, ensure_ascii=False)
-    dj = _json.dumps(default_model, ensure_ascii=False)
+
+    model_rows = []
+    for item in (models or []):
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("id") or "").strip()
+            if not name:
+                continue
+            model_rows.append({
+                "name": name,
+                "id": item.get("id"),
+                "org": str(item.get("org") or item.get("organization") or "").strip(),
+            })
+        else:
+            name = str(item or "").strip()
+            if name:
+                model_rows.append({"name": name, "id": None, "org": ""})
+
+    default_name = str(default_model or "").strip()
+    if default_name not in {row["name"] for row in model_rows}:
+        default_name = model_rows[0]["name"] if model_rows else ""
+
+    mj = _json.dumps(model_rows, ensure_ascii=False)
+    dj = _json.dumps(default_name, ensure_ascii=False)
     tpl = r'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover"><meta name="color-scheme" content="dark light"><title>Chat · Bridgena</title>
 <style>
 :root{--bg:#201d18;--sidebar:#25211c;--surface:#2d2822;--surface2:#373028;--line:#4a4036;--fg:#f4eee4;--muted:#bdb2a4;--dim:#918578;--good:#7acb98;--warn:#e0ad67;--bad:#e78882;--brand:#d97757;--shadow:0 24px 80px rgba(25,18,12,.32);--ease:cubic-bezier(.2,.8,.2,1);--serif:"Iowan Old Style","Palatino Linotype","Book Antiqua",Palatino,Charter,Georgia,serif;--sans:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
@@ -11217,7 +11325,15 @@ button,.ow-model-picker,.ow-composer,.ow-user-bubble,.ow-runtime,.ow-suggestion,
 .ow-main{min-width:0;min-height:0;height:100dvh;display:grid;grid-template-rows:54px minmax(0,1fr) auto;background:var(--bg);overflow:hidden}.ow-header{min-width:0;height:54px;display:flex;align-items:center;padding:0 14px;gap:7px;border-bottom:1px solid color-mix(in srgb,var(--line) 72%,transparent);background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(18px);z-index:20}
 .ow-icon-btn{width:36px;height:36px;border:0;border-radius:12px;corner-shape:squircle;background:transparent;display:grid;place-items:center;cursor:pointer}.ow-icon-btn:hover{background:var(--surface)}.ow-mobile-menu{display:none}.ow-model-wrap{position:relative;min-width:0}.ow-model-btn{max-width:min(520px,55vw);height:36px;border:0;border-radius:12px;corner-shape:squircle;background:transparent;padding:0 10px;font-weight:620;cursor:pointer;display:flex;align-items:center;gap:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ow-model-btn:hover{background:var(--surface)}
 .ow-status{margin-left:auto;display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;white-space:nowrap}.ow-status-dot{width:7px;height:7px;border-radius:99px;background:var(--good)}
-.ow-model-picker{position:absolute;z-index:100;top:43px;left:0;width:min(520px,calc(100vw - 28px));display:none;background:var(--sidebar);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;animation:owpop .15s var(--ease)}.ow-model-picker.open{display:block}.ow-picker-search{padding:8px;border-bottom:1px solid var(--line)}.ow-picker-search input{width:100%;height:38px;border:0;border-radius:10px;background:var(--surface);outline:0;color:var(--fg);padding:0 11px}.ow-model-list{max-height:min(430px,60vh);overflow:auto;padding:6px}.ow-model-option{width:100%;border:0;border-radius:11px;corner-shape:squircle;background:transparent;padding:9px 10px;text-align:left;cursor:pointer}.ow-model-option:hover,.ow-model-option.active{background:var(--surface)}
+.ow-model-picker{position:absolute;z-index:100;top:43px;left:0;width:min(520px,calc(100vw - 28px));display:none;background:color-mix(in srgb,var(--sidebar) 96%,var(--surface));border:1px solid var(--line);border-radius:24px;corner-shape:squircle;box-shadow:0 24px 70px rgba(20,14,9,.34);overflow:hidden;animation:owpop .17s var(--ease)}.ow-model-picker.open{display:block}
+.ow-picker-search{padding:10px;border-bottom:1px solid color-mix(in srgb,var(--line) 78%,transparent)}.ow-picker-search input{width:100%;height:42px;border:1px solid color-mix(in srgb,var(--line) 65%,transparent);border-radius:15px;corner-shape:squircle;background:var(--surface);outline:0;color:var(--fg);padding:0 13px}.ow-picker-search input:focus{border-color:color-mix(in srgb,var(--brand) 55%,var(--line));box-shadow:0 0 0 4px color-mix(in srgb,var(--brand) 8%,transparent)}
+.ow-picker-meta{display:flex;align-items:center;justify-content:space-between;padding:9px 13px 5px;color:var(--dim);font:600 10px var(--sans);text-transform:uppercase;letter-spacing:.06em}
+.ow-model-list{max-height:min(460px,62vh);min-height:64px;overflow:auto;padding:5px 7px 8px}
+.ow-model-option{width:100%;min-height:48px;border:0;border-radius:15px;corner-shape:squircle;background:transparent;padding:8px 10px;text-align:left;cursor:pointer;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;transition:background .16s var(--ease),transform .16s var(--ease)}
+.ow-model-option:hover{background:var(--surface);transform:translateX(2px)}.ow-model-option.active{background:color-mix(in srgb,var(--brand) 10%,var(--surface))}
+.ow-model-primary{min-width:0}.ow-model-name{display:block;color:var(--fg);font:600 13px/1.25 var(--sans);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ow-model-org{display:block;color:var(--dim);font:500 10px/1.25 var(--sans);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ow-model-check{width:24px;height:24px;border-radius:9px;corner-shape:squircle;display:grid;place-items:center;color:transparent;background:transparent}.ow-model-option.active .ow-model-check{color:#fff8f1;background:var(--brand)}.ow-model-check svg{width:14px;height:14px}
+.ow-model-empty{padding:28px 16px;text-align:center;color:var(--dim);font:400 14px var(--serif)}
 .ow-scroller{min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior-y:contain;scrollbar-gutter:stable both-edges;scroll-behavior:auto}.ow-feed{width:min(100%,52rem);margin:0 auto;padding:32px 20px 32px}.ow-empty{min-height:calc(100dvh - 180px);display:grid;place-items:center;text-align:center;padding:30px 0}.ow-empty-inner{width:min(630px,100%)}.ow-empty-logo{width:42px;height:42px;border-radius:14px;corner-shape:squircle;background:var(--fg);color:var(--bg);display:grid;place-items:center;margin:0 auto 17px;font-weight:800}.ow-empty h1{font:600 38px/1.08 var(--serif);letter-spacing:-.025em;margin:0 0 9px}.ow-empty p{margin:0;color:var(--muted)}
 .ow-suggestions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:25px auto 0;width:min(590px,100%)}.ow-suggestion{min-height:52px;border:1px solid var(--line);border-radius:16px;background:var(--sidebar);color:var(--muted);padding:10px 13px;text-align:left;cursor:pointer}.ow-suggestion:hover{background:var(--surface);color:var(--fg)}
 .ow-message{width:100%;margin:0 0 34px;animation:owmsg .17s var(--ease)}.ow-assistant{display:grid;grid-template-columns:32px minmax(0,1fr);gap:13px}.ow-avatar{width:30px;height:30px;border-radius:11px;corner-shape:squircle;background:var(--surface);display:grid;place-items:center;font-size:9px;font-weight:800}.ow-msg-head{font:600 11px var(--sans);color:var(--brand);margin:4px 0 6px}.ow-msg-body{font:400 17px/1.72 var(--serif);letter-spacing:-.006em;word-break:break-word;min-width:0}.ow-msg-body pre{max-width:100%;overflow:auto;background:#070709;border:1px solid var(--line);border-radius:15px;corner-shape:squircle;padding:14px;font:12px/1.62 ui-monospace,SFMono-Regular,Menlo,monospace}.ow-msg-body code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--surface);border-radius:6px;padding:2px 5px}.ow-msg-body pre code{padding:0;background:none}.ow-reason{color:var(--muted);font-size:12px;border-left:2px solid var(--line);padding:5px 0 5px 10px;margin-bottom:11px;white-space:pre-wrap}.ow-error{color:var(--bad)}
@@ -11229,18 +11345,65 @@ button,.ow-model-picker,.ow-composer,.ow-user-bubble,.ow-runtime,.ow-suggestion,
 @media(max-width:420px){.ow-compose-foot>span{display:none}.ow-feed{padding-left:10px;padding-right:10px}}@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 </style></head><body>
 <div class="ow-app"><aside class="ow-sidebar" id="side"><div class="ow-side-head"><div class="ow-logo">✦</div><div class="ow-title">Bridgena</div></div><div class="ow-side-tools"><button class="ow-new" onclick="newChat()"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg><span>New chat</span></button><label class="ow-search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="threadSearch" placeholder="Search chats"></label></div><div class="ow-history"><div class="ow-history-label">Chats</div><div id="threads"></div></div><div class="ow-side-foot"><a class="ow-admin" href="/dashboard"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21h-4v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3h4a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9A1.7 1.7 0 0 0 21 10v4a1.7 1.7 0 0 0-1.6 1Z"/></svg>Admin settings</a></div></aside><div class="ow-sidebar-backdrop" id="sideBackdrop" onclick="closeSide()"></div>
-<main class="ow-main"><header class="ow-header"><button class="ow-icon-btn ow-mobile-menu" onclick="openSide()" aria-label="Open sidebar"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><div class="ow-model-wrap"><button class="ow-model-btn" id="modelBtn" onclick="togglePicker()"><span id="modelBtnText">Model</span><svg viewBox="0 0 24 24"><path d="m8 10 4 4 4-4"/></svg></button><div class="ow-model-picker" id="picker"><div class="ow-picker-search"><input id="modelSearch" placeholder="Search models"></div><div class="ow-model-list" id="modelList"></div></div></div><div class="ow-status"><i class="ow-status-dot" id="statusDot"></i><span id="statusText">Ready</span></div><button class="ow-icon-btn" onclick="toggleRuntime()" aria-label="Runtime"><svg viewBox="0 0 24 24"><path d="M4 17 9 12 4 7M11 19h9"/></svg></button><button class="ow-icon-btn" onclick="toggleTheme()" aria-label="Theme"><svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/></svg></button></header>
+<main class="ow-main"><header class="ow-header"><button class="ow-icon-btn ow-mobile-menu" onclick="openSide()" aria-label="Open sidebar"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><div class="ow-model-wrap"><button class="ow-model-btn" id="modelBtn" onclick="togglePicker()"><span id="modelBtnText">Model</span><svg viewBox="0 0 24 24"><path d="m8 10 4 4 4-4"/></svg></button><div class="ow-model-picker" id="picker"><div class="ow-picker-search"><input id="modelSearch" placeholder="Search models"></div><div class="ow-picker-meta"><span>Available models</span><span id="modelCount"></span></div><div class="ow-model-list" id="modelList"></div></div></div><div class="ow-status"><i class="ow-status-dot" id="statusDot"></i><span id="statusText">Ready</span></div><button class="ow-icon-btn" onclick="toggleRuntime()" aria-label="Runtime"><svg viewBox="0 0 24 24"><path d="M4 17 9 12 4 7M11 19h9"/></svg></button><button class="ow-icon-btn" onclick="toggleTheme()" aria-label="Theme"><svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/></svg></button></header>
 <div class="ow-scroller" id="scroll"><div class="ow-feed" id="conversation"></div></div>
 <div class="ow-composer-zone"><div class="ow-composer"><textarea id="input" rows="1" placeholder="Message Bridgena"></textarea><div class="ow-compose-foot"><span>Enter to send · Shift+Enter for a new line</span><button class="ow-send" id="send" onclick="sendOrStop()" aria-label="Send"><svg id="sendIcon" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></svg></button></div></div></div></main></div>
 <aside class="ow-runtime" id="runtime"><div class="ow-runtime-head"><strong>Runtime</strong><button class="ow-icon-btn" style="margin-left:auto" onclick="toggleRuntime()" aria-label="Close"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div><pre id="signal">Waiting for activity…</pre></aside>
 <script>
-const MODELS=__MODELS__,DEFAULT_MODEL=__DEFAULT__,$=id=>document.getElementById(id);let controller=null,busy=false,autoFollow=true,model=localStorage.getItem('bgn.v3.model')||DEFAULT_MODEL,chatId=localStorage.getItem('bgn.v3.chat')||newId();
+const MODEL_ROWS=__MODELS__,DEFAULT_MODEL=__DEFAULT__,$=id=>document.getElementById(id);
+const MODELS=(Array.isArray(MODEL_ROWS)?MODEL_ROWS:[]).map(m=>typeof m==='string'?{name:m,id:null,org:''}:m).filter(m=>m&&typeof m.name==='string'&&m.name.trim());
+let controller=null,busy=false,autoFollow=true;
+let model=localStorage.getItem('bgn.v3.model')||DEFAULT_MODEL;
+if(!MODELS.some(m=>m.name===model))model=DEFAULT_MODEL||(MODELS[0]?.name||'');
+let chatId=localStorage.getItem('bgn.v3.chat')||newId();
 function newId(){return 'c-'+crypto.getRandomValues(new Uint32Array(2)).join('-')}function store(){try{return JSON.parse(localStorage.getItem('bgn.v3.chats')||'{}')}catch(e){return {}}}function saveStore(v){localStorage.setItem('bgn.v3.chats',JSON.stringify(v))}function current(){const s=store();return s[chatId]||{id:chatId,title:'New chat',messages:[],updated:Date.now()}}function saveCurrent(c){const s=store();s[chatId]=c;saveStore(s);localStorage.setItem('bgn.v3.chat',chatId);renderThreads()}function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function md(s){let x=esc(s);x=x.replace(/```([\s\S]*?)```/g,(_,b)=>'<pre><code>'+b+'</code></pre>');x=x.replace(/`([^`]+)`/g,'<code>$1</code>');x=x.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');return x.replace(/\n/g,'<br>')}
 function renderThreads(){const q=($('threadSearch').value||'').trim().toLowerCase(),items=Object.values(store()).sort((a,b)=>(b.updated||0)-(a.updated||0)).filter(c=>!q||(c.title||'').toLowerCase().includes(q)).slice(0,80);$('threads').innerHTML=items.map(c=>'<button class="ow-thread '+(c.id===chatId?'active':'')+'" onclick="openChat(\''+c.id.replace(/'/g,'')+'\')">'+esc(c.title||'New chat')+'</button>').join('')}function openChat(id){chatId=id;localStorage.setItem('bgn.v3.chat',id);renderConversation();renderThreads();closeSide()}function newChat(){chatId=newId();saveCurrent({id:chatId,title:'New chat',messages:[],updated:Date.now()});renderConversation();closeSide();$('input').focus()}function openSide(){$('side').classList.add('open');$('sideBackdrop').classList.add('open')}function closeSide(){$('side').classList.remove('open');$('sideBackdrop').classList.remove('open')}
 function renderConversation(){const c=current(),root=$('conversation');root.innerHTML='';if(!c.messages.length){root.innerHTML='<div class="ow-empty"><div class="ow-empty-inner"><div class="ow-empty-logo">✦</div><h1>How can I help?</h1><p>Choose a model and start a conversation.</p><div class="ow-suggestions"><button class="ow-suggestion" onclick="usePrompt(\'Review this code and identify reliability risks\')">Review code and reliability</button><button class="ow-suggestion" onclick="usePrompt(\'Help me diagnose a failed API request\')">Diagnose an API request</button></div></div></div>';return}c.messages.forEach(m=>appendRendered(m.role,m.content,m.reasoning||''));requestAnimationFrame(()=>scrollBottom(false,true))}
 function appendRendered(role,content,reasoning=''){const root=$('conversation'),empty=root.querySelector('.ow-empty');if(empty)empty.remove();const wrap=document.createElement('div');wrap.className='ow-message '+(role==='user'?'ow-user':'ow-assistant');if(role==='user'){wrap.innerHTML='<div class="ow-user-bubble">'+md(content)+'</div>';root.appendChild(wrap);return wrap.querySelector('.ow-user-bubble')}wrap.innerHTML='<div class="ow-avatar">✦</div><div><div class="ow-msg-head">Bridgena</div><div class="ow-msg-body">'+(reasoning?'<div class="ow-reason">'+esc(reasoning)+'</div>':'')+md(content)+'</div></div>';root.appendChild(wrap);return wrap.querySelector('.ow-msg-body')}
 function setStatus(t,state='ok'){$('statusText').textContent=t;const d=$('statusDot');d.className='ow-status-dot '+state;d.style.background=state==='bad'?'var(--bad)':state==='busy'?'var(--warn)':'var(--good)'}function isNearBottom(){const s=$('scroll');return(s.scrollHeight-s.scrollTop-s.clientHeight)<140}function scrollBottom(smooth=false,force=false){if(!force&&!autoFollow)return;const s=$('scroll');s.scrollTo({top:s.scrollHeight,behavior:smooth?'smooth':'auto'})}$('scroll').addEventListener('scroll',()=>{autoFollow=isNearBottom()},{passive:true});
-function toggleTheme(){const r=document.documentElement,n=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=n;localStorage.setItem('bgn.theme',n)}document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||'dark';function togglePicker(){$('picker').classList.toggle('open');if($('picker').classList.contains('open')){$('modelSearch').value='';renderModels('');$('modelSearch').focus()}}function renderModels(q=''){const x=q.toLowerCase(),arr=MODELS.filter(m=>m.toLowerCase().includes(x)).slice(0,300);$('modelList').innerHTML=arr.map(m=>'<button class="ow-model-option '+(m===model?'active':'')+'" data-m="'+esc(m)+'">'+esc(m)+'</button>').join('')||'<div style="padding:18px;color:var(--muted)">No matching models</div>';document.querySelectorAll('.ow-model-option').forEach(b=>b.onclick=()=>{model=b.dataset.m;localStorage.setItem('bgn.v3.model',model);$('modelBtnText').textContent=model;$('picker').classList.remove('open')})}$('modelSearch').addEventListener('input',e=>renderModels(e.target.value));$('modelBtnText').textContent=model;renderModels('');
+function toggleTheme(){const r=document.documentElement,n=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=n;localStorage.setItem('bgn.theme',n)}
+document.documentElement.dataset.theme=localStorage.getItem('bgn.theme')||'dark';
+
+function togglePicker(){
+  const p=$('picker');
+  p.classList.toggle('open');
+  if(p.classList.contains('open')){
+    $('modelSearch').value='';
+    renderModels('');
+    requestAnimationFrame(()=>$('modelSearch').focus());
+  }
+}
+
+function renderModels(q=''){
+  const x=String(q||'').trim().toLowerCase();
+  const arr=MODELS.filter(m=>{
+    const hay=(m.name+' '+(m.org||'')+' '+(m.id||'')).toLowerCase();
+    return !x||hay.includes(x);
+  }).slice(0,300);
+
+  $('modelCount').textContent=x ? `${arr.length} match${arr.length===1?'':'es'}` : `${MODELS.length} total`;
+
+  $('modelList').innerHTML=arr.length ? arr.map(m=>{
+    const active=m.name===model;
+    const subtitle=m.org||m.id||'';
+    return '<button class="ow-model-option '+(active?'active':'')+'" data-m="'+esc(m.name)+'">'
+      +'<span class="ow-model-primary"><span class="ow-model-name">'+esc(m.name)+'</span>'
+      +(subtitle?'<span class="ow-model-org">'+esc(subtitle)+'</span>':'')
+      +'</span><span class="ow-model-check"><svg viewBox="0 0 24 24"><path d="m6 12 4 4 8-9"/></svg></span></button>';
+  }).join('') : '<div class="ow-model-empty">No models match “'+esc(q)+'”.</div>';
+
+  document.querySelectorAll('.ow-model-option').forEach(b=>b.onclick=()=>{
+    model=b.dataset.m;
+    localStorage.setItem('bgn.v3.model',model);
+    $('modelBtnText').textContent=model;
+    $('picker').classList.remove('open');
+    renderModels($('modelSearch').value);
+  });
+}
+
+$('modelSearch').addEventListener('input',e=>renderModels(e.target.value));
+$('modelBtnText').textContent=model||'Select model';
+renderModels('');
 function usePrompt(s){$('input').value=s;$('input').focus();autoSize()}function autoSize(){const t=$('input');t.style.height='46px';t.style.height=Math.min(180,t.scrollHeight)+'px'}$('input').addEventListener('input',autoSize);$('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendOrStop()}});$('threadSearch').addEventListener('input',renderThreads);function toggleRuntime(){$('runtime').classList.toggle('open')}async function refreshSignal(){try{const r=await fetch('/debug-logs/data',{cache:'no-store'});if(!r.ok)return;const d=await r.json();$('signal').textContent=d.slice(-120).map(x=>x.line||x.message||'').join('\n')}catch(e){}}setInterval(refreshSignal,2500);function saveMsg(role,content,reasoning=''){const c=current();c.messages.push({role,content,reasoning,ts:Date.now()});if(c.title==='New chat'&&role==='user')c.title=content.replace(/\s+/g,' ').slice(0,52)||'New chat';c.updated=Date.now();saveCurrent(c)}function sendOrStop(){if(busy){controller?.abort();return}sendMessage()}function setSendBusy(on){const b=$('send');b.classList.toggle('stop',on);b.setAttribute('aria-label',on?'Stop':'Send');$('sendIcon').innerHTML=on?'<rect x="7" y="7" width="10" height="10" rx="2"></rect>':'<path d="M12 19V5M6 11l6-6 6 6"></path>'}
 async function sendMessage(){const input=$('input'),txt=input.value.trim();if(!txt)return;busy=true;controller=new AbortController();autoFollow=true;input.value='';autoSize();setSendBusy(true);setStatus('Generating','busy');saveMsg('user',txt);appendRendered('user',txt);const body=appendRendered('assistant','');let acc='',reason='';scrollBottom(false,true);try{const c=current(),messages=c.messages.slice(-24).map(m=>({role:m.role==='assistant'?'assistant':'user',content:m.content})),r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({model,messages,stream:true,chat_id:chatId,stream_options:{include_usage:true}})});if(!r.ok)throw new Error('HTTP '+r.status+': '+await r.text());const rd=r.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let cut;while((cut=buf.indexOf('\n'))>=0){const line=buf.slice(0,cut).trim();buf=buf.slice(cut+1);if(!line.startsWith('data: '))continue;const raw=line.slice(6);if(raw==='[DONE]')continue;let j;try{j=JSON.parse(raw)}catch(e){continue}if(j.error)throw new Error(j.error.message||'Bridge stream error');const d=j.choices?.[0]?.delta||{};if(d.reasoning_content)reason+=d.reasoning_content;if(d.content)acc+=d.content;body.innerHTML=(reason?'<div class="ow-reason">'+esc(reason)+'</div>':'')+md(acc);if(autoFollow)scrollBottom(false)}}if(!acc)throw new Error('The upstream completed without assistant content.');saveMsg('assistant',acc,reason);setStatus('Ready')}catch(e){if(e.name==='AbortError'){body.innerHTML=(reason?'<div class="ow-reason">'+esc(reason)+'</div>':'')+md(acc||'Generation stopped.');if(acc)saveMsg('assistant',acc,reason);setStatus('Stopped')}else{const err='<div class="ow-error">'+esc(e.message||e)+'</div>';if(acc||reason){body.innerHTML=(reason?'<div class="ow-reason">'+esc(reason)+'</div>':'')+md(acc)+err;if(acc)saveMsg('assistant',acc,reason)}else body.innerHTML=err;setStatus('Error','bad')}}finally{busy=false;controller=null;setSendBusy(false);renderThreads()}}
 renderThreads();renderConversation();refreshSignal();document.addEventListener('click',e=>{if(!$('picker').contains(e.target)&&!$('modelBtn').contains(e.target))$('picker').classList.remove('open')});
@@ -12788,7 +12951,10 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
             elif kind == "reasoning" and isinstance(payload, str):
                 reasoning_acc += payload
             elif kind == "error":
-                raise HTTPException(status_code=502, detail=payload)
+                raise HTTPException(
+                    status_code=_status_from_internal_error(payload, 502),
+                    detail=payload,
+                )
 
         parsed = _extract_tool_calls(acc, body, "openai")
         calls = _openai_tool_calls_payload(parsed)
@@ -12820,11 +12986,93 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
     prompt = _format_conversation_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
+
     model = body.get("model", "auto")
     chat_id = _disposable_chat_id("api-tool")
     created = int(time.time())
     rid = "chatcmpl-" + uuid7()[:23]
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+    acc = ""
+    reasoning_acc = ""
+    outcome = "complete"
+    upstream_error = None
+
+    # Tool turns are intentionally buffered so Bridgena can distinguish normal
+    # assistant prose from the structured tool-call envelope. Because nothing
+    # useful is streamed before that decision anyway, finish upstream admission
+    # first and only then commit an HTTP response.
+    try:
+        async for kind, payload in run_turn(
+            chat_id,
+            prompt,
+            model,
+            attachments=body.get("attachments"),
+            system_prompt=_tool_runtime_system_context(body, "openai"),
+            tenant_id=_tenant_identity(keyinfo),
+            handoff_prompt=prompt,
+        ):
+            if kind == "content" and isinstance(payload, str):
+                acc += payload
+            elif kind == "reasoning" and isinstance(payload, str):
+                reasoning_acc += payload
+            elif kind == "error":
+                outcome = "upstream-error"
+                upstream_error = str(payload or "502: upstream tool turn failed")
+                break
+    except Exception as exc:
+        outcome = "bridge-exception"
+        upstream_error = f"500: {type(exc).__name__}: {exc}"
+    finally:
+        _release_api_request(body, keyinfo, prompt)
+
+    if upstream_error is not None:
+        status_code = _status_from_internal_error(upstream_error, 502)
+        error_id, public_message = _openai_public_error(
+            status_code,
+            upstream_error,
+            source="openai_tool_stream",
+            context={
+                "model": model,
+                "chat_id": str(chat_id)[:120],
+                "buffered_chars": len(acc),
+            },
+        )
+
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Bridgena-Retryable": (
+                "true" if status_code in (429, 502, 503, 504) else "false"
+            ),
+        }
+        retry_after = _retry_after_from_internal_error(upstream_error)
+        if retry_after:
+            headers["Retry-After"] = str(max(1, int(retry_after)))
+        elif status_code == 503:
+            # Short retry hint for clients such as coding agents. The challenged
+            # keeper has already been removed from API scheduling.
+            headers["Retry-After"] = "1"
+
+        _record_reliability_outcome(False, outcome)
+        log(
+            "WARN",
+            f"OpenAI tool stream {rid[-8:]} · real HTTP {status_code} before SSE commit · "
+            f"buffered {len(acc)} chars · retryable={headers['X-Bridgena-Retryable']}",
+        )
+        return JSONResponse(
+            status_code=status_code,
+            headers=headers,
+            content={
+                "error": {
+                    "message": public_message,
+                    "type": "api_error",
+                    "code": error_id,
+                }
+            },
+        )
+
+    parsed = _extract_tool_calls(acc, body, "openai")
+    calls = _openai_tool_calls_payload(parsed)
+    _tool_output_log("OpenAI", model, parsed, acc)
 
     def chunk(delta, finish=None):
         return _sse({
@@ -12832,52 +13080,20 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish,
+            }],
         })
 
     async def gen():
-        acc = ""
-        reasoning_acc = ""
-        terminal_sent = False
-        outcome = "complete"
-        try:
-            yield chunk({"role": "assistant"})
-            async for kind, payload in run_turn(
-                chat_id, prompt, model,
-                attachments=body.get("attachments"),
-                system_prompt=_tool_runtime_system_context(body, "openai"),
-                tenant_id=_tenant_identity(keyinfo),
-                handoff_prompt=prompt,
-            ):
-                if kind == "content" and isinstance(payload, str):
-                    acc += payload
-                elif kind == "reasoning" and isinstance(payload, str):
-                    reasoning_acc += payload
-                elif kind == "error":
-                    outcome = "upstream-error"
-                    status_code = _status_from_internal_error(payload, 502)
-                    error_id, public_message = _openai_public_error(
-                        status_code, payload, source="openai_tool_stream",
-                        context={"model": model, "chat_id": str(chat_id)[:120],
-                                 "buffered_chars": len(acc)}
-                    )
-                    yield _sse({"error": {
-                        "message": public_message,
-                        "type": "api_error",
-                        "code": error_id,
-                    }})
-                    yield chunk({}, finish="stop")
-                    yield "data: [DONE]\n\n"
-                    terminal_sent = True
-                    return
+        yield chunk({"role": "assistant"})
 
-            parsed = _extract_tool_calls(acc, body, "openai")
-            calls = _openai_tool_calls_payload(parsed)
-            _tool_output_log("OpenAI", model, parsed, acc)
-
-            if calls:
-                for index, call in enumerate(calls):
-                    yield chunk({"tool_calls": [{
+        if calls:
+            for index, call in enumerate(calls):
+                yield chunk({
+                    "tool_calls": [{
                         "index": index,
                         "id": call["id"],
                         "type": "function",
@@ -12885,48 +13101,49 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
                             "name": call["function"]["name"],
                             "arguments": call["function"]["arguments"],
                         },
-                    }]})
-                yield chunk({}, finish="tool_calls")
-            else:
-                if reasoning_acc:
-                    yield chunk({"reasoning_content": reasoning_acc})
-                if acc:
-                    yield chunk({"content": acc})
-                yield chunk({}, finish="stop")
-
-            if include_usage:
-                pt = _rough_tokens(prompt)
-                ct = _rough_tokens(acc)
-                yield _sse({
-                    "id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
-                    "choices": [],
-                    "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+                    }]
                 })
-            yield "data: [DONE]\n\n"
-            terminal_sent = True
-        except Exception as exc:
-            outcome = "bridge-exception"
-            error_id, public_message = _openai_public_error(
-                500, f"{type(exc).__name__}: {exc}",
-                source="openai_tool_stream_exception",
-                context={"model": model, "chat_id": str(chat_id)[:120], "buffered_chars": len(acc)},
-                exception_type=type(exc).__name__,
-            )
-            yield _sse({"error": {"message": public_message, "type": "api_error", "code": error_id}})
+            yield chunk({}, finish="tool_calls")
+        else:
+            if reasoning_acc:
+                yield chunk({"reasoning_content": reasoning_acc})
+            if acc:
+                yield chunk({"content": acc})
             yield chunk({}, finish="stop")
-            yield "data: [DONE]\n\n"
-            terminal_sent = True
-        finally:
-            _release_api_request(body, keyinfo, prompt)
-            _record_reliability_outcome(bool(outcome == "complete" and terminal_sent), outcome)
-            log("INFO" if terminal_sent else "WARN",
-                f"OpenAI tool stream {rid[-8:]} · outcome {outcome} · "
-                f"buffered {len(acc)} chars · terminal {'yes' if terminal_sent else 'no'}")
+
+        if include_usage:
+            pt = _rough_tokens(prompt)
+            ct = _rough_tokens(acc)
+            yield _sse({
+                "id": rid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": pt,
+                    "completion_tokens": ct,
+                    "total_tokens": pt + ct,
+                },
+            })
+
+        yield "data: [DONE]\n\n"
+
+    _record_reliability_outcome(True, "complete")
+    log(
+        "INFO",
+        f"OpenAI tool stream {rid[-8:]} · buffered upstream complete · "
+        f"{len(calls)} tool call(s) · {len(acc)} chars",
+    )
 
     return StreamingResponse(
-        gen(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache, no-transform",
-                 "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 
@@ -14916,6 +15133,9 @@ async def _lifespan(app):
     log("INFO", f"Text encoding · explicit UTF-8 Content-Type for HTML/SSE ON")
     log("INFO", f"Agent semantic SLA · normal {FIRST_ASSISTANT_RESPONSE_SEC:.0f}s · "
                 f"tool turns {TOOL_FIRST_ASSISTANT_RESPONSE_SEC:.0f}s")
+    log("INFO", f"API keeper admission · fresh turns prefer verified idle keepers · "
+                f"normal wait {UNBOUND_READY_KEEPER_WAIT_SEC:.0f}s · tool wait {TOOL_READY_KEEPER_WAIT_SEC:.0f}s")
+    log("INFO", "OpenAI tool transport · upstream admission buffered before SSE commit · real HTTP retry statuses ON")
     log("INFO", f"Browser-native session mode · persistent contexts "
                 f"{'ON' if BROWSER_PERSISTENT_CONTEXT else 'OFF'} · JavaScript ON · "
                 f"service workers {'ON' if BROWSER_SERVICE_WORKERS else 'OFF'} · "
@@ -14924,7 +15144,7 @@ async def _lifespan(app):
                 f"{'HEADED' if KEEPERS_HEADED_DEFAULT else 'per-account/headless-compatible'} · "
                 f"auto-Xvfb {'ON' if KEEPERS_AUTO_XVFB else 'OFF'} · "
                 f"DISPLAY={os.environ.get('DISPLAY') or _V3_VNC_DISPLAY}")
-    log("INFO", "Control UI · v3.9.3 warm editorial pass · refined chat motion + structured live console")
+    log("INFO", "Control UI · v3.9.4 model picker data-contract fix · searchable model browser")
     log("INFO", "Proxy lifecycle · non-destructive circuit breaker · auto-recovery + automatic re-admission · no automatic deletion")
     if get_verification_solver:
         log("OK", f"Verification adapter factory loaded: {_VERIFICATION_FACTORY_SPEC}")
