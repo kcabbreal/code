@@ -440,7 +440,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.10.4-sticky-agent-idempotency")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.10.5-deferred-agent-completion")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2095,24 +2095,24 @@ TOOL_TRANSCRIPT_MAX_CHARS = max(
 )
 AGENT_CHALLENGE_BACKOFF_SEC = max(
     2.0,
-    min(30.0, float(os.environ.get("BRIDGENA_AGENT_CHALLENGE_BACKOFF_SEC", "5"))),
+    min(60.0, float(os.environ.get("BRIDGENA_AGENT_CHALLENGE_BACKOFF_SEC", "15"))),
 )
 AGENT_CHALLENGE_BACKOFF_MAX_SEC = max(
     AGENT_CHALLENGE_BACKOFF_SEC,
-    min(45.0, float(os.environ.get("BRIDGENA_AGENT_CHALLENGE_BACKOFF_MAX_SEC", "18"))),
+    min(120.0, float(os.environ.get("BRIDGENA_AGENT_CHALLENGE_BACKOFF_MAX_SEC", "60"))),
 )
 TOOL_CONTINUATION_MAX_CHARS = max(
     2500,
     min(12000, int(os.environ.get("BRIDGENA_TOOL_CONTINUATION_MAX_CHARS", "7000"))),
 )
 BRIDGENA_ACTION_PROTOCOL = os.environ.get(
-    "BRIDGENA_ACTION_PROTOCOL", "v2"
-).strip().lower() or "v2"
+    "BRIDGENA_ACTION_PROTOCOL", "v3"
+).strip().lower() or "v3"
 BRIDGENA_ACTION_MAX_CHARS = max(
     1000,
     min(50000, int(os.environ.get("BRIDGENA_ACTION_MAX_CHARS", "24000"))),
 )
-BRIDGENA_ACTION_MARKER = "<<<BRIDGENA_ACTION_PROTOCOL_V2>>>"
+BRIDGENA_ACTION_MARKER = "<<<BRIDGENA_ACTION_PROTOCOL_V3>>>"
 AGENT_ACTION_DRAIN_WAIT_SEC = max(
     1.0,
     min(20.0, float(os.environ.get("BRIDGENA_AGENT_ACTION_DRAIN_WAIT_SEC", "6"))),
@@ -2138,8 +2138,24 @@ TRANSPORT_PROBE_LOCK_WAIT_SEC = max(
     min(5.0, float(os.environ.get("BRIDGENA_TRANSPORT_PROBE_LOCK_WAIT_SEC", "1.5"))),
 )
 AGENT_TERMINAL_REPLAY_TTL_SEC = max(
-    15.0,
-    min(600.0, float(os.environ.get("BRIDGENA_AGENT_TERMINAL_REPLAY_TTL_SEC", "180"))),
+    30.0,
+    min(3600.0, float(os.environ.get("BRIDGENA_AGENT_TERMINAL_REPLAY_TTL_SEC", "600"))),
+)
+AGENT_PENDING_ACTION_TTL_SEC = max(
+    30.0,
+    min(3600.0, float(os.environ.get("BRIDGENA_AGENT_PENDING_ACTION_TTL_SEC", "900"))),
+)
+MODEL_NOT_FOUND_HOLD_SEC = max(
+    60.0,
+    min(7200.0, float(os.environ.get("BRIDGENA_MODEL_NOT_FOUND_HOLD_SEC", "1800"))),
+)
+MODEL_EMPTY_STREAM_HOLD_SEC = max(
+    30.0,
+    min(1800.0, float(os.environ.get("BRIDGENA_MODEL_EMPTY_STREAM_HOLD_SEC", "300"))),
+)
+MODEL_EMPTY_STREAM_STRIKES = max(
+    1,
+    min(5, int(os.environ.get("BRIDGENA_MODEL_EMPTY_STREAM_STRIKES", "2"))),
 )
 AGENT_BOUND_RETRY_AFTER_SEC = max(
     1.0,
@@ -7819,6 +7835,82 @@ def _parse_retry_after_seconds(value: str) -> Optional[float]:
     except Exception:
         return None
 
+_runtime_model_holds: Dict[str, dict] = {}
+_runtime_model_empty_strikes: Dict[str, int] = {}
+
+
+def _mark_runtime_model_hold(model_name: str, reason: str, seconds: float) -> None:
+    name = str(model_name or "").strip()
+    if not name or name == "auto":
+        return
+    until = time.time() + max(1.0, float(seconds or 0.0))
+    row = {"until": until, "reason": str(reason or "unavailable")[:160]}
+    _runtime_model_holds[name] = dict(row)
+
+    def fn(state: dict):
+        holds = state.setdefault("runtime_model_holds", {})
+        holds[name] = dict(row)
+
+    try:
+        mutate_state(fn)
+    except Exception:
+        pass
+    log("WARN", f"Model runtime hold · {name} · {int(max(1, seconds))}s · {row['reason']}")
+
+
+def _runtime_model_hold(model_name: str) -> Optional[dict]:
+    name = str(model_name or "").strip()
+    if not name or name == "auto":
+        return None
+    now = time.time()
+    row = _runtime_model_holds.get(name)
+    if not row:
+        try:
+            row = (load_state().get("runtime_model_holds") or {}).get(name)
+        except Exception:
+            row = None
+        if isinstance(row, dict):
+            _runtime_model_holds[name] = dict(row)
+    if not isinstance(row, dict):
+        return None
+    if now >= float(row.get("until", 0.0) or 0.0):
+        _runtime_model_holds.pop(name, None)
+        return None
+    return dict(row)
+
+
+def _clear_runtime_model_health(model_name: str) -> None:
+    name = str(model_name or "").strip()
+    if not name:
+        return
+    _runtime_model_holds.pop(name, None)
+    _runtime_model_empty_strikes.pop(name, None)
+
+    def fn(state: dict):
+        holds = state.get("runtime_model_holds")
+        if isinstance(holds, dict):
+            holds.pop(name, None)
+
+    try:
+        mutate_state(fn)
+    except Exception:
+        pass
+
+
+def _note_runtime_model_empty(model_name: str) -> None:
+    name = str(model_name or "").strip()
+    if not name or name == "auto":
+        return
+    strikes = int(_runtime_model_empty_strikes.get(name, 0)) + 1
+    _runtime_model_empty_strikes[name] = strikes
+    if strikes >= MODEL_EMPTY_STREAM_STRIKES:
+        _mark_runtime_model_hold(
+            name,
+            f"HTTP 200 but no decodable assistant output ({strikes} consecutive occurrences)",
+            MODEL_EMPTY_STREAM_HOLD_SEC,
+        )
+
+
 def _mark_model_rate_limited(model_name: str, seconds: float = None) -> float:
     """Adaptive throttle lease.
 
@@ -9678,6 +9770,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     yield ("content", reasoning_text)
                     log("INFO", f"[{jar.get('name')}] stream compatibility · reasoning-only model mirrored to final content")
                 if not response_text:
+                    _note_runtime_model_empty(model_name)
                     log("WARN", f"[{jar.get('name')}] Arena returned HTTP 200 but no decodable text frames for {model_name}")
                     yield ("error", "502: Arena completed the stream without a text response. The model may be unavailable or using an unsupported event format.")
                     return
@@ -9695,11 +9788,13 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             f"{len(response_text)} text chars · {_decoded_events} decoded events · "
                             f"{_unknown_frames} metadata/unknown frames")
                 _clear_model_rate_limit(model_name)
+                _clear_runtime_model_health(model_name)
                 if retry_envelope_ids:
                     _bump_undelivered_retry("succeeded")
                     log("OK", f"[{jar.get('name')}] confirmed-absence retry succeeded · "
                               f"{len(response_text)} chars")
                 _note_keeper_model_success(jar.get("id"), model_name)
+                _clear_runtime_model_health(model_name)
                 yield ("done", response_text)
                 return
             except BridgeHTTPError as e:
@@ -10250,10 +10345,14 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                         f"{type(recovery_exc).__name__}: {redact(str(recovery_exc))[:160]}")
 
                         if mc:
-                            clear_conversation_model(chat_id, model_name)
+                            log(
+                                "INFO",
+                                f"[{jar.get('name')}] verification rejection · preserving bound "
+                                f"Arena conversation {str(mc.get('arena_id') or '')[:12]}… for same-thread recovery",
+                            )
 
                         log("WARN", f"[{jar.get('name')}] Arena verification rejected (HTTP {e.status}); "
-                                    "keeper retained and local recovery started")
+                                    "keeper retained, thread preserved, and local recovery started")
                         rejection = (e.body or "").strip().replace("\n", " ")[:220]
                         yield ("error",
                                "503: Arena rejected verification for this request and the same-keeper continuation did not complete. "
@@ -10261,6 +10360,10 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                + (f" Upstream: {rejection}" if rejection else ""))
                         return
 
+                    if e.status == 404 and "model not found" in (e.body or "").lower():
+                        _mark_runtime_model_hold(
+                            model_name, "upstream returned Model not found", MODEL_NOT_FOUND_HOLD_SEC
+                        )
                     if e.status == 400 and "user message is invalid" in (e.body or "").lower():
                         yield ("error", "400: Arena rejected the message content. Send plain text or supported text content parts; images and unsupported multimodal parts are not accepted by this bridge yet.")
                         return
@@ -10372,6 +10475,10 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     level = "WARN" if 400 <= resp.status_code < 500 else "ERROR"
                     log(level, f"Status {resp.status_code}, URL {url}, Body: {body[:600]}")
 
+                    if resp.status_code == 404 and "model not found" in body.lower():
+                        _mark_runtime_model_hold(
+                            model_name, "upstream returned Model not found", MODEL_NOT_FOUND_HOLD_SEC
+                        )
                     if resp.status_code == 404 and "model not found" in body.lower() and mc:
                         clear_conversation_model(chat_id, model_name)
                         mc = None
@@ -10427,14 +10534,15 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                 log("OK", f"[{jar.get('name')}] V2 token harvested ({len(esc)} chars) — retrying SAME jar with V2 only")
                                 continue
                         if mc:
-                            clear_conversation_model(chat_id, model_name)
-                            mc = None
-                            conv = {}
-                            response_text = ""
-                            reasoning_text = ""
+                            log(
+                                "INFO",
+                                f"[{jar.get('name')}] verification rejection · preserving bound "
+                                f"Arena conversation {str(mc.get('arena_id') or '')[:12]}… for same-thread recovery",
+                            )
                         # Verification rejection is intentionally NOT a
-                        # cross-account failover condition. Keep recovery local
-                        # and non-destructive.
+                        # cross-account failover condition. Keep recovery local,
+                        # preserve the upstream thread binding, and recover the
+                        # browser/session without replaying the whole transcript.
                         _mark_api_keeper_unready(
                             failed_jar_id,
                             "verification rejection; local readiness recovery requested",
@@ -10557,6 +10665,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     response_text = reasoning_text
                     yield ("content", reasoning_text)
                 if not response_text:
+                    _note_runtime_model_empty(model_name)
                     log("WARN", f"[{jar.get('name')}] Arena returned HTTP 200 but no decodable text frames for {model_name}")
                     yield ("error", "502: Arena completed the stream without a text response. The model may be unavailable or using an unsupported event format.")
                     return
@@ -12665,47 +12774,46 @@ def _tool_protocol_system(body: dict, protocol: str) -> str:
 
     return (
         "You are operating inside a tool-capable coding/agent client through "
-        "Bridgena Action Protocol v2. The CLIENT executes tools; you only request "
-        "an action. Never claim that a tool, file write, shell command, browser "
-        "action, or MCP operation succeeded until a Tool Result is provided.\n\n"
+        "Bridgena Action Protocol v3. The CLIENT executes tools; you only request "
+        "an action. Never expose a success claim to the user before the client "
+        "actually reports that the action succeeded.\n\n"
         "AVAILABLE CLIENT TOOLS (JSON):\n"
         + encoded
         + "\n\nTOOL CHOICE: "
         + choice
         + "\n\n"
         "WHEN AN ACTION IS NEEDED:\n"
-        "Emit exactly ONE Bridgena action and STOP THE TURN immediately after "
-        "its closing ]. Do not add success text after the action. Bridgena cuts "
-        "the turn at the first valid action, validates it, and translates it "
-        "into the client's native tool-call protocol.\n\n"
+        "Emit exactly ONE Bridgena action. Bridgena validates it and translates "
+        "it into the client's native tool-call protocol.\n\n"
         "Preferred universal form:\n"
         'bridgena_call[{"tool":"EXACT_CLIENT_TOOL_NAME","arguments":{"arg":"value"}}]\n\n'
-        "Simple shorthand is valid when the suffix identifies exactly one "
-        "available client tool:\n"
-        'bridgena_write[{"filePath":"example.txt","content":"hello"}]\n'
+        "If a successful execution of this tool would COMPLETELY finish the current "
+        "task and you do not need to inspect the returned data, add an on_success "
+        "message to the same action:\n"
+        'bridgena_call[{"tool":"write","arguments":{"filePath":"example.txt","content":"hello"},"on_success":"Created example.txt successfully."}]\n\n'
+        "Bridgena stores on_success privately. It is NEVER sent to the client as a "
+        "tool argument and is only returned after the client reports successful "
+        "execution. This removes an unnecessary second model round-trip for terminal "
+        "write/edit/create actions.\n\n"
+        "Do NOT use on_success for read/search/list/MCP query tools, commands whose "
+        "output must be interpreted, or any action after which more reasoning or more "
+        "tools may be needed. In those cases omit on_success and Bridgena will send "
+        "the Tool Result back to you normally.\n\n"
+        "Simple shorthand remains valid when the suffix identifies exactly one tool:\n"
+        'bridgena_write[{"filePath":"example.txt","content":"hello","on_success":"Created example.txt."}]\n'
         'bridgena_read[{"path":"example.txt"}]\n\n'
         "For MCP-exposed tools use:\n"
         'bridgena_mcp[{"tool":"EXACT_CLIENT_TOOL_NAME","arguments":{"arg":"value"}}]\n'
-        "The tool must exist in AVAILABLE CLIENT TOOLS. Bridgena never invents "
-        "or executes a nonexistent tool.\n\n"
-        "Bracket payloads should be JSON. Keyword form such as "
-        'bridgena_mcp[tool="server.tool", arguments={"path":"x"}] is also '
-        "accepted, but JSON is preferred. Use the tool schema's field names "
-        "exactly.\n\n"
-        "If no tool is needed, answer normally. If TOOL CHOICE is none, never "
-        "emit a Bridgena action. If a tool is required, emit a valid action "
-        "instead of a final prose answer.\n\n"
+        "The tool must exist in AVAILABLE CLIENT TOOLS. Bridgena never invents a tool.\n\n"
+        "If no tool is needed, answer normally. If TOOL CHOICE is none, never emit "
+        "a Bridgena action. If a tool is required, emit the action instead of a fake "
+        "success response.\n\n"
         "EFFICIENCY RULES:\n"
-        "- For a direct create/write request with a clear target and enough content, "
-        "prefer the appropriate write/create tool immediately.\n"
-        "- Do not Glob/Search/Read merely to confirm that a brand-new requested file "
-        "does not exist unless that information is genuinely required.\n"
-        "- After a successful write/edit tool result, finish normally unless another "
-        "tool is actually necessary to satisfy the request.\n\n"
-
-        "After a Tool Result arrives, continue the SAME task. If another action "
-        "is required, emit one new Bridgena action and stop again. Otherwise "
-        "return the final normal-text answer."
+        "- For a direct create/write request with a clear target, prefer write/create immediately.\n"
+        "- Do not Glob/Search/Read merely to prove that a brand-new requested file is absent.\n"
+        "- Use on_success for a terminal write/edit/create action when success alone finishes the task.\n"
+        "- After a Tool Result arrives, continue the SAME task only when the result must be interpreted "
+        "or another tool is actually needed."
     )
 
 
@@ -13465,18 +13573,23 @@ def _action_args_from_payload(
             if isinstance(payload.get(key), dict):
                 return payload[key]
 
+        _reserved = {
+            "tool", "name", "tool_name", "server_tool",
+            "on_success", "success_message", "terminal_on_success",
+        }
         if action_kind in {"call", "tool", "action", "mcp"}:
             return {
                 str(k): v
                 for k, v in payload.items()
-                if str(k) not in {"tool", "name", "tool_name", "server_tool"}
+                if str(k) not in _reserved
                 and not str(k).startswith("_")
             }
 
         return {
             str(k): v
             for k, v in payload.items()
-            if not str(k).startswith("_")
+            if str(k) not in {"on_success", "success_message", "terminal_on_success"}
+            and not str(k).startswith("_")
         }
 
     schema = _action_schema_for_tool(resolved_tool, body, protocol)
@@ -13558,6 +13671,15 @@ def _bridgena_action_calls(text: str, body: dict, protocol: str) -> list:
             protocol,
         )
         if validated:
+            if isinstance(payload, dict):
+                _success_text = str(
+                    payload.get("on_success")
+                    or payload.get("success_message")
+                    or payload.get("terminal_on_success")
+                    or ""
+                ).strip()
+                if _success_text:
+                    validated[0]["_on_success"] = _success_text[:4000]
             # Sequential action boundaries are deliberate: the client executes
             # this call, returns its Tool Result, then the same Arena thread
             # decides whether another action is needed.
@@ -13663,29 +13785,222 @@ def _extract_tool_calls(text: str, body: dict, protocol: str) -> list:
     return []
 
 
-def _openai_tool_calls_payload(calls: list) -> list:
+def _pending_agent_action_state_key(chat_id: str, call_id: str) -> str:
+    return hashlib.sha256(
+        (str(chat_id or "") + "\x00" + str(call_id or "")).encode("utf-8", "ignore")
+    ).hexdigest()[:40]
+
+
+def _save_pending_agent_action(
+    chat_id: str,
+    call_id: str,
+    protocol: str,
+    model_name: str,
+    tool_name: str,
+    success_text: str,
+) -> None:
+    success_text = str(success_text or "").strip()
+    if not chat_id or not call_id or not success_text:
+        return
+    now = time.time()
+    key = _pending_agent_action_state_key(chat_id, call_id)
+
+    def fn(state: dict):
+        table = state.setdefault("agent_pending_actions", {})
+        # TTL + bounded persistent table.
+        for old_key, row in list(table.items()):
+            if now - float((row or {}).get("created", 0.0) or 0.0) > AGENT_PENDING_ACTION_TTL_SEC:
+                table.pop(old_key, None)
+        table[key] = {
+            "chat_id": str(chat_id),
+            "call_id": str(call_id),
+            "protocol": str(protocol),
+            "model": str(model_name or "auto"),
+            "tool": str(tool_name or ""),
+            "success_text": success_text[:4000],
+            "created": now,
+        }
+        if len(table) > 256:
+            oldest = sorted(table.items(), key=lambda kv: float((kv[1] or {}).get("created", 0.0)))
+            for old_key, _ in oldest[:len(table) - 256]:
+                table.pop(old_key, None)
+
+    try:
+        mutate_state(fn)
+    except Exception as exc:
+        log("WARN", f"pending agent action save failed · {type(exc).__name__}: {exc}")
+
+
+def _pop_pending_agent_action(chat_id: str, call_id: str) -> Optional[dict]:
+    key = _pending_agent_action_state_key(chat_id, call_id)
+    found = None
+
+    def fn(state: dict):
+        nonlocal found
+        table = state.setdefault("agent_pending_actions", {})
+        row = table.pop(key, None)
+        if isinstance(row, dict):
+            found = dict(row)
+
+    try:
+        mutate_state(fn)
+    except Exception:
+        return None
+    if not found:
+        return None
+    if time.time() - float(found.get("created", 0.0) or 0.0) > AGENT_PENDING_ACTION_TTL_SEC:
+        return None
+    if str(found.get("chat_id") or "") != str(chat_id or ""):
+        return None
+    return found
+
+
+def _tool_result_succeeded(content, *, explicit_error: bool = False) -> bool:
+    if explicit_error:
+        return False
+    if isinstance(content, dict):
+        if content.get("is_error") is True or content.get("success") is False:
+            return False
+        if content.get("error") not in (None, "", False):
+            return False
+        return True
+    if isinstance(content, list):
+        # Anthropic content arrays may contain structured error blocks.
+        for item in content:
+            if isinstance(item, dict) and (
+                item.get("is_error") is True
+                or item.get("success") is False
+                or item.get("type") == "error"
+            ):
+                return False
+        return True
+
+    raw = str(content or "").strip()
+    if not raw:
+        # A tool that returned no explicit error is considered successful.
+        return True
+    low = raw.lower()
+    # First try structured JSON returned as text.
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            if parsed.get("is_error") is True or parsed.get("success") is False:
+                return False
+            if parsed.get("error") not in (None, "", False):
+                return False
+    except Exception:
+        pass
+    bad_prefixes = (
+        "error:", "error ", "failed:", "failed ", "failure:",
+        "exception:", "traceback", "permission denied", "not found:",
+    )
+    return not low.startswith(bad_prefixes)
+
+
+def _consume_openai_pending_success(body: dict, chat_id: str) -> str:
+    for message in reversed(body.get("messages") or []):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        if role not in {"tool", "function"}:
+            continue
+        call_id = str(message.get("tool_call_id") or message.get("call_id") or "").strip()
+        if not call_id:
+            continue
+        pending = _pop_pending_agent_action(chat_id, call_id)
+        if not pending:
+            continue
+        if not _tool_result_succeeded(
+            message.get("content", ""),
+            explicit_error=bool(message.get("is_error") is True),
+        ):
+            log("INFO", f"OpenAI deferred completion cancelled · tool {pending.get('tool')} reported failure")
+            return ""
+        text_value = str(pending.get("success_text") or "").strip()
+        if text_value:
+            log("INFO", f"OpenAI deferred completion · tool {pending.get('tool')} succeeded · no second upstream turn")
+            return text_value
+    return ""
+
+
+def _consume_anthropic_pending_success(body: dict, chat_id: str) -> str:
+    for message in reversed(body.get("messages") or []):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            call_id = str(block.get("tool_use_id") or "").strip()
+            if not call_id:
+                continue
+            pending = _pop_pending_agent_action(chat_id, call_id)
+            if not pending:
+                continue
+            if not _tool_result_succeeded(
+                block.get("content", ""),
+                explicit_error=bool(block.get("is_error") is True),
+            ):
+                log("INFO", f"Anthropic deferred completion cancelled · tool {pending.get('tool')} reported failure")
+                return ""
+            text_value = str(pending.get("success_text") or "").strip()
+            if text_value:
+                log("INFO", f"Anthropic deferred completion · tool {pending.get('tool')} succeeded · no second upstream turn")
+                return text_value
+    return ""
+
+
+def _openai_tool_calls_payload(
+    calls: list,
+    *,
+    chat_id: str = "",
+    model_name: str = "",
+) -> list:
     out = []
     for call in calls:
         cid = str(call.get("id") or "").strip()
         if not cid.startswith("call_"):
             cid = "call_" + uuid7().replace("-", "")[:24]
+        success_text = str(call.get("_on_success") or "").strip()
+        if success_text and chat_id:
+            _save_pending_agent_action(
+                chat_id, cid, "openai", model_name,
+                str(call.get("name") or ""), success_text,
+            )
         out.append({
             "id": cid,
             "type": "function",
             "function": {
                 "name": call["name"],
-                "arguments": json.dumps(call.get("arguments") or {}, ensure_ascii=False, separators=(",", ":")),
+                "arguments": json.dumps(
+                    call.get("arguments") or {},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
             },
         })
     return out
 
 
-def _anthropic_tool_calls_payload(calls: list) -> list:
+def _anthropic_tool_calls_payload(
+    calls: list,
+    *,
+    chat_id: str = "",
+    model_name: str = "",
+) -> list:
     out = []
     for call in calls:
         cid = str(call.get("id") or "").strip()
         if not cid.startswith("toolu_"):
             cid = "toolu_" + uuid7().replace("-", "")[:24]
+        success_text = str(call.get("_on_success") or "").strip()
+        if success_text and chat_id:
+            _save_pending_agent_action(
+                chat_id, cid, "anthropic", model_name,
+                str(call.get("name") or ""), success_text,
+            )
         out.append({
             "type": "tool_use",
             "id": cid,
@@ -14023,18 +14338,28 @@ def _get_agent_terminal_replay(
         return None
 
     key = _agent_terminal_replay_key(body, keyinfo, protocol)
-    now = time.monotonic()
+    now = time.time()
     with _agent_terminal_replays_lock:
         for old_key, item in list(_agent_terminal_replays.items()):
-            if now - float(item.get("ts") or 0.0) > AGENT_TERMINAL_REPLAY_TTL_SEC:
+            if now - float(item.get("ts_wall") or 0.0) > AGENT_TERMINAL_REPLAY_TTL_SEC:
                 _agent_terminal_replays.pop(old_key, None)
         item = _agent_terminal_replays.get(key)
-        if not item:
-            return None
-        if now - float(item.get("ts") or 0.0) > AGENT_TERMINAL_REPLAY_TTL_SEC:
-            _agent_terminal_replays.pop(key, None)
-            return None
-        return dict(item)
+        if item and now - float(item.get("ts_wall") or 0.0) <= AGENT_TERMINAL_REPLAY_TTL_SEC:
+            return dict(item)
+
+    # Process restarts used to erase idempotency and make OpenCode replay an
+    # already-finished tool state upstream. Keep a small persistent replay table.
+    try:
+        state = load_state()
+        table = state.get("agent_terminal_replays") or {}
+        item = table.get(key) if isinstance(table, dict) else None
+        if isinstance(item, dict) and now - float(item.get("ts_wall") or 0.0) <= AGENT_TERMINAL_REPLAY_TTL_SEC:
+            with _agent_terminal_replays_lock:
+                _agent_terminal_replays[key] = dict(item)
+            return dict(item)
+    except Exception:
+        pass
+    return None
 
 
 def _store_agent_terminal_replay(
@@ -14052,13 +14377,31 @@ def _store_agent_terminal_replay(
         return
 
     key = _agent_terminal_replay_key(body, keyinfo, protocol)
+    now = time.time()
+    item = {
+        "ts_wall": now,
+        "model": str(model or "auto"),
+        "text": str(text_value),
+        "reasoning": str(reasoning_value or ""),
+    }
     with _agent_terminal_replays_lock:
-        _agent_terminal_replays[key] = {
-            "ts": time.monotonic(),
-            "model": str(model or "auto"),
-            "text": str(text_value),
-            "reasoning": str(reasoning_value or ""),
-        }
+        _agent_terminal_replays[key] = dict(item)
+
+    def fn(state: dict):
+        table = state.setdefault("agent_terminal_replays", {})
+        for old_key, row in list(table.items()):
+            if now - float((row or {}).get("ts_wall", 0.0) or 0.0) > AGENT_TERMINAL_REPLAY_TTL_SEC:
+                table.pop(old_key, None)
+        table[key] = dict(item)
+        if len(table) > 128:
+            oldest = sorted(table.items(), key=lambda kv: float((kv[1] or {}).get("ts_wall", 0.0)))
+            for old_key, _ in oldest[:len(table) - 128]:
+                table.pop(old_key, None)
+
+    try:
+        mutate_state(fn)
+    except Exception as exc:
+        log("WARN", f"agent terminal replay persistence failed · {type(exc).__name__}: {exc}")
 
 
 def _bound_agent_edge_hold(chat_id: str, model_name: str) -> tuple:
@@ -14102,6 +14445,13 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
     )
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
+
+    _deferred_success = _consume_openai_pending_success(body, chat_id)
+    if _deferred_success:
+        _store_agent_terminal_replay(
+            body, keyinfo, "openai",
+            model=model, text_value=_deferred_success,
+        )
 
     cached = _get_agent_terminal_replay(body, keyinfo, "openai")
     if cached:
@@ -14219,7 +14569,7 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
                 detail="upstream completed without assistant text or a tool action",
             )
 
-        calls = _openai_tool_calls_payload(parsed)
+        calls = _openai_tool_calls_payload(parsed, chat_id=chat_id, model_name=model)
         _tool_output_log("OpenAI", model, parsed, acc)
 
         if not calls and acc.strip():
@@ -14263,6 +14613,13 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
     )
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
+
+    _deferred_success = _consume_openai_pending_success(body, chat_id)
+    if _deferred_success:
+        _store_agent_terminal_replay(
+            body, keyinfo, "openai",
+            model=model, text_value=_deferred_success,
+        )
 
     cached = _get_agent_terminal_replay(body, keyinfo, "openai")
     if cached:
@@ -14587,7 +14944,7 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
             },
         )
 
-    calls = _openai_tool_calls_payload(parsed)
+    calls = _openai_tool_calls_payload(parsed, chat_id=chat_id, model_name=model)
     _tool_output_log("OpenAI", model, parsed, acc)
 
     if not calls and acc.strip():
@@ -14996,6 +15353,17 @@ async def chat_completions(request: Request):
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
     messages = body.get("messages") or []
+    _requested_model = str(body.get("model") or "auto")
+    _model_hold = _runtime_model_hold(_requested_model)
+    if _model_hold:
+        _remaining = max(1, int(float(_model_hold.get("until", 0.0)) - time.time() + 0.999))
+        _reason = str(_model_hold.get("reason") or "temporarily unavailable")
+        _status = 404 if "model not found" in _reason.lower() else 503
+        raise HTTPException(
+            status_code=_status,
+            detail=f"Model '{_requested_model}' is temporarily unavailable: {_reason}",
+            headers={"Retry-After": str(_remaining)},
+        )
     await _wait_if_model_rate_limited(body.get("model", "auto"))
     log("INFO", f"OpenAI request · model {str(body.get('model') or 'auto')[:80]} · "
                 f"messages {len(messages) if isinstance(messages, list) else 0} · "
@@ -15125,6 +15493,62 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
 
+    _deferred_success = _consume_anthropic_pending_success(body, chat_id)
+    if _deferred_success:
+        message_id = "msg_" + uuid7().replace("-", "")
+        if not body.get("stream", False):
+            return JSONResponse({
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [{"type": "text", "text": _deferred_success}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": _rough_tokens(prompt),
+                    "output_tokens": _rough_tokens(_deferred_success),
+                },
+            })
+
+        async def deferred_gen():
+            yield _anthropic_sse("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": _rough_tokens(prompt), "output_tokens": 0},
+                },
+            })
+            yield _anthropic_sse("content_block_start", {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            })
+            yield _anthropic_sse("content_block_delta", {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": _deferred_success},
+            })
+            yield _anthropic_sse("content_block_stop", {
+                "type": "content_block_stop", "index": 0,
+            })
+            yield _anthropic_sse("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": _rough_tokens(_deferred_success)},
+            })
+            yield _anthropic_sse("message_stop", {"type": "message_stop"})
+
+        log("INFO", f"Anthropic deferred completion · logical chat {chat_id[-12:]} · no upstream request")
+        return StreamingResponse(
+            deferred_gen(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        )
+
     if continuation:
         settled = await _await_agent_action_drain(chat_id, "Anthropic")
         if not settled:
@@ -15207,7 +15631,7 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
             parsed = early_parsed or _extract_tool_calls(
                 acc, body, "anthropic"
             )
-            calls = _anthropic_tool_calls_payload(parsed)
+            calls = _anthropic_tool_calls_payload(parsed, chat_id=chat_id, model_name=model)
             _tool_output_log("Anthropic", model, parsed, acc)
 
             content = (
@@ -15342,7 +15766,7 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
             parsed = early_parsed or _extract_tool_calls(
                 acc, body, "anthropic"
             )
-            calls = _anthropic_tool_calls_payload(parsed)
+            calls = _anthropic_tool_calls_payload(parsed, chat_id=chat_id, model_name=model)
             _tool_output_log("Anthropic", model, parsed, acc)
 
             if calls:
@@ -15691,7 +16115,9 @@ async def models_api():
     state = load_state()
     blocked = state.get("blocked_models", [])
     data = [{"id": model_name(m), "object": "model", "created": int(time.time()), "owned_by": "arena-bridge",
-             "arena_id": m.get("id") if isinstance(m, dict) else None} for m in get_models() if model_name(m) not in blocked]
+             "arena_id": m.get("id") if isinstance(m, dict) else None}
+            for m in get_models()
+            if model_name(m) not in blocked and not _runtime_model_hold(model_name(m))]
     return JSONResponse({"object": "list", "data": data})
 
 
@@ -16900,6 +17326,11 @@ async def _lifespan(app):
     log("INFO", "Agent challenge policy · bound tool threads preserved · no giant cross-account replay during edge hold")
     log("INFO", f"Agent terminal idempotency · final tool-result responses cached "
                 f"{AGENT_TERMINAL_REPLAY_TTL_SEC:.0f}s · exact retries never re-hit upstream")
+    log("INFO", f"Action Protocol v3 · terminal on_success completion ON · pending actions persist "
+                f"{AGENT_PENDING_ACTION_TTL_SEC:.0f}s · successful terminal tools need no second upstream turn")
+    log("INFO", "Agent verification recovery · bound Arena thread preserved across request-level verification rejection")
+    log("INFO", f"Runtime model health · Model-not-found hold {MODEL_NOT_FOUND_HOLD_SEC:.0f}s · "
+                f"empty-stream hold after {MODEL_EMPTY_STREAM_STRIKES} strikes")
     log("INFO", f"Agent sticky-thread policy · ALL bound agent turns use <= "
                 f"{AGENT_CONTINUATION_GATE_WAIT_SEC:.0f}s logical gate · account handoff suppressed")
     log("INFO", f"Edge challenge backoff · base {EDGE_CHALLENGE_HOLD_SEC:.0f}s · "
