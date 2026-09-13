@@ -440,7 +440,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.10.3-low-latency-tool-results")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.10.4-sticky-agent-idempotency")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2137,6 +2137,20 @@ TRANSPORT_PROBE_LOCK_WAIT_SEC = max(
     0.5,
     min(5.0, float(os.environ.get("BRIDGENA_TRANSPORT_PROBE_LOCK_WAIT_SEC", "1.5"))),
 )
+AGENT_TERMINAL_REPLAY_TTL_SEC = max(
+    15.0,
+    min(600.0, float(os.environ.get("BRIDGENA_AGENT_TERMINAL_REPLAY_TTL_SEC", "180"))),
+)
+AGENT_BOUND_RETRY_AFTER_SEC = max(
+    1.0,
+    min(30.0, float(os.environ.get("BRIDGENA_AGENT_BOUND_RETRY_AFTER_SEC", "5"))),
+)
+EDGE_CHALLENGE_HOLD_MAX_SEC = max(
+    EDGE_CHALLENGE_HOLD_SEC,
+    min(3600.0, float(os.environ.get("BRIDGENA_EDGE_CHALLENGE_HOLD_MAX_SEC", "900"))),
+)
+_agent_terminal_replays: Dict[str, dict] = {}
+_agent_terminal_replays_lock = threading.Lock()
 _agent_action_drain_tasks: Dict[str, asyncio.Task] = {}
 _agent_action_drain_started: Dict[str, float] = {}
 
@@ -2391,14 +2405,21 @@ def _hold_challenged_keeper(
     if not sid:
         return
     sid = str(sid)
-    hold = float(seconds or EDGE_CHALLENGE_HOLD_SEC)
+    previous = int(_api_keeper_challenge_count.get(sid, 0) or 0)
+    if seconds is None:
+        hold = min(
+            EDGE_CHALLENGE_HOLD_MAX_SEC,
+            EDGE_CHALLENGE_HOLD_SEC * (2 ** min(previous, 3)),
+        )
+    else:
+        hold = max(1.0, float(seconds))
     now = time.monotonic()
     _api_verified_keepers.pop(sid, None)
     _api_keeper_challenge_until[sid] = max(
         float(_api_keeper_challenge_until.get(sid, 0.0)),
         now + hold,
     )
-    _api_keeper_challenge_count[sid] = int(_api_keeper_challenge_count.get(sid, 0)) + 1
+    _api_keeper_challenge_count[sid] = previous + 1
 
     # Do not let the generic verification scheduler immediately soft-refresh or
     # restart the same browser back into the edge challenge.
@@ -7960,14 +7981,24 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
     if handoff_prompt:
         save_context_capsule(chat_id, model_name, handoff_prompt, source="client-transcript")
 
-    _continuation_gate = bool(
+    _agent_tool_run = bool(
         BRIDGENA_ACTION_MARKER in str(system_prompt or "")
-        and str(prompt or "").lstrip().startswith(
-            "Continue the SAME coding-agent task"
-        )
+        or "Bridgena Action Protocol" in str(system_prompt or "")
+        or "AVAILABLE CLIENT TOOLS (JSON):" in str(system_prompt or "")
     )
+    _entry_conv = get_conversation(chat_id) or {}
+    _entry_mc = (
+        (_entry_conv.get("arena") or {}).get(model_name)
+        if _entry_conv.get("model") == model_name
+        and isinstance(_entry_conv.get("arena"), dict)
+        else None
+    )
+    _agent_bound_at_entry = bool(_agent_tool_run and _entry_mc)
+
+    # Agent clients should never wait tens of seconds behind an invisible stale
+    # logical turn. Every tool-capable turn gets the bounded gate.
     async with _ConversationTurnLease(
-        chat_id, continuation=_continuation_gate
+        chat_id, continuation=_agent_tool_run
     ) as _conversation_acquired:
         if not _conversation_acquired:
             yield (
@@ -8001,7 +8032,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
             continuity_context = handoff_prompt or load_context_capsule(chat_id, model_name)
 
             pending_rehome = get_throttle_thread_rehome(chat_id, model_name)
-            if THROTTLE_THREAD_REHOME and pending_rehome:
+            if THROTTLE_THREAD_REHOME and pending_rehome and not _agent_bound_at_entry:
                 not_before = float(pending_rehome.get("not_before") or 0.0)
                 if time.time() >= not_before:
                     continuity_context = handoff_prompt or load_context_capsule(chat_id, model_name)
@@ -8117,6 +8148,15 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                         await asyncio.sleep(delay + 0.05)
 
                     next_hint = failed_id or next_hint
+                    if rehome_thread and THROTTLE_THREAD_REHOME and _agent_bound_at_entry:
+                        retry_after = max(1, int(delay + 0.999))
+                        yield (
+                            "error",
+                            f"429: This bound agent thread is temporarily throttled upstream. "
+                            f"Retry in about {retry_after}s; Bridgena preserved the existing thread.",
+                        )
+                        return
+
                     if rehome_thread and THROTTLE_THREAD_REHOME:
                         continuity_context = handoff_prompt or load_context_capsule(chat_id, model_name)
                         if continuity_context:
@@ -8139,6 +8179,21 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                 failed_name = str(retry_info.get("jar_name") or failed_id or "unknown")
                 reason = str(retry_info.get("reason") or "account unavailable")
                 migrate_thread = bool(retry_info.get("migrate_thread"))
+
+                if _agent_bound_at_entry:
+                    log(
+                        "WARN",
+                        f"Agent thread handoff suppressed · {str(chat_id)[:12]}… · "
+                        f"bound keeper {failed_name} · {reason}",
+                    )
+                    yield (
+                        "error",
+                        f"503: This existing agent thread stayed bound to its original "
+                        f"upstream conversation instead of being rebuilt on another account. "
+                        f"Retry in about {max(1, int(AGENT_BOUND_RETRY_AFTER_SEC))}s.",
+                    )
+                    return
+
                 if failed_id:
                     excluded.add(failed_id)
 
@@ -9098,12 +9153,6 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         or "tool-capable API client" in str(system_prompt or "")
         or "AVAILABLE TOOLS (JSON):" in str(system_prompt or "")
     )
-    _is_tool_continuation = bool(
-        _is_agent_tool_turn
-        and str(prompt or "").lstrip().startswith(
-            "Continue the SAME coding-agent task"
-        )
-    )
     _first_semantic_timeout = (
         TOOL_FIRST_ASSISTANT_RESPONSE_SEC
         if _is_agent_tool_turn else FIRST_ASSISTANT_RESPONSE_SEC
@@ -9111,6 +9160,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
 
     conv = get_conversation(chat_id) or {}
     mc = conv.get("arena", {}).get(model_name) if conv.get("model") == model_name else None
+    _is_tool_continuation = bool(_is_agent_tool_turn and mc)
     max_attempts = REQUEST_MAX_ATTEMPTS
     route_fails: list = []
     cf_clear_attempts = 0
@@ -9210,12 +9260,12 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             log("WARN", f"[{jar.get('name')}] bound conversation blocked by edge challenge hold · "
                         f"{challenge_remaining:.0f}s remaining · no prompt replay")
             if _is_tool_continuation:
+                _retry_sec = max(1, int(challenge_remaining + 0.999))
                 yield (
                     "error",
                     f"503: This agent thread is temporarily paused by an upstream challenge "
-                    f"on its bound keeper (~{max(1, int(challenge_remaining))}s remaining). "
-                    "Bridgena preserved the existing thread and did not replay the tool "
-                    "continuation on another account.",
+                    f"on its bound keeper. Retry in about {_retry_sec}s. Bridgena preserved "
+                    "the existing thread and did not replay the tool continuation on another account.",
                 )
                 return
             yield ("retry-account", {
@@ -9614,8 +9664,11 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     _proxy_health_record(proxy, True, 0, source="browser-stream")
                     _flagged_exits.pop(_proxy_hkey(proxy), None)
                 _captcha_failed_jars.pop(jar.get("id"), None)
-                _api_keeper_quarantine_until.pop(str(jar.get("id")), None)
-                _api_verified_keepers[str(jar.get("id"))] = time.monotonic()
+                _sid_success = str(jar.get("id") or "")
+                _api_keeper_quarantine_until.pop(_sid_success, None)
+                _api_verified_keepers[_sid_success] = time.monotonic()
+                _clear_challenge_hold(_sid_success, "successful upstream model response")
+                _api_keeper_challenge_count.pop(_sid_success, None)
                 _refresh_api_ready_event()
                 if not response_text and reasoning_text:
                     # Some reasoning-only Arena adapters never emit a separate
@@ -10138,8 +10191,9 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         # Challenge != dead proxy. Keep route/session identity
                         # intact, stop scheduling new requests onto this keeper,
                         # and let the rest of the healthy fleet carry traffic.
+                        _held_for = _api_keeper_challenge_remaining(failed_jar_id)
                         log("WARN", f"[{jar.get('name')}] browser-origin upstream challenge · "
-                                    f"keeper isolated {EDGE_CHALLENGE_HOLD_SEC:.0f}s · "
+                                    f"keeper isolated {_held_for:.0f}s · "
                                     "proxy kept sticky · no immediate restart")
                         yield ("error",
                                "503: Arena/edge requested browser verification for this keeper. "
@@ -13023,62 +13077,76 @@ def _conversation_has_model_binding(chat_id: str, model_name: str) -> bool:
 
 
 def _openai_tool_continuation_prompt(body: dict) -> str:
-    """Send only newly returned tool results to an existing Arena conversation.
+    """Render only NEW client-side events for an already-bound Arena agent thread.
 
-    Arena already has the model's previous bridgena_* action in the bound thread.
-    Repeating a large write/edit payload on the result turn is redundant.
+    Tool results, OpenCode synthetic user reminders, and subsequent user turns
+    all become small deltas. Everything before the newest assistant message is
+    already represented by the same Arena conversation.
     """
     messages = [m for m in (body.get("messages") or []) if isinstance(m, dict)]
     if not messages:
         return ""
 
-    result_indexes = [
-        i for i, m in enumerate(messages)
-        if str(m.get("role") or "").strip().lower() in {"tool", "function"}
-    ]
-    if not result_indexes:
-        return ""
+    last_assistant = -1
+    for i, message in enumerate(messages):
+        if str(message.get("role") or "").strip().lower() == "assistant":
+            last_assistant = i
 
-    last_result = result_indexes[-1]
+    tail = messages[last_assistant + 1:] if last_assistant >= 0 else []
 
-    for m in messages[last_result + 1:]:
-        role = str(m.get("role") or "").strip().lower()
-        if role in {"user", "developer", "system"}:
-            if _openai_text_content(m.get("content", "")).strip():
-                return ""
-
-    # Keep only contiguous tool/function result messages. The preceding
-    # assistant tool call is already part of the same Arena conversation.
-    start_index = last_result
-    while start_index > 0:
-        prev_role = str(messages[start_index - 1].get("role") or "").strip().lower()
-        if prev_role not in {"tool", "function"}:
-            break
-        start_index -= 1
+    # If the client omitted the last assistant from its replay, fall back to the
+    # newest tool/function result tail rather than resending the entire history.
+    if not tail:
+        result_indexes = [
+            i for i, m in enumerate(messages)
+            if str(m.get("role") or "").strip().lower() in {"tool", "function"}
+        ]
+        if result_indexes:
+            last = result_indexes[-1]
+            start_i = last
+            while start_i > 0:
+                prev_role = str(messages[start_i - 1].get("role") or "").strip().lower()
+                if prev_role not in {"tool", "function"}:
+                    break
+                start_i -= 1
+            tail = messages[start_i:last + 1]
 
     rows = []
-    for m in messages[start_index:last_result + 1]:
-        rendered = _render_openai_tool_message(m)
-        if rendered:
-            rows.append(rendered)
+    for message in tail:
+        role = str(message.get("role") or "").strip().lower()
+        if role in {"tool", "function"}:
+            rendered = _render_openai_tool_message(message)
+            if rendered:
+                rows.append(rendered)
+            continue
+
+        value = _openai_text_content(message.get("content", "")).strip()
+        if not value:
+            continue
+
+        if role == "user":
+            rows.append("User continuation:\n" + value)
+        elif role == "developer":
+            rows.append("Developer update:\n" + value)
+        elif role == "system":
+            rows.append("System update:\n" + value)
 
     if not rows:
         return ""
 
     rendered = (
         "Continue the SAME coding-agent task in this existing conversation. "
-        "The client executed your previous action. Here is ONLY the new tool "
-        "result; the previous action and its arguments are already present in "
-        "this conversation. Do not repeat a completed action. If another tool "
-        "is genuinely required, emit one Bridgena action and stop immediately "
-        "after its closing ]. Otherwise finish the task normally.\n\n"
+        "Only the NEW client-side events since your previous assistant turn are "
+        "included below. Do not repeat already-completed actions. If another "
+        "tool is genuinely required, emit one Bridgena action and stop at its "
+        "closing ]. Otherwise answer normally.\n\n"
         + "\n\n".join(rows)
     )
 
     if len(rendered) <= TOOL_CONTINUATION_MAX_CHARS:
         return rendered
 
-    marker = "\n\n[large tool result tail compacted]\n\n"
+    marker = "\n\n[older continuation detail compacted]\n\n"
     keep = max(1, TOOL_CONTINUATION_MAX_CHARS - len(marker))
     return marker + rendered[-keep:]
 
@@ -13929,6 +13997,104 @@ def _release_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> No
         _duplicate_notices.pop(fp, None)
 
 
+def _openai_body_has_tool_result(body: dict) -> bool:
+    return any(
+        isinstance(message, dict)
+        and str(message.get("role") or "").strip().lower() in {"tool", "function"}
+        for message in (body.get("messages") or [])
+    )
+
+
+def _agent_terminal_replay_key(
+    body: dict,
+    keyinfo: Optional[dict],
+    protocol: str,
+) -> str:
+    raw = _api_request_fingerprint(body, keyinfo, "")
+    return f"{protocol}:{raw}"
+
+
+def _get_agent_terminal_replay(
+    body: dict,
+    keyinfo: Optional[dict],
+    protocol: str,
+) -> Optional[dict]:
+    if protocol == "openai" and not _openai_body_has_tool_result(body):
+        return None
+
+    key = _agent_terminal_replay_key(body, keyinfo, protocol)
+    now = time.monotonic()
+    with _agent_terminal_replays_lock:
+        for old_key, item in list(_agent_terminal_replays.items()):
+            if now - float(item.get("ts") or 0.0) > AGENT_TERMINAL_REPLAY_TTL_SEC:
+                _agent_terminal_replays.pop(old_key, None)
+        item = _agent_terminal_replays.get(key)
+        if not item:
+            return None
+        if now - float(item.get("ts") or 0.0) > AGENT_TERMINAL_REPLAY_TTL_SEC:
+            _agent_terminal_replays.pop(key, None)
+            return None
+        return dict(item)
+
+
+def _store_agent_terminal_replay(
+    body: dict,
+    keyinfo: Optional[dict],
+    protocol: str,
+    *,
+    model: str,
+    text_value: str,
+    reasoning_value: str = "",
+) -> None:
+    if not str(text_value or "").strip():
+        return
+    if protocol == "openai" and not _openai_body_has_tool_result(body):
+        return
+
+    key = _agent_terminal_replay_key(body, keyinfo, protocol)
+    with _agent_terminal_replays_lock:
+        _agent_terminal_replays[key] = {
+            "ts": time.monotonic(),
+            "model": str(model or "auto"),
+            "text": str(text_value),
+            "reasoning": str(reasoning_value or ""),
+        }
+
+
+def _bound_agent_edge_hold(chat_id: str, model_name: str) -> tuple:
+    conv = get_conversation(chat_id) or {}
+    mc = (
+        (conv.get("arena") or {}).get(model_name)
+        if conv.get("model") == model_name
+        and isinstance(conv.get("arena"), dict)
+        else None
+    )
+    sid = str((mc or {}).get("jar_id") or "")
+    return sid, _api_keeper_challenge_remaining(sid) if sid else 0.0
+
+
+def _agent_hold_json_response(seconds: float):
+    retry_after = max(1, int(float(seconds or 0.0) + 0.999))
+    return JSONResponse(
+        status_code=503,
+        headers={
+            "Retry-After": str(retry_after),
+            "X-Bridgena-Retryable": "true",
+            "Cache-Control": "no-store",
+        },
+        content={
+            "error": {
+                "message": (
+                    "This existing agent thread is temporarily paused while its "
+                    f"bound upstream browser recovers. Retry in about {retry_after}s."
+                ),
+                "type": "api_error",
+                "code": "agent_thread_bound_hold",
+            }
+        },
+    )
+
+
 async def _openai_tool_nonstream(body: dict, keyinfo: dict):
     model = body.get("model", "auto")
     chat_id, prompt, handoff_prompt, continuation = _openai_tool_turn_prompts(
@@ -13936,6 +14102,43 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
     )
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
+
+    cached = _get_agent_terminal_replay(body, keyinfo, "openai")
+    if cached:
+        log(
+            "INFO",
+            f"OpenAI agent terminal replay · logical chat {chat_id[-12:]} · "
+            f"{len(cached.get('text') or '')} chars · no upstream request",
+        )
+        message = {
+            "role": "assistant",
+            "content": cached.get("text") or "",
+        }
+        if cached.get("reasoning"):
+            message["reasoning_content"] = cached["reasoning"]
+        return JSONResponse({
+            "id": "chatcmpl-" + uuid7()[:23],
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": cached.get("model") or model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": _rough_tokens(prompt),
+                "completion_tokens": _rough_tokens(cached.get("text") or ""),
+                "total_tokens": (
+                    _rough_tokens(prompt)
+                    + _rough_tokens(cached.get("text") or "")
+                ),
+            },
+        })
+
+    _bound_sid, _bound_hold = _bound_agent_edge_hold(chat_id, model)
+    if _bound_hold > 0:
+        return _agent_hold_json_response(_bound_hold)
 
     if continuation:
         settled = await _await_agent_action_drain(chat_id, "OpenAI")
@@ -14019,6 +14222,16 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
         calls = _openai_tool_calls_payload(parsed)
         _tool_output_log("OpenAI", model, parsed, acc)
 
+        if not calls and acc.strip():
+            _store_agent_terminal_replay(
+                body,
+                keyinfo,
+                "openai",
+                model=model,
+                text_value=acc,
+                reasoning_value=reasoning_acc,
+            )
+
         message = {"role": "assistant", "content": None if calls else acc}
         finish = "stop"
         if calls:
@@ -14050,6 +14263,106 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
     )
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
+
+    cached = _get_agent_terminal_replay(body, keyinfo, "openai")
+    if cached:
+        cached_text = str(cached.get("text") or "")
+        cached_reasoning = str(cached.get("reasoning") or "")
+        cached_model = str(cached.get("model") or model)
+        created = int(time.time())
+        rid = "chatcmpl-" + uuid7()[:23]
+        include_usage = bool(
+            (body.get("stream_options") or {}).get("include_usage")
+        )
+
+        async def replay_gen():
+            yield _sse({
+                "id": rid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": cached_model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": None,
+                }],
+            })
+            if cached_reasoning:
+                yield _sse({
+                    "id": rid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": cached_model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"reasoning_content": cached_reasoning},
+                        "finish_reason": None,
+                    }],
+                })
+            if cached_text:
+                yield _sse({
+                    "id": rid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": cached_model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": cached_text},
+                        "finish_reason": None,
+                    }],
+                })
+            yield _sse({
+                "id": rid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": cached_model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+            })
+            if include_usage:
+                pt = _rough_tokens(prompt)
+                ct = _rough_tokens(cached_text)
+                yield _sse({
+                    "id": rid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": cached_model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": pt,
+                        "completion_tokens": ct,
+                        "total_tokens": pt + ct,
+                    },
+                })
+            yield "data: [DONE]\n\n"
+
+        log(
+            "INFO",
+            f"OpenAI agent terminal replay · logical chat {chat_id[-12:]} · "
+            f"{len(cached_text)} chars · no upstream request",
+        )
+        return StreamingResponse(
+            replay_gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+                "X-Bridgena-Replayed": "true",
+            },
+        )
+
+    _bound_sid, _bound_hold = _bound_agent_edge_hold(chat_id, model)
+    if _bound_hold > 0:
+        log(
+            "INFO",
+            f"Agent bound hold · logical chat {chat_id[-12:]} · "
+            f"{_bound_hold:.0f}s remaining · no upstream request",
+        )
+        return _agent_hold_json_response(_bound_hold)
 
     if continuation:
         settled = await _await_agent_action_drain(chat_id, "OpenAI")
@@ -14276,6 +14589,16 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
 
     calls = _openai_tool_calls_payload(parsed)
     _tool_output_log("OpenAI", model, parsed, acc)
+
+    if not calls and acc.strip():
+        _store_agent_terminal_replay(
+            body,
+            keyinfo,
+            "openai",
+            model=model,
+            text_value=acc,
+            reasoning_value=reasoning_acc,
+        )
 
     def chunk(delta, finish=None):
         return _sse({
@@ -16087,8 +16410,12 @@ async def _preflight_one_keeper(sid: str, session, jar: dict) -> tuple:
         if ok:
             _api_verified_keepers[sid] = time.monotonic()
             _api_keeper_quarantine_until.pop(sid, None)
-            _clear_challenge_hold(sid, "verification preflight passed")
-            _api_keeper_challenge_count.pop(sid, None)
+            # An expired edge hold may be removed from the active map here, but
+            # its strike count survives until a REAL model request succeeds.
+            # This prevents a local grecaptcha-ready check from resetting the
+            # circuit after the upstream edge rejected the same keeper.
+            if sid in _api_keeper_challenge_until and not _api_keeper_challenge_held(sid):
+                _clear_challenge_hold(sid, "hold timer elapsed; local verification client ready")
             _keeper_recovery_attempts.pop(sid, None)
             log("OK", f"[{name}] verification client ready · Enterprise execute available")
             return sid, True
@@ -16571,6 +16898,12 @@ async def _lifespan(app):
                 f"{LIVE_COOKIE_READ_TIMEOUT_SEC:.1f}s · transport-lock wait <= "
                 f"{TRANSPORT_PROBE_LOCK_WAIT_SEC:.1f}s")
     log("INFO", "Agent challenge policy · bound tool threads preserved · no giant cross-account replay during edge hold")
+    log("INFO", f"Agent terminal idempotency · final tool-result responses cached "
+                f"{AGENT_TERMINAL_REPLAY_TTL_SEC:.0f}s · exact retries never re-hit upstream")
+    log("INFO", f"Agent sticky-thread policy · ALL bound agent turns use <= "
+                f"{AGENT_CONTINUATION_GATE_WAIT_SEC:.0f}s logical gate · account handoff suppressed")
+    log("INFO", f"Edge challenge backoff · base {EDGE_CHALLENGE_HOLD_SEC:.0f}s · "
+                f"adaptive max {EDGE_CHALLENGE_HOLD_MAX_SEC:.0f}s · strike reset only after real upstream success")
     log("INFO", f"Browser-native session mode · persistent contexts "
                 f"{'ON' if BROWSER_PERSISTENT_CONTEXT else 'OFF'} · JavaScript ON · "
                 f"service workers {'ON' if BROWSER_SERVICE_WORKERS else 'OFF'} · "
