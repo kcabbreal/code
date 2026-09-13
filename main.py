@@ -229,6 +229,18 @@ PROXY_FLAG_TTL = int(os.environ.get("PROXY_FLAG_TTL", "10800"))      # arena-blo
 PROXY_QUARANTINE = int(os.environ.get("PROXY_QUARANTINE", "21600"))  # legacy compatibility; pool quarantine is non-destructive
 PROXY_RECOVERY_INTERVAL_SEC = max(5.0, min(300.0, float(os.environ.get("BRIDGENA_PROXY_RECOVERY_INTERVAL_SEC", "15"))))
 PROXY_RECOVERY_MAX_BACKOFF_SEC = max(PROXY_RECOVERY_INTERVAL_SEC, min(900.0, float(os.environ.get("BRIDGENA_PROXY_RECOVERY_MAX_BACKOFF_SEC", "120"))))
+PROXY_RANDOMIZE_STARTUP = os.environ.get(
+    "BRIDGENA_PROXY_RANDOMIZE_STARTUP", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROXY_NETWORK_FAILOVER = os.environ.get(
+    "BRIDGENA_PROXY_NETWORK_FAILOVER", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROXY_HEALTHY_RANDOM_FRACTION = max(
+    0.50, min(1.0, float(os.environ.get("BRIDGENA_PROXY_HEALTHY_RANDOM_FRACTION", "0.75")))
+)
+PROXY_FAILOVER_IDLE_WAIT_SEC = max(
+    2.0, min(120.0, float(os.environ.get("BRIDGENA_PROXY_FAILOVER_IDLE_WAIT_SEC", "20")))
+)
 _FLAGGED_TTL = PROXY_FLAG_TTL     # legacy alias (primitives use it)
 PROBE_OK_TTL = 900
 PROBE_BUDGET = 40
@@ -314,7 +326,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.8.3-tool-call-parser-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.8.4-randomized-stable-proxy-failover")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2932,7 +2944,7 @@ def acquire_ready_jar(exclude: Optional[set] = None) -> Optional[dict]:
     mutate_jars(mark_used)
     return selected
 
-async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None) -> dict:
+async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None, *, randomize: bool = False) -> dict:
     """Pre-allocate distinct healthy upstream proxies to keeper accounts.
 
     This runs before keeper browsers launch so stale sticky assignments cannot
@@ -3015,12 +3027,22 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None) -> d
                 _proxy_latency[proxy] = ms
             live.append(proxy)
 
-    # Prefer lower-latency exits, but allocation is one-pass and unique: unlike
-    # request-time selection, sorting cannot cause every keeper to reuse #1.
-    live.sort(key=lambda proxy: (
-        _proxy_latency.get(proxy, 10**9),
-        _proxy_hkey(proxy),
-    ))
+    # Build a stability-ranked list first. Cold-start randomization happens
+    # only inside the healthier part of the live pool: we get genuinely random
+    # keeper→exit mappings without intentionally pinning browsers to the worst
+    # latency/failure outliers.
+    _proxy_health_load()
+    def _stable_proxy_key(proxy):
+        row = _proxy_health.get(_proxy_hkey(proxy)) or {}
+        latency = _proxy_latency.get(proxy)
+        if not isinstance(latency, int) or latency <= 0:
+            latency = row.get("latency")
+        if not isinstance(latency, int) or latency <= 0:
+            latency = 10**9
+        fails = int(row.get("fails") or 0)
+        return (fails, latency, _proxy_hkey(proxy))
+
+    live.sort(key=_stable_proxy_key)
     stats["live"] = len(live)
 
     if not live:
@@ -3028,21 +3050,49 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None) -> d
                     f"live 0 · keepers {len(keepers)}")
         return stats
 
-    # Preserve an existing sticky assignment only when it is live and unique.
-    # Duplicate sticky pins are deliberately broken when spare live exits exist.
     assigned: Dict[str, str] = {}
     used = set()
-    keeper_ids = {j.get("id") for j in keepers}
 
-    for jar in keepers:
-        sid = jar.get("id")
-        sticky = _normalize_proxy(jar.get("proxy") or jar.get("_last_proxy") or "")
-        if not sid or not sticky or sticky not in live or sticky in used:
-            continue
-        assigned[sid] = sticky
-        used.add(sticky)
+    # On cold startup, deliberately break yesterday's deterministic jar→proxy
+    # mapping. Randomize among the healthier fraction of the currently-live
+    # pool, while still keeping one stable proxy per keeper for the lifetime of
+    # that browser context.
+    do_randomize = bool(randomize and PROXY_RANDOMIZE_STARTUP)
+    allocation_pool = list(live)
 
-    remaining = [proxy for proxy in live if proxy not in used]
+    if do_randomize:
+        min_window = min(len(live), max(1, len(keepers)))
+        healthy_window = min(
+            len(live),
+            max(min_window, int(math.ceil(len(live) * PROXY_HEALTHY_RANDOM_FRACTION))),
+        )
+        preferred = list(live[:healthy_window])
+        tail = list(live[healthy_window:])
+        rng = secrets.SystemRandom()
+        rng.shuffle(preferred)
+        rng.shuffle(tail)
+        allocation_pool = preferred + tail
+        stats["randomized"] = True
+        stats["random_window"] = healthy_window
+        log("INFO", f"Proxy allocator · randomized cold-start mapping ON · "
+                    f"healthy random window {healthy_window}/{len(live)} · "
+                    f"keepers {len(keepers)}")
+    else:
+        stats["randomized"] = False
+        stats["random_window"] = 0
+
+        # Outside cold startup (e.g. adding/removing proxies from the dashboard),
+        # preserve a healthy unique sticky pin to avoid gratuitous browser
+        # restarts.
+        for jar in keepers:
+            sid = jar.get("id")
+            sticky = _normalize_proxy(jar.get("proxy") or jar.get("_last_proxy") or "")
+            if not sid or not sticky or sticky not in live or sticky in used:
+                continue
+            assigned[sid] = sticky
+            used.add(sticky)
+
+    remaining = [proxy for proxy in allocation_pool if proxy not in used]
     rr = 0
     for jar in keepers:
         sid = jar.get("id")
@@ -3052,8 +3102,8 @@ async def allocate_unique_keeper_proxies(jars: Optional[List[dict]] = None) -> d
             chosen = remaining.pop(0)
         else:
             # If there are fewer healthy exits than keepers, reuse is explicit
-            # and evenly distributed instead of silently collapsing onto one.
-            chosen = live[rr % len(live)]
+            # and spread over the live list rather than collapsing onto one.
+            chosen = allocation_pool[rr % len(allocation_pool)]
             rr += 1
         assigned[sid] = chosen
         used.add(chosen)
@@ -3182,7 +3232,7 @@ async def auto_login_on_boot():
 
     # Allocate the complete proxy pool before any keeper browser is launched.
     # Reload jars after enabling keepers so the allocator sees current state.
-    await allocate_unique_keeper_proxies(load_jars())
+    await allocate_unique_keeper_proxies(load_jars(), randomize=True)
 
     # Do not wait for the supervisor's next 15-second tick. Register every
     # session immediately; sync() starts browsers as background tasks.
@@ -5616,6 +5666,45 @@ def strike_proxy(proxy_url: str, reason: str = "") -> bool:
     return False
 
 
+def _proxy_network_failure_kind(value) -> str:
+    """Classify ordinary transport failures; never treats HTTP challenge pages
+    or verification rejection as proxy/network death."""
+    low = str(value or "").lower()
+    hard = (
+        "err_proxy_connection_failed",
+        "err_tunnel_connection_failed",
+        "proxy connection failed",
+        "tunnel connection failed",
+        "cannot complete socks",
+        "socks5",
+        "socks reply",
+        "connection refused",
+        "connect refused",
+        "proxy authentication",
+        "authentication failed",
+        "no route to host",
+        "network is unreachable",
+        "name or service not known",
+        "could not resolve proxy",
+    )
+    transient = (
+        "err_connection_reset",
+        "err_connection_closed",
+        "err_timed_out",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection closed",
+        "networkerror",
+        "failed to fetch",
+    )
+    if any(token in low for token in hard):
+        return "hard"
+    if any(token in low for token in transient):
+        return "transient"
+    return ""
+
+
 def clear_strikes(proxy_url: str) -> None:
     key = _proxy_hkey(proxy_url)
     _proxy_strikes.pop(key, None)
@@ -5773,7 +5862,7 @@ async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bo
             return await apick_live_proxy(jar, purpose=purpose or "last-resort", rotate=rotate,
                                           include_flagged=True, exclude=excluded)
         return None
-    if purpose == "keeper":
+    if str(purpose or "").startswith("keeper"):
         current_id = (jar or {}).get("id")
         reserved = set()
         for sid, session in keeper.sessions.items():
@@ -5787,6 +5876,12 @@ async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bo
         # smaller than the fleet, sharing remains an explicit last resort.
         if unreserved:
             live = unreserved
+
+        # A keeper failover should not deterministically walk the global cursor.
+        # The candidate set is already health/probe filtered, so randomize the
+        # remaining healthy choices for this replacement.
+        if rotate and live:
+            secrets.SystemRandom().shuffle(live)
     if assignment_mode and not rotate and jar is not None:
         pinned = _normalize_proxy(jar.get("proxy") or "") or None
         if pinned and pinned in live:
@@ -5802,10 +5897,15 @@ async def apick_live_proxy(jar: Optional[dict], *, purpose: str = "", rotate: bo
     if jar is not None and jar.get("id"):
         if assignment_mode:
             assign_jar_proxy(jar["id"], chosen)
-        try:
-            await anchor_proxy_to_keeper(jar["id"], chosen)
-        except Exception:
-            pass
+
+        # During keeper failover the old browser is intentionally about to be
+        # restarted. Do not let anchor_proxy_to_keeper pin us back onto its old
+        # still-running route merely because one generic liveness probe succeeds.
+        if not (rotate and str(purpose or "").startswith("keeper")):
+            try:
+                await anchor_proxy_to_keeper(jar["id"], chosen)
+            except Exception:
+                pass
     return chosen
 
 
@@ -9380,6 +9480,27 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         yield ("error", "502: Upstream request failed; it was not replayed because delivery may have occurred.")
                         return
 
+                    if verdict == "CHALLENGE":
+                        failed_jar_id = jar.get("id")
+                        _mark_api_keeper_unready(
+                            failed_jar_id,
+                            "browser-origin upstream challenge; same-exit recovery requested",
+                        )
+                        # Important: a challenge page is NOT ordinary proxy
+                        # network death. Preserve the browser's current proxy and
+                        # recover the same keeper/session locally.
+                        _schedule_transport_recovery(
+                            failed_jar_id,
+                            "browser-origin upstream challenge",
+                            rotate_proxy=False,
+                        )
+                        log("WARN", f"[{jar.get('name')}] browser-origin upstream challenge · "
+                                    "proxy kept sticky · same-keeper recovery scheduled")
+                        yield ("error",
+                               "503: Arena/edge requested browser verification for this keeper. "
+                               "The proxy was kept sticky and local keeper recovery was scheduled.")
+                        return
+
                     if verdict == "RECAPTCHA":
                         failed_jar_id = jar.get("id")
                         _captcha_failed_jars[failed_jar_id] = time.time()
@@ -9446,7 +9567,36 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     yield ("error", f"{e.status or 502}: Arena browser-origin request failed: {e.body[:350] or 'empty response'}")
                     return
             except Exception as browser_e:
-                log("WARN", f"[{jar.get('name')}] browser-origin failed ({type(browser_e).__name__}: {browser_e}); delivery uncertain — no account failover")
+                failure_text = f"{type(browser_e).__name__}: {browser_e}"
+                failure_kind = _proxy_network_failure_kind(failure_text)
+                used_proxy = _normalize_proxy(
+                    getattr(browser_session, "_used_proxy", "") or proxy or ""
+                ) or ""
+
+                rotate_for_health = False
+                if used_proxy and failure_kind == "hard":
+                    quarantine_proxy(
+                        used_proxy,
+                        f"browser-origin hard network failure: {failure_text[:100]}",
+                    )
+                    rotate_for_health = True
+                elif used_proxy and failure_kind == "transient":
+                    rotate_for_health = strike_proxy(
+                        used_proxy,
+                        f"browser-origin transient network failure: {failure_text[:100]}",
+                    )
+
+                if rotate_for_health and jar.get("id"):
+                    _schedule_transport_recovery(
+                        jar.get("id"),
+                        "browser-origin proxy/network failure",
+                        rotate_proxy=True,
+                        failed_proxy=used_proxy,
+                    )
+
+                log("WARN", f"[{jar.get('name')}] browser-origin failed "
+                            f"({failure_text}); delivery uncertain · "
+                            f"proxy_health_failover={'scheduled' if rotate_for_health else 'not-needed'}")
                 yield ("error", "502: Browser request was interrupted before a reliable HTTP response. Retry the request.")
                 return
 
@@ -9484,10 +9634,28 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                             yield ("error", f"503: {hosts} — {len(route_fails)} exit(s) connected+authed but none could route ({why}). "
                                             "Nothing exiled; flags self-expire (~3h). 'Scan pool' re-probes now.")
                             return
-                        quarantine_proxy(proxy, f"curl: {msg[:90]}")
+                        failure_kind = _proxy_network_failure_kind(msg)
+                        rotate_for_health = False
+                        if failure_kind == "hard":
+                            quarantine_proxy(proxy, f"curl hard network failure: {msg[:90]}")
+                            rotate_for_health = True
+                        else:
+                            rotate_for_health = strike_proxy(
+                                proxy,
+                                f"curl transient network failure: {msg[:90]}",
+                            )
+
+                        if rotate_for_health and jar.get("id"):
+                            _schedule_transport_recovery(
+                                jar.get("id"),
+                                "curl proxy/network failure",
+                                rotate_proxy=True,
+                                failed_proxy=proxy,
+                            )
+
                         if attempt + 1 < max_attempts:
                             continue
-                        yield ("error", f"502: Network error (all proxies down): {msg[:200]}")
+                        yield ("error", f"502: Network error (proxy route failed): {msg[:200]}")
                         return
                     yield ("error", f"Network error: {msg[:220]}")
                     return
@@ -13674,7 +13842,13 @@ async def _preflight_one_keeper(sid: str, session, jar: dict) -> tuple:
         return sid, False
 
 
-def _schedule_transport_recovery(sid: Optional[str], reason: str) -> None:
+def _schedule_transport_recovery(
+    sid: Optional[str],
+    reason: str,
+    *,
+    rotate_proxy: bool = False,
+    failed_proxy: Optional[str] = None,
+) -> None:
     sid = str(sid or "")
     if not sid:
         return
@@ -13692,7 +13866,77 @@ def _schedule_transport_recovery(sid: Optional[str], reason: str) -> None:
                 log("WARN", f"[{sid}] transport recovery · keeper session unavailable")
                 return
 
-            log("INFO", f"[{getattr(session, 'name', sid)}] transport recovery · restarting same keeper · {reason}")
+            name = getattr(session, "name", sid)
+
+            # Never restart the browser underneath an active request. Network
+            # failover is a control-plane recovery action after the failed turn
+            # leaves the transport lane.
+            if getattr(session, "active_requests", 0):
+                wait_deadline = time.monotonic() + PROXY_FAILOVER_IDLE_WAIT_SEC
+                while getattr(session, "active_requests", 0) and time.monotonic() < wait_deadline:
+                    await asyncio.sleep(0.20)
+                if getattr(session, "active_requests", 0):
+                    log("WARN", f"[{name}] transport recovery deferred · active request still owns "
+                                f"the browser lane after {PROXY_FAILOVER_IDLE_WAIT_SEC:.0f}s · no restart performed")
+                    _verification_preflight_retry_after[sid] = time.monotonic() + 2.0
+                    _wake_verification_scheduler()
+                    return
+
+            current_proxy = _normalize_proxy(
+                failed_proxy or getattr(session, "_used_proxy", "") or ""
+            ) or ""
+
+            should_rotate = bool(rotate_proxy and PROXY_NETWORK_FAILOVER and current_proxy)
+
+            # Even generic same-keeper recovery gets a new exit automatically if
+            # its existing one is already circuit-open or fails a fresh Arena
+            # route probe. Challenge/verification errors do not satisfy this.
+            if (
+                not should_rotate
+                and PROXY_NETWORK_FAILOVER
+                and current_proxy
+                and _proxy_hkey(current_proxy) in _QUARANTINED_KEYS
+            ):
+                should_rotate = True
+
+            replacement = None
+            if should_rotate:
+                jar = next(
+                    (j for j in load_jars() if str(j.get("id")) == sid),
+                    {"id": sid},
+                )
+                excluded = {
+                    current_proxy,
+                    _proxy_hkey(current_proxy),
+                }
+                replacement = await apick_live_proxy(
+                    jar,
+                    purpose="keeper-recovery",
+                    rotate=True,
+                    exclude=excluded,
+                )
+                replacement = _normalize_proxy(replacement or "") or ""
+
+                if replacement and replacement != current_proxy:
+                    assign_jar_proxy(sid, replacement)
+                    session._tried_proxies.clear()
+                    session._direct_tried = False
+                    log("WARN", f"[{name}] proxy failover · "
+                                f"{_proxy_hkey(current_proxy)} → {_proxy_hkey(replacement)} · "
+                                f"{redact(reason)[:150]}")
+                else:
+                    replacement = None
+                    log("WARN", f"[{name}] proxy failover requested but no alternate healthy exit "
+                                f"was available · retaining {_proxy_hkey(current_proxy)}")
+
+            route_label = (
+                f"new exit {_proxy_hkey(replacement)}"
+                if replacement else
+                f"same exit {_proxy_hkey(current_proxy)}" if current_proxy else
+                "direct/no pinned exit"
+            )
+            log("INFO", f"[{name}] transport recovery · restarting keeper on {route_label} · {reason}")
+
             async with _keeper_recovery_gate:
                 _mark_api_keeper_unready(sid, "transport recovery")
                 await session.restart()
@@ -14026,7 +14270,10 @@ async def _lifespan(app):
                 f"{UPSTREAM_429_COOLDOWN_SEC:.0f}s · inline wait <= {UPSTREAM_429_INLINE_WAIT_MAX_SEC:.0f}s · "
                 f"same-account retries {UPSTREAM_429_SAME_ACCOUNT_RETRIES} · Retry-After honored · no route/account rotation")
     log("INFO", "Capacity target · queued multi-user admission · one stable browser transport lane per keeper")
-    log("INFO", "Proxy allocator · full-pool startup scan + distinct keeper assignment enabled")
+    log("INFO", f"Proxy allocator · full-pool startup scan + random distinct keeper assignment "
+                f"{'ON' if PROXY_RANDOMIZE_STARTUP else 'OFF'} · healthy window {PROXY_HEALTHY_RANDOM_FRACTION:.0%}")
+    log("INFO", f"Proxy network failover · {'ON' if PROXY_NETWORK_FAILOVER else 'OFF'} · "
+                "sticky while healthy · controlled rebind only after genuine transport failure")
     log("INFO", "Proxy lifecycle · non-destructive circuit breaker · auto-recovery + automatic re-admission · no automatic deletion")
     if get_verification_solver:
         log("OK", f"Verification adapter factory loaded: {_VERIFICATION_FACTORY_SPEC}")
