@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.8.2-agent-tool-loop")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.8.3-tool-call-parser-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -11360,11 +11360,11 @@ def _tool_protocol_system(body: dict, protocol: str) -> str:
         "AVAILABLE TOOLS (JSON):\\n" + encoded + "\\n\\n"
         "TOOL CHOICE: " + choice + "\\n"
         "PARALLEL TOOL CALLS: " + ("allowed" if parallel else "one call only") + "\\n\\n"
-        "When a tool is needed, output ONLY this exact machine-readable envelope, "
-        "with no markdown fence and no prose before or after it:\\n"
-        "<<<BRIDGENA_TOOL_CALLS_V1>>>"
+        "When a tool is needed, output ONLY one JSON object and no normal prose. "
+        "Preferred exact shape:\\n"
         '{"tool_calls":[{"name":"EXACT_TOOL_NAME","arguments":{}}]}'
-        "<<<END_BRIDGENA_TOOL_CALLS_V1>>>\\n"
+        "\\nDo not wrap this JSON in markdown. If your interface adds harmless wrapper "
+        "characters around it, preserve the JSON object itself exactly. "
         "Arguments MUST be valid JSON and MUST follow the selected tool schema. "
         "You may include multiple calls in tool_calls only when parallel calls are allowed. "
         "If TOOL CHOICE is none, do not call a tool. If it is required, or names a required "
@@ -11603,31 +11603,79 @@ def _normalize_parsed_tool_calls(value, body: dict, protocol: str) -> list:
     return out
 
 
+def _tool_json_candidates(text: str):
+    """Yield JSON values embedded anywhere in model output.
+
+    Arena/model rendering may rewrite decorative sentinels (for example into
+    <><>), so tool detection depends on the JSON object itself, not wrappers.
+    """
+    if not isinstance(text, str):
+        return
+
+    signatures = set()
+
+    def remember(value):
+        try:
+            sig = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            sig = repr(value)
+        if sig in signatures:
+            return False
+        signatures.add(sig)
+        return True
+
+    stripped = text.strip()
+    if stripped:
+        try:
+            value = json.loads(stripped)
+            if remember(value):
+                yield value
+        except Exception:
+            pass
+
+    begin = "<<<BRIDGENA_TOOL_CALLS_V1>>>"
+    end = "<<<END_BRIDGENA_TOOL_CALLS_V1>>>"
+    cursor = 0
+    while True:
+        start = text.find(begin, cursor)
+        if start < 0:
+            break
+        stop = text.find(end, start + len(begin))
+        if stop < 0:
+            break
+        raw = text[start + len(begin):stop].strip()
+        try:
+            value = json.loads(raw)
+            if remember(value):
+                yield value
+        except Exception:
+            pass
+        cursor = stop + len(end)
+
+    for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.I):
+        try:
+            value = json.loads(match.group(1).strip())
+            if remember(value):
+                yield value
+        except Exception:
+            pass
+
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        try:
+            value, _consumed = decoder.raw_decode(text[i:])
+        except Exception:
+            continue
+        if remember(value):
+            yield value
+
+
 def _extract_tool_calls(text: str, body: dict, protocol: str) -> list:
     if not isinstance(text, str) or not text.strip():
         return []
-    begin = "<<<BRIDGENA_TOOL_CALLS_V1>>>"
-    end = "<<<END_BRIDGENA_TOOL_CALLS_V1>>>"
-    candidates = []
-
-    start = text.find(begin)
-    if start >= 0:
-        stop = text.find(end, start + len(begin))
-        if stop > start:
-            candidates.append(text[start + len(begin):stop].strip())
-
-    for match in re.finditer(r"```(?:json)?\\s*(\\{.*?\\})\\s*```", text, re.I | re.S):
-        candidates.append(match.group(1).strip())
-
-    stripped = text.strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        candidates.append(stripped)
-
-    for raw in candidates:
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            continue
+    for parsed in _tool_json_candidates(text):
         calls = _normalize_parsed_tool_calls(parsed, body, protocol)
         if calls:
             return calls
@@ -11668,8 +11716,9 @@ def _anthropic_tool_calls_payload(calls: list) -> list:
 
 def _tool_output_log(protocol: str, model: str, calls: list, text: str) -> None:
     names = ",".join(str(c.get("name") or "") for c in calls[:8]) or "-"
+    raw_hint = " · raw_tool_json_seen=yes" if '"tool_calls"' in str(text or "") else ""
     log("INFO", f"{protocol} agent turn · model {str(model)[:80]} · "
-                f"tool_calls {len(calls)} [{names}] · buffered {len(text)} chars")
+                f"tool_calls {len(calls)} [{names}] · buffered {len(text)} chars{raw_hint}")
 
 
 def _disposable_context_prompt(body: dict) -> str:
@@ -13943,7 +13992,7 @@ async def _lifespan(app):
     app.state.background_tasks = tasks
     app.state.ready_at = time.time()
     log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
-    log("INFO", "Agent compatibility · OpenAI tools/tool_calls + Anthropic tool_use/tool_result ON · tool turns buffered for structured emission")
+    log("INFO", "Agent compatibility · OpenAI tools/tool_calls + Anthropic tool_use/tool_result ON · embedded/bare JSON parser v2")
     log("INFO", "Conversation mode · disposable Arena evaluation per API message · bounded client-history capsule")
     log("INFO", "Keeper rejection policy · non-destructive local recovery · no 45s API exile")
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
