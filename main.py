@@ -440,7 +440,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.9.5-ready-keeper-agent-routing")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.9.6-agent-envelope-stability")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2080,6 +2080,27 @@ TOOL_READY_KEEPER_WAIT_SEC = max(
     UNBOUND_READY_KEEPER_WAIT_SEC,
     min(60.0, float(os.environ.get("BRIDGENA_TOOL_READY_KEEPER_WAIT_SEC", "15"))),
 )
+
+TOOL_TOTAL_ENVELOPE_MAX_CHARS = max(
+    12000,
+    min(45000, int(os.environ.get("BRIDGENA_TOOL_TOTAL_ENVELOPE_MAX_CHARS", "24000"))),
+)
+TOOL_SCHEMA_MAX_CHARS = max(
+    4000,
+    min(20000, int(os.environ.get("BRIDGENA_TOOL_SCHEMA_MAX_CHARS", "9000"))),
+)
+TOOL_TRANSCRIPT_MAX_CHARS = max(
+    6000,
+    min(30000, int(os.environ.get("BRIDGENA_TOOL_TRANSCRIPT_MAX_CHARS", "13000"))),
+)
+AGENT_CHALLENGE_BACKOFF_SEC = max(
+    5.0,
+    min(180.0, float(os.environ.get("BRIDGENA_AGENT_CHALLENGE_BACKOFF_SEC", "20"))),
+)
+
+_agent_challenge_until: Dict[str, float] = {}
+_agent_challenge_count: Dict[str, int] = {}
+_keeper_model_success_ts: Dict[tuple, float] = {}
 from contextlib import asynccontextmanager
 
 # Keeper lanes and proxy-exit lanes are separate capacity constraints. Several
@@ -3108,8 +3129,24 @@ def acquire_jar(prefer_live: bool = True, exclude: Optional[set] = None) -> Opti
     mutate_jars(pick)
     return chosen.get("jar")
 
-def acquire_ready_jar(exclude: Optional[set] = None) -> Optional[dict]:
-    """Select a different authenticated keeper that is ready right now."""
+def _note_keeper_model_success(sid: Optional[str], model_name: str) -> None:
+    if not sid:
+        return
+    _keeper_model_success_ts[(str(sid), str(model_name or ""))] = time.monotonic()
+
+
+def _keeper_model_success_age(sid: Optional[str], model_name: str) -> float:
+    if not sid:
+        return 10**9
+    ts = _keeper_model_success_ts.get((str(sid), str(model_name or "")), 0.0)
+    return max(0.0, time.monotonic() - ts) if ts else 10**9
+
+
+def acquire_ready_jar(
+    exclude: Optional[set] = None,
+    model_name: str = "",
+) -> Optional[dict]:
+    """Select an authenticated keeper that is admitted and idle right now."""
     now = time.time()
     excluded = set(exclude or ())
     candidates = []
@@ -3135,6 +3172,8 @@ def acquire_ready_jar(exclude: Optional[set] = None) -> Optional[dict]:
     candidates.sort(key=lambda jar: (
         0 if now - _captcha_failed_jars.get(jar.get("id"), 0.0) > 300 else 1,
         int(getattr(keeper.sessions.get(jar.get("id")), "active_requests", 0) or 0),
+        0 if _keeper_model_success_age(jar.get("id"), model_name) < 900 else 1,
+        _keeper_model_success_age(jar.get("id"), model_name),
         float(jar.get("last_used", 0) or 0),
     ))
     selected = candidates[0]
@@ -3154,6 +3193,7 @@ async def wait_for_ready_jar(
     *,
     exclude: Optional[set] = None,
     timeout_sec: float = 0.0,
+    model_name: str = "",
 ) -> Optional[dict]:
     """Return any verified, running, idle keeper admitted for API traffic.
 
@@ -3162,7 +3202,7 @@ async def wait_for_ready_jar(
     excluded = set(exclude or ())
     deadline = time.monotonic() + max(0.0, float(timeout_sec or 0.0))
     while True:
-        jar = acquire_ready_jar(exclude=excluded)
+        jar = acquire_ready_jar(exclude=excluded, model_name=model_name)
         if jar:
             return jar
         if time.monotonic() >= deadline:
@@ -7981,7 +8021,7 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
                                     "Failed keepers are being recovered in the background.")
                     return
 
-                nxt = acquire_ready_jar(exclude=excluded)
+                nxt = acquire_ready_jar(exclude=excluded, model_name=model_name)
                 if not nxt:
                     _bump_account_failover("exhausted")
                     log("WARN", f"Account failover stopped · no alternate ready keeper · last {failed_name}: {reason}")
@@ -8935,7 +8975,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         )
         if wanted_jar_id
         else (
-            acquire_ready_jar(exclude=excluded)
+            acquire_ready_jar(exclude=excluded, model_name=model_name)
             or acquire_jar(prefer_live=True, exclude=excluded)
         )
     )
@@ -8981,6 +9021,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             replacement = await wait_for_ready_jar(
                 exclude=excluded | ({sid} if sid else set()),
                 timeout_sec=wait_sec,
+                model_name=model_name,
             )
             if replacement:
                 old_name = jar.get("name") or sid or "unknown"
@@ -9409,6 +9450,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                     _bump_undelivered_retry("succeeded")
                     log("OK", f"[{jar.get('name')}] confirmed-absence retry succeeded · "
                               f"{len(response_text)} chars")
+                _note_keeper_model_success(jar.get("id"), model_name)
                 yield ("done", response_text)
                 return
             except BridgeHTTPError as e:
@@ -9506,6 +9548,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         log("OK", f"[{jar.get('name')}] interrupted stream recovered after "
                                   f"{salvage.get('source') or 'history/UI'} salvage · "
                                   f"{len(response_text)} final chars")
+                        _note_keeper_model_success(jar.get("id"), model_name)
                         yield ("done", response_text)
                         return
 
@@ -9521,6 +9564,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         log("WARN", f"[{jar.get('name')}] delivered-turn recovery exhausted, but "
                                     f"{len(response_text)} semantic chars were already streamed; "
                                     "closing as degraded terminal success and preserving Arena binding")
+                        _note_keeper_model_success(jar.get("id"), model_name)
                         yield ("done", response_text)
                         return
                     if response_text:
@@ -9607,6 +9651,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
 
                         log("OK", f"[{jar.get('name')}] HTTP-0 request recovered after route repair · "
                                   f"{len(response_text)} chars · source {salvage.get('source') or 'history/UI'}")
+                        _note_keeper_model_success(jar.get("id"), model_name)
                         yield ("done", response_text)
                         return
 
@@ -9656,6 +9701,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                     response_text = final_text or response_text
                                 log("OK", f"[{jar.get('name')}] HTTP-0 follow-up recovered without replay · "
                                           f"{len(response_text)} chars · source {final_salvage.get('source') or 'history/UI'}")
+                                _note_keeper_model_success(jar.get("id"), model_name)
                                 yield ("done", response_text)
                                 return
 
@@ -9812,6 +9858,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                                 response_text = final_text or response_text
                             log("OK", f"[{jar.get('name')}] duplicate {'message' if _duplicate_message_ack else 'ID'} turn recovered · "
                                       f"{len(response_text)} chars · source {salvage.get('source') or 'history/UI'}")
+                            _note_keeper_model_success(jar.get("id"), model_name)
                             yield ("done", response_text)
                             return
 
@@ -10273,6 +10320,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
                         "jar_id": jar.get("id"), "proxy": proxy,
                     }
                     save_conversation(chat_id, conv2)
+                _note_keeper_model_success(jar.get("id"), model_name)
                 yield ("done", response_text)
                 return
         except asyncio.CancelledError:
@@ -12298,13 +12346,70 @@ def _tool_choice_text(body: dict, protocol: str) -> str:
     return kind or "auto"
 
 
+def _compact_tool_schema(value, *, depth: int = 0):
+    if depth > 12:
+        return {}
+    if isinstance(value, list):
+        return [_compact_tool_schema(v, depth=depth + 1) for v in value[:64]]
+    if not isinstance(value, dict):
+        if isinstance(value, str) and len(value) > 600:
+            return value[:600] + "…"
+        return value
+    drop = {"$comment", "examples", "example", "default", "deprecated", "readOnly", "writeOnly", "title"}
+    out = {}
+    for key, raw in value.items():
+        if key in drop:
+            continue
+        if key == "description":
+            desc = str(raw or "").strip()
+            if desc:
+                out[key] = desc[:220] + ("…" if len(desc) > 220 else "")
+            continue
+        out[key] = _compact_tool_schema(raw, depth=depth + 1)
+    return out
+
+
+def _compact_tool_defs(defs: list) -> list:
+    out = []
+    for item in defs:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        desc = str(item.get("description") or "").strip()
+        out.append({
+            "name": str(item.get("name")),
+            "description": desc[:480] + ("…" if len(desc) > 480 else ""),
+            "parameters": _compact_tool_schema(item.get("parameters") if isinstance(item.get("parameters"), dict) else {"type":"object","properties":{}}),
+        })
+    return out
+
+
+def _fit_valid_tool_defs(defs: list, budget: int) -> str:
+    compact = _compact_tool_defs(defs)
+    encoded = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded) <= budget:
+        return encoded
+    lean = [{"name": item["name"], "parameters": item.get("parameters") or {"type":"object","properties":{}}} for item in compact]
+    encoded = json.dumps(lean, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded) <= budget:
+        return encoded
+    kept=[]
+    for item in reversed(lean):
+        candidate=[item]+kept
+        raw=json.dumps(candidate,ensure_ascii=False,separators=(",",":"))
+        if len(raw)<=budget:
+            kept=candidate
+        elif not kept:
+            tiny={"name":item["name"],"parameters":{"type":"object","properties":{}}}
+            if len(json.dumps([tiny],ensure_ascii=False,separators=(",",":")))<=budget:
+                kept=[tiny]
+    return json.dumps(kept, ensure_ascii=False, separators=(",", ":"))
+
+
 def _tool_protocol_system(body: dict, protocol: str) -> str:
     defs = _tool_anthropic_defs(body) if protocol == "anthropic" else _tool_openai_defs(body)
     if not defs:
         return ""
-    encoded = json.dumps(defs, ensure_ascii=False, separators=(",", ":"))
-    if len(encoded) > 30000:
-        encoded = encoded[:30000] + "…"
+    encoded = _fit_valid_tool_defs(defs, TOOL_SCHEMA_MAX_CHARS)
     choice = _tool_choice_text(body, protocol)
     parallel = bool(body.get("parallel_tool_calls", True))
     return (
@@ -12325,6 +12430,34 @@ def _tool_protocol_system(body: dict, protocol: str) -> str:
         "After the client provides a Tool Result, continue from that result: either call "
         "another tool with the same envelope or return the final normal-text answer."
     )
+
+
+def _clip_middle(text: str, limit: int, marker: str) -> str:
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    if limit <= len(marker) + 32:
+        return value[:limit]
+    head = int((limit - len(marker)) * 0.68)
+    tail = limit - len(marker) - head
+    return value[:head] + marker + value[-tail:]
+
+
+def _fit_tool_envelope(system_text: str, prompt_text: str) -> tuple:
+    system_text = str(system_text or "").strip()
+    prompt_text = str(prompt_text or "").strip()
+    total = len(system_text) + (2 if system_text and prompt_text else 0) + len(prompt_text)
+    if total <= TOOL_TOTAL_ENVELOPE_MAX_CHARS:
+        return system_text, prompt_text
+    min_prompt = min(len(prompt_text), max(6000, TOOL_TOTAL_ENVELOPE_MAX_CHARS // 2))
+    system_budget = max(4000, TOOL_TOTAL_ENVELOPE_MAX_CHARS - min_prompt - 2)
+    system_text = _clip_middle(system_text, system_budget, "\\n\\n[older agent/system detail compacted]\\n\\n")
+    prompt_budget = max(5000, TOOL_TOTAL_ENVELOPE_MAX_CHARS - len(system_text) - 2)
+    if len(prompt_text) > prompt_budget:
+        marker = "\\n\\n[older agent events compacted]\\n\\n"
+        keep = max(1, prompt_budget - len(marker))
+        prompt_text = marker + prompt_text[-keep:]
+    return system_text, prompt_text
 
 
 def _tool_runtime_system_context(body: dict, protocol: str) -> str:
@@ -12470,7 +12603,8 @@ def _bounded_tool_transcript(rows: list) -> str:
         "--- BEGIN CONVERSATION ---\\n"
     )
     suffix = "\\n--- END CONVERSATION ---\\n\\nContinue from the final conversation event."
-    budget = max(1000, MAX_PROMPT - len(instruction) - len(suffix))
+    limit = min(MAX_PROMPT, TOOL_TRANSCRIPT_MAX_CHARS)
+    budget = max(1000, limit - len(instruction) - len(suffix))
     kept = []
     used = 0
     omitted = 0
@@ -12665,6 +12799,31 @@ def _anthropic_tool_calls_payload(calls: list) -> list:
             "input": call.get("arguments") or {},
         })
     return out
+
+
+def _agent_request_fingerprint(body: dict) -> str:
+    tools = sorted(item.get("name") or "" for item in _tool_openai_defs(body) if item.get("name"))
+    messages = body.get("messages") or []
+    shape = [(str(m.get("role") or ""), len(_openai_text_content(m.get("content", ""))), len(m.get("tool_calls") or []) if isinstance(m, dict) else 0) for m in messages[-12:] if isinstance(m, dict)]
+    raw = json.dumps({"model":body.get("model"),"tools":tools,"shape":shape,"last":_last_openai_user_prompt(body)[-1200:]},ensure_ascii=False,sort_keys=True,separators=(",",":"))
+    return hashlib.sha256(raw.encode("utf-8","ignore")).hexdigest()[:24]
+
+
+def _agent_challenge_remaining(fp: str) -> float:
+    return max(0.0, _agent_challenge_until.get(fp, 0.0) - time.monotonic())
+
+
+def _arm_agent_challenge_circuit(fp: str) -> float:
+    count = int(_agent_challenge_count.get(fp, 0)) + 1
+    _agent_challenge_count[fp] = count
+    delay = min(120.0, AGENT_CHALLENGE_BACKOFF_SEC * (1.5 ** max(0, count - 1)))
+    _agent_challenge_until[fp] = time.monotonic() + delay
+    return delay
+
+
+def _clear_agent_challenge_circuit(fp: str) -> None:
+    _agent_challenge_until.pop(fp, None)
+    _agent_challenge_count.pop(fp, None)
 
 
 def _tool_output_log(protocol: str, model: str, calls: list, text: str) -> None:
@@ -12988,6 +13147,19 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
         raise HTTPException(status_code=400, detail="no conversation content")
 
     model = body.get("model", "auto")
+    agent_fp = _agent_request_fingerprint(body)
+    remaining = _agent_challenge_remaining(agent_fp)
+    if remaining > 0:
+        retry_after = max(1, int(remaining + 0.999))
+        log("WARN", f"Agent request circuit · identical challenged request held {retry_after}s before consuming another keeper")
+        return JSONResponse(status_code=503, headers={"Retry-After":str(retry_after),"X-Bridgena-Retryable":"true","Cache-Control":"no-store"}, content={"error":{"message":f"The upstream edge temporarily challenged this agent request class. Retry after about {retry_after}s.","type":"api_error","code":"agent_request_backoff"}})
+
+    system_context = _tool_runtime_system_context(body, "openai")
+    original_size = len(system_context) + len(prompt)
+    system_context, prompt = _fit_tool_envelope(system_context, prompt)
+    compact_size = len(system_context) + len(prompt)
+    if compact_size < original_size:
+        log("INFO", f"OpenAI agent envelope compacted · {original_size} → {compact_size} chars · tools {len(_tool_openai_defs(body))} · messages {len(body.get('messages') or [])}")
     chat_id = _disposable_chat_id("api-tool")
     created = int(time.time())
     rid = "chatcmpl-" + uuid7()[:23]
@@ -13007,7 +13179,7 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
             prompt,
             model,
             attachments=body.get("attachments"),
-            system_prompt=_tool_runtime_system_context(body, "openai"),
+            system_prompt=system_context,
             tenant_id=_tenant_identity(keyinfo),
             handoff_prompt=prompt,
         ):
@@ -13044,13 +13216,16 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
                 "true" if status_code in (429, 502, 503, 504) else "false"
             ),
         }
+        challenge_error = ("edge requested browser verification" in upstream_error.lower() or "upstream challenge" in upstream_error.lower())
+        challenge_delay = _arm_agent_challenge_circuit(agent_fp) if challenge_error else 0.0
+
         retry_after = _retry_after_from_internal_error(upstream_error)
         if retry_after:
             headers["Retry-After"] = str(max(1, int(retry_after)))
+        elif challenge_delay > 0:
+            headers["Retry-After"] = str(max(1, int(challenge_delay + 0.999)))
         elif status_code == 503:
-            # Short retry hint for clients such as coding agents. The challenged
-            # keeper has already been removed from API scheduling.
-            headers["Retry-After"] = "1"
+            headers["Retry-After"] = "3"
 
         _record_reliability_outcome(False, outcome)
         log(
@@ -13070,6 +13245,7 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
             },
         )
 
+    _clear_agent_challenge_circuit(agent_fp)
     parsed = _extract_tool_calls(acc, body, "openai")
     calls = _openai_tool_calls_payload(parsed)
     _tool_output_log("OpenAI", model, parsed, acc)
@@ -13598,6 +13774,7 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
     chat_id = _disposable_chat_id("anthropic-tool")
     tenant_id = _tenant_identity(keyinfo)
     system_prompt = _tool_runtime_system_context(body, "anthropic")
+    system_prompt, prompt = _fit_tool_envelope(system_prompt, prompt)
     message_id = "msg_" + uuid7().replace("-", "")
     input_tokens = _rough_tokens(prompt + "\n" + system_prompt)
 
@@ -15136,6 +15313,8 @@ async def _lifespan(app):
     log("INFO", f"API keeper admission · fresh turns prefer verified idle keepers · "
                 f"normal wait {UNBOUND_READY_KEEPER_WAIT_SEC:.0f}s · tool wait {TOOL_READY_KEEPER_WAIT_SEC:.0f}s")
     log("INFO", "OpenAI tool transport · upstream admission buffered before SSE commit · real HTTP retry statuses ON")
+    log("INFO", f"Agent envelope · total <= {TOOL_TOTAL_ENVELOPE_MAX_CHARS} chars · tool schema <= {TOOL_SCHEMA_MAX_CHARS} · transcript <= {TOOL_TRANSCRIPT_MAX_CHARS}")
+    log("INFO", f"Agent challenge circuit · identical request backoff base {AGENT_CHALLENGE_BACKOFF_SEC:.0f}s · retry storms cannot consume the keeper fleet")
     log("INFO", f"Browser-native session mode · persistent contexts "
                 f"{'ON' if BROWSER_PERSISTENT_CONTEXT else 'OFF'} · JavaScript ON · "
                 f"service workers {'ON' if BROWSER_SERVICE_WORKERS else 'OFF'} · "
