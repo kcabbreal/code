@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # ================================================================
-#  BRIDGENA v4.1 — autonomous headed keeper fleet + browser-extension transport
+#  BRIDGENA v3 — production control plane + compatibility engine
 #  modules: core · identity · pool · keepers · verification · UI · API · VNC
-#  Deploy: extract and run ./launch.sh (or python3 bridgena-v4.3.2-terms-gate-worker-health-fix.py).
+#  Deploy: run bridgena-v3.py. Existing state, jars and API clients stay valid.
 # ================================================================
 import asyncio, base64, functools, hashlib, hmac, json, math, os, random
 import re, secrets, socket, struct, subprocess, threading, time, uuid
@@ -314,7 +314,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v4.3.2-terms-gate-worker-health-fix")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.8.2-agent-tool-loop")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -897,82 +897,16 @@ def get_solver(models_dir: Optional[str] = None) -> RecaptchaSolver:
 
 
 def model_name(m) -> str:
-    """Return the label a human actually sees in Arena's model picker."""
+
+    """Arena catalog entries carry publicName/id; OpenAI surface needs one canonical name."""
     if isinstance(m, str):
         return m
-    for key in (
-        "uiName", "displayName", "modelDisplayName", "display_name",
-        "label", "title", "publicName", "name", "id",
-    ):
-        value = str(m.get(key) or "").strip()
-        if value:
-            return value
-    return ""
-
-
-def _model_aliases(m) -> list[str]:
-    if isinstance(m, str):
-        return [m]
-    out = []
-    for key in (
-        "uiName", "displayName", "modelDisplayName", "display_name",
-        "label", "title", "publicName", "name", "id",
-    ):
-        value = str(m.get(key) or "").strip()
-        if value and value not in out:
-            out.append(value)
-    return out
-
-
-def canonical_public_model_name(value: str) -> str:
-    """Map a cached slug/internal id to the current Arena display label."""
-    raw = str(value or "auto").strip() or "auto"
-    if raw == "auto":
-        return raw
-    wanted = _model_key(raw)
-    for item in get_models():
-        aliases = _model_aliases(item)
-        if raw in aliases or wanted in {_model_key(x) for x in aliases}:
-            return model_name(item) or raw
-    return raw
+    return m.get("name") or m.get("publicName") or m.get("id") or ""
 
 
 def _model_key(value: str) -> str:
     """Canonical comparison key for Arena display labels and API slugs."""
     return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
-
-
-def _v4_model_aliases_for_request(value: str) -> list[str]:
-    """Return safe model-picker aliases for one public API model label."""
-    raw = str(value or "auto").strip() or "auto"
-    if raw == "auto":
-        return ["auto"]
-    out: list[str] = []
-    def add(v):
-        v = str(v or "").strip()
-        if v and v not in out:
-            out.append(v)
-
-    add(raw)
-    wanted = _model_key(raw)
-    try:
-        for item in get_models():
-            aliases = _model_aliases(item)
-            keys = {_model_key(x) for x in aliases if x}
-            if raw in aliases or wanted in keys:
-                for alias in aliases:
-                    add(alias)
-                break
-    except Exception:
-        pass
-
-    # Arena has historically exposed the Max route under both a human-facing
-    # Max/Arena Max label and an internal boss-bandit identity.
-    if wanted in {"max", "arena-max", "boss-bandit"}:
-        for alias in ("Max", "Arena Max", "boss-bandit", "boss bandit"):
-            add(alias)
-
-    return out[:24]
 
 
 # Captured from Arena's working direct-chat client on 2026-09-03. These are
@@ -1001,9 +935,9 @@ def resolve_model_id(public_name: str, jar: Optional[dict] = None) -> str:
     for item in get_models():
         if not isinstance(item, dict):
             continue
-        labels = _model_aliases(item)
+        labels = (item.get("name"), item.get("publicName"), item.get("id"))
         if public_name in labels or wanted in {_model_key(x) for x in labels if x}:
-            return item.get("id") or item.get("name") or public_name
+            return item.get("id") or public_name
     if wanted in _VERIFIED_MODEL_IDS:
         return _VERIFIED_MODEL_IDS[wanted]
     jar_map = (jar or {}).get("model_map", {})
@@ -1930,25 +1864,6 @@ def save_models(models: list) -> None:
     _models_cache = models
     _models_cache_time = time.time()
 
-
-def _catalog_names(models: list) -> list[str]:
-    out, seen = [], set()
-    for m in models or []:
-        try:
-            n = model_name(m).strip()
-        except Exception:
-            n = str((m or {}).get("name") or (m or {}).get("publicName") or (m or {}).get("id") or "").strip() if isinstance(m, dict) else str(m).strip()
-        if n and n not in seen:
-            seen.add(n); out.append(n)
-    return out
-
-def _valid_model_catalog(models: list) -> bool:
-    # Arena's public catalog size changes over time; requiring >50 made valid
-    # refreshes look like failures and left models.json stale. Validate shape
-    # and a small non-empty unique-name floor instead.
-    floor = max(1, int(os.getenv("BRIDGENA_MODEL_REFRESH_MIN", "3") or 3))
-    return isinstance(models, list) and len(_catalog_names(models)) >= floor
-
 def find_cookie(cookies: list, name: str) -> str:
     for c in cookies:
         if c.get("name") == name:
@@ -2533,347 +2448,95 @@ async def get_initial_data() -> list:
     return result["models"]
 
 async def refresh_models_via_worker(worker):
-    """Refresh Arena's model catalog from live Next.js/Flight state.
-
-    v4.1.4 deliberately scans several page-state representations instead of
-    assuming `initialModels` lives in one exact serialized location.
-    """
-    log("INFO", f"[{worker.name}] Refreshing models via live browser state...")
+    """Fetch models from Arena's Next.js page/Flight state using a live keeper."""
+    log("INFO", f"[{worker.name}] Refreshing models via worker navigation...")
     try:
         async with worker._action_lock:
             await worker.page.goto(ARENA_DIRECT_URL, wait_until="domcontentloaded", timeout=30000)
-            try:
-                await worker.page.wait_for_load_state("domcontentloaded", timeout=10000)
-            except Exception:
-                pass
-
+            await worker.page.wait_for_load_state("domcontentloaded")
             body = await worker.page.content()
             try:
-                flight_obj = await worker.page.evaluate("() => self.__next_f || []")
+                flight = await worker.page.evaluate("() => JSON.stringify(self.__next_f || [])")
             except Exception:
-                flight_obj = []
-            try:
-                script_texts = await worker.page.evaluate(
-                    "() => Array.from(document.scripts).map(s => s.textContent || '').filter(Boolean)"
-                )
-            except Exception:
-                script_texts = []
+                flight = ""
+
+        def _array_after_key(src: str):
+            """Extract nested JSON safely; a non-greedy regex truncates on the
+            first capability array/object inside initialModels."""
+            if not src:
+                return None
+            for needle in ('"initialModels"', "'initialModels'"):
+                pos = src.find(needle)
+                while pos >= 0:
+                    start = src.find("[", pos + len(needle))
+                    if start < 0:
+                        break
+                    depth, quoted, escaped = 0, False, False
+                    for i in range(start, len(src)):
+                        ch = src[i]
+                        if quoted:
+                            if escaped:
+                                escaped = False
+                            elif ch == "\\":
+                                escaped = True
+                            elif ch == '"':
+                                quoted = False
+                        elif ch == '"':
+                            quoted = True
+                        elif ch == "[":
+                            depth += 1
+                        elif ch == "]":
+                            depth -= 1
+                            if depth == 0:
+                                try:
+                                    value = json.loads(src[start:i + 1])
+                                    if isinstance(value, list):
+                                        return value
+                                except Exception:
+                                    break
+                    pos = src.find(needle, pos + len(needle))
+            return None
 
         import html as _model_html
+        sources = [body, _model_html.unescape(body), flight]
+        sources += [s.replace('\\"', '"').replace('\\\\', '\\')
+                    for s in list(sources) if s]
+        models_data = next((v for v in (_array_after_key(s) for s in sources) if v), None)
+        if models_data:
 
-        def _balanced_arrays_after_key(src: str, keys=("initialModels", "models")):
-            if not src:
-                return []
-            found = []
-            for key in keys:
-                for needle in (f'"{key}"', f"'{key}'"):
-                    pos = 0
-                    while True:
-                        pos = src.find(needle, pos)
-                        if pos < 0:
-                            break
-                        start = src.find("[", pos + len(needle))
-                        if start < 0:
-                            break
-                        depth = 0
-                        quoted = False
-                        quote_ch = ""
-                        escaped = False
-                        for i in range(start, len(src)):
-                            ch = src[i]
-                            if quoted:
-                                if escaped:
-                                    escaped = False
-                                elif ch == "\\":
-                                    escaped = True
-                                elif ch == quote_ch:
-                                    quoted = False
-                            elif ch in ('"', "'"):
-                                quoted = True
-                                quote_ch = ch
-                            elif ch == "[":
-                                depth += 1
-                            elif ch == "]":
-                                depth -= 1
-                                if depth == 0:
-                                    raw = src[start:i+1]
-                                    try:
-                                        value = json.loads(raw)
-                                        if isinstance(value, list):
-                                            found.append(value)
-                                    except Exception:
-                                        pass
-                                    break
-                        pos += len(needle)
-            return found
-
-        def _looks_like_model_entry(v):
-            if not isinstance(v, dict):
-                return False
-            ident = (
-                v.get("id") or v.get("publicName") or v.get("displayName")
-                or v.get("modelDisplayName") or v.get("label") or v.get("name")
-            )
-            if not isinstance(ident, str) or not ident.strip():
-                return False
-            return any(k in v for k in (
-                "publicName", "displayName", "modelDisplayName", "display_name",
-                "label", "title", "organization", "capabilities", "provider",
-                "modelOrganization", "access", "availability", "outputCapabilities"
-            )) or ("model" in str(v.get("type", "")).lower())
-
-        def _candidate_score(arr):
-            if not isinstance(arr, list) or not arr:
-                return 0
-            dicts = [x for x in arr if isinstance(x, dict)]
-            if not dicts:
-                return 0
-            good = sum(1 for x in dicts if _looks_like_model_entry(x))
-            # Weight both absolute size and model-entry density.
-            return good * 1000 + int((good / max(1, len(dicts))) * 100)
-
-        candidates = []
-
-        # Direct Python object from __next_f, recursively inspected.
-        def _walk(obj, depth=0):
-            if depth > 12:
-                return
-            if isinstance(obj, list):
-                if obj:
-                    candidates.append(("flight-object", obj))
-                for x in obj:
-                    _walk(x, depth + 1)
-            elif isinstance(obj, dict):
-                for k, v in obj.items():
-                    if k in ("initialModels", "models") and isinstance(v, list):
-                        candidates.append((f"flight-key:{k}", v))
-                    _walk(v, depth + 1)
-            elif isinstance(obj, str) and len(obj) > 80:
-                for arr in _balanced_arrays_after_key(obj):
-                    candidates.append(("flight-string", arr))
-                # Some Flight entries themselves contain JSON strings.
-                try:
-                    parsed = json.loads(obj)
-                except Exception:
-                    parsed = None
-                if parsed is not None and parsed is not obj:
-                    _walk(parsed, depth + 1)
-
-        _walk(flight_obj)
-
-        sources = [("html", body), ("html-unescaped", _model_html.unescape(body))]
-        for i, s in enumerate(script_texts or []):
-            sources.append((f"script-{i}", s))
-
-        for label, src in sources:
-            if not src:
-                continue
-            variants = [src]
-            if '\\"' in src:
-                variants.append(src.replace('\\"', '"').replace('\\\\', '\\'))
-            for variant in variants:
-                for arr in _balanced_arrays_after_key(variant):
-                    candidates.append((label, arr))
-
-        # Last-resort scan of JSON script blocks: recursively discover arrays
-        # containing model-shaped objects even if Arena renamed `initialModels`.
-        for i, s in enumerate(script_texts or []):
-            st = (s or "").strip()
-            if not st or st[0] not in "[{":
-                continue
+            # Always dump the raw, unfiltered payload so we can inspect the
+            # exact fields Arena sends for any given model (e.g. to figure
+            # out why an internal/test model like "gpt-5.4-no-system-prompt"
+            # isn't being caught by is_model_selectable()).
             try:
-                parsed = json.loads(st)
-            except Exception:
-                continue
-            def _collect_json(obj, depth=0):
-                if depth > 10:
-                    return
-                if isinstance(obj, list):
-                    if _candidate_score(obj):
-                        candidates.append((f"json-script-{i}", obj))
-                    for x in obj:
-                        _collect_json(x, depth+1)
-                elif isinstance(obj, dict):
-                    for v in obj.values():
-                        _collect_json(v, depth+1)
-            _collect_json(parsed)
+                atomic_write(MODELS_RAW_DEBUG_FILE, models_data)
+            except Exception as e:
+                log("WARN", f"Failed to write raw model debug dump: {e}")
 
-        candidates = [(label, arr) for label, arr in candidates if _candidate_score(arr) > 0]
-        candidates.sort(key=lambda item: _candidate_score(item[1]), reverse=True)
-
-        if not candidates:
-            log("WARN", f"[{worker.name}] Model refresh found no model-shaped arrays in Flight/HTML/scripts")
-            return []
-
-        source_label, models_data = candidates[0]
-        log("INFO", f"[{worker.name}] Model extractor selected {source_label} · raw entries {len(models_data)} · candidates {len(candidates)}")
-
-        try:
-            atomic_write(MODELS_RAW_DEBUG_FILE, models_data)
-        except Exception as e:
-            log("WARN", f"Failed to write raw model debug dump: {e}")
-
-        # Learn the names Arena actually renders in its model picker. Catalog
-        # `id` / `publicName` values are not guaranteed to be selectable UI
-        # strings (e.g. `glm-5.2` vs `glm-5.2 (max)`).
-        ui_labels = []
-        try:
-            async with worker._action_lock:
-                page = worker.page
-                trigger = await page.evaluate("""
-                () => {
-                  const vis = e => {
-                    if (!e) return false;
-                    const r=e.getBoundingClientRect(),s=getComputedStyle(e);
-                    return r.width>4 && r.height>4 && s.display!=='none' && s.visibility!=='hidden';
-                  };
-                  const txt=e=>(e.innerText||e.textContent||'').trim();
-                  const nodes=[...document.querySelectorAll('button,[role="button"]')].filter(vis);
-                  const scored=nodes.map((e,i)=>{
-                    const blob=((e.getAttribute('aria-label')||'')+' '+(e.getAttribute('data-testid')||'')+' '+txt(e)).toLowerCase();
-                    let score=0;
-                    if(/select model|choose model|model selector/.test(blob))score+=100;
-                    if(/\\bmodel\\b/.test(blob))score+=50;
-                    if(e.getAttribute('aria-haspopup'))score+=15;
-                    if(/^(max|auto|battle|side by side)$/i.test(txt(e)))score+=12;
-                    return {i,score};
-                  }).sort((a,b)=>b.score-a.score);
-                  return scored[0] && scored[0].score>=12 ? scored[0].i : -1;
-                }
-                """)
-                if isinstance(trigger, int) and trigger >= 0:
-                    buttons = page.locator('button,[role="button"]')
-                    if trigger < await buttons.count():
-                        await buttons.nth(trigger).click(timeout=3000)
-                        await page.wait_for_timeout(450)
-                        ui_labels = await page.evaluate("""
-                        () => {
-                          const vis=e=>{
-                            if(!e)return false;
-                            const r=e.getBoundingClientRect(),s=getComputedStyle(e);
-                            return r.width>4&&r.height>4&&s.display!=='none'&&s.visibility!=='hidden';
-                          };
-                          const clean=s=>(s||'').replace(/\\s+/g,' ').trim();
-                          const sels=[
-                            '[role="option"]','[role="menuitem"]','[role="menuitemradio"]',
-                            '[role="listbox"] button','[role="menu"] button',
-                            '[data-radix-popper-content-wrapper] button',
-                            '[data-radix-popper-content-wrapper] [role="option"]',
-                            '[data-radix-popper-content-wrapper] [role="menuitem"]'
-                          ];
-                          const out=[];
-                          for(const sel of sels){
-                            for(const e of document.querySelectorAll(sel)){
-                              if(!vis(e))continue;
-                              const t=clean(e.innerText||e.textContent);
-                              if(!t||t.length>140)continue;
-                              if(/^(search|close|cancel|manage|learn more)$/i.test(t))continue;
-                              if(!out.includes(t))out.push(t);
-                            }
-                          }
-                          return out.slice(0,1000);
-                        }
-                        """)
-                        try:
-                            await page.keyboard.press("Escape")
-                        except Exception:
-                            pass
-        except Exception as e:
-            log("WARN", f"[{worker.name}] Arena UI model-label scan skipped: {type(e).__name__}: {e}")
-
-        def _ui_key(s: str) -> str:
-            s = str(s or "").strip().lower()
-            s = re.sub(r"[^a-z0-9]+", " ", s)
-            return re.sub(r"\\s+", " ", s).strip()
-
-        def _base_ui_key(s: str) -> str:
-            # Parenthetical Arena tier suffixes such as "(max)" should not stop
-            # us matching the catalog slug to the visible picker label.
-            s = re.sub(r"\\s*\\([^)]*\\)\\s*$", "", str(s or "")).strip()
-            return _ui_key(s)
-
-        if ui_labels:
-            normalized_ui = [(label, _ui_key(label), _base_ui_key(label)) for label in ui_labels]
-            matched = 0
+            hidden = [m.get("publicName") or m.get("id") for m in models_data if not is_model_selectable(m)]
+            kept = [m.get("publicName") or m.get("id") for m in models_data if is_model_selectable(m)]
+            log("INFO", f"Model filter kept={len(kept)} hidden={len(hidden)} hidden_sample={hidden[:20]}")
+            
+            filtered = []
             for m in models_data:
-                if not isinstance(m, dict):
+                name = m.get("publicName") or m.get("id") or m.get("name")
+                if not name:
                     continue
-                aliases = []
-                for key in ("displayName","modelDisplayName","display_name","label","title","publicName","name","id"):
-                    value = str(m.get(key) or "").strip()
-                    if value and value not in aliases:
-                        aliases.append(value)
-                best = None
-                best_score = -1
-                for alias in aliases:
-                    ak, ab = _ui_key(alias), _base_ui_key(alias)
-                    if not ak:
-                        continue
-                    for label, lk, lb in normalized_ui:
-                        score = -1
-                        if ak == lk:
-                            score = 1000
-                        elif ab and ab == lb:
-                            score = 950
-                        elif lk.startswith(ak + " ") or ak.startswith(lk + " "):
-                            score = 800
-                        elif lb.startswith(ab + " ") or ab.startswith(lb + " "):
-                            score = 760
-                        if score > best_score:
-                            best_score, best = score, label
-                if best and best_score >= 760:
-                    m["uiName"] = best
-                    matched += 1
-            log("INFO", f"[{worker.name}] Arena UI model labels learned · visible={len(ui_labels)} · matched={matched}")
-        else:
-            log("WARN", f"[{worker.name}] Arena UI model-label scan found no visible picker entries")
-
-        filtered = []
-        hidden = []
-        for m in models_data:
-            if not isinstance(m, dict):
-                continue
-            name = model_name(m) or m.get("id") or m.get("name")
-            if not name:
-                continue
-            if not is_model_selectable(m):
-                hidden.append(name)
-                continue
-            caps = (m.get("capabilities") or {}).get("outputCapabilities") or m.get("outputCapabilities") or {}
-            if isinstance(caps, dict) and caps.get("text") is False:
-                hidden.append(name)
-                continue
-            filtered.append(m)
-
-        # De-duplicate by canonical name while preserving current catalog order.
-        deduped, seen = [], set()
-        for m in filtered:
-            n = model_name(m).strip()
-            if n and n not in seen:
-                seen.add(n)
-                deduped.append(m)
-
-        log("INFO", f"Model filter kept={len(deduped)} hidden={len(hidden)} hidden_sample={hidden[:20]}")
-
-        if not _valid_model_catalog(deduped):
-            log("WARN", f"Model extractor produced only {len(_catalog_names(deduped))} usable unique model(s); current catalog retained")
-            return []
-
-        before = set(_catalog_names(get_models()))
-        after = set(_catalog_names(deduped))
-        save_models(deduped)
-        added = sorted(after - before)
-        removed = sorted(before - after)
-        log("OK", f"Model catalog refreshed via worker ({len(after)} unique models · +{len(added)} / -{len(removed)})")
-        if added:
-            log("INFO", f"Model catalog added sample: {added[:20]}")
-        if removed:
-            log("INFO", f"Model catalog removed sample: {removed[:20]}")
-        return deduped
-
+                if not is_model_selectable(m):
+                    continue
+                caps = (m.get("capabilities") or {}).get("outputCapabilities") or m.get("outputCapabilities") or {}
+                if caps.get("text") is False:
+                    continue
+                filtered.append(m)
+            
+            if filtered:
+                save_models(filtered)
+                log("OK", f"Model catalog refreshed via worker ({len(filtered)} models)")
+                return filtered
+        log("WARN", "Could not find a balanced initialModels array in page/Flight source.")
     except Exception as e:
-        log("ERROR", f"Failed to refresh models: {type(e).__name__}: {e}")
-        return []
+        log("ERROR", f"Failed to refresh models: {e}")
+    return []
 
 def _session_secret() -> str:
     """Stable secret derived from dashboard password."""
@@ -3846,7 +3509,7 @@ async def refresh_model_catalog() -> dict:
             if s and s.running and s.page and not s.page.is_closed():
                 tried_any_worker = True
                 fetched_models = await refresh_models_via_worker(s)
-                if _valid_model_catalog(fetched_models):
+                if fetched_models and len(fetched_models) > 50:
                     break
     except Exception as e:
         def mark_fail_exc(s):
@@ -3854,14 +3517,14 @@ async def refresh_model_catalog() -> dict:
         mutate_state(mark_fail_exc)
         return {"ok": False, "models": get_models(), "reason": f"Refresh crashed: {type(e).__name__}: {e}"}
 
-    if _valid_model_catalog(fetched_models):
+    if fetched_models and len(fetched_models) > 50:
         def mark_done(s):
             s["last_refresh"] = time.time()
             s["refresh_started"] = 0
         mutate_state(mark_done)
         return {
             "ok": True, "models": fetched_models,
-            "reason": f"Refreshed successfully — {len(_catalog_names(fetched_models))} unique models loaded.",
+            "reason": f"Refreshed successfully — {len(fetched_models)} models loaded.",
         }
 
     def mark_fail(s):
@@ -3871,7 +3534,7 @@ async def refresh_model_catalog() -> dict:
     if not tried_any_worker:
         reason = "No live keeper session with an open browser page was available to fetch the catalog."
     else:
-        reason = "Fetched the page but could not extract a valid model catalog — existing models.json was preserved."
+        reason = "Fetched the page but couldn't extract a valid model list (regex/parse failure) — catalog left unchanged."
     return {"ok": False, "models": get_models(), "reason": reason}
 
 class BridgeHTTPError(Exception):
@@ -5416,6 +5079,8 @@ class KeeperSession:
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-software-rasterizer",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--window-size=1920,1080",
@@ -5445,7 +5110,7 @@ class KeeperSession:
                     # "--headless=new" ourselves as a raw arg. Visibly-headed keepers
                     # just skip that arg and get a normal window as before.
                     self._set_step(
-                        f"Launching persistent headed context with Bridgena v4 Extension"
+                        f"Launching persistent context with Captcha Extension"
                         f"{' (headless=new)' if self.headless else ''}..."
                     )
                     ext_args = common_args + [
@@ -5463,16 +5128,12 @@ class KeeperSession:
                         user_agent=self.user_agent or KEEPER_UA,  # persona-bound; cf_clearance is UA+IP-bound
                     )
                     if _pw_proxy:
-                        _local_proxy = dict(_pw_proxy)
-                        existing_bypass = str(_local_proxy.get("bypass") or "").strip()
-                        local_bypass = "localhost,127.0.0.1,[::1]"
-                        _local_proxy["bypass"] = ",".join(x for x in (existing_bypass, local_bypass) if x)
-                        _pc_kw["proxy"] = _local_proxy
+                        _pc_kw["proxy"] = _pw_proxy
                     self.context = await self.playwright.chromium.launch_persistent_context(**_pc_kw)
                     self.browser = None
                     self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
                     launched = True
-                    log("OK", f"[{self.name}] Bridgena v4 extension loaded from {ext_path}"
+                    log("OK", f"[{self.name}] Captcha extension loaded from {ext_path}"
                               f"{' in new-headless mode' if self.headless else ' (headed window)'}")
                 else:
                     if ext_path:
@@ -5714,6 +5375,7 @@ class KeeperSession:
         self.page = None
         self.status = "stopped"
         self._set_step("Keeper stopped")
+        log("INFO", f"[{self.name}] Keeper stopped")
 
     async def restart(self):
         self.last_restart = time.time()
@@ -5827,18 +5489,10 @@ class SessionKeeper:
         for jid, jar in wanted.items():
             s = self.sessions.get(jid)
             if s is None:
-                _v4_headed = bool(globals().get("V4_TRANSPORT") == "extension"
-                                  and globals().get("V4_AUTO_ATTACH_KEEPERS", False))
-                s = KeeperSession(jar, headless=False if _v4_headed else jar.get("keeper_headless", None))
+                s = KeeperSession(jar, headless=jar.get("keeper_headless", None))
                 self.sessions[jid] = s
                 self._spawn(s.start(), f"start:{jid[:8]}")
             else:
-                if (globals().get("V4_TRANSPORT") == "extension"
-                        and globals().get("V4_AUTO_ATTACH_KEEPERS", False)
-                        and s.headless):
-                    log("INFO", f"[{s.name}] v4 extension transport requires headed keeper · restarting visible")
-                    s.headless = False
-                    self._spawn(s.restart(), f"v4-headed:{jid[:8]}")
                 if (s.email != (jar.get("email") or "") or s.password != (jar.get("password") or "")
                         or s.login_method != (jar.get("login_method") or "email")):
                     s.email = jar.get("email") or ""
@@ -10654,31 +10308,16 @@ def models_page(models: list, blocked: list) -> str:
     rows = "".join(_row(m) for m in models[:400])
     return page("Models", '<div class="pagehead"><div><h1>Model Catalog</h1><p>' + str(len(models)) +
                 " known · " + str(len(blocked)) + ' blocked on this account set</p></div>' +
-                """<div class="row"><button class="btn" id="refreshModels" onclick="refreshModelsNow()">↻ Refresh</button></div></div>
+                """<div class="row"><button class="btn" onclick="fetch('/keeper/config',{method:'POST'}).then(()=>toast('refresh queued'))">↻ Refresh</button></div></div>
 <div class="card"><input id="q" placeholder="filter…" oninput="flt()" style="margin-bottom:12px">
 <table><thead><tr><th>name</th><th>arena id</th><th>state</th><th></th></tr></thead><tbody id="tb">""" +
                 rows + """</tbody></table></div>""", active="models", raw_js="""
 function flt(){var q=document.getElementById('q').value.toLowerCase();
-document.querySelectorAll('#tb tr').forEach(r=>{r.style.display=r.textContent.toLowerCase().includes(q)?'':'none'})}
-async function refreshModelsNow(){
- const b=document.getElementById('refreshModels'); b.disabled=true; b.textContent='Refreshing…';
- try{
-   const r=await fetch('/models/refresh',{method:'POST',headers:{'Accept':'application/json'}});
-   const j=await r.json();
-   if(!r.ok || !j.ok) throw new Error(j.reason||('HTTP '+r.status));
-   if(typeof toast==='function') toast(j.reason||'Model catalog refreshed');
-   setTimeout(()=>location.reload(),250);
- }catch(e){
-   b.disabled=false; b.textContent='↻ Refresh';
-   if(typeof toast==='function') toast('Refresh failed: '+(e.message||e)); else alert('Refresh failed: '+(e.message||e));
- }
-}""")
+document.querySelectorAll('#tb tr').forEach(r=>{r.style.display=r.textContent.toLowerCase().includes(q)?'':'none'})}""")
 
 
 def _legacy_chat_page(models: list, default_model: str) -> str:
-    public_names = [model_name(m) for m in models if model_name(m)]
-    public_default = canonical_public_model_name(default_model)
-    opts = "".join(f'<option value="{esc(n)}"{" selected" if n==public_default else ""}>{esc(n)}</option>' for n in public_names[:300]) or '<option>auto</option>'
+    opts = "".join(f'<option value="{esc(m["name"])}"{" selected" if m["name"]==default_model else ""}>{esc(m["name"])}</option>' for m in models[:300]) or '<option>gpt-4.1</option>'
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bridgena · Live Chat</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -10748,10 +10387,9 @@ def chat_page(models: list, default_model: str) -> str:
     than a React build; the visual tokens and interaction model match the
     shadcn/Vercel family without adding a fragile CDN/runtime dependency.
     """
-    names = [model_name(m) for m in models if model_name(m)]
+    names = [m.get("name", "") for m in models if m.get("name")]
     payload = _json.dumps(names, ensure_ascii=False).replace("</", "<\\/")
-    selected_name = canonical_public_model_name(default_model or (names[0] if names else "auto"))
-    selected = _json.dumps(selected_name, ensure_ascii=False)
+    selected = _json.dumps(default_model or (names[0] if names else "auto"), ensure_ascii=False)
     template = r'''<!doctype html><html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bridgena</title>
 <style>
@@ -10914,7 +10552,7 @@ from fastapi.responses import FileResponse
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
 from fastapi.security import APIKeyHeader
 
-app = FastAPI(title="Bridgena", version="4.0.0")
+app = FastAPI(title="Bridgena", version="3.2.4")
 
 # ---------- v3 optional VNC integration ----------
 _V3_VNC_PROCS=[]
@@ -11163,11 +10801,8 @@ def _register_private_error(*, status_code: int, detail: Any, source: str,
     with _error_events_lock:
         _error_events.append(row)
     _persist_error_event(row)
-    context_preview = redact(str(safe_context))[:900] if safe_context else ""
     log("WARN", f"Customer error {error_id} · HTTP {row['status']} · {row['source']} · "
-                f"{row['method']} {row['path']} · exception={row['exception_type'] or '-'} · "
-                f"internal: {safe_detail[:900]}" +
-                (f" · context={context_preview}" if context_preview else ""))
+                f"{row['method']} {row['path']} · internal: {safe_detail[:260]}")
     return error_id, _public_error_phrase(error_id, row["status"])
 
 
@@ -11619,6 +11254,424 @@ def _openai_system_context(body: dict) -> str:
     return "\n\n".join(parts)
 
 
+def _tool_openai_defs(body: dict) -> list:
+    out = []
+    for raw in body.get("tools") or []:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("type") not in (None, "function"):
+            continue
+        fn = raw.get("function") if isinstance(raw.get("function"), dict) else raw
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "description": str(fn.get("description") or "")[:6000],
+            "parameters": fn.get("parameters") if isinstance(fn.get("parameters"), dict) else
+                          (fn.get("input_schema") if isinstance(fn.get("input_schema"), dict) else
+                           {"type": "object", "properties": {}}),
+        })
+    return out
+
+
+def _tool_anthropic_defs(body: dict) -> list:
+    out = []
+    for raw in body.get("tools") or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "description": str(raw.get("description") or "")[:6000],
+            "parameters": raw.get("input_schema") if isinstance(raw.get("input_schema"), dict) else
+                          (raw.get("parameters") if isinstance(raw.get("parameters"), dict) else
+                           {"type": "object", "properties": {}}),
+        })
+    return out
+
+
+def _openai_has_tool_context(body: dict) -> bool:
+    if _tool_openai_defs(body):
+        return True
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "").lower() in {"tool", "function"}:
+            return True
+        if message.get("tool_calls") or message.get("function_call"):
+            return True
+    return False
+
+
+def _anthropic_has_tool_context(body: dict) -> bool:
+    if _tool_anthropic_defs(body):
+        return True
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in {"tool_use", "tool_result"}:
+                return True
+    return False
+
+
+def _tool_choice_text(body: dict, protocol: str) -> str:
+    choice = body.get("tool_choice")
+    if choice is None:
+        return "auto"
+    if isinstance(choice, str):
+        return choice
+    if not isinstance(choice, dict):
+        return "auto"
+    if protocol == "anthropic":
+        kind = str(choice.get("type") or "auto")
+        if kind == "tool":
+            name = str(choice.get("name") or "").strip()
+            return f"required tool: {name}" if name else "required"
+        if kind == "any":
+            return "required"
+        return kind
+    kind = str(choice.get("type") or "")
+    fn = choice.get("function") if isinstance(choice.get("function"), dict) else {}
+    if kind == "function":
+        name = str(fn.get("name") or "").strip()
+        return f"required tool: {name}" if name else "required"
+    return kind or "auto"
+
+
+def _tool_protocol_system(body: dict, protocol: str) -> str:
+    defs = _tool_anthropic_defs(body) if protocol == "anthropic" else _tool_openai_defs(body)
+    if not defs:
+        return ""
+    encoded = json.dumps(defs, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded) > 30000:
+        encoded = encoded[:30000] + "…"
+    choice = _tool_choice_text(body, protocol)
+    parallel = bool(body.get("parallel_tool_calls", True))
+    return (
+        "You are operating inside a tool-capable API client. Tool execution is performed "
+        "by the client, not by you. Never claim that you executed a tool yourself.\\n\\n"
+        "AVAILABLE TOOLS (JSON):\\n" + encoded + "\\n\\n"
+        "TOOL CHOICE: " + choice + "\\n"
+        "PARALLEL TOOL CALLS: " + ("allowed" if parallel else "one call only") + "\\n\\n"
+        "When a tool is needed, output ONLY this exact machine-readable envelope, "
+        "with no markdown fence and no prose before or after it:\\n"
+        "<<<BRIDGENA_TOOL_CALLS_V1>>>"
+        '{"tool_calls":[{"name":"EXACT_TOOL_NAME","arguments":{}}]}'
+        "<<<END_BRIDGENA_TOOL_CALLS_V1>>>\\n"
+        "Arguments MUST be valid JSON and MUST follow the selected tool schema. "
+        "You may include multiple calls in tool_calls only when parallel calls are allowed. "
+        "If TOOL CHOICE is none, do not call a tool. If it is required, or names a required "
+        "tool, you must return a valid tool envelope instead of a normal answer. "
+        "After the client provides a Tool Result, continue from that result: either call "
+        "another tool with the same envelope or return the final normal-text answer."
+    )
+
+
+def _tool_runtime_system_context(body: dict, protocol: str) -> str:
+    parts = []
+    if protocol == "anthropic":
+        base = _anthropic_system_context(body)
+        if base:
+            parts.append(base)
+    else:
+        base = _openai_system_context(body)
+        if base:
+            parts.append(base)
+        for message in body.get("messages") or []:
+            if not isinstance(message, dict) or str(message.get("role") or "").lower() != "developer":
+                continue
+            value = _openai_text_content(message.get("content", "")).strip()
+            if value and value not in parts:
+                parts.append(value)
+    tool_system = _tool_protocol_system(body, protocol)
+    if tool_system:
+        parts.append(tool_system)
+    return "\\n\\n".join(parts)
+
+
+def _tool_json_string(value) -> str:
+    if value is None:
+        return "{}"
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return "{}"
+        try:
+            parsed = json.loads(raw)
+            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            return raw
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return "{}"
+
+
+def _render_openai_tool_message(message: dict) -> str:
+    role = str(message.get("role") or "").strip().lower()
+    content = _openai_text_content(message.get("content", "")).strip()
+    if role in {"system", "developer"}:
+        return ""
+    if role == "assistant":
+        rows = []
+        if content:
+            rows.append("Assistant:\\n" + content)
+        calls = message.get("tool_calls") or []
+        if isinstance(calls, list):
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") if isinstance(call.get("function"), dict) else call
+                name = str(fn.get("name") or "").strip()
+                if not name:
+                    continue
+                cid = str(call.get("id") or "").strip()
+                args = _tool_json_string(fn.get("arguments"))
+                prefix = "Assistant Tool Call" + (f" (id={cid})" if cid else "") + ":\\n"
+                rows.append(prefix + '{"name":' + json.dumps(name, ensure_ascii=False)
+                            + ',"arguments":' + args + '}')
+        legacy = message.get("function_call")
+        if isinstance(legacy, dict) and legacy.get("name"):
+            rows.append(
+                "Assistant Tool Call:\\n"
+                + json.dumps({
+                    "name": str(legacy.get("name")),
+                    "arguments": legacy.get("arguments") or {},
+                }, ensure_ascii=False)
+            )
+        return "\\n\\n".join(rows)
+    if role in {"tool", "function"}:
+        cid = str(message.get("tool_call_id") or "").strip()
+        name = str(message.get("name") or "").strip()
+        meta = ", ".join(x for x in [
+            f"id={cid}" if cid else "",
+            f"name={name}" if name else "",
+        ] if x)
+        return f"Tool Result{' (' + meta + ')' if meta else ''}:\\n{content}"
+    label = "User" if role == "user" else (role.title() or "Message")
+    return f"{label}:\\n{content}" if content else ""
+
+
+def _render_anthropic_tool_messages(body: dict) -> list:
+    rows = []
+    known_calls = {}
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else [{"type": "text", "text": _openai_text_content(content)}]
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            typ = str(block.get("type") or "text")
+            if typ == "text":
+                value = str(block.get("text") or "").strip()
+                if value:
+                    label = "Assistant" if role == "assistant" else "User"
+                    rows.append(f"{label}:\\n{value}")
+            elif typ == "tool_use":
+                cid = str(block.get("id") or "").strip()
+                name = str(block.get("name") or "").strip()
+                if cid:
+                    known_calls[cid] = name
+                rows.append(
+                    "Assistant Tool Call"
+                    + (f" (id={cid})" if cid else "")
+                    + ":\\n"
+                    + json.dumps({
+                        "name": name,
+                        "arguments": block.get("input") if isinstance(block.get("input"), (dict, list)) else {},
+                    }, ensure_ascii=False)
+                )
+            elif typ == "tool_result":
+                cid = str(block.get("tool_use_id") or "").strip()
+                name = known_calls.get(cid, "")
+                result = block.get("content")
+                if isinstance(result, list):
+                    result_text = _openai_text_content(result)
+                elif isinstance(result, str):
+                    result_text = result
+                else:
+                    result_text = json.dumps(result, ensure_ascii=False) if result is not None else ""
+                suffix = ""
+                if cid:
+                    suffix = f" (id={cid}" + (f", name={name}" if name else "") + ")"
+                rows.append("Tool Result" + suffix + ":\\n" + result_text)
+    return rows
+
+
+def _bounded_tool_transcript(rows: list) -> str:
+    rows = [str(row).strip() for row in rows if str(row).strip()]
+    instruction = (
+        "Continue the conversation below. Tool calls and tool results are part of the "
+        "same client-side agent loop. Do not repeat a completed tool call unless the "
+        "new result makes another call necessary.\\n\\n"
+        "--- BEGIN CONVERSATION ---\\n"
+    )
+    suffix = "\\n--- END CONVERSATION ---\\n\\nContinue from the final conversation event."
+    budget = max(1000, MAX_PROMPT - len(instruction) - len(suffix))
+    kept = []
+    used = 0
+    omitted = 0
+    for row in reversed(rows):
+        cost = len(row) + 2
+        if used + cost <= budget:
+            kept.append(row)
+            used += cost
+        else:
+            omitted += 1
+    kept.reverse()
+    if omitted:
+        kept.insert(0, f"[{omitted} older event(s) omitted to fit the context budget.]")
+    return (instruction + "\\n\\n".join(kept) + suffix)[:MAX_PROMPT]
+
+
+def _openai_tool_prompt(body: dict) -> str:
+    rows = []
+    for message in body.get("messages") or []:
+        if isinstance(message, dict):
+            rendered = _render_openai_tool_message(message)
+            if rendered:
+                rows.append(rendered)
+    return _bounded_tool_transcript(rows) if rows else ""
+
+
+def _anthropic_tool_prompt(body: dict) -> str:
+    rows = _render_anthropic_tool_messages(body)
+    return _bounded_tool_transcript(rows) if rows else ""
+
+
+def _allowed_tool_names(body: dict, protocol: str) -> set:
+    defs = _tool_anthropic_defs(body) if protocol == "anthropic" else _tool_openai_defs(body)
+    return {str(item.get("name") or "") for item in defs if item.get("name")}
+
+
+def _normalize_parsed_tool_calls(value, body: dict, protocol: str) -> list:
+    allowed = _allowed_tool_names(body, protocol)
+    if not allowed:
+        return []
+    if isinstance(value, dict):
+        calls = value.get("tool_calls")
+        if calls is None and isinstance(value.get("tool_call"), dict):
+            calls = [value.get("tool_call")]
+        if calls is None and value.get("name"):
+            calls = [value]
+    elif isinstance(value, list):
+        calls = value
+    else:
+        calls = None
+    if not isinstance(calls, list):
+        return []
+
+    out = []
+    for raw in calls[:16]:
+        if not isinstance(raw, dict):
+            continue
+        fn = raw.get("function") if isinstance(raw.get("function"), dict) else raw
+        name = str(fn.get("name") or raw.get("name") or "").strip()
+        if name not in allowed:
+            continue
+        args = fn.get("arguments")
+        if args is None:
+            args = fn.get("input")
+        if isinstance(args, str):
+            try:
+                parsed_args = json.loads(args)
+            except Exception:
+                continue
+        elif args is None:
+            parsed_args = {}
+        else:
+            parsed_args = args
+        if not isinstance(parsed_args, dict):
+            continue
+        out.append({
+            "id": str(raw.get("id") or ""),
+            "name": name,
+            "arguments": parsed_args,
+        })
+        if body.get("parallel_tool_calls") is False:
+            break
+    return out
+
+
+def _extract_tool_calls(text: str, body: dict, protocol: str) -> list:
+    if not isinstance(text, str) or not text.strip():
+        return []
+    begin = "<<<BRIDGENA_TOOL_CALLS_V1>>>"
+    end = "<<<END_BRIDGENA_TOOL_CALLS_V1>>>"
+    candidates = []
+
+    start = text.find(begin)
+    if start >= 0:
+        stop = text.find(end, start + len(begin))
+        if stop > start:
+            candidates.append(text[start + len(begin):stop].strip())
+
+    for match in re.finditer(r"```(?:json)?\\s*(\\{.*?\\})\\s*```", text, re.I | re.S):
+        candidates.append(match.group(1).strip())
+
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        candidates.append(stripped)
+
+    for raw in candidates:
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        calls = _normalize_parsed_tool_calls(parsed, body, protocol)
+        if calls:
+            return calls
+    return []
+
+
+def _openai_tool_calls_payload(calls: list) -> list:
+    out = []
+    for call in calls:
+        cid = str(call.get("id") or "").strip()
+        if not cid.startswith("call_"):
+            cid = "call_" + uuid7().replace("-", "")[:24]
+        out.append({
+            "id": cid,
+            "type": "function",
+            "function": {
+                "name": call["name"],
+                "arguments": json.dumps(call.get("arguments") or {}, ensure_ascii=False, separators=(",", ":")),
+            },
+        })
+    return out
+
+
+def _anthropic_tool_calls_payload(calls: list) -> list:
+    out = []
+    for call in calls:
+        cid = str(call.get("id") or "").strip()
+        if not cid.startswith("toolu_"):
+            cid = "toolu_" + uuid7().replace("-", "")[:24]
+        out.append({
+            "type": "tool_use",
+            "id": cid,
+            "name": call["name"],
+            "input": call.get("arguments") or {},
+        })
+    return out
+
+
+def _tool_output_log(protocol: str, model: str, calls: list, text: str) -> None:
+    names = ",".join(str(c.get("name") or "") for c in calls[:8]) or "-"
+    log("INFO", f"{protocol} agent turn · model {str(model)[:80]} · "
+                f"tool_calls {len(calls)} [{names}] · buffered {len(text)} chars")
+
+
 def _disposable_context_prompt(body: dict) -> str:
     """Build a bounded, non-recursive transcript for one disposable Arena evaluation.
 
@@ -11669,12 +11722,6 @@ def _disposable_context_prompt(body: dict) -> str:
         }.get(role, role.title() or "Message")
         rows.append(f"{label}:\n{value}")
 
-    # A genuinely new conversation should enter Arena exactly as the user's
-    # newest turn. The history capsule is only needed when we are rebuilding an
-    # existing client transcript into a fresh Arena conversation.
-    if not rows:
-        return newest[-MAX_PROMPT:]
-
     prefix = (
         "Previous messages from this same conversation are provided below. "
         "Use them only as conversation history and continue naturally. "
@@ -11721,10 +11768,14 @@ def _disposable_context_prompt(body: dict) -> str:
 
 
 def _format_conversation_prompt(body: dict) -> str:
+    if _openai_has_tool_context(body):
+        return _openai_tool_prompt(body)
     return _disposable_context_prompt(body)
 
 
 def _anthropic_prompt(body: dict) -> str:
+    if _anthropic_has_tool_context(body):
+        return _anthropic_tool_prompt(body)
     return _disposable_context_prompt(body)
 
 
@@ -11783,16 +11834,6 @@ def _tenant_identity(keyinfo: Optional[dict]) -> str:
 def _first_user_text(body: dict) -> str:
     for message in body.get("messages") or []:
         if isinstance(message, dict) and message.get("role") == "user":
-            value = _openai_text_content(message.get("content", "")).strip()
-            if value:
-                return value
-    return ""
-
-
-def _latest_user_text(body: dict) -> str:
-    """Newest user turn only, for an already-bound Arena conversation."""
-    for message in reversed(body.get("messages") or []):
-        if isinstance(message, dict) and str(message.get("role") or "").lower() == "user":
             value = _openai_text_content(message.get("content", "")).strip()
             if value:
                 return value
@@ -11887,2496 +11928,179 @@ def _release_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> No
         _duplicate_notices.pop(fp, None)
 
 
-
-# ============================================================================
-# Bridgena v4 browser-extension transport
-# ============================================================================
-# The headed browser owns Arena UI interaction and response rendering. Python
-# owns API compatibility, scheduling and SSE translation. The extension never
-# needs to understand provider-specific private stream frames.
-V4_TRANSPORT = os.environ.get("BRIDGENA_V4_TRANSPORT", "extension").strip().lower()
-V4_FALLBACK_LEGACY = os.environ.get("BRIDGENA_V4_FALLBACK_LEGACY", "0").strip().lower() in {"1","true","yes","on"}
-# v4.3: keep the loopback extension credential stable across process restarts.
-# An operator-provided token still wins. Otherwise a private local token file is
-# created once and reused, avoiding reconnect storms from still-running headed
-# browser profiles after a control-plane restart.
-import secrets as _v4_secrets
-V4_EXTENSION_TOKEN_FILE = os.environ.get(
-    "BRIDGENA_V4_EXTENSION_TOKEN_FILE",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bridgena-v4-extension-token"),
-).strip()
-
-def _v4_load_or_create_extension_token() -> tuple[str, str]:
-    configured = os.environ.get("BRIDGENA_V4_EXTENSION_TOKEN", "").strip()
-    if configured:
-        return configured, "configured"
+async def _openai_tool_nonstream(body: dict, keyinfo: dict):
+    prompt = _format_conversation_prompt(body)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="no conversation content")
+    model = body.get("model", "auto")
+    chat_id = _disposable_chat_id("api-tool")
+    acc = ""
+    reasoning_acc = ""
     try:
-        if V4_EXTENSION_TOKEN_FILE and os.path.isfile(V4_EXTENSION_TOKEN_FILE):
-            with open(V4_EXTENSION_TOKEN_FILE, "r", encoding="utf-8") as fh:
-                existing = fh.read().strip()
-            if len(existing) >= 24:
-                return existing, "persistent-local"
-    except Exception as exc:
-        log("WARN", f"v4 extension token read failed · {type(exc).__name__}: {redact(str(exc))[:180]}")
-    token = _v4_secrets.token_urlsafe(32)
-    if V4_EXTENSION_TOKEN_FILE:
+        async for kind, payload in run_turn(
+            chat_id, prompt, model,
+            attachments=body.get("attachments"),
+            system_prompt=_tool_runtime_system_context(body, "openai"),
+            tenant_id=_tenant_identity(keyinfo),
+            handoff_prompt=prompt,
+        ):
+            if kind == "content" and isinstance(payload, str):
+                acc += payload
+            elif kind == "reasoning" and isinstance(payload, str):
+                reasoning_acc += payload
+            elif kind == "error":
+                raise HTTPException(status_code=502, detail=payload)
+
+        parsed = _extract_tool_calls(acc, body, "openai")
+        calls = _openai_tool_calls_payload(parsed)
+        _tool_output_log("OpenAI", model, parsed, acc)
+        message = {"role": "assistant", "content": None if calls else acc}
+        finish = "stop"
+        if calls:
+            message["tool_calls"] = calls
+            finish = "tool_calls"
+        if reasoning_acc:
+            message["reasoning_content"] = reasoning_acc
+        return JSONResponse({
+            "id": "chatcmpl-" + uuid7()[:23],
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+            "usage": {
+                "prompt_tokens": _rough_tokens(prompt),
+                "completion_tokens": _rough_tokens(acc),
+                "total_tokens": _rough_tokens(prompt) + _rough_tokens(acc),
+            },
+        })
+    finally:
+        _release_api_request(body, keyinfo, prompt)
+
+
+async def _openai_tool_stream(body: dict, keyinfo: dict):
+    prompt = _format_conversation_prompt(body)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="no conversation content")
+    model = body.get("model", "auto")
+    chat_id = _disposable_chat_id("api-tool")
+    created = int(time.time())
+    rid = "chatcmpl-" + uuid7()[:23]
+    include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+
+    def chunk(delta, finish=None):
+        return _sse({
+            "id": rid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        })
+
+    async def gen():
+        acc = ""
+        reasoning_acc = ""
+        terminal_sent = False
+        outcome = "complete"
         try:
-            parent = os.path.dirname(os.path.abspath(V4_EXTENSION_TOKEN_FILE))
-            os.makedirs(parent, exist_ok=True)
-            tmp = V4_EXTENSION_TOKEN_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(token + "\n")
-            try:
-                os.chmod(tmp, 0o600)
-            except Exception:
-                pass
-            os.replace(tmp, V4_EXTENSION_TOKEN_FILE)
-            return token, "persistent-local"
-        except Exception as exc:
-            log("WARN", f"v4 extension token persist failed · {type(exc).__name__}: {redact(str(exc))[:180]}")
-    return token, "ephemeral-fallback"
-
-V4_EXTENSION_TOKEN, V4_EXTENSION_TOKEN_MODE = _v4_load_or_create_extension_token()
-V4_FIRST_TOKEN_SEC = max(5.0, min(180.0, float(os.environ.get("BRIDGENA_V4_FIRST_TOKEN_SEC", "45"))))
-V4_IDLE_STREAM_SEC = max(5.0, min(180.0, float(os.environ.get("BRIDGENA_V4_IDLE_STREAM_SEC", "30"))))
-V4_JOB_MAX_SEC = max(30.0, min(900.0, float(os.environ.get("BRIDGENA_V4_JOB_MAX_SEC", "300"))))
-V4_AUTOLAUNCH = os.environ.get("BRIDGENA_V4_AUTOLAUNCH", "0").strip().lower() in {"1","true","yes","on"}
-V4_AUTO_ATTACH_KEEPERS = os.environ.get("BRIDGENA_V4_AUTO_ATTACH_KEEPERS", "1").strip().lower() in {"1","true","yes","on"}
-V4_CHROME_BIN = os.environ.get("BRIDGENA_V4_CHROME_BIN", "").strip()
-V4_PROFILE_DIR = os.environ.get("BRIDGENA_V4_PROFILE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser-profile"))
-
-# V4_EXTENSION_SOURCE_DIR is the operator/bundled template. Chromium is loaded
-# from V4_EXTENSION_DIR, a build-specific copy. Unpacked Chrome extension state
-# is cached by profile + extension identity; using a build-isolated directory
-# makes stale service-worker/content-script execution impossible after upgrades.
-V4_EXTENSION_BUILD = "4.3.2"
-V4_EXTENSION_SOURCE_DIR = os.environ.get(
-    "BRIDGENA_V4_EXTENSION_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension"),
-)
-V4_EXTENSION_DIR = os.environ.get(
-    "BRIDGENA_V4_RUNTIME_EXTENSION_DIR",
-    os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        f".bridgena-extension-v{V4_EXTENSION_BUILD}",
-    ),
-)
-V4_BROWSER_PROXY = os.environ.get("BRIDGENA_V4_BROWSER_PROXY", "").strip()
-
-# v4.2: logical API conversations stay attached to their real Arena chat.
-# Only opaque ids, worker ids and Arena URLs are persisted -- never prompt text.
-V4_SESSION_TTL_SEC = max(300.0, min(7*24*3600.0, float(os.environ.get("BRIDGENA_V4_SESSION_TTL_SEC", "21600"))))
-V4_SESSION_MAX = max(32, min(10000, int(os.environ.get("BRIDGENA_V4_SESSION_MAX", "2000"))))
-V4_SESSION_FILE = os.environ.get(
-    "BRIDGENA_V4_SESSION_FILE",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "v4_sessions.json"),
-)
-_v4_sessions: Dict[str, dict] = {}
-_v4_sessions_guard = threading.Lock()
-
-def _v4_sessions_load() -> None:
-    try:
-        if not os.path.isfile(V4_SESSION_FILE):
-            return
-        with open(V4_SESSION_FILE, "r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-        now = time.time()
-        if isinstance(raw, dict):
-            with _v4_sessions_guard:
-                for cid, item in raw.items():
-                    if not isinstance(item, dict):
-                        continue
-                    updated = float(item.get("updated") or 0)
-                    if updated and now - updated <= V4_SESSION_TTL_SEC:
-                        _v4_sessions[str(cid)] = {
-                            "worker_id": str(item.get("worker_id") or ""),
-                            "url": str(item.get("url") or ""),
-                            "model": str(item.get("model") or "auto"),
-                            "extension_build": str(item.get("extension_build") or ""),
-                            "updated": updated,
-                        }
-        if _v4_sessions:
-            log("INFO", f"v4 sticky sessions restored · {len(_v4_sessions)} binding(s)")
-    except Exception as exc:
-        log("WARN", f"v4 sticky session restore skipped: {type(exc).__name__}: {redact(str(exc))[:140]}")
-
-def _v4_sessions_persist_locked() -> None:
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(V4_SESSION_FILE)), exist_ok=True)
-        tmp = V4_SESSION_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(_v4_sessions, fh, ensure_ascii=False, indent=2)
-            fh.write("\n")
-        os.replace(tmp, V4_SESSION_FILE)
-    except Exception as exc:
-        log("WARN", f"v4 sticky session persist skipped: {type(exc).__name__}: {redact(str(exc))[:140]}")
-
-def _v4_session_get(chat_id: str, model: str) -> Optional[dict]:
-    now = time.time()
-    key = str(chat_id)
-    with _v4_sessions_guard:
-        item = _v4_sessions.get(key)
-        if not item:
-            return None
-        expired = now - float(item.get("updated") or 0) > V4_SESSION_TTL_SEC
-        mismatch = str(item.get("model") or "auto") != str(model or "auto")
-        extension_mismatch = str(item.get("extension_build") or "") != V4_EXTENSION_BUILD
-        if expired or mismatch or extension_mismatch:
-            _v4_sessions.pop(key, None)
-            _v4_sessions_persist_locked()
-            return None
-        return dict(item)
-
-def _v4_session_bind(chat_id: str, worker_id: str, url: str, model: str) -> None:
-    key = str(chat_id)
-    if not key or not worker_id:
-        return
-    safe_url = str(url or "")
-    if safe_url and not (safe_url.startswith("https://arena.ai/") or safe_url.startswith("https://www.arena.ai/")):
-        safe_url = ""
-    with _v4_sessions_guard:
-        _v4_sessions[key] = {
-            "worker_id": str(worker_id),
-            "url": safe_url,
-            "model": str(model or "auto"),
-            "extension_build": V4_EXTENSION_BUILD,
-            "updated": time.time(),
-        }
-        if len(_v4_sessions) > V4_SESSION_MAX:
-            victims = sorted(_v4_sessions.items(), key=lambda kv: float(kv[1].get("updated") or 0))
-            for old_key, _ in victims[:len(_v4_sessions)-V4_SESSION_MAX]:
-                _v4_sessions.pop(old_key, None)
-        _v4_sessions_persist_locked()
-
-def _v4_session_drop(chat_id: str, reason: str = "") -> None:
-    key = str(chat_id)
-    removed = None
-    with _v4_sessions_guard:
-        removed = _v4_sessions.pop(key, None)
-        if removed is not None:
-            _v4_sessions_persist_locked()
-    if removed is not None:
-        log("INFO", f"v4 sticky session released · {key[:18]}…" + (f" · {reason}" if reason else ""))
-
-_v4_sessions_load()
-
-# v4.1.4: the authenticated keeper fleet *is* the headed extension worker fleet.
-# Force the bundled extension path before any bootstrap work. A bootstrap
-# preparation error must never resurrect a stale legacy extension path.
-def _v4_prepare_bundled_extension():
-    manifest_path=os.path.join(V4_EXTENSION_DIR, "manifest.json")
-    sw_path=os.path.join(V4_EXTENSION_DIR, "service-worker.js")
-
-    try:
-        source_manifest=os.path.join(V4_EXTENSION_SOURCE_DIR, "manifest.json")
-        if os.path.abspath(V4_EXTENSION_SOURCE_DIR) != os.path.abspath(V4_EXTENSION_DIR):
-            if not os.path.isfile(source_manifest):
-                log("WARN", f"v4 bundled extension template missing: {V4_EXTENSION_SOURCE_DIR}")
-                return False
-            os.makedirs(V4_EXTENSION_DIR, exist_ok=True)
-            # Copy static assets/options on every bootstrap. Generated worker and
-            # content-script files are overwritten below.
-            for entry in os.listdir(V4_EXTENSION_SOURCE_DIR):
-                src=os.path.join(V4_EXTENSION_SOURCE_DIR, entry)
-                out=os.path.join(V4_EXTENSION_DIR, entry)
-                if os.path.isdir(src):
-                    shutil.copytree(src, out, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(src, out)
-
-        if not os.path.isfile(manifest_path):
-            log("WARN", f"v4 runtime extension manifest missing: {V4_EXTENSION_DIR}")
-            return False
-
-        with open(manifest_path, "r", encoding="utf-8") as fh:
-            manifest=json.load(fh)
-        hp=list(manifest.get("host_permissions") or [])
-        for pat in ("https://arena.ai/*", "https://*.arena.ai/*",
-                    "http://127.0.0.1/*", "http://localhost/*"):
-            if pat not in hp:
-                hp.append(pat)
-        manifest["host_permissions"]=hp
-        perms=list(manifest.get("permissions") or [])
-        if "debugger" not in perms:
-            perms.append("debugger")
-        manifest["permissions"]=perms
-        manifest["version"]="4.3.2"
-        with open(manifest_path, "w", encoding="utf-8") as fh:
-            json.dump(manifest, fh, indent=2)
-            fh.write("\n")
-
-        ws_url=os.environ.get(
-            "BRIDGENA_V4_EXTENSION_WS_URL",
-            f"ws://127.0.0.1:{PORT}/v4/extension/ws"
-        ).strip()
-
-        sw_template = r"""const BOOT = __BOOT__;
-let ws=null,reconnectTimer=null,pingTimer=null,currentRequest=null;
-let pendingJob=null,pendingTabId=null,currentPhase="",lastDispatchAt=0;
-
-async function dispatchJob(tab,job,reason="server"){
-  if(!tab?.id||!job)return false;
-  pendingTabId=tab.id;
-  lastDispatchAt=Date.now();
-  send({
-    type:"trace",request_id:job.request_id,
-    stage:"sw-dispatch",reason,tab_id:tab.id,expected_build:BOOT.build
-  });
-  try{
-    let probe=null;
-    try{
-      probe=await chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_VERSION_PROBE"});
-    }catch(e){
-      send({
-        type:"trace",request_id:job.request_id,
-        stage:"content-build-probe-failed",
-        reason,
-        expected:BOOT.build,
-        message:String(e?.message||e).slice(0,220)
-      });
-      return false;
-    }
-
-    if(
-      !probe ||
-      probe.build!==BOOT.build ||
-      probe.contentFingerprint!==BOOT.contentFingerprint
-    ){
-      send({
-        type:"trace",request_id:job.request_id,
-        stage:"content-build-mismatch",
-        reason,
-        expected:BOOT.build,
-        actual:String(probe?.build||"missing"),
-        expected_fingerprint:String(BOOT.contentFingerprint||""),
-        actual_fingerprint:String(probe?.contentFingerprint||"missing"),
-        href:String(probe?.href||"").slice(0,240)
-      });
-      return false;
-    }
-
-    send({
-      type:"trace",request_id:job.request_id,
-      stage:"content-build-ok",
-      build:probe.build,
-      fingerprint:probe.contentFingerprint,
-      href:String(probe.href||"").slice(0,240)
-    });
-    await chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_SEND",job});
-    return true;
-  }catch(e){
-    send({
-      type:"trace",request_id:job.request_id,
-      stage:"sw-dispatch-failed",reason,
-      message:String(e?.message||e).slice(0,220)
-    });
-    return false;
-  }
-}
-
-async function cfg() {
-  const saved=await chrome.storage.local.get({workerId:"",proxyLabel:""});
-  if(!saved.workerId) {
-    saved.workerId="keeper-"+crypto.randomUUID();
-    await chrome.storage.local.set({workerId:saved.workerId});
-  }
-  return {wsUrl:BOOT.wsUrl,token:BOOT.token,workerId:saved.workerId,proxyLabel:saved.proxyLabel||""};
-}
-function send(obj){if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify(obj));}
-async function activeArenaTab(){
-  let tabs=await chrome.tabs.query({url:["https://arena.ai/*","https://*.arena.ai/*"]});
-  if(tabs.length)return tabs[0];
-  return await chrome.tabs.create({url:"https://arena.ai/",active:true});
-}
-async function connect(){
-  clearTimeout(reconnectTimer);
-  const c=await cfg();
-  const url=c.wsUrl+(c.wsUrl.includes("?")?"&":"?")+"token="+encodeURIComponent(c.token||"");
-  try{ws=new WebSocket(url);}catch(e){reconnectTimer=setTimeout(connect,1500);return;}
-  ws.onopen=()=>{send({type:"hello",worker_id:c.workerId,ready:true,proxy:c.proxyLabel||"",user_agent:navigator.userAgent});
-    clearInterval(pingTimer);pingTimer=setInterval(()=>send({type:"heartbeat",ts:Date.now(),request_id:currentRequest||""}),15000);};
-  ws.onmessage=async(ev)=>{let m;try{m=JSON.parse(ev.data)}catch{return}
-    if(m.type==="send_message"){
-      currentRequest=m.request_id;
-      pendingJob=m;
-      currentPhase="dispatch";
-      let tab=await activeArenaTab();
-      const ok=await dispatchJob(tab,m,"server");
-      if(!ok){
-        try{
-          await chrome.tabs.reload(tab.id);
-          setTimeout(async()=>{
-            const retry=await dispatchJob(tab,m,"reload-retry");
-            if(!retry)send({type:"error",request_id:m.request_id,message:"content script unavailable after reload"});
-          },1800);
-        }catch(x){
-          send({type:"error",request_id:m.request_id,message:String(x)});
-        }
-      }
-    }
-    else if(m.type==="cancel"){
-      let tab=await activeArenaTab();
-      chrome.tabs.sendMessage(tab.id,{type:"BRIDGENA_CANCEL",request_id:m.request_id}).catch(()=>{});
-      if(currentRequest===m.request_id){
-        currentRequest=null;pendingJob=null;pendingTabId=null;currentPhase="";
-      }
-    }
-  };
-  ws.onclose=()=>{clearInterval(pingTimer);reconnectTimer=setTimeout(connect,1500);};
-  ws.onerror=()=>{try{ws.close()}catch{}};
-}
-async function nativeSubmit(tabId,msg){
-  if(!tabId)throw new Error("native submit has no tab id");
-  const target={tabId};
-  let attached=false;
-  try{
-    await chrome.debugger.attach(target,"1.3");
-    attached=true;
-
-    // Prefer the actual visible Send control when content script supplied its
-    // viewport center. This is a browser-level input event, not a DOM event.
-    if(Number.isFinite(msg.x)&&Number.isFinite(msg.y)){
-      await chrome.debugger.sendCommand(target,"Input.dispatchMouseEvent",{
-        type:"mouseMoved",x:msg.x,y:msg.y,button:"none"
-      });
-      await chrome.debugger.sendCommand(target,"Input.dispatchMouseEvent",{
-        type:"mousePressed",x:msg.x,y:msg.y,button:"left",buttons:1,clickCount:1
-      });
-      await chrome.debugger.sendCommand(target,"Input.dispatchMouseEvent",{
-        type:"mouseReleased",x:msg.x,y:msg.y,button:"left",buttons:0,clickCount:1
-      });
-      return {ok:true,method:"cdp-click"};
-    }
-
-    // Fallback to native Enter in the focused composer.
-    await chrome.debugger.sendCommand(target,"Input.dispatchKeyEvent",{
-      type:"rawKeyDown",key:"Enter",code:"Enter",
-      windowsVirtualKeyCode:13,nativeVirtualKeyCode:13
-    });
-    await chrome.debugger.sendCommand(target,"Input.dispatchKeyEvent",{
-      type:"keyUp",key:"Enter",code:"Enter",
-      windowsVirtualKeyCode:13,nativeVirtualKeyCode:13
-    });
-    return {ok:true,method:"cdp-enter"};
-  }finally{
-    if(attached){
-      try{await chrome.debugger.detach(target)}catch{}
-    }
-  }
-}
-
-chrome.runtime.onMessage.addListener((msg,sender,sendResponse)=>{
-  if(!msg||!msg.type)return;
-
-  // Local lifecycle messages stay inside the extension. They let the service
-  // worker recover only navigation that happened BEFORE prompt submission.
-  if(msg.type==="BRIDGENA_PHASE_LOCAL"){
-    if(msg.request_id&&msg.request_id===currentRequest){
-      currentPhase=String(msg.phase||"");
-    }
-    return;
-  }
-
-  if(msg.type==="BRIDGENA_CONTENT_READY_LOCAL"){
-    const tabId=sender?.tab?.id;
-    const canResume=!!(
-      pendingJob && currentRequest===pendingJob.request_id &&
-      tabId && (pendingTabId===null||pendingTabId===tabId) &&
-      currentPhase==="pre_navigation" &&
-      Date.now()-lastDispatchAt>300
-    );
-    if(canResume){
-      const recovered={...pendingJob,_navigation_recovered:true};
-      setTimeout(()=>dispatchJob({id:tabId},recovered,"post-navigation-resume"),120);
-    }
-    return;
-  }
-
-  if(msg.type==="BRIDGENA_NATIVE_SUBMIT_LOCAL"){
-    nativeSubmit(sender?.tab?.id,msg)
-      .then(r=>sendResponse(r))
-      .catch(e=>sendResponse({ok:false,error:String(e?.message||e)}));
-    return true;
-  }
-
-  if(msg.type.startsWith("BRIDGENA_")){
-    let out={...msg};delete out.type;
-    send({type:msg.type.replace("BRIDGENA_","").toLowerCase(),...out});
-    if(
-      msg.type==="BRIDGENA_DONE"||
-      msg.type==="BRIDGENA_ERROR"||
-      msg.type==="BRIDGENA_CHALLENGE"||
-      msg.type==="BRIDGENA_LOGIN_REQUIRED"||
-      msg.type==="BRIDGENA_TERMS_REQUIRED"
-    ){
-      if(!msg.request_id||msg.request_id===currentRequest){
-        currentRequest=null;pendingJob=null;pendingTabId=null;currentPhase="";
-      }
-    }
-  }
-});
-chrome.runtime.onInstalled.addListener(()=>connect());
-chrome.runtime.onStartup.addListener(()=>connect());
-connect();
-"""
-        boot=json.dumps({"wsUrl":ws_url,"token":V4_EXTENSION_TOKEN,"build":V4_EXTENSION_BUILD,"contentFingerprint":"v4.3.2-terms-gate-r1"}, separators=(",",":"))
-        sw_source=sw_template.replace("__BOOT__", boot)
-        with open(sw_path, "w", encoding="utf-8") as fh:
-            fh.write(sw_source)
-
-        # v4.1.7: Arena normally keeps invisible reCAPTCHA/Enterprise iframes in
-        # the DOM. Those are transport prerequisites, not interactive challenge
-        # screens. Rebuild the content script with challenge detection based on
-        # visible challenge UI instead of the mere presence of a reCAPTCHA URL.
-        content_path=os.path.join(V4_EXTENSION_DIR, "arena-content.js")
-        content_source=r"""const CONTENT_BUILD="4.3.2";
-const CONTENT_FINGERPRINT="v4.3.2-terms-gate-r1";
-let active=null;
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-function visible(el){
-  if(!el)return false;
-  const r=el.getBoundingClientRect(),s=getComputedStyle(el);
-  if(s.visibility==="hidden"||s.display==="none"||Number(s.opacity||1)===0)return false;
-  return r.width>=4&&r.height>=4;
-}
-function txt(el){return (el?.innerText||el?.textContent||"").trim()}
-function emit(type,request_id,extra={}){chrome.runtime.sendMessage({type:"BRIDGENA_"+type.toUpperCase(),request_id,...extra}).catch(()=>{})}
-function trace(id,stage,extra={}){emit("trace",id,{stage,...extra})}
-function phase(id,value){
-  if(active&&active.id===id)active.phase=String(value||"");
-  chrome.runtime.sendMessage({
-    type:"BRIDGENA_PHASE_LOCAL",request_id:id,phase:String(value||"")
-  }).catch(()=>{});
-}
-
-function challengePresent(){
-  const frameChallenge=[...document.querySelectorAll("iframe")].some(f=>{
-    const src=(f.src||"").toLowerCase(),title=(f.title||"").toLowerCase();
-    if(!/(recaptcha|captcha|challenge|turnstile)/i.test(src+" "+title)||!visible(f))return false;
-    const r=f.getBoundingClientRect();
-    if(r.width<180||r.height<80)return false;
-    return /bframe|challenge|verify|captcha/i.test(src+" "+title)||r.height>=180;
-  });
-  const textChallenge=[...document.querySelectorAll('[role="dialog"],[aria-modal="true"],main,section,form,body>div')].some(el=>{
-    if(!visible(el))return false;
-    const t=txt(el).replace(/\s+/g," ").trim();
-    return !!t&&t.length<700&&/verify you are human|verification required|complete the security check|prove you are human|checking your browser/i.test(t);
-  });
-  return frameChallenge||textChallenge;
-}
-
-function loginRequired(){
-  return [...document.querySelectorAll('button,a,[role="button"]')].some(x=>{
-    if(!visible(x))return false;
-    const t=txt(x).replace(/\s+/g," ").trim(),a=(x.getAttribute("aria-label")||"").trim();
-    return /^(sign in|log in|login)$/i.test(t)||/^(sign in|log in|login)$/i.test(a);
-  });
-}
-
-function termsGate(){
-  const roots=[
-    ...document.querySelectorAll(
-      '[role="dialog"],[aria-modal="true"],dialog,[data-radix-dialog-content],'+
-      '[class*="modal" i],[class*="dialog" i]'
-    )
-  ].filter(visible);
-
-  for(const el of roots){
-    const t=normalizedText(txt(el));
-    if(!t)return;
-    const buttons=[...el.querySelectorAll('button,[role="button"]')]
-      .filter(visible)
-      .map(b=>(b.getAttribute("aria-label")||txt(b)).replace(/\s+/g," ").trim())
-      .filter(Boolean);
-
-    const termsText=
-      /terms of use/i.test(t) &&
-      /privacy policy/i.test(t) &&
-      /agree/i.test(t);
-    const agreeButton=buttons.some(x=>/^agree$/i.test(x));
-
-    if(termsText&&agreeButton){
-      return {
-        element:el,
-        text:t.slice(0,420),
-        buttons:buttons.slice(0,12)
-      };
-    }
-  }
-  return null;
-}
-function termsRequired(){return !!termsGate()}
-
-function domRoots(){
-  const roots=[document],seen=new Set([document]);
-  const queue=[document.documentElement];
-  while(queue.length){
-    const node=queue.shift();
-    if(!node||!node.querySelectorAll)continue;
-    for(const el of node.querySelectorAll('*')){
-      if(el.shadowRoot&&!seen.has(el.shadowRoot)){
-        seen.add(el.shadowRoot);
-        roots.push(el.shadowRoot);
-        queue.push(el.shadowRoot);
-      }
-    }
-  }
-  return roots;
-}
-
-function composer(){
-  const selectors=[
-    'textarea[placeholder*="ask" i]',
-    'textarea[placeholder*="message" i]',
-    'textarea[placeholder*="prompt" i]',
-    'textarea',
-    '[contenteditable="true"][role="textbox"]',
-    '[contenteditable="true"]'
-  ];
-  let all=[];
-  for(const root of domRoots()){
-    for(const s of selectors){
-      try{all.push(...root.querySelectorAll(s))}catch{}
-    }
-  }
-  all=[...new Set(all)].filter(visible);
-  all.sort((a,b)=>{
-    // Prefer a visible composer lower in the viewport and associated with a
-    // form/send control over incidental textareas in dialogs/settings.
-    const af=!!a.closest?.('form'),bf=!!b.closest?.('form');
-    if(af!==bf)return bf-af;
-    return b.getBoundingClientRect().top-a.getBoundingClientRect().top;
-  });
-  return all[0]||null;
-}
-
-async function waitForComposer(timeoutMs=12000,id=null,stage="composer-wait"){
-  const started=Date.now();
-  let lastDiag=0;
-  while(Date.now()-started<timeoutMs){
-    const c=composer();
-    if(c)return c;
-    const now=Date.now();
-    if(id&&now-lastDiag>1800){
-      lastDiag=now;
-      trace(id,stage,{
-        elapsed_ms:now-started,
-        href:location.href,
-        readyState:document.readyState,
-        login_required:loginRequired(),
-        challenge:challengePresent()
-      });
-    }
-    await sleep(120);
-  }
-  return null;
-}
-
-async function frameOrTimer(maxWait=100){
-  return await Promise.race([
-    new Promise(resolve=>{
-      try{
-        requestAnimationFrame(()=>requestAnimationFrame(()=>resolve("raf")));
-      }catch{resolve("no-raf")}
-    }),
-    sleep(maxWait).then(()=>"timer")
-  ]);
-}
-
-async function settleUi(ms=500,id=null,stage="ui-settle"){
-  const started=Date.now();
-  let rafTicks=0,timerFallbacks=0;
-  while(Date.now()-started<ms){
-    const mode=await frameOrTimer(Math.min(120,Math.max(40,ms)));
-    if(mode==="raf")rafTicks++;else timerFallbacks++;
-    await sleep(20);
-  }
-  if(id&&timerFallbacks){
-    trace(id,stage,{
-      elapsed_ms:Date.now()-started,
-      raf_ticks:rafTicks,
-      timer_fallbacks:timerFallbacks,
-      visibility:document.visibilityState
-    });
-  }
-}
-
-function validArenaUrl(value){
-  try{
-    const u=new URL(String(value||""),location.href);
-    return u.protocol==="https:" && (u.hostname==="arena.ai"||u.hostname.endsWith(".arena.ai"));
-  }catch{return false}
-}
-
-async function restoreSession(url,id){
-  if(!validArenaUrl(url))return false;
-  const target=new URL(url,location.href).href;
-  if(location.href!==target){
-    trace(id,"session-navigate",{from:location.href,to:target});
-    phase(id,"pre_navigation");
-    location.assign(target);
-    // A real document navigation destroys this content script. If Arena keeps
-    // the same document for any reason, this wait still provides a safe local
-    // continuation. Otherwise the service worker resumes the pending job after
-    // BRIDGENA_CONTENT_READY_LOCAL from the new page.
-    const c=await waitForComposer(12000,id,"session-restore-wait");
-    if(!c)return false;
-    phase(id,"post_navigation");
-  }else{
-    const c=await waitForComposer(5000,id,"session-current-wait");
-    if(!c)return false;
-  }
-  await settleUi(450);
-  trace(id,"session-resumed",{url:location.href});
-  return true;
-}
-
-function promptFragments(prompt){
-  const p=normalizedText(prompt);
-  if(!p)return [];
-  if(p.length<=32)return [p];
-
-  const out=[];
-  const add=s=>{
-    s=normalizedText(s);
-    if(s.length>=18&&!out.includes(s))out.push(s);
-  };
-  add(p.slice(0,Math.min(96,p.length)));
-  add(p.slice(Math.max(0,p.length-96)));
-
-  // Recovery/context capsules end with the newest user turn. Including a
-  // fragment around that marker makes acknowledgement survive UI truncation
-  // of the older history while still binding the evidence to this request.
-  const marker=p.toLowerCase().lastIndexOf("newest user message:");
-  if(marker>=0)add(p.slice(marker,Math.min(p.length,marker+160)));
-  return out;
-}
-
-function promptMatchesText(text,prompt){
-  const t=normalizedText(text),p=normalizedText(prompt);
-  if(!t||!p)return false;
-  if(p.length<=32)return t===p || t.endsWith(p);
-
-  const probes=promptFragments(p);
-  if(!probes.length)return false;
-  const hits=probes.filter(x=>t.includes(x)).length;
-  // Long payloads require two independent fragments when available, which
-  // prevents a generic page container from becoming "proof" of submission.
-  return hits>=Math.min(2,probes.length);
-}
-
-function transcriptBoundaries(){
-  const selector=[
-    '[data-message-author-role="user"]','[data-message-author-role="assistant"]',
-    '[data-role="user"]','[data-role="assistant"]',
-    '[data-author="user"]','[data-author="assistant"]',
-    '[data-testid*="user" i]','[data-testid*="assistant" i]',
-    '[data-testid*="message" i]','[class*="message" i]','[class*="bubble" i]',
-    'article','[role="article"]'
-  ].join(',');
-  const raw=[...document.querySelectorAll(selector)].filter(el=>{
-    if(!visible(el)||el===document.body||el===document.documentElement||el.tagName==='MAIN')return false;
-    if(el.closest('nav,aside,[role="navigation"],form'))return false;
-    if(el.matches('textarea,input,[contenteditable="true"]')||
-       el.querySelector('textarea,input,[contenteditable="true"]'))return false;
-    return !!normalizedText(txt(el));
-  });
-  return raw.filter(el=>!raw.some(other=>other!==el&&el.contains(other)));
-}
-
-function conversationMessageCount(){
-  return transcriptBoundaries().length;
-}
-
-function renderedPromptBoundaryCount(prompt){
-  const p=normalizedText(prompt);
-  if(!p)return 0;
-  const main=document.querySelector('main')||document.body;
-  let raw=transcriptBoundaries().filter(el=>main.contains(el)&&promptMatchesText(txt(el),p));
-
-  // Arena occasionally changes the message wrapper class. Fall back to
-  // compact visible descendants of <main>, but never forms/navigation or
-  // giant conversation containers.
-  if(!raw.length){
-    const maxLen=Math.max(260,Math.min(9000,p.length+700));
-    const generic=[...main.querySelectorAll('div,p,section,li')].filter(el=>{
-      if(!visible(el)||el.closest('nav,aside,[role="navigation"],form'))return false;
-      if(el.matches('textarea,input,[contenteditable="true"],button')||
-         el.querySelector('textarea,input,[contenteditable="true"]'))return false;
-      const t=normalizedText(txt(el));
-      return !!t&&t.length<=maxLen&&promptMatchesText(t,p);
-    });
-    raw=generic.filter(el=>!generic.some(other=>other!==el&&el.contains(other)));
-  }
-  return raw.length;
-}
-
-function committedPromptCount(prompt){
-  return renderedPromptBoundaryCount(prompt);
-}
-
-function submitControl(c){
-  const form=c?.closest("form");
-  if(form){
-    const b=[...form.querySelectorAll('button,input[type="submit"]')].find(x=>
-      visible(x)&&!x.disabled&&(x.type==="submit"||/send|submit/i.test((x.getAttribute("aria-label")||"")+" "+txt(x)))
-    );
-    if(b)return b;
-  }
-  const buttons=[...document.querySelectorAll('button,[role="button"]')].filter(x=>visible(x)&&!x.disabled);
-  return buttons.find(b=>/send|submit/i.test((b.getAttribute("aria-label")||"")+" "+(b.getAttribute("data-testid")||"")+" "+txt(b)));
-}
-
-function stopButton(){
-  return [...document.querySelectorAll('button,[role="button"]')].find(b=>
-    visible(b)&&/stop|cancel generation|stop generating/i.test(
-      (b.getAttribute('aria-label')||'')+' '+(b.getAttribute('data-testid')||'')+' '+txt(b)
-    )
-  );
-}
-
-async function setValue(el,value,id){
-  el.focus();
-  await sleep(60);
-
-  if(el.tagName==='TEXTAREA'||el.tagName==='INPUT'){
-    // React controlled inputs need the native prototype setter, followed by
-    // an input transaction. Using el.value directly can leave React state at
-    // the old/empty value even though the DOM visibly contains text.
-    const proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
-    const desc=Object.getOwnPropertyDescriptor(proto,'value');
-    if(desc?.set)desc.set.call(el,"");
-    else el.value="";
-    el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward',data:null}));
-    await sleep(30);
-    if(desc?.set)desc.set.call(el,value);
-    else el.value=value;
-    el.dispatchEvent(new InputEvent('beforeinput',{bubbles:true,cancelable:true,inputType:'insertText',data:value}));
-    el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));
-    el.dispatchEvent(new Event('change',{bubbles:true}));
-  }else{
-    // Arena's richer editors are happiest when text is inserted through the
-    // browser's editing command, because it updates the editor's internal
-    // document model in addition to the visible DOM.
-    try{
-      const sel=getSelection(),range=document.createRange();
-      range.selectNodeContents(el);
-      sel.removeAllRanges();sel.addRange(range);
-      document.execCommand("delete",false,null);
-      await sleep(20);
-      document.execCommand("insertText",false,value);
-    }catch{
-      el.textContent="";
-      el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward',data:null}));
-      el.textContent=value;
-      el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));
-    }
-  }
-
-  await sleep(120);
-  trace(id,"editor-state-synced",{
-    tag:el.tagName,
-    value_chars:composerValue(el).length,
-    form:!!el.closest("form")
-  });
-}
-
-async function clickNewChat(id=null){
-  const c=[...document.querySelectorAll('button,a,[role="button"]')].find(x=>
-    visible(x)&&/new chat|new conversation|start new/i.test((x.getAttribute("aria-label")||"")+" "+txt(x))
-  );
-  if(!c)return false;
-  if(id)trace(id,"fresh-chat-click",{
-    href:location.href,
-    visibility:document.visibilityState,
-    label:(c.getAttribute("aria-label")||txt(c)).slice(0,100)
-  });
-  c.click();
-  await settleUi(350,id,"fresh-chat-settle");
-  return true;
-}
-
-function visibleUiBlockers(){
-  const roots=allDom(
-    '[role="dialog"],[aria-modal="true"],dialog,[data-radix-dialog-content],'+
-    '[class*="modal" i],[class*="dialog" i]'
-  ).filter(visible);
-  return roots.map(el=>({
-    text:normalizedText(txt(el)).slice(0,320),
-    buttons:[...el.querySelectorAll('button,[role="button"]')]
-      .filter(visible)
-      .map(b=>(b.getAttribute("aria-label")||txt(b)).replace(/\s+/g," ").trim())
-      .filter(Boolean)
-      .slice(0,12)
-  })).filter(x=>x.text||x.buttons.length).slice(0,6);
-}
-
-function runtimeDiagnostics(model=""){
-  const c=composer();
-  const stop=stopButton();
-  const controls=allDom('button,[role="button"]').filter(visible);
-  return {
-    href:location.href,
-    readyState:document.readyState,
-    visibility:document.visibilityState,
-    model:model||"",
-    composer:!!c,
-    composer_tag:c?.tagName||"",
-    composer_placeholder:c?.getAttribute?.("placeholder")||"",
-    generating:!!stop,
-    challenge:challengePresent(),
-    login_required:loginRequired(),
-    terms_required:termsRequired(),
-    transcript_messages:conversationMessageCount(),
-    visible_user_messages:visibleUserMessageCount(),
-    assistant_candidates:assistantCandidates("").length,
-    ui_blockers:visibleUiBlockers(),
-    content_build:CONTENT_BUILD,
-    nearby_controls:controls.slice(-16).map(el=>modelControlBlob(el).slice(0,100))
-  };
-}
-
-function blankChatShell(){
-  const c=composer();
-  if(!c||stopButton())return false;
-  if(conversationMessageCount()>0)return false;
-  if(assistantCandidates("").length>0)return false;
-
-  // Extra semantic-role guard in case Arena changed generic message wrappers.
-  const explicit=document.querySelectorAll(
-    '[data-message-author-role="user"],[data-message-author-role="assistant"],'+
-    '[data-role="user"],[data-role="assistant"],[data-author="user"],[data-author="assistant"]'
-  );
-  return explicit.length===0;
-}
-
-function allDom(selector){
-  const out=[],seen=new Set();
-  for(const root of domRoots()){
-    let nodes=[];
-    try{nodes=[...root.querySelectorAll(selector)]}catch{}
-    for(const n of nodes){
-      if(!seen.has(n)){seen.add(n);out.push(n)}
-    }
-  }
-  return out;
-}
-
-function modelClean(s){
-  return String(s||"").toLowerCase().replace(/[^a-z0-9]+/g," ").replace(/\s+/g," ").trim();
-}
-function modelBase(s){
-  return modelClean(String(s||"").replace(/\s*\([^)]*\)\s*$/,""));
-}
-function modelVariants(values){
-  const out=new Set();
-  const add=v=>{
-    const c=modelClean(v);
-    if(!c)return;
-    out.add(c);
-    out.add(modelBase(c));
-    if(c.startsWith("arena "))out.add(c.slice(6).trim());
-    if(c.endsWith(" model"))out.add(c.slice(0,-6).trim());
-  };
-  for(const v of values||[])add(v);
-
-  if(out.has("max")||out.has("arena max")||out.has("boss bandit")){
-    ["max","arena max","boss bandit"].forEach(x=>out.add(x));
-  }
-  return [...out].filter(Boolean);
-}
-
-function routeModelMatches(model,aliases=[]){
-  try{
-    const u=new URL(location.href);
-    const routeRaw=
-      u.searchParams.get("model_a")||
-      u.searchParams.get("model")||
-      u.searchParams.get("modelId")||
-      "";
-    if(!routeRaw)return false;
-    const route=modelClean(routeRaw);
-    const vars=modelVariants([model,...(aliases||[])]);
-    return vars.some(v=>{
-      const c=modelClean(v);
-      return route===c || modelBase(route)===modelBase(c);
-    });
-  }catch{return false}
-}
-
-function modelMatchScore(label,variants){
-  const raw=String(label||"").trim();
-  if(!raw)return -1;
-  const t=modelClean(raw),b=modelBase(raw);
-  const lines=raw.split(/\n+/).map(modelClean).filter(Boolean);
-  let score=-1;
-  for(const a of variants){
-    const ab=modelBase(a);
-    if(t===a)score=Math.max(score,1000);
-    if(b===ab)score=Math.max(score,980);
-    if(t==="arena "+a || (t.startsWith("arena ")&&t.slice(6)===a))score=Math.max(score,970);
-    if(lines.includes(a)||lines.includes(ab))score=Math.max(score,950);
-    if(t.startsWith(a+" "))score=Math.max(score,850);
-    if(b.startsWith(ab+" "))score=Math.max(score,830);
-  }
-  return score;
-}
-
-function modelControlBlob(el){
-  return [
-    el?.getAttribute?.("aria-label")||"",
-    el?.getAttribute?.("data-testid")||"",
-    el?.getAttribute?.("title")||"",
-    txt(el)
-  ].join(" ").replace(/\s+/g," ").trim();
-}
-
-function modelPickerDiagnostics(model,aliases){
-  const variants=modelVariants([model,...(aliases||[])]);
-  const controls=allDom('button,[role="button"],[aria-haspopup]').filter(visible);
-  const options=allDom(
-    '[role="option"],[role="menuitem"],[role="menuitemradio"],'+
-    '[role="listbox"] button,[role="menu"] button,li,button'
-  ).filter(visible);
-  const bestControls=controls.map(el=>({
-    text:modelControlBlob(el).slice(0,120),
-    score:modelMatchScore(modelControlBlob(el),variants),
-    popup:el.getAttribute("aria-haspopup")||"",
-    testid:el.getAttribute("data-testid")||""
-  })).filter(x=>x.score>=0||/model/i.test(x.text)).sort((a,b)=>b.score-a.score).slice(0,12);
-  const bestOptions=options.map(el=>({
-    text:txt(el).replace(/\s+/g," ").trim().slice(0,140),
-    score:modelMatchScore(txt(el),variants),
-    role:el.getAttribute("role")||""
-  })).filter(x=>x.score>=0).sort((a,b)=>b.score-a.score).slice(0,16);
-  return {
-    requested:model,
-    aliases:(aliases||[]).slice(0,12),
-    controls:bestControls,
-    options:bestOptions,
-    href:location.href,
-    visibility:document.visibilityState,
-    composer:!!composer()
-  };
-}
-
-async function selectModel(model,aliases=[],id=null){
-  if(!model||model==='auto')return true;
-  if(routeModelMatches(model,aliases)){
-    if(id)trace(id,"model-route-already-selected",{
-      model,
-      href:location.href,
-      aliases:(aliases||[]).slice(0,12)
-    });
-    return true;
-  }
-  const variants=modelVariants([model,...(aliases||[])]);
-
-  const controls=allDom('button,[role="button"],[aria-haspopup]').filter(visible);
-
-  // First prove that an already-selected model is actually represented by a
-  // model-ish control. A random "Max" button elsewhere on the page is not enough.
-  const current=controls.map(el=>{
-    const blob=modelControlBlob(el);
-    let score=modelMatchScore(blob,variants);
-    if(/model/i.test((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('data-testid')||'')))score+=90;
-    if(el.getAttribute("aria-haspopup"))score+=25;
-    return {el,score,blob};
-  }).sort((a,b)=>b.score-a.score)[0];
-
-  if(current&&current.score>=1020){
-    if(id)trace(id,"model-already-selected",{
-      model,
-      control:current.blob.slice(0,140),
-      score:current.score
-    });
-    return true;
-  }
-
-  const triggerRanked=controls.map(el=>{
-    const blob=modelControlBlob(el);
-    let score=0;
-    if(/select model|choose model|model selector|change model/i.test(blob))score+=130;
-    if(/\bmodel\b/i.test((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('data-testid')||'')))score+=100;
-    if(el.getAttribute("aria-haspopup")==="listbox")score+=45;
-    else if(el.getAttribute("aria-haspopup"))score+=20;
-    const match=modelMatchScore(blob,variants);
-    if(match>=950)score+=80;
-    return {el,score,blob};
-  }).filter(x=>x.score>=45).sort((a,b)=>b.score-a.score);
-
-  const trigger=triggerRanked[0]?.el||null;
-  if(!trigger){
-    if(id)trace(id,"model-picker-missing",modelPickerDiagnostics(model,aliases));
-    return false;
-  }
-
-  const collectOptions=()=>{
-    const nodes=allDom(
-      '[role="option"],[role="menuitem"],[role="menuitemradio"],'+
-      '[role="listbox"] button,[role="menu"] button,'+
-      '[data-radix-popper-content-wrapper] button,'+
-      '[data-radix-popper-content-wrapper] [role="option"],li,button'
-    ).filter(visible);
-    return nodes.map(el=>({
-      el,
-      text:txt(el).replace(/\s+/g," ").trim(),
-      score:modelMatchScore(txt(el),variants)
-    })).filter(x=>x.text&&x.score>=0).sort((a,b)=>b.score-a.score);
-  };
-
-  // Snapshot menu-like nodes that were already visible so generic page buttons
-  // cannot masquerade as picker options merely because their text matches.
-  const preOpenVisible=new Set(allDom(
-    '[role="option"],[role="menuitem"],[role="menuitemradio"],'+
-    '[role="listbox"] button,[role="menu"] button,'+
-    '[data-radix-popper-content-wrapper] button,'+
-    '[data-radix-popper-content-wrapper] [role="option"],li,button'
-  ).filter(visible));
-
-  const collectPickerOptions=()=>{
-    const ranked=collectOptions().filter(x=>x.el!==trigger);
-    const menuLike=ranked.filter(x=>{
-      const el=x.el;
-      const role=el.getAttribute("role")||"";
-      return !preOpenVisible.has(el) ||
-        /option|menuitem/i.test(role) ||
-        !!el.closest('[role="listbox"],[role="menu"],[data-radix-popper-content-wrapper]');
-    });
-    return menuLike.length?menuLike:ranked.filter(x=>!preOpenVisible.has(x.el));
-  };
-
-  trigger.click();
-  await settleUi(420,id,"model-picker-open-settle");
-  let ranked=collectPickerOptions();
-
-  // React occasionally ignores DOM .click(). Escalate to a browser-level click
-  // only for the ordinary model picker control.
-  if(!ranked.length||ranked[0].score<830){
-    await nativeClick(trigger,id,"model-trigger-native-cdp");
-    await settleUi(520,id,"model-picker-native-open-settle");
-    ranked=collectPickerOptions();
-  }
-
-  const best=ranked[0]||null;
-  const second=ranked[1]||null;
-  const uniquelyStrong=best && best.score>=830 &&
-    (!second || best.score-second.score>=80 || best.score>=950);
-
-  if(!uniquelyStrong){
-    if(id)trace(id,"model-option-unresolved",modelPickerDiagnostics(model,aliases));
-    try{document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true}))}catch{}
-    return false;
-  }
-
-  if(id)trace(id,"model-option-match",{
-    requested:model,
-    matched:best.text.slice(0,140),
-    score:best.score,
-    runner_up:second?{text:second.text.slice(0,100),score:second.score}:null
-  });
-
-  // Prefer native input because some Arena picker implementations ignore
-  // untrusted synthetic clicks.
-  const nativeOk=await nativeClick(best.el,id,"model-option-native-cdp");
-  if(!nativeOk){
-    try{best.el.click()}catch{}
-  }
-  await settleUi(650,id,"model-selection-settle");
-
-  // Verify if possible. If the strongly matched option disappeared and the
-  // composer remains usable, the selection was committed by the picker.
-  const afterControls=allDom('button,[role="button"],[aria-haspopup]').filter(visible);
-  const verified=afterControls.some(el=>{
-    const blob=modelControlBlob(el);
-    return modelMatchScore(blob,variants)>=950 &&
-      (/model/i.test((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('data-testid')||'')) ||
-       !!el.getAttribute("aria-haspopup"));
-  });
-  const optionStillVisible=visible(best.el);
-  const committed=verified || (!optionStillVisible && !!composer());
-
-  if(id)trace(id,"model-selection-verify",{
-    model,verified,option_still_visible:optionStillVisible,
-    composer:!!composer(),committed
-  });
-  return committed;
-}
-
-async function selectModelStable(model,aliases,id){
-  if(!model||model==='auto')return true;
-  for(let attempt=1;attempt<=3;attempt++){
-    const c=await waitForComposer(attempt===1?8000:5000,id,"pre-model-composer-wait");
-    if(!c){
-      trace(id,"model-selection-no-composer",{attempt,model});
-      continue;
-    }
-    await settleUi(attempt===1?300:550,id,"pre-model-settle");
-
-    const ok=await selectModel(model,aliases||[],id);
-    trace(id,"model-selection-attempt",{attempt,ok,model});
-    if(ok){
-      await settleUi(650,id,"post-model-settle");
-      return true;
-    }
-
-    try{
-      document.dispatchEvent(new KeyboardEvent('keydown',{
-        key:'Escape',code:'Escape',bubbles:true,cancelable:true
-      }));
-    }catch{}
-    await sleep(350*attempt);
-  }
-  trace(id,"model-selection-final-diagnostics",modelPickerDiagnostics(model,aliases||[]));
-  return false;
-}
-
-function normalizedText(s){
-  return String(s||"").replace(/\s+/g," ").trim();
-}
-function promptProbe(prompt){
-  const p=normalizedText(prompt);
-  if(!p)return "";
-  // Long enough to avoid accidental overlap with a normal answer, short
-  // enough to survive UI wrapping/whitespace changes.
-  return p.slice(0,Math.min(180,p.length));
-}
-function contaminatedByPrompt(text,prompt){
-  const t=normalizedText(text),probe=promptProbe(prompt);
-  if(!t)return true;
-  if(probe&&t.includes(probe))return true;
-  // Bridgena's context capsule markers must never be surfaced as assistant
-  // output even if a parent chat container is accidentally considered.
-  if(/Previous messages from this same conversation are provided below/i.test(t))return true;
-  if(/--- BEGIN PREVIOUS CONVERSATION ---/i.test(t))return true;
-  if(/Reply to the newest user message below/i.test(t))return true;
-  if(/Newest user message:/i.test(t))return true;
-  return false;
-}
-function excludedResponseNode(el,prompt){
-  if(!el||!visible(el))return true;
-  if(el.closest('nav,aside,[data-sidebar],[role="navigation"],form'))return true;
-  if(el.matches('textarea,input,[contenteditable="true"]')||el.querySelector('textarea,input,[contenteditable="true"]'))return true;
-  const t=normalizedText(txt(el));
-  if(!t||contaminatedByPrompt(t,prompt))return true;
-  return false;
-}
-
-function explicitAssistantCandidates(prompt=""){
-  const selectors=[
-    '[data-message-author-role="assistant"]',
-    '[data-role="assistant"]',
-    '[data-author="assistant"]',
-    '[data-testid*="assistant" i]',
-    '[aria-label*="assistant" i]'
-  ];
-  const out=[],seen=new Set();
-  for(const s of selectors){
-    for(const el of document.querySelectorAll(s)){
-      if(seen.has(el)||excludedResponseNode(el,prompt))continue;
-      const v=txt(el);
-      if(!v||contaminatedByPrompt(v,prompt))continue;
-      seen.add(el);out.push({el,text:v});
-    }
-  }
-  return out;
-}
-
-function assistantCandidates(prompt=""){
-  // Diagnostics only: explicit assistant-semantic nodes. Generic article/
-  // markdown/message containers are intentionally excluded here because they
-  // can contain both the user prompt and the assistant region.
-  return explicitAssistantCandidates(prompt);
-}
-
-function assistantSnapshot(prompt=""){
-  const a=explicitAssistantCandidates(prompt);
-  return a.length?a[a.length-1].text:"";
-}
-
-function chatRoot(c){
-  const attached=(c&&c.isConnected)?c:null;
-  const fromComposer=attached?.closest('main');
-  return (fromComposer&&fromComposer.isConnected?fromComposer:null)||document.querySelector('main')||document.body;
-}
-
-function responseTracker(c,prompt,id){
-  const root=chatRoot(c);
-  const baselineNodes=new WeakSet();
-  for(const el of root.querySelectorAll('*'))baselineNodes.add(el);
-
-  let bestEl=null,bestText="",lastMutation=Date.now(),mutations=0;
-  const explicitSelector='[data-message-author-role="assistant"],[data-role="assistant"],[data-author="assistant"],[data-testid*="assistant" i],[aria-label*="assistant" i]';
-  const genericSelector='article,[role="article"],[data-testid*="message" i],[class*="message" i],[class*="prose" i],[class*="markdown" i]';
-
-  const semanticStrength=el=>{
-    if(el.matches(explicitSelector))return 3;
-    if(el.closest(explicitSelector))return 2;
-    if(el.matches(genericSelector))return 1;
-    return 0;
-  };
-
-  const score=(el,t,isNew)=>{
-    let s=Math.min(t.length,4000);
-    const sem=semanticStrength(el);
-    s+=sem*2500;
-    if(isNew)s+=1800;
-    // Prefer leaf-ish response regions over giant conversation wrappers.
-    const childText=[...el.children].reduce((n,ch)=>n+normalizedText(txt(ch)).length,0);
-    if(childText<t.length*0.9)s+=500;
-    const r=el.getBoundingClientRect();
-    if(r.top>0)s+=Math.min(300,r.top/5);
-    return s;
-  };
-
-  const consider=el=>{
-    if(!(el instanceof Element)||!root.contains(el))return;
-    // Do not climb arbitrary parents anymore. Only inspect the changed/new
-    // element itself and the nearest message-like boundary. This prevents a
-    // mutation inside the user message from promoting the whole chat wrapper.
-    const boundary=el.closest(explicitSelector+','+genericSelector);
-    const chain=[el,boundary].filter((x,i,a)=>x&&a.indexOf(x)===i);
-    for(const x of chain){
-      if(!root.contains(x)||excludedResponseNode(x,prompt))continue;
-      const t=normalizedText(txt(x));
-      if(!t||contaminatedByPrompt(t,prompt))continue;
-
-      const isNew=!baselineNodes.has(x);
-      const sem=semanticStrength(x);
-      // Generic nodes are eligible only when they were created after submit.
-      // Existing generic wrappers are too ambiguous to classify safely.
-      if(sem<2&&!isNew)continue;
-
-      const s=score(x,t,isNew);
-      const currentScore=bestEl?score(bestEl,bestText,!baselineNodes.has(bestEl)):-1;
-      if(s>currentScore){
-        bestEl=x;bestText=t;
-      }else if(x===bestEl&&t!==bestText){
-        bestText=t;
-      }
-    }
-  };
-
-  const mo=new MutationObserver(ms=>{
-    mutations+=ms.length;lastMutation=Date.now();
-    for(const m of ms){
-      if(m.type==="characterData"){
-        consider(m.target.parentElement);
-      }else{
-        for(const n of m.addedNodes){
-          if(n.nodeType===1){
-            consider(n);
-            // A newly inserted message shell may already contain the real
-            // assistant body by the time MutationObserver runs.
-            for(const d of n.querySelectorAll?.(explicitSelector+','+genericSelector)||[])consider(d);
-          }
-        }
-        // Only reconsider the target if it has explicit assistant semantics.
-        if(m.target instanceof Element && (m.target.matches(explicitSelector)||m.target.closest(explicitSelector))){
-          consider(m.target);
-        }
-      }
-    }
-  });
-  mo.observe(root,{subtree:true,childList:true,characterData:true});
-  trace(id,"response-observer-started",{root:root.tagName,mode:"assistant-boundary"});
-
-  return {
-    snapshot(){
-      const explicit=assistantSnapshot(prompt);
-      if(explicit&&!contaminatedByPrompt(explicit,prompt)){
-        if(!bestText||explicit.length>=bestText.length)return explicit;
-      }
-      if(bestEl&&root.contains(bestEl)&&visible(bestEl)){
-        const live=normalizedText(txt(bestEl));
-        if(live&&!contaminatedByPrompt(live,prompt))bestText=live;
-      }
-      return contaminatedByPrompt(bestText,prompt)?"":bestText;
-    },
-    stats(){
-      return {
-        mutations,
-        best_chars:bestText.length,
-        idle_ms:Date.now()-lastMutation,
-        best_semantic:bestEl?semanticStrength(bestEl):0
-      };
-    },
-    stop(){try{mo.disconnect()}catch{}}
-  };
-}
-function bodyHasPrompt(prompt){
-  return committedPromptCount(prompt)>0;
-}
-function composerValue(c){return (c?.value??c?.innerText??c?.textContent??"").trim()}
-
-function visibleUserMessageCount(){
-  const sels=[
-    '[data-message-author-role="user"]',
-    '[data-role="user"]',
-    '[data-author="user"]',
-    '[data-testid*="user" i]'
-  ];
-  const seen=new Set();
-  for(const s of sels){
-    for(const e of document.querySelectorAll(s)){
-      if(visible(e))seen.add(e);
-    }
-  }
-  return seen.size;
-}
-
-async function nativeClick(el,id,stage="native-click-cdp"){
-  try{
-    let x=null,y=null;
-    if(el&&visible(el)){
-      el.scrollIntoView({block:'center',inline:'center'});
-      await sleep(40);
-      const r=el.getBoundingClientRect();
-      x=r.left+r.width/2;
-      y=r.top+r.height/2;
-    }
-    const request=chrome.runtime.sendMessage({
-      type:"BRIDGENA_NATIVE_SUBMIT_LOCAL",
-      request_id:id,
-      x,y
-    });
-    const result=await Promise.race([
-      request,
-      sleep(3500).then(()=>({ok:false,error:"native input RPC timeout"}))
-    ]);
-    trace(id,stage,{
-      ok:!!result?.ok,
-      method:result?.method||"",
-      error:String(result?.error||(!result?"native input RPC returned no response":"")).slice(0,220)
-    });
-    return !!result?.ok;
-  }catch(e){
-    trace(id,stage+"-error",{
-      name:String(e?.name||"Error"),
-      message:String(e?.message||e).slice(0,220)
-    });
-    return false;
-  }
-}
-
-async function nativeSubmit(el,id){
-  return await nativeClick(el,id,"submit-native-cdp");
-}
-
-function realClick(el,id){
-  if(!el)return false;
-  try{
-    el.scrollIntoView({block:'center',inline:'center'});
-    const r=el.getBoundingClientRect();
-    const x=r.left+r.width/2,y=r.top+r.height/2;
-    const common={bubbles:true,cancelable:true,composed:true,clientX:x,clientY:y,button:0};
-    el.dispatchEvent(new PointerEvent('pointerdown',{...common,buttons:1,pointerId:1,pointerType:'mouse',isPrimary:true}));
-    el.dispatchEvent(new MouseEvent('mousedown',{...common,buttons:1}));
-    el.dispatchEvent(new PointerEvent('pointerup',{...common,buttons:0,pointerId:1,pointerType:'mouse',isPrimary:true}));
-    el.dispatchEvent(new MouseEvent('mouseup',{...common,buttons:0}));
-    el.dispatchEvent(new MouseEvent('click',{...common,buttons:0}));
-    try{el.click()}catch{}
-    trace(id,"submit-real-click",{
-      tag:el.tagName,
-      label:(el.getAttribute("aria-label")||txt(el)).slice(0,120),
-      disabled:!!el.disabled
-    });
-    return true;
-  }catch(e){
-    trace(id,"submit-real-click-error",{message:String(e?.message||e).slice(0,120)});
-    return false;
-  }
-}
-
-async function submitPrompt(c,payload,id){
-  const startHref=location.href;
-  const startCommitted=committedPromptCount(payload);
-  const startMessages=conversationMessageCount();
-  const startUsers=visibleUserMessageCount();
-  const startAssistants=assistantCandidates(payload).length;
-  const startGenerating=!!stopButton();
-
-  await setValue(c,payload,id);
-  const initialButton=submitControl(c);
-  trace(id,"prompt-inserted",{
-    composer:c.tagName,
-    chars:payload.length,
-    value_chars:composerValue(c).length,
-    send_found:!!initialButton,
-    send_disabled:!!initialButton?.disabled,
-    send_label:initialButton?(initialButton.getAttribute("aria-label")||txt(initialButton)).slice(0,100):"",
-    baseline_messages:startMessages,
-    baseline_users:startUsers,
-    baseline_assistants:startAssistants
-  });
-
-  const evidence=()=>{
-    const liveComposer=(c&&c.isConnected)?c:composer();
-    const committedNow=committedPromptCount(payload);
-    const messageNow=conversationMessageCount();
-    const userNow=visibleUserMessageCount();
-    const assistantNow=assistantCandidates(payload).length;
-    const generatingNow=!!stopButton();
-
-    const committed=committedNow>startCommitted;
-    const newMessage=messageNow>startMessages;
-    const newUser=userNow>startUsers;
-    const assistant=assistantNow>startAssistants;
-    const generating=!startGenerating&&generatingNow;
-    const cleared=liveComposer?composerValue(liveComposer).length===0:false;
-    const hrefChanged=location.href!==startHref;
-
-    // Strong acknowledgement is explicitly a before/after transition. Existing
-    // assistant messages in a sticky chat are never allowed to count.
-    const strong=committed||newUser||assistant||generating||(cleared&&newMessage);
-    return {
-      strong,committed,newMessage,newUser,assistant,generating,cleared,hrefChanged,
-      committed_count:committedNow,message_count:messageNow,user_count:userNow,
-      assistant_count:assistantNow
-    };
-  };
-
-  const waitStrong=async(ms,stage)=>{
-    const deadline=Date.now()+ms;
-    let lastDiag=0;
-    while(Date.now()<deadline){
-      await sleep(140);
-      const e=evidence();
-      if(e.strong){
-        trace(id,stage,e);
-        return true;
-      }
-      if(challengePresent()||loginRequired()||termsRequired())return false;
-      if(Date.now()-lastDiag>2200){
-        lastDiag=Date.now();
-        trace(id,"submission-ack-wait",{
-          stage,
-          committed:e.committed,newMessage:e.newMessage,newUser:e.newUser,
-          assistant:e.assistant,generating:e.generating,cleared:e.cleared,
-          hrefChanged:e.hrefChanged
-        });
-      }
-    }
-    return false;
-  };
-
-  // Prefer the actual enabled Send control. This is materially more reliable
-  // than synthesizing Enter against Arena's controlled textarea, and unlike a
-  // blind retry we only click while the exact prompt is still present.
-  let liveComposer=(c&&c.isConnected)?c:composer();
-  let clickTarget=submitControl(liveComposer);
-
-  if(
-    liveComposer &&
-    composerValue(liveComposer) &&
-    clickTarget &&
-    !clickTarget.disabled
-  ){
-    trace(id,"submit-send-first",{
-      tag:clickTarget.tagName,
-      label:(clickTarget.getAttribute("aria-label")||txt(clickTarget)).slice(0,120),
-      value_chars:composerValue(liveComposer).length
-    });
-
-    const nativeOk=await nativeClick(clickTarget,id,"submit-send-native-cdp");
-    if(await waitStrong(5200,"submission-confirmed-send-native"))return true;
-
-    // If CDP was unavailable or Arena did not react, the prompt is still in the
-    // composer, so one DOM click is non-duplicating and safe.
-    let afterNative=evidence();
-    liveComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
-    if(
-      !afterNative.strong &&
-      liveComposer &&
-      composerValue(liveComposer) &&
-      clickTarget?.isConnected
-    ){
-      realClick(clickTarget,id);
-      if(await waitStrong(5200,"submission-confirmed-send-click"))return true;
-    }
-
-    let afterClick=evidence();
-    if(afterClick.cleared&&afterClick.hrefChanged){
-      trace(id,"submission-route-ambiguous",afterClick);
-      if(await waitStrong(12000,"submission-confirmed-send-delayed"))return true;
-      trace(id,"submission-ambiguous-no-ack",evidence());
-      return false;
-    }
-  }
-
-  // Reacquire after button attempts; React may replace the textarea/button.
-  liveComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
-
-  // Keyboard fallback only when the exact prompt is still present.
-  if(liveComposer&&composerValue(liveComposer)){
-    trace(id,"submit-enter-keydown",{form:!!liveComposer.closest("form")});
-    liveComposer.focus();
-    liveComposer.dispatchEvent(new KeyboardEvent('keydown',{
-      key:'Enter',code:'Enter',keyCode:13,which:13,
-      bubbles:true,cancelable:true,composed:true,
-      ctrlKey:false,shiftKey:false,altKey:false,metaKey:false
-    }));
-    await sleep(80);
-    liveComposer.dispatchEvent(new KeyboardEvent('keyup',{
-      key:'Enter',code:'Enter',keyCode:13,which:13,
-      bubbles:true,cancelable:true,composed:true
-    }));
-    if(await waitStrong(4200,"submission-confirmed-enter"))return true;
-  }
-
-  let e=evidence();
-  if(e.cleared&&e.hrefChanged){
-    trace(id,"submission-route-ambiguous",e);
-    if(await waitStrong(12000,"submission-confirmed-delayed"))return true;
-    trace(id,"submission-ambiguous-no-ack",evidence());
-    return false;
-  }
-
-  // Native Enter is only attempted while the prompt is visibly still present.
-  liveComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
-  if(liveComposer&&composerValue(liveComposer)){
-    liveComposer.focus();
-    await nativeSubmit(null,id);
-    if(await waitStrong(4200,"submission-confirmed-native-enter"))return true;
-  }
-
-  // requestSubmit is the last ordinary form fallback and is never called once
-  // transcript/generation evidence indicates a submit may already have landed.
-  liveComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
-  const form=liveComposer?.closest("form");
-  if(liveComposer&&composerValue(liveComposer)&&form&&typeof form.requestSubmit==="function"){
-    trace(id,"submit-fallback-requestSubmit");
-    try{
-      const submitter=[...form.querySelectorAll('button,input[type="submit"]')]
-        .find(x=>!x.disabled&&(x.type==="submit"||/send|submit/i.test((x.getAttribute("aria-label")||"")+" "+txt(x))));
-      form.requestSubmit(submitter||undefined);
-    }catch(err){
-      trace(id,"requestSubmit-error",{
-        name:String(err?.name||"Error"),
-        message:String(err?.message||err).slice(0,220)
-      });
-    }
-    if(await waitStrong(4200,"submission-confirmed-fallback"))return true;
-  }
-
-  const finalComposer=(liveComposer&&liveComposer.isConnected)?liveComposer:composer();
-  const finalButton=submitControl(finalComposer);
-  const finalEvidence=evidence();
-  trace(id,"submission-unconfirmed",{
-    value_chars:finalComposer?composerValue(finalComposer).length:0,
-    committed_delta:committedPromptCount(payload)-startCommitted,
-    message_delta:conversationMessageCount()-startMessages,
-    user_delta:visibleUserMessageCount()-startUsers,
-    assistant_delta:assistantCandidates(payload).length-startAssistants,
-    send_found:!!finalButton,
-    send_disabled:!!finalButton?.disabled,
-    href_changed:location.href!==startHref,
-    generating:!!stopButton(),
-    challenge:challengePresent(),
-    login_required:loginRequired(),
-    strong:finalEvidence.strong
-  });
-  return false;
-}
-
-async function run(job){
-  if(active){emit('error',job.request_id,{message:'worker already has an active job'});return}
-  active={id:job.request_id,last:'',cancel:false,phase:'dispatch'};
-  try{
-    trace(job.request_id,"job-received",{
-      model:job.model||"auto",
-      content_build:CONTENT_BUILD,
-      model_aliases:(job.model_aliases||[]).slice(0,12),
-      navigation_recovered:!!job._navigation_recovered,
-      visibility:document.visibilityState,
-      href:location.href
-    });
-    phase(job.request_id,"started");
-    if(loginRequired()){trace(job.request_id,"login-required");emit('login_required',job.request_id);return}
-    if(challengePresent()){trace(job.request_id,"challenge-visible");emit('challenge',job.request_id);return}
-    if(termsRequired()){
-      const gate=termsGate();
-      trace(job.request_id,"terms-required",{
-        text:gate?.text||"",
-        buttons:gate?.buttons||[],
-        href:location.href
-      });
-      emit('terms_required',job.request_id,{
-        text:gate?.text||"",
-        buttons:gate?.buttons||[],
-        href:location.href
-      });
-      return;
-    }
-
-    let usingSession=!!job.reuse_session;
-    if(usingSession){
-      const resumed=await restoreSession(job.session_url,job.request_id);
-      if(!resumed){
-        trace(job.request_id,"session-restore-failed",{url:job.session_url||""});
-        usingSession=false;
-      }
-    }
-
-    if(!usingSession){
-      trace(job.request_id,"fresh-chat-preflight",{
-        blank_shell:blankChatShell(),
-        navigation_recovered:!!job._navigation_recovered,
-        messages:conversationMessageCount(),
-        href:location.href
-      });
-
-      if(blankChatShell()){
-        // Fresh keeper startup already gives us an empty Arena conversation.
-        // Clicking "New chat" here only adds a navigation/rerender failure
-        // surface and provides no isolation benefit.
-        trace(job.request_id,"fresh-chat",{
-          clicked:false,reused_blank:true,
-          recovery:!!job.reuse_session,
-          navigation_recovered:!!job._navigation_recovered
-        });
-      }else{
-        phase(job.request_id,"pre_navigation");
-        const nc=await clickNewChat(job.request_id);
-        trace(job.request_id,"fresh-chat",{
-          clicked:nc,reused_blank:false,
-          recovery:!!job.reuse_session,
-          navigation_recovered:!!job._navigation_recovered
-        });
-        phase(job.request_id,"post_navigation");
-
-        let postFresh=await waitForComposer(10000,job.request_id,"post-fresh-chat-wait");
-        if(!postFresh&&nc){
-          await settleUi(650,job.request_id,"fresh-chat-retry-settle");
-          phase(job.request_id,"pre_navigation");
-          const nc2=await clickNewChat(job.request_id);
-          trace(job.request_id,"fresh-chat-retry",{clicked:nc2});
-          phase(job.request_id,"post_navigation");
-          postFresh=await waitForComposer(8000,job.request_id,"post-fresh-chat-retry-wait");
-        }
-      }
-    }
-
-    if(termsRequired()){
-      const gate=termsGate();
-      trace(job.request_id,"terms-required-after-navigation",{
-        text:gate?.text||"",
-        buttons:gate?.buttons||[],
-        href:location.href
-      });
-      emit('terms_required',job.request_id,{
-        text:gate?.text||"",
-        buttons:gate?.buttons||[],
-        href:location.href
-      });
-      return;
-    }
-
-    // A resumed Arena chat already owns its model. On a fresh/rebuilt chat we
-    // select it exactly once. Python invalidates a sticky session if the client
-    // changes models.
-    let modelOk=true;
-    if(!usingSession){
-      modelOk=await selectModelStable(job.model,job.model_aliases||[],job.request_id);
-      trace(job.request_id,"model-selection",{ok:modelOk,model:job.model||"auto"});
-    }else{
-      trace(job.request_id,"model-selection-skipped-session",{model:job.model||"auto"});
-    }
-    if(job.model&&job.model!=="auto"&&!modelOk){
-      trace(job.request_id,"model-selection-unresolved",{model:job.model});
-      throw new Error("Arena requested model could not be selected");
-    }
-
-    let c=await waitForComposer(12000,job.request_id,"post-model-composer-wait");
-    if(!c){
-      try{
-        document.dispatchEvent(new KeyboardEvent('keydown',{
-          key:'Escape',code:'Escape',bubbles:true,cancelable:true
-        }));
-      }catch{}
-      await settleUi(700);
-      c=await waitForComposer(6000,job.request_id,"composer-recovery-wait");
-    }
-    if(!c){
-      trace(job.request_id,"composer-missing",{
-        href:location.href,readyState:document.readyState,
-        login_required:loginRequired(),challenge:challengePresent(),usingSession
-      });
-      throw new Error('Arena composer not found');
-    }
-    trace(job.request_id,"composer-found",{
-      tag:c.tagName,placeholder:c.getAttribute("placeholder")||"",
-      form:!!c.closest("form"),usingSession
-    });
-
-    const basePrompt=usingSession?job.prompt:(job.recovery_prompt||job.prompt);
-    const payload=((!usingSession&&job.system_prompt)?('System instructions:\n'+job.system_prompt+'\n\n'):'')+basePrompt;
-    const baseline=assistantSnapshot(payload);
-    let tracker=responseTracker(c,payload,job.request_id);
-    phase(job.request_id,"pre_submit");
-    const submitted=await submitPrompt(c,payload,job.request_id);
-    if(!submitted){
-      tracker.stop();
-      if(challengePresent()){
-        trace(job.request_id,"challenge-during-submit");
-        emit('challenge',job.request_id);
-        return;
-      }
-      if(loginRequired()){
-        trace(job.request_id,"login-required-during-submit");
-        emit('login_required',job.request_id);
-        return;
-      }
-      if(termsRequired()){
-        const gate=termsGate();
-        trace(job.request_id,"terms-required-during-submit",{
-          text:gate?.text||"",
-          buttons:gate?.buttons||[],
-          href:location.href
-        });
-        emit('terms_required',job.request_id,{
-          text:gate?.text||"",
-          buttons:gate?.buttons||[],
-          href:location.href
-        });
-        return;
-      }
-      if(usingSession)throw new Error("Arena session submit could not be strongly confirmed");
-      throw new Error("Arena prompt could not be strongly confirmed as submitted");
-    }
-
-    phase(job.request_id,"submitted");
-    // Capture the real Arena conversation as soon as a committed submit exists.
-    emit('session_update',job.request_id,{chat_id:job.chat_id||"",url:location.href,model:job.model||"auto"});
-
-    // A first submit may replace the whole route/main. Never reattach the
-    // mutation observer through a stale textarea from the previous React tree.
-    tracker.stop();
-    const liveComposer=await waitForComposer(2500,job.request_id,"post-submit-live-root-wait");
-    tracker=responseTracker(liveComposer&&liveComposer.isConnected?liveComposer:null,payload,job.request_id);
-    trace(job.request_id,"response-observer-rebased",{
-      live_composer:!!(liveComposer&&liveComposer.isConnected),
-      href:location.href
-    });
-
-    emit('accepted',job.request_id);
-    trace(job.request_id,"accepted",{baseline_chars:baseline.length,using_session:usingSession});
-
-    let lastChange=Date.now(),seen=false,startedGenerating=false,lastDiag=Date.now();
-    let generationStoppedAt=0,lastGenerating=false,completionProbeAt=0;
-    const COMPLETE_TEXT_IDLE_MS=2800;
-    const COMPLETE_MUTATION_IDLE_MS=1400;
-    const COMPLETE_STOP_GRACE_MS=2200;
-
-    while(!active.cancel){
-      if(challengePresent()){trace(job.request_id,"challenge-during-job");emit('challenge',job.request_id);return}
-      if(termsRequired()){
-        const gate=termsGate();
-        trace(job.request_id,"terms-required-during-job",{
-          text:gate?.text||"",
-          buttons:gate?.buttons||[]
-        });
-        emit('terms_required',job.request_id,{
-          text:gate?.text||"",
-          buttons:gate?.buttons||[],
-          href:location.href
-        });
-        return;
-      }
-
-      const generating=!!stopButton();
-      if(generating&&!startedGenerating){
-        startedGenerating=true;
-        trace(job.request_id,"generation-started");
-      }
-      if(lastGenerating&&!generating){
-        generationStoppedAt=Date.now();
-        trace(job.request_id,"generation-stop-observed");
-      }else if(generating){
-        generationStoppedAt=0;
-      }
-      lastGenerating=generating;
-
-      const cur=tracker.snapshot();
-      if(Date.now()-lastDiag>3000){
-        const st=tracker.stats();
-        trace(job.request_id,"response-observer",{
-          mutations:st.mutations,
-          best_chars:st.best_chars,
-          generating,
-          text_idle_ms:Date.now()-lastChange,
-          mutation_idle_ms:st.idle_ms
-        });
-        lastDiag=Date.now();
-      }
-
-      if(cur&&cur!==baseline){
-        if(!seen){
-          seen=true;
-          trace(job.request_id,"assistant-found",{
-            chars:cur.length,
-            candidates:assistantCandidates(payload).length
-          });
-        }
-
-        if(cur.startsWith(active.last)){
-          const d=cur.slice(active.last.length);
-          if(d){
-            active.last=cur;
-            lastChange=Date.now();
-            completionProbeAt=0;
-            emit('delta',job.request_id,{text:d});
-          }
-        }else if(!active.last){
-          active.last=cur;
-          lastChange=Date.now();
-          completionProbeAt=0;
-          emit('delta',job.request_id,{text:cur});
-        }else if(cur!==active.last){
-          let n=0,lim=Math.min(active.last.length,cur.length);
-          while(n<lim&&active.last[n]===cur[n])n++;
-          if(n>=Math.min(24,active.last.length)){
-            const d=cur.slice(n);
-            active.last=cur;
-            lastChange=Date.now();
-            completionProbeAt=0;
-            if(d)emit('delta',job.request_id,{text:d});
-          }
-        }
-      }
-
-      if(seen&&!generating){
-        const now=Date.now();
-        const st=tracker.stats();
-        const textIdle=now-lastChange;
-        const mutationIdle=st.idle_ms;
-        const stopGrace=!startedGenerating || (generationStoppedAt>0 && now-generationStoppedAt>=COMPLETE_STOP_GRACE_MS);
-
-        if(
-          textIdle>=COMPLETE_TEXT_IDLE_MS &&
-          mutationIdle>=COMPLETE_MUTATION_IDLE_MS &&
-          stopGrace
-        ){
-          // One extra delayed snapshot guards against Arena briefly removing
-          // its Stop control between token batches / DOM rerenders.
-          if(!completionProbeAt){
-            completionProbeAt=now;
-            trace(job.request_id,"completion-candidate",{
-              chars:active.last.length,
-              text_idle_ms:textIdle,
-              mutation_idle_ms:mutationIdle,
-              stop_grace_ms:generationStoppedAt?now-generationStoppedAt:null
-            });
-          }else if(now-completionProbeAt>=700){
-            const finalSnapshot=tracker.snapshot();
-            if(finalSnapshot&&finalSnapshot!==active.last){
-              if(finalSnapshot.startsWith(active.last)){
-                const d=finalSnapshot.slice(active.last.length);
-                active.last=finalSnapshot;
-                lastChange=Date.now();
-                completionProbeAt=0;
-                if(d)emit('delta',job.request_id,{text:d});
-              }else{
-                completionProbeAt=0;
-                lastChange=Date.now();
-              }
-            }else{
-              const finalStats=tracker.stats();
-              if(
-                Date.now()-lastChange>=COMPLETE_TEXT_IDLE_MS &&
-                finalStats.idle_ms>=COMPLETE_MUTATION_IDLE_MS
-              ){
-                trace(job.request_id,"done",{
-                  chars:active.last.length,
-                  text_idle_ms:Date.now()-lastChange,
-                  mutation_idle_ms:finalStats.idle_ms,
-                  completion_grace:true
-                });
-                tracker.stop();
-                emit('session_update',job.request_id,{chat_id:job.chat_id||"",url:location.href,model:job.model||"auto"});
-                emit('done',job.request_id,{text:active.last});
-                return;
-              }
-            }
-          }
-        }else{
-          completionProbeAt=0;
-        }
-      }else{
-        completionProbeAt=0;
-      }
-
-      if(startedGenerating&&!seen&&Date.now()-lastChange>8000){
-        const st=tracker.stats();
-        trace(job.request_id,"generation-without-visible-response",{
-          mutations:st.mutations,
-          best_chars:st.best_chars
-        });
-        lastChange=Date.now();
-      }
-      await sleep(180);
-    }
-    tracker.stop();
-    throw new Error('job cancelled');
-  }catch(e){
-    const message=String(e?.message||e);
-    const diag=runtimeDiagnostics(job.model||"");
-    trace(job.request_id,"job-error",{
-      name:String(e?.name||"Error"),
-      message:message.slice(0,700),
-      stack:String(e?.stack||"").slice(0,1200),
-      phase:active?.phase||"",
-      using_session:!!job.reuse_session,
-      diagnostics:diag
-    });
-    emit('error',job.request_id,{
-      message,
-      name:String(e?.name||"Error"),
-      href:location.href,
-      visibility:document.visibilityState,
-      diagnostics:diag
-    })
-  }finally{active=null}
-}
-
-chrome.runtime.onMessage.addListener((m,sender,sendResponse)=>{
-  if(m?.type==='BRIDGENA_VERSION_PROBE'){
-    sendResponse({
-      build:CONTENT_BUILD,
-      contentFingerprint:CONTENT_FINGERPRINT,
-      href:location.href,
-      readyState:document.readyState,
-      visibility:document.visibilityState
-    });
-    return;
-  }
-  if(m?.type==='BRIDGENA_SEND')run(m.job);
-  else if(m?.type==='BRIDGENA_CANCEL'&&active?.id===m.request_id)active.cancel=true
-});
-
-setTimeout(()=>{
-  chrome.runtime.sendMessage({
-    type:"BRIDGENA_CONTENT_READY_LOCAL",
-    build:CONTENT_BUILD,
-    href:location.href,
-    visibility:document.visibilityState
-  }).catch(()=>{});
-},80);
-
-function publishState(){
-  const challenge=challengePresent();
-  const login=loginRequired();
-  const terms=termsRequired();
-  const ready=!challenge&&!login&&!terms&&!!composer();
-  emit('worker_state','',{
-    ready,
-    login_required:login,
-    challenge,
-    terms_required:terms,
-    content_build:CONTENT_BUILD,
-    content_fingerprint:CONTENT_FINGERPRINT
-  });
-}
-setTimeout(publishState,1200);
-setInterval(publishState,5000);
-"""
-        with open(content_path, "w", encoding="utf-8") as fh:
-            fh.write(content_source)
-
-        log("INFO", f"v4 worker bootstrap synchronized · ws={ws_url} · token={V4_EXTENSION_TOKEN_MODE} · storage-safe · native-editor + terms-gate worker health v4.3.2")
-        return True
-    except Exception as exc:
-        log("WARN", f"v4 extension bootstrap preparation failed: {type(exc).__name__}: {redact(str(exc))[:180]}")
-        return False
-
-if V4_TRANSPORT == "extension" and V4_AUTO_ATTACH_KEEPERS:
-    os.environ["BRIDGENA_CAPTCHA_EXT"] = V4_EXTENSION_DIR
-    log("INFO", f"v4 extension injection path forced to build-isolated worker: {V4_EXTENSION_DIR} · source={V4_EXTENSION_SOURCE_DIR}")
-    _v4_prepare_bundled_extension()
-
-_v4_workers: Dict[str, dict] = {}
-_v4_jobs: Dict[str, asyncio.Queue] = {}
-_v4_worker_lock = asyncio.Lock()
-_v4_model_stats: Dict[str, dict] = {}
-_v4_browser_process = None
-
-
-def _v4_stat(model: str) -> dict:
-    key = str(model or "auto")
-    return _v4_model_stats.setdefault(key, {"ok":0,"fail":0,"ttfb":deque(maxlen=40),"duration":deque(maxlen=40)})
-
-
-def _v4_worker_score(worker: dict, model: str) -> float:
-    # v4.1.6: a connected local extension worker is schedulable unless there is
-    # a concrete reason not to use it. The content-script `ready` bit is
-    # advisory because Arena page transitions can transiently publish
-    # ready=false even after the keeper/browser has passed server readiness.
-    if worker.get("busy") or worker.get("ws") is None:
-        return -1e9
-    if worker.get("challenge") or worker.get("login_required") or worker.get("terms_required"):
-        return -1e9
-    last_seen = float(worker.get("last_seen") or 0)
-    if last_seen and (time.monotonic() - last_seen) > 45.0:
-        return -1e9
-    score = 100.0
-    if not worker.get("ready"):
-        score -= 8.0
-    score -= min(30.0, float(worker.get("latency_ms") or 0) / 100.0)
-    score -= min(25.0, float(worker.get("recent_errors") or 0) * 5.0)
-    seen = (worker.get("models") or {}).get(str(model), {})
-    if seen:
-        ok=float(seen.get("ok") or 0); fail=float(seen.get("fail") or 0)
-        total=ok+fail
-        if total:
-            score += 20.0*(ok/total) - 15.0*(fail/total)
-        score -= min(20.0, float(seen.get("avg_ttfb_ms") or 0)/1000.0)
-    # Prefer the longest-idle healthy worker to distribute wear/load.
-    score += min(10.0, max(0.0, time.monotonic()-float(worker.get("last_used") or 0))/30.0)
-    return score
-
-
-async def _v4_pick_worker(model: str, wait_sec: float = 20.0,
-                          preferred_worker_id: str = "", preferred_only: bool = False) -> Optional[dict]:
-    deadline=time.monotonic()+max(0.1, wait_sec)
-    preferred_worker_id=str(preferred_worker_id or "")
-    while time.monotonic() < deadline:
-        async with _v4_worker_lock:
-            if preferred_worker_id:
-                preferred=_v4_workers.get(preferred_worker_id)
-                if preferred and _v4_worker_score(preferred, model) > -1e8:
-                    preferred["busy"]=True
-                    preferred["last_used"]=time.monotonic()
-                    return preferred
-                if preferred_only:
-                    candidates=[]
-                else:
-                    candidates=sorted(_v4_workers.values(), key=lambda w:_v4_worker_score(w, model), reverse=True)
+            yield chunk({"role": "assistant"})
+            async for kind, payload in run_turn(
+                chat_id, prompt, model,
+                attachments=body.get("attachments"),
+                system_prompt=_tool_runtime_system_context(body, "openai"),
+                tenant_id=_tenant_identity(keyinfo),
+                handoff_prompt=prompt,
+            ):
+                if kind == "content" and isinstance(payload, str):
+                    acc += payload
+                elif kind == "reasoning" and isinstance(payload, str):
+                    reasoning_acc += payload
+                elif kind == "error":
+                    outcome = "upstream-error"
+                    status_code = _status_from_internal_error(payload, 502)
+                    error_id, public_message = _openai_public_error(
+                        status_code, payload, source="openai_tool_stream",
+                        context={"model": model, "chat_id": str(chat_id)[:120],
+                                 "buffered_chars": len(acc)}
+                    )
+                    yield _sse({"error": {
+                        "message": public_message,
+                        "type": "api_error",
+                        "code": error_id,
+                    }})
+                    yield chunk({}, finish="stop")
+                    yield "data: [DONE]\n\n"
+                    terminal_sent = True
+                    return
+
+            parsed = _extract_tool_calls(acc, body, "openai")
+            calls = _openai_tool_calls_payload(parsed)
+            _tool_output_log("OpenAI", model, parsed, acc)
+
+            if calls:
+                for index, call in enumerate(calls):
+                    yield chunk({"tool_calls": [{
+                        "index": index,
+                        "id": call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": call["function"]["name"],
+                            "arguments": call["function"]["arguments"],
+                        },
+                    }]})
+                yield chunk({}, finish="tool_calls")
             else:
-                candidates=sorted(_v4_workers.values(), key=lambda w:_v4_worker_score(w, model), reverse=True)
-            if candidates and _v4_worker_score(candidates[0], model) > -1e8:
-                worker=candidates[0]
-                worker["busy"]=True
-                worker["last_used"]=time.monotonic()
-                return worker
-        await asyncio.sleep(0.15)
-    return None
+                if reasoning_acc:
+                    yield chunk({"reasoning_content": reasoning_acc})
+                if acc:
+                    yield chunk({"content": acc})
+                yield chunk({}, finish="stop")
 
-
-async def _v4_release_worker(worker_id: str, *, success: bool, model: str, ttfb: Optional[float]=None, duration: Optional[float]=None):
-    async with _v4_worker_lock:
-        worker=_v4_workers.get(worker_id)
-        if not worker: return
-        worker["busy"]=False
-        worker["last_success"] = time.time() if success else worker.get("last_success",0)
-        worker["recent_errors"] = max(0, int(worker.get("recent_errors") or 0) - 1) if success else min(20, int(worker.get("recent_errors") or 0)+1)
-        ms=worker.setdefault("models",{}).setdefault(str(model), {"ok":0,"fail":0,"avg_ttfb_ms":0.0})
-        ms["ok" if success else "fail"] += 1
-        if success and ttfb is not None:
-            old=float(ms.get("avg_ttfb_ms") or 0.0)
-            ms["avg_ttfb_ms"] = (old*0.8 + ttfb*1000*0.2) if old else ttfb*1000
-    stat=_v4_stat(model)
-    stat["ok" if success else "fail"] += 1
-    if ttfb is not None: stat["ttfb"].append(ttfb)
-    if duration is not None: stat["duration"].append(duration)
-
-
-async def _v4_extension_run_turn(chat_id: str, prompt: str, model_name: str,
-                                 attachments=None, system_prompt: str="",
-                                 tenant_id: str="", handoff_prompt: str="",
-                                 turn_prompt: str=""):
-    session=_v4_session_get(chat_id, model_name)
-    worker=None
-    if session and session.get("worker_id"):
-        worker=await _v4_pick_worker(
-            model_name, wait_sec=12.0,
-            preferred_worker_id=str(session.get("worker_id") or ""),
-            preferred_only=True,
-        )
-        if not worker:
-            _v4_session_drop(chat_id, "bound worker unavailable; rebuilding from client transcript")
-            session=None
-    if not worker:
-        worker=await _v4_pick_worker(model_name, wait_sec=20.0)
-    if not worker:
-        if V4_FALLBACK_LEGACY:
-            async for item in run_turn(chat_id, prompt, model_name, attachments=attachments,
-                                       system_prompt=system_prompt, tenant_id=tenant_id,
-                                       handoff_prompt=handoff_prompt):
-                yield item
-            return
-        yield ("error", "503: no healthy headed-browser extension worker became available within 20s")
-        return
-
-    worker_id=str(worker["id"])
-    request_id="v4-"+uuid7()
-    q=asyncio.Queue(maxsize=512)
-    _v4_jobs[request_id]=q
-    started=time.monotonic(); first=None; success=False; accumulated=""
-    try:
-        reuse_session=bool(session)
-        effective_prompt=(turn_prompt or prompt) if reuse_session else (handoff_prompt or prompt)
-        payload={
-            "type":"send_message", "request_id":request_id,
-            "chat_id":chat_id, "model":model_name,
-            "model_aliases":_v4_model_aliases_for_request(model_name),
-            "prompt":effective_prompt,
-            "recovery_prompt":handoff_prompt or prompt,
-            "system_prompt":system_prompt or "",
-            "fresh_chat":not reuse_session, "disposable":False,
-            "reuse_session":reuse_session,
-            "session_url":str((session or {}).get("url") or ""),
-        }
-        log("INFO", f"v4 job dispatch · {request_id[-12:]} · worker={worker_id} · model={model_name} · "
-                    f"session={'resume' if reuse_session else 'new'} · chat={str(chat_id)[:18]}…")
-        await worker["ws"].send_json(payload)
-        first_deadline=started+V4_FIRST_TOKEN_SEC
-        hard_deadline=started+V4_JOB_MAX_SEC
-        last_activity=started
-        last_stage="dispatch"
-        last_trace={}
-        trace_count=0
-
-        def _worker_diag():
-            w=_v4_workers.get(worker_id) or {}
-            return (
-                f"worker={worker_id} stage={last_stage} "
-                f"ready={bool(w.get('ready'))} challenge={bool(w.get('challenge'))} "
-                f"login_required={bool(w.get('login_required'))} "
-                f"terms_required={bool(w.get('terms_required'))} "
-                f"trace_count={trace_count}"
+            if include_usage:
+                pt = _rough_tokens(prompt)
+                ct = _rough_tokens(acc)
+                yield _sse({
+                    "id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [],
+                    "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+                })
+            yield "data: [DONE]\n\n"
+            terminal_sent = True
+        except Exception as exc:
+            outcome = "bridge-exception"
+            error_id, public_message = _openai_public_error(
+                500, f"{type(exc).__name__}: {exc}",
+                source="openai_tool_stream_exception",
+                context={"model": model, "chat_id": str(chat_id)[:120], "buffered_chars": len(acc)},
+                exception_type=type(exc).__name__,
             )
+            yield _sse({"error": {"message": public_message, "type": "api_error", "code": error_id}})
+            yield chunk({}, finish="stop")
+            yield "data: [DONE]\n\n"
+            terminal_sent = True
+        finally:
+            _release_api_request(body, keyinfo, prompt)
+            _record_reliability_outcome(bool(outcome == "complete" and terminal_sent), outcome)
+            log("INFO" if terminal_sent else "WARN",
+                f"OpenAI tool stream {rid[-8:]} · outcome {outcome} · "
+                f"buffered {len(acc)} chars · terminal {'yes' if terminal_sent else 'no'}")
 
-        while True:
-            now=time.monotonic()
-            if now >= hard_deadline:
-                try: await worker["ws"].send_json({"type":"cancel","request_id":request_id})
-                except Exception: pass
-                detail=f"504: headed-browser job exceeded {V4_JOB_MAX_SEC:.0f}s · {_worker_diag()}"
-                log("ERROR", f"v4 job timeout · {request_id[-12:]} · {detail}")
-                yield ("error", detail)
-                return
-            timeout=min(1.0, hard_deadline-now)
-            try:
-                event=await asyncio.wait_for(q.get(), timeout=timeout)
-            except asyncio.TimeoutError:
-                now=time.monotonic()
-                if first is None and now >= first_deadline:
-                    try: await worker["ws"].send_json({"type":"cancel","request_id":request_id})
-                    except Exception: pass
-                    detail=(f"504: headed-browser worker produced no assistant output within "
-                            f"{V4_FIRST_TOKEN_SEC:.0f}s · {_worker_diag()} · "
-                            f"last_trace={redact(str(last_trace))[:700]}")
-                    log("ERROR", f"v4 first-output timeout · {request_id[-12:]} · {detail}")
-                    yield ("error", detail)
-                    return
-                if first is not None and now-last_activity >= V4_IDLE_STREAM_SEC:
-                    try: await worker["ws"].send_json({"type":"cancel","request_id":request_id})
-                    except Exception: pass
-                    detail=(f"504: headed-browser response stalled for {V4_IDLE_STREAM_SEC:.0f}s · "
-                            f"{_worker_diag()} · last_trace={redact(str(last_trace))[:700]}")
-                    log("ERROR", f"v4 stream stall · {request_id[-12:]} · {detail}")
-                    yield ("error", detail)
-                    return
-                continue
-            et=str(event.get("type") or "")
-            last_activity=time.monotonic()
-            if et == "trace":
-                stage=str(event.get("stage") or "?")
-                extras={k:v for k,v in event.items() if k not in {"type","request_id","stage"}}
-                last_stage=stage
-                last_trace=extras
-                trace_count += 1
-                noisy_error_stage=any(token in stage.lower() for token in (
-                    "error","failed","missing","unresolved","timeout","diagnostic"
-                ))
-                level="WARN" if noisy_error_stage else "INFO"
-                max_detail=1800 if noisy_error_stage else 700
-                log(level, f"v4 job trace · {request_id[-12:]} · {stage}" +
-                    (f" · {redact(str(extras))[:max_detail]}" if extras else ""))
-                continue
-            if et == "accepted":
-                log("INFO", f"v4 job accepted · {request_id[-12:]} · worker={worker_id}")
-                continue
-            if et == "session_update":
-                session_url=str(event.get("url") or "")
-                _v4_session_bind(chat_id, worker_id, session_url, model_name)
-                log("INFO", f"v4 sticky session bound · {str(chat_id)[:18]}… · worker={worker_id} · "
-                            f"url={'yes' if session_url else 'same-tab'}")
-                continue
-            if et in {"state","heartbeat"}:
-                continue
-            if et == "challenge":
-                # The extension pauses the job and reports the browser state. It
-                # does not implement challenge-solving logic here.
-                yield ("error", "503: headed browser requires interactive verification before this request can continue")
-                return
-            if et == "login_required":
-                yield ("error", "503: headed browser profile is not logged in to Arena")
-                return
-            if et == "terms_required":
-                async with _v4_worker_lock:
-                    state=_v4_workers.get(worker_id)
-                    if state:
-                        state["terms_required"]=True
-                        state["ready"]=False
-                gate_text=redact(str(event.get("text") or ""))[:420]
-                log("WARN", f"v4 worker requires one-time Arena Terms acknowledgement · {worker_id} · "
-                            f"request={request_id[-12:]} · {gate_text}")
-                yield ("error",
-                       "503: headed browser requires one-time Arena Terms of Use acknowledgement "
-                       "in its headed window; this worker is quarantined until acknowledged")
-                return
-            if et == "delta":
-                piece=str(event.get("text") or "")
-                if piece:
-                    if first is None:
-                        first=time.monotonic()
-                        log("OK", f"v4 first assistant output · {request_id[-12:]} · {first-started:.2f}s")
-                    accumulated += piece
-                    yield ("content", piece)
-                continue
-            if et == "reasoning_delta":
-                piece=str(event.get("text") or "")
-                if piece:
-                    if first is None: first=time.monotonic()
-                    yield ("reasoning", piece)
-                continue
-            if et == "done":
-                final=str(event.get("text") or "")
-                if final.startswith(accumulated) and len(final)>len(accumulated):
-                    tail=final[len(accumulated):]
-                    accumulated+=tail
-                    yield ("content", tail)
-                success=True
-                log("OK", f"v4 job complete · {request_id[-12:]} · chars={len(accumulated or final)} · {time.monotonic()-started:.2f}s")
-                yield ("done", accumulated or final)
-                return
-            if et == "error":
-                message=str(event.get("message") or "unknown extension error")[:900]
-                extension_diag={
-                    k:v for k,v in event.items()
-                    if k not in {"type","request_id","message"}
-                }
-                if reuse_session and any(token in message.lower() for token in (
-                    "session", "composer not found", "requested model could not be selected"
-                )):
-                    _v4_session_drop(chat_id, "session UI became unusable")
-                detail=(
-                    "502: headed-browser worker: "+message+
-                    f" · {_worker_diag()}"+
-                    (f" · extension={redact(str(extension_diag))[:900]}" if extension_diag else "")
-                )
-                log("ERROR", f"v4 job error · {request_id[-12:]} · model={model_name} · "
-                             f"session={'resume' if reuse_session else 'new'} · {detail}")
-                yield ("error", detail)
-                return
-    except (WebSocketDisconnect, RuntimeError) as exc:
-        detail=(f"502: headed-browser worker disconnected: {type(exc).__name__}: "
-                f"{redact(str(exc))[:300]} · worker={worker_id}")
-        log("ERROR", f"v4 transport disconnect · {request_id[-12:]} · {detail}")
-        yield ("error", detail)
-    except Exception as exc:
-        detail=(f"502: headed-browser transport error: {type(exc).__name__}: "
-                f"{redact(str(exc))[:500]} · worker={worker_id}")
-        log("ERROR", f"v4 transport exception · {request_id[-12:]} · {detail}")
-        yield ("error", detail)
-    finally:
-        _v4_jobs.pop(request_id, None)
-        await _v4_release_worker(worker_id, success=success, model=model_name,
-                                 ttfb=(first-started) if first else None,
-                                 duration=time.monotonic()-started)
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform",
+                 "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
-
-async def _api_run_turn(chat_id: str, prompt: str, model_name: str, **kwargs):
-    if V4_TRANSPORT == "extension":
-        async for item in _v4_extension_run_turn(chat_id, prompt, model_name, **kwargs):
-            yield item
-    else:
-        legacy_kwargs=dict(kwargs)
-        legacy_kwargs.pop("turn_prompt", None)
-        async for item in run_turn(chat_id, prompt, model_name, **legacy_kwargs):
-            yield item
-
-
-_v4_ws_warn_last: Dict[str, float] = {}
-_v4_ws_warn_suppressed: Dict[str, int] = {}
-
-def _v4_ws_warn_once(key: str, message: str, interval: float = 20.0) -> None:
-    now=time.monotonic()
-    last=float(_v4_ws_warn_last.get(key) or 0.0)
-    if now-last >= interval:
-        suppressed=int(_v4_ws_warn_suppressed.pop(key,0) or 0)
-        suffix=f" · suppressed={suppressed}" if suppressed else ""
-        log("WARN", message+suffix)
-        _v4_ws_warn_last[key]=now
-    else:
-        _v4_ws_warn_suppressed[key]=int(_v4_ws_warn_suppressed.get(key) or 0)+1
-
-
-@app.websocket("/v4/extension/ws")
-async def v4_extension_ws(ws: WebSocket):
-    token=ws.query_params.get("token", "")
-    peer=getattr(getattr(ws, "client", None), "host", "?")
-    origin=str(ws.headers.get("origin") or "")[:160]
-    _loopback_peer = str(peer) in {"127.0.0.1", "::1", "localhost"}
-    if V4_EXTENSION_TOKEN and not hmac.compare_digest(token, V4_EXTENSION_TOKEN):
-        if not _loopback_peer:
-            log("WARN", f"v4 extension socket rejected · peer={peer} · origin={origin or '-'} · token mismatch")
-            await ws.close(code=4403)
-            return
-        _v4_ws_warn_once(
-            f"stale:{peer}:{origin}",
-            f"v4 extension socket accepted from loopback with stale token · peer={peer} · "
-            f"origin={origin or '-'} · server_token_mode={V4_EXTENSION_TOKEN_MODE}",
-        )
-    await ws.accept()
-    worker_id=None
-    try:
-        try:
-            hello=await asyncio.wait_for(ws.receive_json(), timeout=10.0)
-        except asyncio.TimeoutError:
-            _v4_ws_warn_once(
-                f"hello-timeout:{peer}:{origin}",
-                f"v4 extension socket hello timeout · peer={peer} · origin={origin or '-'} · "
-                f"server_token_mode={V4_EXTENSION_TOKEN_MODE} · timeout=10s",
-            )
-            await ws.close(code=4408)
-            return
-        if hello.get("type") != "hello":
-            log("WARN", f"v4 extension socket malformed hello · peer={peer} · type={str(hello.get('type') or '-')[:40]}")
-            await ws.close(code=4400); return
-        worker_id=str(hello.get("worker_id") or ("browser-"+uuid7()[:8]))
-        async with _v4_worker_lock:
-            _v4_workers[worker_id]={
-                "id":worker_id,"ws":ws,"ready":bool(hello.get("ready",True)),"busy":False,
-                "challenge":False,"login_required":False,"terms_required":False,
-                "recent_errors":0,"last_used":0.0,
-                "connected_at":time.monotonic(),"last_seen":time.monotonic(),
-                "latency_ms":float(hello.get("latency_ms") or 0),
-                "proxy":str(hello.get("proxy") or ""),"models":{},
-                "user_agent":str(hello.get("user_agent") or "")[:240],
-            }
-        log("OK", f"v4 extension worker connected · {worker_id}")
-        await ws.send_json({"type":"hello_ack","worker_id":worker_id,"build":BUILD_STAMP})
-        while True:
-            msg=await ws.receive_json()
-            et=str(msg.get("type") or "")
-            async with _v4_worker_lock:
-                worker=_v4_workers.get(worker_id)
-                if worker:
-                    worker["last_seen"]=time.monotonic()
-                    if et == "worker_state":
-                        old_ready=bool(worker.get("ready"))
-                        old_challenge=bool(worker.get("challenge"))
-                        old_login=bool(worker.get("login_required"))
-                        old_terms=bool(worker.get("terms_required"))
-                        worker["ready"]=bool(msg.get("ready", worker.get("ready")))
-                        worker["challenge"]=bool(msg.get("challenge",False))
-                        worker["login_required"]=bool(msg.get("login_required",False))
-                        worker["terms_required"]=bool(msg.get("terms_required",False))
-                        worker["content_build"]=str(msg.get("content_build") or worker.get("content_build") or "")
-                        worker["content_fingerprint"]=str(msg.get("content_fingerprint") or worker.get("content_fingerprint") or "")
-                        worker["latency_ms"]=float(msg.get("latency_ms") or worker.get("latency_ms") or 0)
-                        if (old_ready != worker["ready"] or
-                            old_challenge != worker["challenge"] or
-                            old_login != worker["login_required"] or
-                            old_terms != worker["terms_required"]):
-                            level="WARN" if worker["terms_required"] else "INFO"
-                            log(level, f"v4 worker state · {worker_id} · ready={worker['ready']} · "
-                                      f"challenge={worker['challenge']} · login_required={worker['login_required']} · "
-                                      f"terms_required={worker['terms_required']}")
-            rid=str(msg.get("request_id") or "")
-            q=_v4_jobs.get(rid)
-            if q:
-                try: q.put_nowait(msg)
-                except asyncio.QueueFull:
-                    log("WARN", f"v4 job queue full · {rid[-8:]}")
-    except (WebSocketDisconnect, asyncio.CancelledError):
-        pass
-    except Exception as exc:
-        log("WARN", f"v4 extension socket ended · {worker_id or '?'} · {type(exc).__name__}: {redact(str(exc))[:160]}")
-    finally:
-        if worker_id:
-            async with _v4_worker_lock:
-                current=_v4_workers.get(worker_id)
-                if current and current.get("ws") is ws:
-                    _v4_workers.pop(worker_id,None)
-            log("WARN", f"v4 extension worker disconnected · {worker_id}")
-
-
-@app.get("/v4/workers")
-async def v4_workers(request: Request):
-    await _require_admin(request)
-    async with _v4_worker_lock:
-        rows=[]
-        for w in _v4_workers.values():
-            rows.append({k:v for k,v in w.items() if k not in {"ws"}})
-    stats={}
-    for model,s in _v4_model_stats.items():
-        stats[model]={"ok":s["ok"],"fail":s["fail"],
-                      "median_ttfb":sorted(s["ttfb"])[len(s["ttfb"])//2] if s["ttfb"] else None,
-                      "median_duration":sorted(s["duration"])[len(s["duration"])//2] if s["duration"] else None}
-    with _v4_sessions_guard:
-        session_count=len(_v4_sessions)
-    return JSONResponse({"build":BUILD_STAMP,"transport":V4_TRANSPORT,"workers":rows,"models":stats,
-                         "sticky_sessions":session_count})
-
-
-@app.get("/v4/sessions")
-async def v4_sessions(request: Request):
-    await _require_admin(request)
-    now=time.time()
-    with _v4_sessions_guard:
-        rows=[{
-            "chat_id":cid[:24] + ("…" if len(cid)>24 else ""),
-            "worker_id":str(item.get("worker_id") or ""),
-            "model":str(item.get("model") or "auto"),
-            "has_url":bool(item.get("url")),
-            "age_sec":max(0, int(now-float(item.get("updated") or now))),
-        } for cid,item in _v4_sessions.items()]
-    rows.sort(key=lambda x:x["age_sec"])
-    return JSONResponse({"build":BUILD_STAMP,"ttl_sec":V4_SESSION_TTL_SEC,"count":len(rows),"sessions":rows})
-
-
-def _v4_find_chrome() -> Optional[str]:
-    if V4_CHROME_BIN and os.path.isfile(V4_CHROME_BIN): return V4_CHROME_BIN
-    for name in ("google-chrome-stable","google-chrome","chromium","chromium-browser"):
-        found=shutil.which(name)
-        if found: return found
-    return None
-
-
-def _v4_launch_browser_once():
-    global _v4_browser_process
-    if _v4_browser_process and _v4_browser_process.poll() is None:
-        return _v4_browser_process
-    chrome=_v4_find_chrome()
-    if not chrome:
-        log("WARN","v4 autolaunch requested but Chrome/Chromium was not found")
-        return None
-    os.makedirs(V4_PROFILE_DIR,exist_ok=True)
-    args=[chrome, f"--user-data-dir={V4_PROFILE_DIR}", f"--load-extension={V4_EXTENSION_DIR}",
-          f"--disable-extensions-except={V4_EXTENSION_DIR}", "--no-first-run", "--no-default-browser-check",
-          "--start-maximized", "https://arena.ai/"]
-    # Proxy assignment is browser-lifetime scoped. Never switch it under an
-    # active job; drain/restart the worker to rotate exits cleanly.
-    if V4_BROWSER_PROXY:
-        args.insert(-1, f"--proxy-server={V4_BROWSER_PROXY}")
-    env=os.environ.copy()
-    _v4_browser_process=subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
-    log("OK", f"v4 headed browser launched · pid {_v4_browser_process.pid} · profile {V4_PROFILE_DIR}")
-    return _v4_browser_process
 
 async def openai_stream(body: dict, keyinfo: dict):
+    if _openai_has_tool_context(body):
+        return await _openai_tool_stream(body, keyinfo)
     prompt = _format_conversation_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
-    model = canonical_public_model_name(body.get("model", "auto"))
-    body["model"] = model
-    # v4.2: stable tenant-scoped id binds follow-up API turns to the same real
-    # Arena conversation. No prompt/response content is stored in the binding.
-    chat_id = _logical_chat_id(body, keyinfo, "api")
-    turn_prompt = _latest_user_text(body)
+    model = body.get("model", "auto")
+    # A caller-supplied opaque thread id preserves Arena context without storing
+    # prompt or response content. One-off API calls receive a random id.
+    chat_id = _disposable_chat_id("api")
     tenant_id = _tenant_identity(keyinfo)
     system_prompt = _openai_system_context(body)
 
@@ -14401,12 +12125,11 @@ async def openai_stream(body: dict, keyinfo: dict):
         outcome = "complete"
         try:
             yield chunk({"role": "assistant"})
-            async for kind, payload in _api_run_turn(chat_id, prompt, model,
+            async for kind, payload in run_turn(chat_id, prompt, model,
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
-                                                handoff_prompt=prompt,
-                                                turn_prompt=turn_prompt):
+                                                handoff_prompt=prompt):
                 if kind == "content":
                     acc += payload
                     content_chunks += 1
@@ -14595,34 +12318,6 @@ async def _force_capacity_recovery_cycle(deadline: float, *, aggressive: bool = 
 
 
 async def _require_api_ready():
-    # v4 extension transport has its own capacity signal. Do not gate headed-browser
-    # jobs on legacy Playwright keeper readiness. Wait up to the same bounded 20s
-    # admission window for a connected, ready extension worker instead.
-    if V4_TRANSPORT == "extension":
-        deadline = time.monotonic() + min(_API_READY_RECOVERY_WAIT_SEC, 20.0)
-        while time.monotonic() < deadline:
-            if get_models():
-                async with _v4_worker_lock:
-                    if any(_v4_worker_score(w, "auto") > -1e8 for w in _v4_workers.values()):
-                        return
-            await asyncio.sleep(0.15)
-        async with _v4_worker_lock:
-            connected = len(_v4_workers)
-            ready = sum(1 for w in _v4_workers.values() if _v4_worker_score(w, "auto") > -1e8)
-            advisory_ready = sum(1 for w in _v4_workers.values() if w.get("ready"))
-            challenged = sum(1 for w in _v4_workers.values() if w.get("challenge"))
-            login_required = sum(1 for w in _v4_workers.values() if w.get("login_required"))
-            terms_required = sum(1 for w in _v4_workers.values() if w.get("terms_required"))
-        raise HTTPException(
-            status_code=503,
-            detail=(f"Bridgena v4 headed-browser capacity unavailable after "
-                    f"{min(_API_READY_RECOVERY_WAIT_SEC, 20.0):.0f}s: "
-                    f"connected workers={connected}, schedulable workers={ready}, "
-                    f"advisory-ready={advisory_ready}, challenged={challenged}, "
-                    f"login-required={login_required}, terms-required={terms_required}."),
-            headers={"Retry-After": "1"},
-        )
-
     models_ready = bool(get_models())
 
     # During cold startup, briefly wait for the first usable keeper instead of
@@ -14710,7 +12405,6 @@ async def chat_completions(request: Request):
     await _require_api_ready()
     keyinfo = await _require_key(request)
     body = await request.json()
-    body["model"] = canonical_public_model_name(body.get("model", "auto"))
     prompt = _format_conversation_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
@@ -14729,19 +12423,19 @@ async def chat_completions(request: Request):
                         f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
         raise HTTPException(status_code=429, detail="An identical request is already in flight. Wait for it to finish before retrying.", headers={"Retry-After": "2"})
     if not body.get("stream", True):
+        if _openai_has_tool_context(body):
+            return await _openai_tool_nonstream(body, keyinfo)
         out = {"id": "chatcmpl-" + uuid7()[:23], "object": "chat.completion", "created": int(time.time()),
                "model": body.get("model", "auto"), "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]}
         acc = ""
         try:
-            chat_id = _logical_chat_id(body, keyinfo, "api")
-            turn_prompt = _latest_user_text(body)
-            async for kind, payload in _api_run_turn(chat_id, prompt,
+            chat_id = _disposable_chat_id("api")
+            async for kind, payload in run_turn(chat_id, prompt,
                                                 body.get("model", "auto"),
                                                 attachments=body.get("attachments"),
                                                 system_prompt=_openai_system_context(body),
                                                 tenant_id=_tenant_identity(keyinfo),
-                                                handoff_prompt=prompt,
-                                                turn_prompt=turn_prompt):
+                                                handoff_prompt=prompt):
                 if kind == "content":
                     acc += payload
                 elif kind == "error":
@@ -14836,10 +12530,172 @@ async def _native_anthropic_request(request: Request, endpoint: str):
             await client.aclose()
 
 
+async def _anthropic_tool_response(body: dict, keyinfo: dict):
+    prompt = _anthropic_prompt(body)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="no conversation content")
+    model = body.get("model", "auto")
+    chat_id = _disposable_chat_id("anthropic-tool")
+    tenant_id = _tenant_identity(keyinfo)
+    system_prompt = _tool_runtime_system_context(body, "anthropic")
+    message_id = "msg_" + uuid7().replace("-", "")
+    input_tokens = _rough_tokens(prompt + "\n" + system_prompt)
+
+    if not body.get("stream", False):
+        acc = ""
+        reasoning_acc = ""
+        try:
+            async for kind, payload in run_turn(
+                chat_id, prompt, model,
+                attachments=body.get("attachments"),
+                system_prompt=system_prompt,
+                tenant_id=tenant_id,
+                handoff_prompt=prompt,
+            ):
+                if kind == "content" and isinstance(payload, str):
+                    acc += payload
+                elif kind == "reasoning" and isinstance(payload, str):
+                    reasoning_acc += payload
+                elif kind == "error":
+                    raise HTTPException(status_code=502, detail=payload)
+            parsed = _extract_tool_calls(acc, body, "anthropic")
+            calls = _anthropic_tool_calls_payload(parsed)
+            _tool_output_log("Anthropic", model, parsed, acc)
+            content = calls if calls else [{"type": "text", "text": acc}]
+            return JSONResponse({
+                "id": message_id, "type": "message", "role": "assistant", "model": model,
+                "content": content,
+                "stop_reason": "tool_use" if calls else "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": _rough_tokens(acc)},
+            })
+        finally:
+            _release_api_request(body, keyinfo, prompt)
+
+    async def gen():
+        acc = ""
+        reasoning_acc = ""
+        terminal_sent = False
+        outcome = "complete"
+        try:
+            yield _anthropic_sse("message_start", {"type": "message_start", "message": {
+                "id": message_id, "type": "message", "role": "assistant", "model": model,
+                "content": [], "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            }})
+            async for kind, payload in run_turn(
+                chat_id, prompt, model,
+                attachments=body.get("attachments"),
+                system_prompt=system_prompt,
+                tenant_id=tenant_id,
+                handoff_prompt=prompt,
+            ):
+                if kind == "content" and isinstance(payload, str):
+                    acc += payload
+                elif kind == "reasoning" and isinstance(payload, str):
+                    reasoning_acc += payload
+                elif kind == "error":
+                    outcome = "upstream-error"
+                    status_code = _status_from_internal_error(payload, 502)
+                    error_id, public_message = _anthropic_public_error(
+                        status_code, payload, source="anthropic_tool_stream",
+                        context={"model": model, "chat_id": str(chat_id)[:120],
+                                 "buffered_chars": len(acc)},
+                    )
+                    yield _anthropic_sse("error", {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": public_message},
+                        "error_id": error_id,
+                    })
+                    yield _anthropic_sse("message_stop", {"type": "message_stop"})
+                    terminal_sent = True
+                    return
+
+            parsed = _extract_tool_calls(acc, body, "anthropic")
+            calls = _anthropic_tool_calls_payload(parsed)
+            _tool_output_log("Anthropic", model, parsed, acc)
+
+            if calls:
+                for index, call in enumerate(calls):
+                    yield _anthropic_sse("content_block_start", {
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": call["id"],
+                            "name": call["name"],
+                            "input": {},
+                        },
+                    })
+                    args_json = json.dumps(call.get("input") or {}, ensure_ascii=False, separators=(",", ":"))
+                    yield _anthropic_sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": args_json},
+                    })
+                    yield _anthropic_sse("content_block_stop", {
+                        "type": "content_block_stop", "index": index
+                    })
+                stop_reason = "tool_use"
+            else:
+                yield _anthropic_sse("content_block_start", {
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                })
+                if acc:
+                    yield _anthropic_sse("content_block_delta", {
+                        "type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": acc},
+                    })
+                yield _anthropic_sse("content_block_stop", {
+                    "type": "content_block_stop", "index": 0
+                })
+                stop_reason = "end_turn"
+
+            yield _anthropic_sse("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": _rough_tokens(acc)},
+            })
+            yield _anthropic_sse("message_stop", {"type": "message_stop"})
+            terminal_sent = True
+        except Exception as exc:
+            outcome = "bridge-exception"
+            error_id, public_message = _anthropic_public_error(
+                500, f"{type(exc).__name__}: {exc}",
+                source="anthropic_tool_stream_exception",
+                context={"model": model, "chat_id": str(chat_id)[:120], "buffered_chars": len(acc)},
+                exception_type=type(exc).__name__,
+            )
+            yield _anthropic_sse("error", {
+                "type": "error",
+                "error": {"type": "api_error", "message": public_message},
+                "error_id": error_id,
+            })
+        finally:
+            _release_api_request(body, keyinfo, prompt)
+            _record_reliability_outcome(bool(outcome == "complete" and terminal_sent), outcome)
+            log("INFO" if terminal_sent else "WARN",
+                f"Anthropic tool stream {message_id[-8:]} · outcome {outcome} · "
+                f"buffered {len(acc)} chars · terminal {'yes' if terminal_sent else 'no'}")
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform",
+                 "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
 @app.post("/v1/messages/count_tokens")
 async def anthropic_count_tokens(request: Request):
     await _require_key(request)
-    return await _native_anthropic_request(request, "messages/count_tokens")
+    if os.environ.get("BRIDGENA_ANTHROPIC_API_KEY", "").strip():
+        return await _native_anthropic_request(request, "messages/count_tokens")
+    body = await request.json()
+    prompt = _anthropic_prompt(body)
+    system = (_tool_runtime_system_context(body, "anthropic")
+              if _anthropic_has_tool_context(body) else _anthropic_system_context(body))
+    return JSONResponse({"input_tokens": _rough_tokens((prompt or "") + "\n" + (system or ""))})
 
 
 @app.post("/v1/messages")
@@ -14852,19 +12708,34 @@ async def anthropic_messages(request: Request):
     if os.environ.get("BRIDGENA_ANTHROPIC_API_KEY", "").strip():
         return await _native_anthropic_request(request, "messages")
     body = await request.json()
-    if body.get("tools") or body.get("tool_choice") or body.get("thinking") or any(
+    if _anthropic_has_tool_context(body):
+        prompt = _anthropic_prompt(body)
+        if not prompt:
+            raise HTTPException(status_code=400, detail="no conversation content")
+        await _wait_if_model_rate_limited(body.get("model", "auto"))
+        await _pace_api_request(_tenant_identity(keyinfo))
+        reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
+        if not reserved:
+            if duplicate_count == 1:
+                log("INFO", f"duplicate Anthropic tool retry suppressed · model {str(body.get('model') or 'auto')[:80]}")
+            raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
+        return await _anthropic_tool_response(body, keyinfo)
+
+    unsupported_blocks = any(
         isinstance(block, dict) and block.get("type") not in {"text"}
         for message in body.get("messages", []) if isinstance(message, dict)
         for block in (message.get("content") if isinstance(message.get("content"), list) else [])
-    ):
-        return _anthropic_error(400,
-            "Browser text mode cannot preserve tools, thinking, or non-text blocks. "
-            "Configure BRIDGENA_ANTHROPIC_API_KEY for native Claude Code requests.")
+    )
+    if unsupported_blocks:
+        return _anthropic_error(
+            400,
+            "Browser text mode received a non-text content block it cannot represent.",
+            source="anthropic_local_nontext",
+        )
     prompt = _anthropic_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail="no user message")
-    model = canonical_public_model_name(body.get("model", "auto"))
-    body["model"] = model
+    model = body.get("model", "auto")
     await _wait_if_model_rate_limited(model)
     await _pace_api_request(_tenant_identity(keyinfo))
     reserved, duplicate_count = _reserve_api_request(body, keyinfo, prompt)
@@ -14874,8 +12745,7 @@ async def anthropic_messages(request: Request):
                         f"content {len(prompt)} chars · window {API_DUPLICATE_WINDOW_SEC}s")
         raise HTTPException(status_code=409, detail="duplicate request suppressed; reuse the original stream")
 
-    chat_id = _logical_chat_id(body, keyinfo, "anthropic")
-    turn_prompt = _latest_user_text(body)
+    chat_id = _disposable_chat_id("anthropic")
     tenant_id = _tenant_identity(keyinfo)
     system_prompt = _anthropic_system_context(body)
     message_id = "msg_" + uuid7().replace("-", "")
@@ -14884,12 +12754,11 @@ async def anthropic_messages(request: Request):
     if not body.get("stream", False):
         acc = ""
         try:
-            async for kind, payload in _api_run_turn(chat_id, prompt, model,
+            async for kind, payload in run_turn(chat_id, prompt, model,
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
-                                                handoff_prompt=prompt,
-                                                turn_prompt=turn_prompt):
+                                                handoff_prompt=prompt):
                 if kind in ("content", "reasoning") and isinstance(payload, str):
                     acc += payload
                 elif kind == "error":
@@ -14916,12 +12785,11 @@ async def anthropic_messages(request: Request):
             }})
             yield _anthropic_sse("content_block_start", {"type": "content_block_start", "index": 0,
                                                           "content_block": {"type": "text", "text": ""}})
-            async for kind, payload in _api_run_turn(chat_id, prompt, model,
+            async for kind, payload in run_turn(chat_id, prompt, model,
                                                 attachments=body.get("attachments"),
                                                 system_prompt=system_prompt,
                                                 tenant_id=tenant_id,
-                                                handoff_prompt=prompt,
-                                                turn_prompt=turn_prompt):
+                                                handoff_prompt=prompt):
                 if kind in ("content", "reasoning") and isinstance(payload, str):
                     acc += payload
                     chunks += 1
@@ -15024,29 +12892,17 @@ async def anthropic_messages(request: Request):
 async def models_api():
     state = load_state()
     blocked = state.get("blocked_models", [])
-    now = int(time.time())
-    data, seen = [], set()
-    for m in get_models():
-        public = model_name(m).strip()
-        if not public or public in blocked or public in seen:
-            continue
-        seen.add(public)
-        data.append({
-            "id": public,
-            "object": "model",
-            "created": now,
-            "owned_by": "arena",
-        })
+    data = [{"id": model_name(m), "object": "model", "created": int(time.time()), "owned_by": "arena-bridge",
+             "arena_id": m.get("id") if isinstance(m, dict) else None} for m in get_models() if model_name(m) not in blocked]
     return JSONResponse({"object": "list", "data": data})
 
 
 @app.get("/v1/models/{model_id:path}")
 @app.get("/models/{model_id:path}")
 async def model_one(model_id: str):
-    public = canonical_public_model_name(model_id)
     for m in get_models():
-        if model_name(m) == public:
-            return JSONResponse({"id": public, "object": "model", "owned_by": "arena"})
+        if model_name(m) == model_id or (isinstance(m, dict) and m.get("id") == model_id):
+            return JSONResponse({"id": m.get("name"), "object": "model", "owned_by": "arena-bridge"})
     raise HTTPException(status_code=404, detail="unknown model")
 
 
@@ -15352,17 +13208,6 @@ async def readyz():
 @app.get("/debug/raw-models")
 async def raw_models():
     return JSONResponse(read_json(MODELS_RAW_DEBUG_FILE, []))
-
-
-@app.post("/models/refresh")
-async def models_refresh_api(request: Request):
-    g = await _page_guard(request)
-    if g:
-        return g
-    result = await refresh_model_catalog()
-    code = 200 if result.get("ok") else 503
-    log("OK" if result.get("ok") else "WARN", f"Models-page refresh: {result.get('reason','unknown result')}")
-    return JSONResponse(result, status_code=code, headers={"Cache-Control":"no-store"})
 
 
 @app.post("/keeper/config")
@@ -16097,16 +13942,9 @@ async def _lifespan(app):
         tasks.append(asyncio.create_task(_api_verification_readiness_loop(), name="verification-readiness"))
     app.state.background_tasks = tasks
     app.state.ready_at = time.time()
-    log("INFO", f"BRIDGENA build {BUILD_STAMP} · v4 browser-extension control plane · legacy fallback retained")
-    log("INFO", f"v4 transport · {V4_TRANSPORT} · legacy fallback {'on' if V4_FALLBACK_LEGACY else 'off'}")
-    if V4_TRANSPORT == "extension" and V4_AUTO_ATTACH_KEEPERS:
-        log("OK", f"v4 keeper mode · autonomous headed browsers ON · build-isolated extension {V4_EXTENSION_DIR} · build {V4_EXTENSION_BUILD}")
-        log("INFO", "v4 keeper mode · existing account cookies + sticky proxy assignment reused automatically")
-
-    if V4_AUTOLAUNCH and not V4_AUTO_ATTACH_KEEPERS:
-        try: _v4_launch_browser_once()
-        except Exception as exc: log("WARN", f"v4 browser autolaunch failed · {type(exc).__name__}: {redact(str(exc))[:160]}")
-    log("INFO", "Conversation mode · sticky Arena chat sessions · bounded history capsule only for rebuild/recovery")
+    log("INFO", f"BRIDGENA build {BUILD_STAMP} · v3 control plane · compatibility engine active")
+    log("INFO", "Agent compatibility · OpenAI tools/tool_calls + Anthropic tool_use/tool_result ON · tool turns buffered for structured emission")
+    log("INFO", "Conversation mode · disposable Arena evaluation per API message · bounded client-history capsule")
     log("INFO", "Keeper rejection policy · non-destructive local recovery · no 45s API exile")
     log("INFO", f"Multi-user scheduler · global slots {API_TURN_CONCURRENCY} · "
                 f"per-API concurrency unlimited · upstream attempts {REQUEST_MAX_ATTEMPTS}")
@@ -16119,8 +13957,7 @@ async def _lifespan(app):
     log("INFO", f"Transport recovery · same-keeper restart ON · quarantine {TRANSPORT_FAILURE_QUARANTINE_SEC:.0f}s · bound wait {BOUND_KEEPER_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Pre-dispatch transport guard · HEAD probe every request {'ON' if TRANSPORT_PROBE_EVERY_REQUEST else 'OFF'} · timeout {TRANSPORT_PROBE_TIMEOUT_MS}ms · recovery wait {PREDISPATCH_RECOVERY_WAIT_SEC:.0f}s")
     log("INFO", f"Account failover · max {ACCOUNT_FAILOVER_MAX} alternate keeper(s) · thread handoff ON for pre-generation account/session failures · 429+verification+partial-stream excluded")
-    log("INFO", f"Stream completion policy · extension first-output timeout {V4_FIRST_TOKEN_SEC:.0f}s · idle timeout {V4_IDLE_STREAM_SEC:.0f}s · provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} · partial UI preservation ON")
-    log("INFO", "Browser operator gates · Terms-of-Use dialogs detected as unschedulable worker state · never auto-accepted · automatic re-admission after manual acknowledgement")
+    log("INFO", f"Stream completion policy · first assistant output <= {FIRST_ASSISTANT_RESPONSE_SEC:.1f}s · provider finish required {'ON' if REQUIRE_PROVIDER_FINISH else 'OFF'} · partial UI preservation ON")
     log("INFO", f"Arena stream salvage · {'ON' if ARENA_UI_STREAM_RECOVERY else 'OFF'} · "
                 f"quick {ARENA_SALVAGE_QUICK_SEC:.0f}s current-context check → same-keeper route repair → "
                 f"{ARENA_POST_RESTART_SALVAGE_SEC:.0f}s post-restart history/UI salvage · no prompt replay")
@@ -16167,13 +14004,13 @@ app.router.lifespan_context = _lifespan  # starlette late-bind
 # ================================================================
 def _cli():
     import argparse
-    ap = argparse.ArgumentParser(description="Bridgena v4.2 sticky Arena session bridge")
+    ap = argparse.ArgumentParser(description="Bridgena v3")
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--workers", type=int, default=int(os.environ.get("BRIDGENA_WORKERS", "1")))
     args = ap.parse_args()
     jars_count = len([j for j in load_jars() if not j.get("expired")])
     print("=" * 62)
-    print("  BRIDGENA v4.2 — Sticky Arena Session Bridge (" + BUILD_STAMP + ")")
+    print("  BRIDGENA v3 — Arena Bridge (" + BUILD_STAMP + ")")
     print("=" * 62)
     print(f"  * Live Chat   : {PUBLIC_APP_URL}/chat")
     print(f"  * Dashboard   : {PUBLIC_APP_URL}/dashboard")
