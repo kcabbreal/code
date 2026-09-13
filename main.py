@@ -440,7 +440,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.10.0-action-protocol")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.10.1-action-boundary-fix")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2112,6 +2112,7 @@ BRIDGENA_ACTION_MAX_CHARS = max(
     1000,
     min(50000, int(os.environ.get("BRIDGENA_ACTION_MAX_CHARS", "24000"))),
 )
+BRIDGENA_ACTION_MARKER = "<<<BRIDGENA_ACTION_PROTOCOL_V2>>>"
 
 _agent_challenge_until: Dict[str, float] = {}
 _agent_challenge_count: Dict[str, int] = {}
@@ -12432,39 +12433,34 @@ def _tool_protocol_system(body: dict, protocol: str) -> str:
         "You are operating inside a tool-capable coding/agent client through "
         "Bridgena Action Protocol v2. The CLIENT executes tools; you only request "
         "an action. Never claim that a tool, file write, shell command, browser "
-        "action, or MCP operation succeeded until a Tool Result is provided.\\n\\n"
-
-        "AVAILABLE CLIENT TOOLS (JSON):\\n" + encoded + "\\n\\n"
-        "TOOL CHOICE: " + choice + "\\n\\n"
-
-        "WHEN AN ACTION IS NEEDED:\\n"
+        "action, or MCP operation succeeded until a Tool Result is provided.\n\n"
+        "AVAILABLE CLIENT TOOLS (JSON):\n"
+        + encoded
+        + "\n\nTOOL CHOICE: "
+        + choice
+        + "\n\n"
+        "WHEN AN ACTION IS NEEDED:\n"
         "Emit exactly ONE Bridgena action and STOP THE TURN immediately after "
         "its closing ]. Do not add success text after the action. Bridgena cuts "
         "the turn at the first valid action, validates it, and translates it "
-        "into the client's native tool-call protocol.\\n\\n"
-
-        "Preferred universal form:\\n"
-        'bridgena_call[{"tool":"EXACT_CLIENT_TOOL_NAME","arguments":{"arg":"value"}}]\\n\\n'
-
+        "into the client's native tool-call protocol.\n\n"
+        "Preferred universal form:\n"
+        'bridgena_call[{"tool":"EXACT_CLIENT_TOOL_NAME","arguments":{"arg":"value"}}]\n\n'
         "Simple shorthand is valid when the suffix identifies exactly one "
-        "available client tool:\\n"
-        'bridgena_write[{"filePath":"example.txt","content":"hello"}]\\n'
-        'bridgena_read[{"path":"example.txt"}]\\n\\n'
-
-        "For MCP-exposed tools use:\\n"
-        'bridgena_mcp[{"tool":"EXACT_CLIENT_TOOL_NAME","arguments":{"arg":"value"}}]\\n'
+        "available client tool:\n"
+        'bridgena_write[{"filePath":"example.txt","content":"hello"}]\n'
+        'bridgena_read[{"path":"example.txt"}]\n\n'
+        "For MCP-exposed tools use:\n"
+        'bridgena_mcp[{"tool":"EXACT_CLIENT_TOOL_NAME","arguments":{"arg":"value"}}]\n'
         "The tool must exist in AVAILABLE CLIENT TOOLS. Bridgena never invents "
-        "or executes a nonexistent tool.\\n\\n"
-
+        "or executes a nonexistent tool.\n\n"
         "Bracket payloads should be JSON. Keyword form such as "
         'bridgena_mcp[tool="server.tool", arguments={"path":"x"}] is also '
         "accepted, but JSON is preferred. Use the tool schema's field names "
-        "exactly.\\n\\n"
-
+        "exactly.\n\n"
         "If no tool is needed, answer normally. If TOOL CHOICE is none, never "
         "emit a Bridgena action. If a tool is required, emit a valid action "
-        "instead of a final prose answer.\\n\\n"
-
+        "instead of a final prose answer.\n\n"
         "After a Tool Result arrives, continue the SAME task. If another action "
         "is required, emit one new Bridgena action and stop again. Otherwise "
         "return the final normal-text answer."
@@ -12485,18 +12481,48 @@ def _clip_middle(text: str, limit: int, marker: str) -> str:
 def _fit_tool_envelope(system_text: str, prompt_text: str) -> tuple:
     system_text = str(system_text or "").strip()
     prompt_text = str(prompt_text or "").strip()
+
     total = len(system_text) + (2 if system_text and prompt_text else 0) + len(prompt_text)
     if total <= TOOL_TOTAL_ENVELOPE_MAX_CHARS:
         return system_text, prompt_text
-    min_prompt = min(len(prompt_text), max(6000, TOOL_TOTAL_ENVELOPE_MAX_CHARS // 2))
-    system_budget = max(4000, TOOL_TOTAL_ENVELOPE_MAX_CHARS - min_prompt - 2)
-    system_text = _clip_middle(system_text, system_budget, "\\n\\n[older agent/system detail compacted]\\n\\n")
-    prompt_budget = max(5000, TOOL_TOTAL_ENVELOPE_MAX_CHARS - len(system_text) - 2)
+
+    protocol = ""
+    base_system = system_text
+    marker_pos = system_text.find(BRIDGENA_ACTION_MARKER)
+    if marker_pos >= 0:
+        base_system = system_text[:marker_pos].rstrip()
+        protocol = system_text[marker_pos:].lstrip()
+
+    desired_prompt = min(
+        len(prompt_text),
+        max(6000, TOOL_TOTAL_ENVELOPE_MAX_CHARS // 2),
+    )
+    reserved = len(protocol) + (2 if protocol else 0) + desired_prompt
+    base_budget = max(0, TOOL_TOTAL_ENVELOPE_MAX_CHARS - reserved - 2)
+
+    if len(base_system) > base_budget:
+        base_system = _clip_middle(
+            base_system,
+            base_budget,
+            "\n\n[older client/system instructions compacted]\n\n",
+        )
+
+    rebuilt_system = "\n\n".join(
+        part for part in (base_system.strip(), protocol.strip()) if part
+    )
+
+    prompt_budget = max(
+        2500,
+        TOOL_TOTAL_ENVELOPE_MAX_CHARS
+        - len(rebuilt_system)
+        - (2 if rebuilt_system else 0),
+    )
     if len(prompt_text) > prompt_budget:
-        marker = "\\n\\n[older agent events compacted]\\n\\n"
+        marker = "\n\n[older agent events compacted]\n\n"
         keep = max(1, prompt_budget - len(marker))
         prompt_text = marker + prompt_text[-keep:]
-    return system_text, prompt_text
+
+    return rebuilt_system, prompt_text
 
 
 def _tool_runtime_system_context(body: dict, protocol: str) -> str:
@@ -12515,10 +12541,12 @@ def _tool_runtime_system_context(body: dict, protocol: str) -> str:
             value = _openai_text_content(message.get("content", "")).strip()
             if value and value not in parts:
                 parts.append(value)
+
     tool_system = _tool_protocol_system(body, protocol)
     if tool_system:
-        parts.append(tool_system)
-    return "\\n\\n".join(parts)
+        parts.append(BRIDGENA_ACTION_MARKER + "\n" + tool_system)
+
+    return "\n\n".join(parts)
 
 
 def _tool_json_string(value) -> str:
@@ -13085,7 +13113,7 @@ def _bridgena_action_calls(text: str, body: dict, protocol: str) -> list:
     if not isinstance(text, str) or "bridgena_" not in text.lower():
         return []
 
-    pattern = re.compile(r"(?i)\\bbridgena_([a-z0-9_.:/-]+)\\s*\\[")
+    pattern = re.compile(r"(?i)\bbridgena_([a-z0-9_.:/-]+)\s*\[")
 
     for match in pattern.finditer(text):
         action_kind = str(match.group(1) or "").strip()
@@ -13221,6 +13249,17 @@ def _tool_json_candidates(text: str):
             yield value
 
 
+def _merge_tool_terminal_text(acc: str, payload) -> str:
+    complete = payload if isinstance(payload, str) else ""
+    if not complete:
+        return acc
+    if not acc:
+        return complete
+    if complete.startswith(acc) and len(complete) >= len(acc):
+        return complete
+    return acc
+
+
 def _extract_tool_calls(text: str, body: dict, protocol: str) -> list:
     if not isinstance(text, str) or not text.strip():
         return []
@@ -13302,7 +13341,7 @@ def _tool_output_log(protocol: str, model: str, calls: list, text: str) -> None:
     names = ",".join(str(c.get("name") or "") for c in calls[:8]) or "-"
     raw = str(text or "")
 
-    if re.search(r"(?i)\\bbridgena_[a-z0-9_.:/-]+\\s*\\[", raw):
+    if re.search(r"(?i)\bbridgena_[a-z0-9_.:/-]+\s*\[", raw):
         syntax = " · action_protocol=v2"
     elif '"tool_calls"' in raw:
         syntax = " · legacy_tool_json=yes"
@@ -13589,29 +13628,58 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
             f"OpenAI tool continuation · logical chat {chat_id[-12:]} · "
             f"delta {len(prompt)} chars · handoff {len(handoff_prompt)} chars",
         )
+
     acc = ""
     reasoning_acc = ""
+    early_parsed = []
     try:
-        async for kind, payload in run_turn(
+        turn_iter = run_turn(
             chat_id, prompt, model,
             attachments=body.get("attachments"),
             system_prompt=system_context,
             tenant_id=_tenant_identity(keyinfo),
             handoff_prompt=handoff_prompt,
-        ):
-            if kind == "content" and isinstance(payload, str):
-                acc += payload
-            elif kind == "reasoning" and isinstance(payload, str):
-                reasoning_acc += payload
-            elif kind == "error":
-                raise HTTPException(
-                    status_code=_status_from_internal_error(payload, 502),
-                    detail=payload,
-                )
+        )
+        try:
+            async for kind, payload in turn_iter:
+                if kind == "content" and isinstance(payload, str):
+                    acc += payload
+                    early_parsed = _bridgena_action_calls(acc, body, "openai")
+                    if early_parsed:
+                        log(
+                            "INFO",
+                            f"OpenAI action boundary · {early_parsed[0].get('name')} · "
+                            f"cut upstream at {len(acc)} chars",
+                        )
+                        break
+                elif kind == "reasoning" and isinstance(payload, str):
+                    reasoning_acc += payload
+                elif kind == "done":
+                    acc = _merge_tool_terminal_text(acc, payload)
+                    early_parsed = _bridgena_action_calls(acc, body, "openai")
+                    break
+                elif kind == "error":
+                    raise HTTPException(
+                        status_code=_status_from_internal_error(payload, 502),
+                        detail=payload,
+                    )
+        finally:
+            if early_parsed and hasattr(turn_iter, "aclose"):
+                try:
+                    await turn_iter.aclose()
+                except Exception:
+                    pass
 
-        parsed = _extract_tool_calls(acc, body, "openai")
+        parsed = early_parsed or _extract_tool_calls(acc, body, "openai")
+        if not parsed and not acc.strip():
+            raise HTTPException(
+                status_code=502,
+                detail="upstream completed without assistant text or a tool action",
+            )
+
         calls = _openai_tool_calls_payload(parsed)
         _tool_output_log("OpenAI", model, parsed, acc)
+
         message = {"role": "assistant", "content": None if calls else acc}
         finish = "stop"
         if calls:
@@ -13619,6 +13687,7 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
             finish = "tool_calls"
         if reasoning_acc:
             message["reasoning_content"] = reasoning_acc
+
         return JSONResponse({
             "id": "chatcmpl-" + uuid7()[:23],
             "object": "chat.completion",
@@ -13647,8 +13716,29 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
     remaining = _agent_challenge_remaining(agent_fp)
     if remaining > 0:
         retry_after = max(1, int(remaining + 0.999))
-        log("WARN", f"Agent request circuit · identical challenged request held {retry_after}s before consuming another keeper")
-        return JSONResponse(status_code=503, headers={"Retry-After":str(retry_after),"X-Bridgena-Retryable":"true","Cache-Control":"no-store"}, content={"error":{"message":f"The upstream edge temporarily challenged this agent request class. Retry after about {retry_after}s.","type":"api_error","code":"agent_request_backoff"}})
+        log(
+            "WARN",
+            f"Agent request circuit · identical challenged request held "
+            f"{retry_after}s before consuming another keeper",
+        )
+        return JSONResponse(
+            status_code=503,
+            headers={
+                "Retry-After": str(retry_after),
+                "X-Bridgena-Retryable": "true",
+                "Cache-Control": "no-store",
+            },
+            content={
+                "error": {
+                    "message": (
+                        "The upstream edge temporarily challenged this agent "
+                        f"request class. Retry after about {retry_after}s."
+                    ),
+                    "type": "api_error",
+                    "code": "agent_request_backoff",
+                }
+            },
+        )
 
     system_context = _tool_runtime_system_context(body, "openai")
     if continuation:
@@ -13666,8 +13756,10 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
             log(
                 "INFO",
                 f"OpenAI agent envelope compacted · {original_size} → {compact_size} chars · "
-                f"tools {len(_tool_openai_defs(body))} · messages {len(body.get('messages') or [])}",
+                f"tools {len(_tool_openai_defs(body))} · "
+                f"messages {len(body.get('messages') or [])}",
             )
+
     created = int(time.time())
     rid = "chatcmpl-" + uuid7()[:23]
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
@@ -13675,13 +13767,10 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
     reasoning_acc = ""
     outcome = "complete"
     upstream_error = None
+    early_parsed = []
 
-    # Tool turns are intentionally buffered so Bridgena can distinguish normal
-    # assistant prose from the structured tool-call envelope. Because nothing
-    # useful is streamed before that decision anyway, finish upstream admission
-    # first and only then commit an HTTP response.
     try:
-        async for kind, payload in run_turn(
+        turn_iter = run_turn(
             chat_id,
             prompt,
             model,
@@ -13689,15 +13778,38 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
             system_prompt=system_context,
             tenant_id=_tenant_identity(keyinfo),
             handoff_prompt=handoff_prompt,
-        ):
-            if kind == "content" and isinstance(payload, str):
-                acc += payload
-            elif kind == "reasoning" and isinstance(payload, str):
-                reasoning_acc += payload
-            elif kind == "error":
-                outcome = "upstream-error"
-                upstream_error = str(payload or "502: upstream tool turn failed")
-                break
+        )
+        try:
+            async for kind, payload in turn_iter:
+                if kind == "content" and isinstance(payload, str):
+                    acc += payload
+                    early_parsed = _bridgena_action_calls(acc, body, "openai")
+                    if early_parsed:
+                        outcome = "action-boundary"
+                        log(
+                            "INFO",
+                            f"OpenAI action boundary · {early_parsed[0].get('name')} · "
+                            f"cut upstream at {len(acc)} chars",
+                        )
+                        break
+                elif kind == "reasoning" and isinstance(payload, str):
+                    reasoning_acc += payload
+                elif kind == "done":
+                    acc = _merge_tool_terminal_text(acc, payload)
+                    early_parsed = _bridgena_action_calls(acc, body, "openai")
+                    break
+                elif kind == "error":
+                    outcome = "upstream-error"
+                    upstream_error = str(
+                        payload or "502: upstream tool turn failed"
+                    )
+                    break
+        finally:
+            if early_parsed and hasattr(turn_iter, "aclose"):
+                try:
+                    await turn_iter.aclose()
+                except Exception:
+                    pass
     except Exception as exc:
         outcome = "bridge-exception"
         upstream_error = f"500: {type(exc).__name__}: {exc}"
@@ -13723,14 +13835,23 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
                 "true" if status_code in (429, 502, 503, 504) else "false"
             ),
         }
-        challenge_error = ("edge requested browser verification" in upstream_error.lower() or "upstream challenge" in upstream_error.lower())
-        challenge_delay = _arm_agent_challenge_circuit(agent_fp) if challenge_error else 0.0
+
+        challenge_error = (
+            "edge requested browser verification" in upstream_error.lower()
+            or "upstream challenge" in upstream_error.lower()
+        )
+        challenge_delay = (
+            _arm_agent_challenge_circuit(agent_fp)
+            if challenge_error else 0.0
+        )
 
         retry_after = _retry_after_from_internal_error(upstream_error)
         if retry_after:
             headers["Retry-After"] = str(max(1, int(retry_after)))
         elif challenge_delay > 0:
-            headers["Retry-After"] = str(max(1, int(challenge_delay + 0.999)))
+            headers["Retry-After"] = str(
+                max(1, int(challenge_delay + 0.999))
+            )
         elif status_code == 503:
             headers["Retry-After"] = "3"
 
@@ -13738,8 +13859,10 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
         log(
             "WARN",
             f"OpenAI tool stream {rid[-8:]} · real HTTP {status_code} before SSE commit · "
-            f"buffered {len(acc)} chars · retryable={headers['X-Bridgena-Retryable']}",
+            f"buffered {len(acc)} chars · "
+            f"retryable={headers['X-Bridgena-Retryable']}",
         )
+
         return JSONResponse(
             status_code=status_code,
             headers=headers,
@@ -13753,7 +13876,34 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
         )
 
     _clear_agent_challenge_circuit(agent_fp)
-    parsed = _extract_tool_calls(acc, body, "openai")
+
+    parsed = early_parsed or _extract_tool_calls(acc, body, "openai")
+    if not parsed and not acc.strip():
+        error_id, public_message = _openai_public_error(
+            502,
+            "upstream completed without assistant text or a tool action",
+            source="openai_tool_stream",
+            context={
+                "model": model,
+                "chat_id": str(chat_id)[:120],
+                "buffered_chars": 0,
+            },
+        )
+        return JSONResponse(
+            status_code=502,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Bridgena-Retryable": "true",
+            },
+            content={
+                "error": {
+                    "message": public_message,
+                    "type": "api_error",
+                    "code": error_id,
+                }
+            },
+        )
+
     calls = _openai_tool_calls_payload(parsed)
     _tool_output_log("OpenAI", model, parsed, acc)
 
@@ -13812,10 +13962,11 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
 
         yield "data: [DONE]\n\n"
 
-    _record_reliability_outcome(True, "complete")
+    _record_reliability_outcome(True, outcome)
     log(
         "INFO",
-        f"OpenAI tool stream {rid[-8:]} · buffered upstream complete · "
+        f"OpenAI tool stream {rid[-8:]} · "
+        f"{'action boundary' if calls else 'buffered upstream complete'} · "
         f"{len(calls)} tool call(s) · {len(acc)} chars",
     )
 
@@ -14291,36 +14442,78 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
             f"Anthropic tool continuation · logical chat {chat_id[-12:]} · "
             f"delta {len(prompt)} chars · handoff {len(handoff_prompt)} chars",
         )
+
     message_id = "msg_" + uuid7().replace("-", "")
     input_tokens = _rough_tokens(prompt + "\n" + system_prompt)
 
     if not body.get("stream", False):
         acc = ""
         reasoning_acc = ""
+        early_parsed = []
         try:
-            async for kind, payload in run_turn(
+            turn_iter = run_turn(
                 chat_id, prompt, model,
                 attachments=body.get("attachments"),
                 system_prompt=system_prompt,
                 tenant_id=tenant_id,
                 handoff_prompt=handoff_prompt,
-            ):
-                if kind == "content" and isinstance(payload, str):
-                    acc += payload
-                elif kind == "reasoning" and isinstance(payload, str):
-                    reasoning_acc += payload
-                elif kind == "error":
-                    raise HTTPException(status_code=502, detail=payload)
-            parsed = _extract_tool_calls(acc, body, "anthropic")
+            )
+            try:
+                async for kind, payload in turn_iter:
+                    if kind == "content" and isinstance(payload, str):
+                        acc += payload
+                        early_parsed = _bridgena_action_calls(
+                            acc, body, "anthropic"
+                        )
+                        if early_parsed:
+                            log(
+                                "INFO",
+                                f"Anthropic action boundary · "
+                                f"{early_parsed[0].get('name')} · "
+                                f"cut upstream at {len(acc)} chars",
+                            )
+                            break
+                    elif kind == "reasoning" and isinstance(payload, str):
+                        reasoning_acc += payload
+                    elif kind == "done":
+                        acc = _merge_tool_terminal_text(acc, payload)
+                        early_parsed = _bridgena_action_calls(
+                            acc, body, "anthropic"
+                        )
+                        break
+                    elif kind == "error":
+                        raise HTTPException(status_code=502, detail=payload)
+            finally:
+                if early_parsed and hasattr(turn_iter, "aclose"):
+                    try:
+                        await turn_iter.aclose()
+                    except Exception:
+                        pass
+
+            parsed = early_parsed or _extract_tool_calls(
+                acc, body, "anthropic"
+            )
             calls = _anthropic_tool_calls_payload(parsed)
             _tool_output_log("Anthropic", model, parsed, acc)
-            content = calls if calls else [{"type": "text", "text": acc}]
+
+            content = (
+                calls
+                if calls
+                else [{"type": "text", "text": acc}]
+            )
+
             return JSONResponse({
-                "id": message_id, "type": "message", "role": "assistant", "model": model,
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
                 "content": content,
                 "stop_reason": "tool_use" if calls else "end_turn",
                 "stop_sequence": None,
-                "usage": {"input_tokens": input_tokens, "output_tokens": _rough_tokens(acc)},
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": _rough_tokens(acc),
+                },
             })
         finally:
             _release_api_request(body, keyinfo, prompt)
@@ -14328,114 +14521,243 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
     async def gen():
         acc = ""
         reasoning_acc = ""
+        early_parsed = []
         terminal_sent = False
         outcome = "complete"
+
         try:
-            yield _anthropic_sse("message_start", {"type": "message_start", "message": {
-                "id": message_id, "type": "message", "role": "assistant", "model": model,
-                "content": [], "stop_reason": None, "stop_sequence": None,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-            }})
-            async for kind, payload in run_turn(
+            yield _anthropic_sse(
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {
+                            "input_tokens": input_tokens,
+                            "output_tokens": 0,
+                        },
+                    },
+                },
+            )
+
+            turn_iter = run_turn(
                 chat_id, prompt, model,
                 attachments=body.get("attachments"),
                 system_prompt=system_prompt,
                 tenant_id=tenant_id,
                 handoff_prompt=handoff_prompt,
-            ):
-                if kind == "content" and isinstance(payload, str):
-                    acc += payload
-                elif kind == "reasoning" and isinstance(payload, str):
-                    reasoning_acc += payload
-                elif kind == "error":
-                    outcome = "upstream-error"
-                    status_code = _status_from_internal_error(payload, 502)
-                    error_id, public_message = _anthropic_public_error(
-                        status_code, payload, source="anthropic_tool_stream",
-                        context={"model": model, "chat_id": str(chat_id)[:120],
-                                 "buffered_chars": len(acc)},
-                    )
-                    yield _anthropic_sse("error", {
-                        "type": "error",
-                        "error": {"type": "api_error", "message": public_message},
-                        "error_id": error_id,
-                    })
-                    yield _anthropic_sse("message_stop", {"type": "message_stop"})
-                    terminal_sent = True
-                    return
+            )
+            try:
+                async for kind, payload in turn_iter:
+                    if kind == "content" and isinstance(payload, str):
+                        acc += payload
+                        early_parsed = _bridgena_action_calls(
+                            acc, body, "anthropic"
+                        )
+                        if early_parsed:
+                            outcome = "action-boundary"
+                            log(
+                                "INFO",
+                                f"Anthropic action boundary · "
+                                f"{early_parsed[0].get('name')} · "
+                                f"cut upstream at {len(acc)} chars",
+                            )
+                            break
+                    elif kind == "reasoning" and isinstance(payload, str):
+                        reasoning_acc += payload
+                    elif kind == "done":
+                        acc = _merge_tool_terminal_text(acc, payload)
+                        early_parsed = _bridgena_action_calls(
+                            acc, body, "anthropic"
+                        )
+                        break
+                    elif kind == "error":
+                        outcome = "upstream-error"
+                        status_code = _status_from_internal_error(
+                            payload, 502
+                        )
+                        error_id, public_message = _anthropic_public_error(
+                            status_code,
+                            payload,
+                            source="anthropic_tool_stream",
+                            context={
+                                "model": model,
+                                "chat_id": str(chat_id)[:120],
+                                "buffered_chars": len(acc),
+                            },
+                        )
+                        yield _anthropic_sse(
+                            "error",
+                            {
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": public_message,
+                                },
+                                "error_id": error_id,
+                            },
+                        )
+                        yield _anthropic_sse(
+                            "message_stop",
+                            {"type": "message_stop"},
+                        )
+                        terminal_sent = True
+                        return
+            finally:
+                if early_parsed and hasattr(turn_iter, "aclose"):
+                    try:
+                        await turn_iter.aclose()
+                    except Exception:
+                        pass
 
-            parsed = _extract_tool_calls(acc, body, "anthropic")
+            parsed = early_parsed or _extract_tool_calls(
+                acc, body, "anthropic"
+            )
             calls = _anthropic_tool_calls_payload(parsed)
             _tool_output_log("Anthropic", model, parsed, acc)
 
             if calls:
                 for index, call in enumerate(calls):
-                    yield _anthropic_sse("content_block_start", {
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": call["id"],
-                            "name": call["name"],
-                            "input": {},
+                    yield _anthropic_sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": call["id"],
+                                "name": call["name"],
+                                "input": {},
+                            },
                         },
-                    })
-                    args_json = json.dumps(call.get("input") or {}, ensure_ascii=False, separators=(",", ":"))
-                    yield _anthropic_sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {"type": "input_json_delta", "partial_json": args_json},
-                    })
-                    yield _anthropic_sse("content_block_stop", {
-                        "type": "content_block_stop", "index": index
-                    })
+                    )
+                    args_json = json.dumps(
+                        call.get("input") or {},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    yield _anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": args_json,
+                            },
+                        },
+                    )
+                    yield _anthropic_sse(
+                        "content_block_stop",
+                        {
+                            "type": "content_block_stop",
+                            "index": index,
+                        },
+                    )
                 stop_reason = "tool_use"
             else:
-                yield _anthropic_sse("content_block_start", {
-                    "type": "content_block_start", "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                })
+                yield _anthropic_sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "text",
+                            "text": "",
+                        },
+                    },
+                )
                 if acc:
-                    yield _anthropic_sse("content_block_delta", {
-                        "type": "content_block_delta", "index": 0,
-                        "delta": {"type": "text_delta", "text": acc},
-                    })
-                yield _anthropic_sse("content_block_stop", {
-                    "type": "content_block_stop", "index": 0
-                })
+                    yield _anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "text_delta",
+                                "text": acc,
+                            },
+                        },
+                    )
+                yield _anthropic_sse(
+                    "content_block_stop",
+                    {
+                        "type": "content_block_stop",
+                        "index": 0,
+                    },
+                )
                 stop_reason = "end_turn"
 
-            yield _anthropic_sse("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": _rough_tokens(acc)},
-            })
-            yield _anthropic_sse("message_stop", {"type": "message_stop"})
+            yield _anthropic_sse(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": stop_reason,
+                        "stop_sequence": None,
+                    },
+                    "usage": {
+                        "output_tokens": _rough_tokens(acc),
+                    },
+                },
+            )
+            yield _anthropic_sse(
+                "message_stop",
+                {"type": "message_stop"},
+            )
             terminal_sent = True
+
         except Exception as exc:
             outcome = "bridge-exception"
             error_id, public_message = _anthropic_public_error(
-                500, f"{type(exc).__name__}: {exc}",
+                500,
+                f"{type(exc).__name__}: {exc}",
                 source="anthropic_tool_stream_exception",
-                context={"model": model, "chat_id": str(chat_id)[:120], "buffered_chars": len(acc)},
+                context={
+                    "model": model,
+                    "chat_id": str(chat_id)[:120],
+                    "buffered_chars": len(acc),
+                },
                 exception_type=type(exc).__name__,
             )
-            yield _anthropic_sse("error", {
-                "type": "error",
-                "error": {"type": "api_error", "message": public_message},
-                "error_id": error_id,
-            })
+            yield _anthropic_sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": public_message,
+                    },
+                    "error_id": error_id,
+                },
+            )
         finally:
             _release_api_request(body, keyinfo, prompt)
-            _record_reliability_outcome(bool(outcome == "complete" and terminal_sent), outcome)
-            log("INFO" if terminal_sent else "WARN",
-                f"Anthropic tool stream {message_id[-8:]} · outcome {outcome} · "
-                f"buffered {len(acc)} chars · terminal {'yes' if terminal_sent else 'no'}")
+            _record_reliability_outcome(
+                bool(terminal_sent and outcome in {"complete", "action-boundary"}),
+                outcome,
+            )
+            log(
+                "INFO" if terminal_sent else "WARN",
+                f"Anthropic tool stream {message_id[-8:]} · "
+                f"outcome {outcome} · buffered {len(acc)} chars · "
+                f"terminal {'yes' if terminal_sent else 'no'}",
+            )
 
     return StreamingResponse(
-        gen(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache, no-transform",
-                 "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 
@@ -15838,6 +16160,8 @@ async def _lifespan(app):
                 "model actions → OpenAI tool_calls / Anthropic tool_use")
     log("INFO", "Action boundary · first valid bridgena_*[] action wins · trailing prose discarded")
     log("INFO", "MCP action bridge · bridgena_mcp[{tool,arguments}] → client-exposed MCP tool")
+    log("INFO", "Action parser fix · real bridgena_*[] regex + real protocol newlines + terminal done capture")
+    log("INFO", "Action early-cut · upstream generation closes as soon as first valid action is complete")
     log("INFO", f"Browser-native session mode · persistent contexts "
                 f"{'ON' if BROWSER_PERSISTENT_CONTEXT else 'OFF'} · JavaScript ON · "
                 f"service workers {'ON' if BROWSER_SERVICE_WORKERS else 'OFF'} · "
