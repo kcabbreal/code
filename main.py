@@ -440,7 +440,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.10.2-fast-tool-continuations")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.10.3-low-latency-tool-results")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2120,6 +2120,22 @@ AGENT_ACTION_DRAIN_WAIT_SEC = max(
 AGENT_ACTION_DRAIN_HARD_SEC = max(
     AGENT_ACTION_DRAIN_WAIT_SEC,
     min(45.0, float(os.environ.get("BRIDGENA_AGENT_ACTION_DRAIN_HARD_SEC", "18"))),
+)
+AGENT_CONTINUATION_GATE_WAIT_SEC = max(
+    1.0,
+    min(15.0, float(os.environ.get("BRIDGENA_AGENT_CONTINUATION_GATE_WAIT_SEC", "5"))),
+)
+AGENT_CONTINUATION_ROUTE_FRESH_SEC = max(
+    2.0,
+    min(60.0, float(os.environ.get("BRIDGENA_AGENT_CONTINUATION_ROUTE_FRESH_SEC", "20"))),
+)
+LIVE_COOKIE_READ_TIMEOUT_SEC = max(
+    0.5,
+    min(5.0, float(os.environ.get("BRIDGENA_LIVE_COOKIE_READ_TIMEOUT_SEC", "1.5"))),
+)
+TRANSPORT_PROBE_LOCK_WAIT_SEC = max(
+    0.5,
+    min(5.0, float(os.environ.get("BRIDGENA_TRANSPORT_PROBE_LOCK_WAIT_SEC", "1.5"))),
 )
 _agent_action_drain_tasks: Dict[str, asyncio.Task] = {}
 _agent_action_drain_started: Dict[str, float] = {}
@@ -5081,24 +5097,45 @@ class KeeperSession:
     async def probe_transport(self, *, force: bool = False) -> tuple:
         """Check whether the keeper browser can currently reach Arena.
 
-        This is a harmless same-origin HEAD request. Any HTTP response proves
-        the browser/proxy route is alive; no model prompt or evaluation is sent.
+        Lock acquisition is bounded. A recent successful browser-origin response
+        is accepted when housekeeping temporarily owns the action lane.
         """
         if not self.context or not self.page or self.page.is_closed() or not self.running:
             self.last_transport_probe_error = "keeper browser unavailable"
             return False, 0, self.last_transport_probe_error
 
         now = time.monotonic()
-        if (not force and not TRANSPORT_PROBE_EVERY_REQUEST
-                and self.last_transport_ok
-                and now - self.last_transport_ok <= TRANSPORT_PROBE_FRESH_SEC):
+        if (
+            not force
+            and not TRANSPORT_PROBE_EVERY_REQUEST
+            and self.last_transport_ok
+            and now - self.last_transport_ok <= TRANSPORT_PROBE_FRESH_SEC
+        ):
             return True, 200, "recent-ok"
 
-        async with self._action_lock:
+        acquired = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    self._action_lock.acquire(),
+                    timeout=TRANSPORT_PROBE_LOCK_WAIT_SEC,
+                )
+                acquired = True
+            except asyncio.TimeoutError:
+                age = (
+                    time.monotonic() - self.last_transport_ok
+                    if self.last_transport_ok else 10**9
+                )
+                if age <= AGENT_CONTINUATION_ROUTE_FRESH_SEC:
+                    return True, 200, "recent-ok-action-lane-busy"
+                self.last_transport_probe_error = "keeper action lane busy"
+                return False, 0, self.last_transport_probe_error
+
             page = self.page
             if not page or page.is_closed():
                 self.last_transport_probe_error = "keeper page closed"
                 return False, 0, self.last_transport_probe_error
+
             self.last_transport_probe = time.monotonic()
             try:
                 result = await asyncio.wait_for(
@@ -5129,20 +5166,37 @@ class KeeperSession:
                 )
             except Exception as exc:
                 self.transport_fail_streak += 1
-                self.last_transport_probe_error = f"{type(exc).__name__}: {redact(str(exc))[:140]}"
+                self.last_transport_probe_error = (
+                    f"{type(exc).__name__}: {redact(str(exc))[:140]}"
+                )
                 return False, 0, self.last_transport_probe_error
 
-        ok = bool(isinstance(result, dict) and result.get("ok") and int(result.get("status") or 0) > 0)
-        status_code = int((result or {}).get("status") or 0) if isinstance(result, dict) else 0
-        if ok:
-            self.last_transport_ok = time.monotonic()
-            self.transport_fail_streak = 0
-            self.last_transport_probe_error = ""
-            return True, status_code, ""
+            ok = bool(
+                isinstance(result, dict)
+                and result.get("ok")
+                and int(result.get("status") or 0) > 0
+            )
+            status_code = (
+                int((result or {}).get("status") or 0)
+                if isinstance(result, dict) else 0
+            )
+            if ok:
+                self.last_transport_ok = time.monotonic()
+                self.transport_fail_streak = 0
+                self.last_transport_probe_error = ""
+                return True, status_code, ""
 
-        self.transport_fail_streak += 1
-        self.last_transport_probe_error = str((result or {}).get("error") or "route probe failed")[:180]
-        return False, status_code, self.last_transport_probe_error
+            self.transport_fail_streak += 1
+            self.last_transport_probe_error = str(
+                (result or {}).get("error") or "route probe failed"
+            )[:180]
+            return False, status_code, self.last_transport_probe_error
+        finally:
+            if acquired:
+                try:
+                    self._action_lock.release()
+                except Exception:
+                    pass
 
 
     async def bridge_fetch(self, url: str, payload: dict):
@@ -7316,11 +7370,22 @@ def _headers_for(jar: dict, p, json_body: bool) -> dict:
 
 
 async def _live_cookies(jar: dict) -> dict:
-    """Refresh cookies from this jar's live keeper when it has harvested newer ones."""
+    """Refresh cookies from the live keeper without stalling API dispatch."""
     try:
         s = keeper.sessions.get(jar.get("id"))
         if s and getattr(s, "running", False) and getattr(s, "context", None):
-            live = await s.context.cookies()
+            try:
+                live = await asyncio.wait_for(
+                    s.context.cookies(),
+                    timeout=LIVE_COOKIE_READ_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                log(
+                    "WARN",
+                    f"[{jar.get('name')}] live cookie refresh exceeded "
+                    f"{LIVE_COOKIE_READ_TIMEOUT_SEC:.1f}s · using stored jar",
+                )
+                return jar
             if live:
                 jar = dict(jar)
                 jar["cookies"] = [dict(c) for c in live]
@@ -7832,6 +7897,46 @@ def _conversation_gate(chat_id: str) -> asyncio.Lock:
         return lock
 
 
+class _ConversationTurnLease:
+    def __init__(self, chat_id: str, *, continuation: bool):
+        self.chat_id = str(chat_id or "anonymous")
+        self.continuation = bool(continuation)
+        self.lock = _conversation_gate(self.chat_id)
+        self.acquired = False
+        self.waited = 0.0
+
+    async def __aenter__(self):
+        started = time.monotonic()
+        try:
+            if self.continuation:
+                await asyncio.wait_for(
+                    self.lock.acquire(),
+                    timeout=AGENT_CONTINUATION_GATE_WAIT_SEC,
+                )
+            else:
+                await self.lock.acquire()
+            self.acquired = True
+        except asyncio.TimeoutError:
+            self.acquired = False
+
+        self.waited = time.monotonic() - started
+        if self.waited >= 0.25:
+            log(
+                "INFO" if self.acquired else "WARN",
+                f"conversation gate · {self.chat_id[:12]}… · "
+                f"waited {self.waited:.2f}s · "
+                f"{'acquired' if self.acquired else 'timed out'}",
+            )
+        return self.acquired
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.acquired:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
+
+
 async def run_turn(chat_id: str, prompt: str, model_name: str,
                    attachments: Optional[list] = None, jar_hint: Optional[str] = None,
                    system_prompt: str = "", tenant_id: str = "anonymous",
@@ -7855,7 +7960,24 @@ async def run_turn(chat_id: str, prompt: str, model_name: str,
     if handoff_prompt:
         save_context_capsule(chat_id, model_name, handoff_prompt, source="client-transcript")
 
-    async with _conversation_gate(chat_id):
+    _continuation_gate = bool(
+        BRIDGENA_ACTION_MARKER in str(system_prompt or "")
+        and str(prompt or "").lstrip().startswith(
+            "Continue the SAME coding-agent task"
+        )
+    )
+    async with _ConversationTurnLease(
+        chat_id, continuation=_continuation_gate
+    ) as _conversation_acquired:
+        if not _conversation_acquired:
+            yield (
+                "error",
+                "503: The previous turn for this agent conversation is still active. "
+                "Bridgena did not queue this tool-result continuation indefinitely; "
+                "retry shortly.",
+            )
+            return
+
         if CONVERSATION_MIN_GAP_SEC > 0:
             now = time.monotonic()
             due = _conversation_next_start.get(str(chat_id), now)
@@ -8970,8 +9092,17 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         return
 
     _is_agent_tool_turn = (
-        "tool-capable API client" in str(system_prompt or "")
+        BRIDGENA_ACTION_MARKER in str(system_prompt or "")
+        or "Bridgena Action Protocol" in str(system_prompt or "")
+        or "AVAILABLE CLIENT TOOLS (JSON):" in str(system_prompt or "")
+        or "tool-capable API client" in str(system_prompt or "")
         or "AVAILABLE TOOLS (JSON):" in str(system_prompt or "")
+    )
+    _is_tool_continuation = bool(
+        _is_agent_tool_turn
+        and str(prompt or "").lstrip().startswith(
+            "Continue the SAME coding-agent task"
+        )
     )
     _first_semantic_timeout = (
         TOOL_FIRST_ASSISTANT_RESPONSE_SEC
@@ -9078,6 +9209,15 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         if sid and challenge_remaining > 0:
             log("WARN", f"[{jar.get('name')}] bound conversation blocked by edge challenge hold · "
                         f"{challenge_remaining:.0f}s remaining · no prompt replay")
+            if _is_tool_continuation:
+                yield (
+                    "error",
+                    f"503: This agent thread is temporarily paused by an upstream challenge "
+                    f"on its bound keeper (~{max(1, int(challenge_remaining))}s remaining). "
+                    "Bridgena preserved the existing thread and did not replay the tool "
+                    "continuation on another account.",
+                )
+                return
             yield ("retry-account", {
                 "jar_id": jar.get("id"), "jar_name": jar.get("name"),
                 "reason": "bound keeper is temporarily isolated after an edge challenge",
@@ -9188,9 +9328,33 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             return
 
     # Catch dead SOCKS/browser routes before minting a token or submitting a
-    # model request. New/unbound chats fail over immediately while the broken
-    # keeper recovers in the background. Bound chats wait for the same keeper.
-    if not await _ensure_predispatch_transport(jar, wait_for_recovery=bool(bound_jar_id)):
+    # model request. For a bound tool-result continuation, a successful
+    # browser-origin response from moments ago is already a stronger/fresher
+    # route proof than another HEAD request.
+    _skip_transport_probe = False
+    if _is_tool_continuation and bound_jar_id:
+        _cont_session = keeper.sessions.get(str(jar.get("id") or ""))
+        _last_ok = float(getattr(_cont_session, "last_transport_ok", 0.0) or 0.0)
+        _route_age = (time.monotonic() - _last_ok) if _last_ok else 10**9
+        if (
+            keeper_session_ready(_cont_session)
+            and _api_keeper_verified(str(jar.get("id") or ""))
+            and _route_age <= AGENT_CONTINUATION_ROUTE_FRESH_SEC
+        ):
+            _skip_transport_probe = True
+            log(
+                "INFO",
+                f"[{jar.get('name')}] agent continuation fast-route · "
+                f"recent browser transport {_route_age:.2f}s old · "
+                "redundant pre-dispatch HEAD skipped",
+            )
+
+    if (
+        not _skip_transport_probe
+        and not await _ensure_predispatch_transport(
+            jar, wait_for_recovery=bool(bound_jar_id)
+        )
+    ):
         if not bound_jar_id:
             _bump_account_failover("predispatch")
             yield ("retry-account", {
@@ -9205,6 +9369,7 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
         })
         return
 
+    _predispatch_ready_at = time.monotonic()
     response_text = ""
     reasoning_text = ""
     pending_v2_token = None
@@ -9282,8 +9447,13 @@ async def _run_turn_impl(chat_id: str, prompt: str, model_name: str,
             "metadata": {},
         }
         base["userMessage"] = user_message
-        log("INFO", f"[{jar.get('name')}] outbound {'follow-up' if follow_url else 'create'} envelope · "
-                    f"content string {len(content)} chars · attachments {len(attachments or [])}")
+        _pre_envelope_delay = time.monotonic() - _predispatch_ready_at
+        log(
+            "INFO",
+            f"[{jar.get('name')}] outbound {'follow-up' if follow_url else 'create'} envelope · "
+            f"content string {len(content)} chars · attachments {len(attachments or [])} · "
+            f"pre-envelope {_pre_envelope_delay:.2f}s",
+        )
         if retry_envelope_ids:
             log("WARN", f"[{jar.get('name')}] outbound envelope is a confirmed-absence retry · "
                         f"reusing id {str(base.get('id'))[:12]}… · "
@@ -12853,68 +13023,62 @@ def _conversation_has_model_binding(chat_id: str, model_name: str) -> bool:
 
 
 def _openai_tool_continuation_prompt(body: dict) -> str:
-    """Send only the latest completed tool exchange to an existing Arena chat."""
+    """Send only newly returned tool results to an existing Arena conversation.
+
+    Arena already has the model's previous bridgena_* action in the bound thread.
+    Repeating a large write/edit payload on the result turn is redundant.
+    """
     messages = [m for m in (body.get("messages") or []) if isinstance(m, dict)]
     if not messages:
         return ""
 
-    tool_indexes = [
+    result_indexes = [
         i for i, m in enumerate(messages)
         if str(m.get("role") or "").strip().lower() in {"tool", "function"}
     ]
-    if not tool_indexes:
+    if not result_indexes:
         return ""
 
-    last_tool = tool_indexes[-1]
+    last_result = result_indexes[-1]
 
-    # If a real new user turn follows the tool result, this is not merely a
-    # tool-result continuation; use the normal transcript path.
-    for m in messages[last_tool + 1:]:
+    for m in messages[last_result + 1:]:
         role = str(m.get("role") or "").strip().lower()
         if role in {"user", "developer", "system"}:
             if _openai_text_content(m.get("content", "")).strip():
                 return ""
 
-    start = last_tool
-    for i in range(last_tool - 1, -1, -1):
-        role = str(messages[i].get("role") or "").strip().lower()
-        if role == "assistant" and (
-            messages[i].get("tool_calls") or messages[i].get("function_call")
-        ):
-            start = i
+    # Keep only contiguous tool/function result messages. The preceding
+    # assistant tool call is already part of the same Arena conversation.
+    start_index = last_result
+    while start_index > 0:
+        prev_role = str(messages[start_index - 1].get("role") or "").strip().lower()
+        if prev_role not in {"tool", "function"}:
             break
-        if role == "user":
-            break
+        start_index -= 1
 
     rows = []
-    saw_result = False
-    for m in messages[start:]:
-        role = str(m.get("role") or "").strip().lower()
-        if role not in {"assistant", "tool", "function"}:
-            continue
+    for m in messages[start_index:last_result + 1]:
         rendered = _render_openai_tool_message(m)
-        if not rendered:
-            continue
-        rows.append(rendered)
-        if role in {"tool", "function"}:
-            saw_result = True
+        if rendered:
+            rows.append(rendered)
 
-    if not saw_result or not rows:
+    if not rows:
         return ""
 
-    prefix = (
+    rendered = (
         "Continue the SAME coding-agent task in this existing conversation. "
-        "The previously requested tool operation has completed. Use the result "
-        "below and do not repeat an already-completed tool call unless another "
-        "tool action is genuinely required. If another tool is needed, emit "
-        "one Bridgena action and stop immediately after its closing ].\n\n"
+        "The client executed your previous action. Here is ONLY the new tool "
+        "result; the previous action and its arguments are already present in "
+        "this conversation. Do not repeat a completed action. If another tool "
+        "is genuinely required, emit one Bridgena action and stop immediately "
+        "after its closing ]. Otherwise finish the task normally.\n\n"
+        + "\n\n".join(rows)
     )
-    rendered = prefix + "\n\n".join(rows)
 
     if len(rendered) <= TOOL_CONTINUATION_MAX_CHARS:
         return rendered
 
-    marker = "\n\n[older tool detail compacted]\n\n"
+    marker = "\n\n[large tool result tail compacted]\n\n"
     keep = max(1, TOOL_CONTINUATION_MAX_CHARS - len(marker))
     return marker + rendered[-keep:]
 
@@ -12943,55 +13107,69 @@ def _openai_tool_turn_prompts(
 
 
 def _anthropic_tool_continuation_prompt(body: dict) -> str:
+    """Send only newest tool_result blocks to an existing Anthropic tool thread."""
     messages = [m for m in (body.get("messages") or []) if isinstance(m, dict)]
     if not messages:
         return ""
 
-    result_message_indexes = []
+    result_indexes = []
     for i, message in enumerate(messages):
         content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        if any(
+        if isinstance(content, list) and any(
             isinstance(block, dict) and block.get("type") == "tool_result"
             for block in content
         ):
-            result_message_indexes.append(i)
+            result_indexes.append(i)
 
-    if not result_message_indexes:
+    if not result_indexes:
         return ""
 
-    last_result_message = result_message_indexes[-1]
+    last_result = result_indexes[-1]
 
-    # A later ordinary user text means a new turn, not just a tool continuation.
-    for message in messages[last_result_message + 1:]:
+    for message in messages[last_result + 1:]:
         if str(message.get("role") or "").lower() != "user":
             continue
         content = message.get("content")
-        blocks = content if isinstance(content, list) else [{"type": "text", "text": _openai_text_content(content)}]
+        blocks = content if isinstance(content, list) else [
+            {"type": "text", "text": _openai_text_content(content)}
+        ]
         for block in blocks:
             if isinstance(block, dict) and block.get("type") == "text":
                 if str(block.get("text") or "").strip():
                     return ""
 
-    rows = _render_anthropic_tool_messages(
-        {"messages": messages[max(0, last_result_message - 1):last_result_message + 1]}
-    )
+    rows = []
+    content = messages[last_result].get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_id = str(block.get("tool_use_id") or "")
+            value = _openai_text_content(block.get("content", ""))
+            rows.append(
+                "Tool Result"
+                + (f" (id={tool_id})" if tool_id else "")
+                + ":\n"
+                + value
+            )
+
     if not rows:
         return ""
 
     rendered = (
         "Continue the SAME coding-agent task in this existing conversation. "
-        "The client completed the requested tool operation. Use the result below. "
-        "If another tool is needed, emit one Bridgena action and stop immediately "
-        "after its closing ].\n\n"
+        "The client executed your previous action. Here is ONLY the new tool "
+        "result; the previous action is already in this conversation. Do not "
+        "repeat a completed action. If another tool is genuinely required, "
+        "emit one Bridgena action and stop at its closing ]. Otherwise finish "
+        "normally.\n\n"
         + "\n\n".join(rows)
     )
 
     if len(rendered) <= TOOL_CONTINUATION_MAX_CHARS:
         return rendered
 
-    marker = "\n\n[older tool detail compacted]\n\n"
+    marker = "\n\n[large tool result tail compacted]\n\n"
     keep = max(1, TOOL_CONTINUATION_MAX_CHARS - len(marker))
     return marker + rendered[-keep:]
 
@@ -16386,6 +16564,13 @@ async def _lifespan(app):
     log("INFO", "Action boundary · client tool call is released immediately; Arena remainder drains silently")
     log("INFO", f"Tool continuation settle gate · wait <= {AGENT_ACTION_DRAIN_WAIT_SEC:.0f}s · "
                 f"hard drain <= {AGENT_ACTION_DRAIN_HARD_SEC:.0f}s")
+    log("INFO", f"Agent continuation dispatch · result-only delta ON · "
+                f"conversation gate <= {AGENT_CONTINUATION_GATE_WAIT_SEC:.0f}s · "
+                f"recent-route reuse <= {AGENT_CONTINUATION_ROUTE_FRESH_SEC:.0f}s")
+    log("INFO", f"Browser predispatch guards · live-cookie read <= "
+                f"{LIVE_COOKIE_READ_TIMEOUT_SEC:.1f}s · transport-lock wait <= "
+                f"{TRANSPORT_PROBE_LOCK_WAIT_SEC:.1f}s")
+    log("INFO", "Agent challenge policy · bound tool threads preserved · no giant cross-account replay during edge hold")
     log("INFO", f"Browser-native session mode · persistent contexts "
                 f"{'ON' if BROWSER_PERSISTENT_CONTEXT else 'OFF'} · JavaScript ON · "
                 f"service workers {'ON' if BROWSER_SERVICE_WORKERS else 'OFF'} · "
