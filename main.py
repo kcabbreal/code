@@ -440,7 +440,7 @@ def _configure_keeper_concurrency(account_count: int) -> tuple:
 
     return starts, logins
 
-BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.9.6-agent-envelope-stability")
+BUILD_STAMP = os.environ.get("BRIDGENA_BUILD", "v3.10.0-action-protocol")
 DURABLE_WRITES = os.environ.get("BRIDGENA_DURABLE_WRITES", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 CONFIG_FILE = "config.json"
@@ -2094,8 +2094,23 @@ TOOL_TRANSCRIPT_MAX_CHARS = max(
     min(30000, int(os.environ.get("BRIDGENA_TOOL_TRANSCRIPT_MAX_CHARS", "13000"))),
 )
 AGENT_CHALLENGE_BACKOFF_SEC = max(
-    5.0,
-    min(180.0, float(os.environ.get("BRIDGENA_AGENT_CHALLENGE_BACKOFF_SEC", "20"))),
+    2.0,
+    min(30.0, float(os.environ.get("BRIDGENA_AGENT_CHALLENGE_BACKOFF_SEC", "5"))),
+)
+AGENT_CHALLENGE_BACKOFF_MAX_SEC = max(
+    AGENT_CHALLENGE_BACKOFF_SEC,
+    min(45.0, float(os.environ.get("BRIDGENA_AGENT_CHALLENGE_BACKOFF_MAX_SEC", "18"))),
+)
+TOOL_CONTINUATION_MAX_CHARS = max(
+    2500,
+    min(12000, int(os.environ.get("BRIDGENA_TOOL_CONTINUATION_MAX_CHARS", "7000"))),
+)
+BRIDGENA_ACTION_PROTOCOL = os.environ.get(
+    "BRIDGENA_ACTION_PROTOCOL", "v2"
+).strip().lower() or "v2"
+BRIDGENA_ACTION_MAX_CHARS = max(
+    1000,
+    min(50000, int(os.environ.get("BRIDGENA_ACTION_MAX_CHARS", "24000"))),
 )
 
 _agent_challenge_until: Dict[str, float] = {}
@@ -12409,26 +12424,50 @@ def _tool_protocol_system(body: dict, protocol: str) -> str:
     defs = _tool_anthropic_defs(body) if protocol == "anthropic" else _tool_openai_defs(body)
     if not defs:
         return ""
+
     encoded = _fit_valid_tool_defs(defs, TOOL_SCHEMA_MAX_CHARS)
     choice = _tool_choice_text(body, protocol)
-    parallel = bool(body.get("parallel_tool_calls", True))
+
     return (
-        "You are operating inside a tool-capable API client. Tool execution is performed "
-        "by the client, not by you. Never claim that you executed a tool yourself.\\n\\n"
-        "AVAILABLE TOOLS (JSON):\\n" + encoded + "\\n\\n"
-        "TOOL CHOICE: " + choice + "\\n"
-        "PARALLEL TOOL CALLS: " + ("allowed" if parallel else "one call only") + "\\n\\n"
-        "When a tool is needed, output ONLY one JSON object and no normal prose. "
-        "Preferred exact shape:\\n"
-        '{"tool_calls":[{"name":"EXACT_TOOL_NAME","arguments":{}}]}'
-        "\\nDo not wrap this JSON in markdown. If your interface adds harmless wrapper "
-        "characters around it, preserve the JSON object itself exactly. "
-        "Arguments MUST be valid JSON and MUST follow the selected tool schema. "
-        "You may include multiple calls in tool_calls only when parallel calls are allowed. "
-        "If TOOL CHOICE is none, do not call a tool. If it is required, or names a required "
-        "tool, you must return a valid tool envelope instead of a normal answer. "
-        "After the client provides a Tool Result, continue from that result: either call "
-        "another tool with the same envelope or return the final normal-text answer."
+        "You are operating inside a tool-capable coding/agent client through "
+        "Bridgena Action Protocol v2. The CLIENT executes tools; you only request "
+        "an action. Never claim that a tool, file write, shell command, browser "
+        "action, or MCP operation succeeded until a Tool Result is provided.\\n\\n"
+
+        "AVAILABLE CLIENT TOOLS (JSON):\\n" + encoded + "\\n\\n"
+        "TOOL CHOICE: " + choice + "\\n\\n"
+
+        "WHEN AN ACTION IS NEEDED:\\n"
+        "Emit exactly ONE Bridgena action and STOP THE TURN immediately after "
+        "its closing ]. Do not add success text after the action. Bridgena cuts "
+        "the turn at the first valid action, validates it, and translates it "
+        "into the client's native tool-call protocol.\\n\\n"
+
+        "Preferred universal form:\\n"
+        'bridgena_call[{"tool":"EXACT_CLIENT_TOOL_NAME","arguments":{"arg":"value"}}]\\n\\n'
+
+        "Simple shorthand is valid when the suffix identifies exactly one "
+        "available client tool:\\n"
+        'bridgena_write[{"filePath":"example.txt","content":"hello"}]\\n'
+        'bridgena_read[{"path":"example.txt"}]\\n\\n'
+
+        "For MCP-exposed tools use:\\n"
+        'bridgena_mcp[{"tool":"EXACT_CLIENT_TOOL_NAME","arguments":{"arg":"value"}}]\\n'
+        "The tool must exist in AVAILABLE CLIENT TOOLS. Bridgena never invents "
+        "or executes a nonexistent tool.\\n\\n"
+
+        "Bracket payloads should be JSON. Keyword form such as "
+        'bridgena_mcp[tool="server.tool", arguments={"path":"x"}] is also '
+        "accepted, but JSON is preferred. Use the tool schema's field names "
+        "exactly.\\n\\n"
+
+        "If no tool is needed, answer normally. If TOOL CHOICE is none, never "
+        "emit a Bridgena action. If a tool is required, emit a valid action "
+        "instead of a final prose answer.\\n\\n"
+
+        "After a Tool Result arrives, continue the SAME task. If another action "
+        "is required, emit one new Bridgena action and stop again. Otherwise "
+        "return the final normal-text answer."
     )
 
 
@@ -12618,7 +12657,7 @@ def _bounded_tool_transcript(rows: list) -> str:
     kept.reverse()
     if omitted:
         kept.insert(0, f"[{omitted} older event(s) omitted to fit the context budget.]")
-    return (instruction + "\\n\\n".join(kept) + suffix)[:MAX_PROMPT]
+    return (instruction + "\\n\\n".join(kept) + suffix)[:limit]
 
 
 def _openai_tool_prompt(body: dict) -> str:
@@ -12634,6 +12673,178 @@ def _openai_tool_prompt(body: dict) -> str:
 def _anthropic_tool_prompt(body: dict) -> str:
     rows = _render_anthropic_tool_messages(body)
     return _bounded_tool_transcript(rows) if rows else ""
+
+
+
+def _conversation_has_model_binding(chat_id: str, model_name: str) -> bool:
+    conv = get_conversation(chat_id) or {}
+    if conv.get("model") != model_name:
+        return False
+    arena = conv.get("arena") if isinstance(conv.get("arena"), dict) else {}
+    return bool(arena.get(model_name))
+
+
+def _openai_tool_continuation_prompt(body: dict) -> str:
+    """Send only the latest completed tool exchange to an existing Arena chat."""
+    messages = [m for m in (body.get("messages") or []) if isinstance(m, dict)]
+    if not messages:
+        return ""
+
+    tool_indexes = [
+        i for i, m in enumerate(messages)
+        if str(m.get("role") or "").strip().lower() in {"tool", "function"}
+    ]
+    if not tool_indexes:
+        return ""
+
+    last_tool = tool_indexes[-1]
+
+    # If a real new user turn follows the tool result, this is not merely a
+    # tool-result continuation; use the normal transcript path.
+    for m in messages[last_tool + 1:]:
+        role = str(m.get("role") or "").strip().lower()
+        if role in {"user", "developer", "system"}:
+            if _openai_text_content(m.get("content", "")).strip():
+                return ""
+
+    start = last_tool
+    for i in range(last_tool - 1, -1, -1):
+        role = str(messages[i].get("role") or "").strip().lower()
+        if role == "assistant" and (
+            messages[i].get("tool_calls") or messages[i].get("function_call")
+        ):
+            start = i
+            break
+        if role == "user":
+            break
+
+    rows = []
+    saw_result = False
+    for m in messages[start:]:
+        role = str(m.get("role") or "").strip().lower()
+        if role not in {"assistant", "tool", "function"}:
+            continue
+        rendered = _render_openai_tool_message(m)
+        if not rendered:
+            continue
+        rows.append(rendered)
+        if role in {"tool", "function"}:
+            saw_result = True
+
+    if not saw_result or not rows:
+        return ""
+
+    prefix = (
+        "Continue the SAME coding-agent task in this existing conversation. "
+        "The previously requested tool operation has completed. Use the result "
+        "below and do not repeat an already-completed tool call unless another "
+        "tool action is genuinely required. If another tool is needed, emit "
+        "one Bridgena action and stop immediately after its closing ].\\n\\n"
+    )
+    rendered = prefix + "\\n\\n".join(rows)
+
+    if len(rendered) <= TOOL_CONTINUATION_MAX_CHARS:
+        return rendered
+
+    marker = "\\n\\n[older tool detail compacted]\\n\\n"
+    keep = max(1, TOOL_CONTINUATION_MAX_CHARS - len(marker))
+    return marker + rendered[-keep:]
+
+
+def _openai_tool_turn_prompts(
+    body: dict,
+    keyinfo: Optional[dict],
+    model_name: str,
+) -> tuple:
+    """Return logical id, dispatch prompt, complete handoff prompt, continuation."""
+    logical_id = _logical_chat_id(body, keyinfo, "api-tool")
+    full_prompt = _format_conversation_prompt(body)
+    dispatch_prompt = full_prompt
+    continuation = False
+
+    # Only use the delta path when the logical Arena conversation actually
+    # exists. After a process restart, the complete transcript is used once to
+    # rebuild context safely.
+    if _conversation_has_model_binding(logical_id, model_name):
+        delta = _openai_tool_continuation_prompt(body)
+        if delta:
+            dispatch_prompt = delta
+            continuation = True
+
+    return logical_id, dispatch_prompt, full_prompt, continuation
+
+
+def _anthropic_tool_continuation_prompt(body: dict) -> str:
+    messages = [m for m in (body.get("messages") or []) if isinstance(m, dict)]
+    if not messages:
+        return ""
+
+    result_message_indexes = []
+    for i, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        if any(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in content
+        ):
+            result_message_indexes.append(i)
+
+    if not result_message_indexes:
+        return ""
+
+    last_result_message = result_message_indexes[-1]
+
+    # A later ordinary user text means a new turn, not just a tool continuation.
+    for message in messages[last_result_message + 1:]:
+        if str(message.get("role") or "").lower() != "user":
+            continue
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else [{"type": "text", "text": _openai_text_content(content)}]
+        for block in blocks:
+            if isinstance(block, dict) and block.get("type") == "text":
+                if str(block.get("text") or "").strip():
+                    return ""
+
+    rows = _render_anthropic_tool_messages(
+        {"messages": messages[max(0, last_result_message - 1):last_result_message + 1]}
+    )
+    if not rows:
+        return ""
+
+    rendered = (
+        "Continue the SAME coding-agent task in this existing conversation. "
+        "The client completed the requested tool operation. Use the result below. "
+        "If another tool is needed, emit one Bridgena action and stop immediately "
+        "after its closing ].\\n\\n"
+        + "\\n\\n".join(rows)
+    )
+
+    if len(rendered) <= TOOL_CONTINUATION_MAX_CHARS:
+        return rendered
+
+    marker = "\\n\\n[older tool detail compacted]\\n\\n"
+    keep = max(1, TOOL_CONTINUATION_MAX_CHARS - len(marker))
+    return marker + rendered[-keep:]
+
+
+def _anthropic_tool_turn_prompts(
+    body: dict,
+    keyinfo: Optional[dict],
+    model_name: str,
+) -> tuple:
+    logical_id = _logical_chat_id(body, keyinfo, "anthropic-tool")
+    full_prompt = _anthropic_prompt(body)
+    dispatch_prompt = full_prompt
+    continuation = False
+
+    if _conversation_has_model_binding(logical_id, model_name):
+        delta = _anthropic_tool_continuation_prompt(body)
+        if delta:
+            dispatch_prompt = delta
+            continuation = True
+
+    return logical_id, dispatch_prompt, full_prompt, continuation
 
 
 def _allowed_tool_names(body: dict, protocol: str) -> set:
@@ -12688,6 +12899,257 @@ def _normalize_parsed_tool_calls(value, body: dict, protocol: str) -> list:
         if body.get("parallel_tool_calls") is False:
             break
     return out
+
+
+def _action_norm(value: str) -> str:
+    raw = re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+    if raw.startswith("mcp") and len(raw) > 3:
+        raw = raw[3:]
+    return raw
+
+
+def _tool_defs_for_protocol(body: dict, protocol: str) -> list:
+    return _tool_anthropic_defs(body) if protocol == "anthropic" else _tool_openai_defs(body)
+
+
+def _tool_aliases(name: str) -> set:
+    value = str(name or "").strip()
+    aliases = {value.lower(), _action_norm(value)}
+    parts = [p for p in re.split(r"__|[.:/\\\\-]+", value) if p]
+    for i in range(len(parts)):
+        suffix = "".join(parts[i:])
+        aliases.add(suffix.lower())
+        aliases.add(_action_norm(suffix))
+        aliases.add(parts[i].lower())
+        aliases.add(_action_norm(parts[i]))
+    return {item for item in aliases if item}
+
+
+def _resolve_action_tool_name(requested: str, body: dict, protocol: str) -> str:
+    requested = str(requested or "").strip()
+    if not requested:
+        return ""
+
+    names = [
+        str(item.get("name") or "")
+        for item in _tool_defs_for_protocol(body, protocol)
+        if item.get("name")
+    ]
+
+    for name in names:
+        if requested == name or requested.lower() == name.lower():
+            return name
+
+    wanted = _tool_aliases(requested)
+    matches = []
+    for name in names:
+        if wanted & _tool_aliases(name):
+            matches.append(name)
+
+    unique = list(dict.fromkeys(matches))
+    return unique[0] if len(unique) == 1 else ""
+
+
+def _action_schema_for_tool(tool_name: str, body: dict, protocol: str) -> dict:
+    for item in _tool_defs_for_protocol(body, protocol):
+        if str(item.get("name") or "") == tool_name:
+            schema = item.get("parameters")
+            return schema if isinstance(schema, dict) else {}
+    return {}
+
+
+def _extract_balanced_action_payload(text: str, bracket_index: int):
+    if bracket_index < 0 or bracket_index >= len(text) or text[bracket_index] != "[":
+        return None
+
+    depth = 0
+    quote = None
+    escape = False
+    stop = min(len(text), bracket_index + BRIDGENA_ACTION_MAX_CHARS + 1)
+
+    for i in range(bracket_index, stop):
+        ch = text[i]
+
+        if quote is not None:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = None
+            continue
+
+        if ch in ('"', "'"):
+            quote = ch
+            continue
+
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return text[bracket_index + 1:i], i + 1
+
+    return None
+
+
+def _parse_action_keyword_payload(raw: str):
+    """Safely parse bridgena_x[key=value,...]; no eval/code execution."""
+    try:
+        import ast
+        expr = ast.parse("bridgena_action(" + raw + ")", mode="eval").body
+        if not isinstance(expr, ast.Call):
+            return None
+
+        positional = [ast.literal_eval(node) for node in expr.args]
+        values = {}
+        for kw in expr.keywords:
+            if kw.arg is None:
+                return None
+            values[str(kw.arg)] = ast.literal_eval(kw.value)
+
+        if values and positional:
+            values["_positional"] = positional
+            return values
+        if values:
+            return values
+        if len(positional) == 1:
+            return positional[0]
+        return positional if positional else {}
+    except Exception:
+        return None
+
+
+def _parse_bridgena_action_payload(raw: str):
+    raw = str(raw or "").strip()
+    if not raw:
+        return {}
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    try:
+        import ast
+        return ast.literal_eval(raw)
+    except Exception:
+        pass
+
+    return _parse_action_keyword_payload(raw)
+
+
+def _action_args_from_payload(
+    action_kind: str,
+    payload,
+    resolved_tool: str,
+    body: dict,
+    protocol: str,
+) -> dict:
+    if isinstance(payload, dict):
+        for key in ("arguments", "args", "input", "parameters"):
+            if isinstance(payload.get(key), dict):
+                return payload[key]
+
+        if action_kind in {"call", "tool", "action", "mcp"}:
+            return {
+                str(k): v
+                for k, v in payload.items()
+                if str(k) not in {"tool", "name", "tool_name", "server_tool"}
+                and not str(k).startswith("_")
+            }
+
+        return {
+            str(k): v
+            for k, v in payload.items()
+            if not str(k).startswith("_")
+        }
+
+    schema = _action_schema_for_tool(resolved_tool, body, protocol)
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    names = list(properties.keys())
+
+    if isinstance(payload, (list, tuple)):
+        if len(payload) <= len(names):
+            return {names[i]: value for i, value in enumerate(payload)}
+        return {}
+
+    if len(names) == 1:
+        return {names[0]: payload}
+
+    return {}
+
+
+def _bridgena_action_calls(text: str, body: dict, protocol: str) -> list:
+    """Translate the FIRST valid bridgena_*[] action into one client tool call."""
+    if not isinstance(text, str) or "bridgena_" not in text.lower():
+        return []
+
+    pattern = re.compile(r"(?i)\\bbridgena_([a-z0-9_.:/-]+)\\s*\\[")
+
+    for match in pattern.finditer(text):
+        action_kind = str(match.group(1) or "").strip()
+        bracket_index = match.end() - 1
+        balanced = _extract_balanced_action_payload(text, bracket_index)
+        if not balanced:
+            continue
+
+        raw_payload, _end_index = balanced
+        payload = _parse_bridgena_action_payload(raw_payload)
+        if payload is None:
+            continue
+
+        lowered = action_kind.lower()
+
+        if lowered in {"call", "tool", "action", "mcp"}:
+            requested = ""
+            if isinstance(payload, dict):
+                requested = str(
+                    payload.get("tool")
+                    or payload.get("name")
+                    or payload.get("tool_name")
+                    or payload.get("server_tool")
+                    or ""
+                ).strip()
+        else:
+            requested = action_kind
+
+        resolved = _resolve_action_tool_name(requested, body, protocol)
+
+        # Some clients expose MCP as one generic dispatcher rather than one
+        # function per remote MCP tool.
+        generic_mcp = False
+        if not resolved and lowered == "mcp" and requested:
+            for generic_name in ("mcp", "mcp_call", "call_mcp", "mcp_tool"):
+                resolved = _resolve_action_tool_name(generic_name, body, protocol)
+                if resolved:
+                    generic_mcp = True
+                    break
+
+        if not resolved:
+            continue
+
+        args = _action_args_from_payload(
+            lowered, payload, resolved, body, protocol
+        )
+        if generic_mcp:
+            args = {"tool": requested, "arguments": args}
+
+        if not isinstance(args, dict):
+            continue
+
+        validated = _normalize_parsed_tool_calls(
+            {"tool_calls": [{"name": resolved, "arguments": args}]},
+            body,
+            protocol,
+        )
+        if validated:
+            # Sequential action boundaries are deliberate: the client executes
+            # this call, returns its Tool Result, then the same Arena thread
+            # decides whether another action is needed.
+            return validated[:1]
+
+    return []
 
 
 def _tool_json_candidates(text: str):
@@ -12762,10 +13224,17 @@ def _tool_json_candidates(text: str):
 def _extract_tool_calls(text: str, body: dict, protocol: str) -> list:
     if not isinstance(text, str) or not text.strip():
         return []
+
+    calls = _bridgena_action_calls(text, body, protocol)
+    if calls:
+        return calls
+
+    # Backward compatibility for models that still produce the v1 JSON envelope.
     for parsed in _tool_json_candidates(text):
         calls = _normalize_parsed_tool_calls(parsed, body, protocol)
         if calls:
             return calls
+
     return []
 
 
@@ -12816,7 +13285,10 @@ def _agent_challenge_remaining(fp: str) -> float:
 def _arm_agent_challenge_circuit(fp: str) -> float:
     count = int(_agent_challenge_count.get(fp, 0)) + 1
     _agent_challenge_count[fp] = count
-    delay = min(120.0, AGENT_CHALLENGE_BACKOFF_SEC * (1.5 ** max(0, count - 1)))
+    delay = min(
+        AGENT_CHALLENGE_BACKOFF_MAX_SEC,
+        AGENT_CHALLENGE_BACKOFF_SEC * (1.0 + 0.5 * max(0, count - 1)),
+    )
     _agent_challenge_until[fp] = time.monotonic() + delay
     return delay
 
@@ -12828,9 +13300,20 @@ def _clear_agent_challenge_circuit(fp: str) -> None:
 
 def _tool_output_log(protocol: str, model: str, calls: list, text: str) -> None:
     names = ",".join(str(c.get("name") or "") for c in calls[:8]) or "-"
-    raw_hint = " · raw_tool_json_seen=yes" if '"tool_calls"' in str(text or "") else ""
-    log("INFO", f"{protocol} agent turn · model {str(model)[:80]} · "
-                f"tool_calls {len(calls)} [{names}] · buffered {len(text)} chars{raw_hint}")
+    raw = str(text or "")
+
+    if re.search(r"(?i)\\bbridgena_[a-z0-9_.:/-]+\\s*\\[", raw):
+        syntax = " · action_protocol=v2"
+    elif '"tool_calls"' in raw:
+        syntax = " · legacy_tool_json=yes"
+    else:
+        syntax = ""
+
+    log(
+        "INFO",
+        f"{protocol} agent turn · model {str(model)[:80]} · "
+        f"tool_calls {len(calls)} [{names}] · buffered {len(raw)} chars{syntax}"
+    )
 
 
 def _disposable_context_prompt(body: dict) -> str:
@@ -13090,20 +13573,31 @@ def _release_api_request(body: dict, keyinfo: Optional[dict], prompt: str) -> No
 
 
 async def _openai_tool_nonstream(body: dict, keyinfo: dict):
-    prompt = _format_conversation_prompt(body)
+    model = body.get("model", "auto")
+    chat_id, prompt, handoff_prompt, continuation = _openai_tool_turn_prompts(
+        body, keyinfo, model
+    )
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
-    model = body.get("model", "auto")
-    chat_id = _disposable_chat_id("api-tool")
+
+    system_context = _tool_runtime_system_context(body, "openai")
+    if not continuation:
+        system_context, prompt = _fit_tool_envelope(system_context, prompt)
+    else:
+        log(
+            "INFO",
+            f"OpenAI tool continuation · logical chat {chat_id[-12:]} · "
+            f"delta {len(prompt)} chars · handoff {len(handoff_prompt)} chars",
+        )
     acc = ""
     reasoning_acc = ""
     try:
         async for kind, payload in run_turn(
             chat_id, prompt, model,
             attachments=body.get("attachments"),
-            system_prompt=_tool_runtime_system_context(body, "openai"),
+            system_prompt=system_context,
             tenant_id=_tenant_identity(keyinfo),
-            handoff_prompt=prompt,
+            handoff_prompt=handoff_prompt,
         ):
             if kind == "content" and isinstance(payload, str):
                 acc += payload
@@ -13142,11 +13636,13 @@ async def _openai_tool_nonstream(body: dict, keyinfo: dict):
 
 
 async def _openai_tool_stream(body: dict, keyinfo: dict):
-    prompt = _format_conversation_prompt(body)
+    model = body.get("model", "auto")
+    chat_id, prompt, handoff_prompt, continuation = _openai_tool_turn_prompts(
+        body, keyinfo, model
+    )
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
 
-    model = body.get("model", "auto")
     agent_fp = _agent_request_fingerprint(body)
     remaining = _agent_challenge_remaining(agent_fp)
     if remaining > 0:
@@ -13155,12 +13651,23 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
         return JSONResponse(status_code=503, headers={"Retry-After":str(retry_after),"X-Bridgena-Retryable":"true","Cache-Control":"no-store"}, content={"error":{"message":f"The upstream edge temporarily challenged this agent request class. Retry after about {retry_after}s.","type":"api_error","code":"agent_request_backoff"}})
 
     system_context = _tool_runtime_system_context(body, "openai")
-    original_size = len(system_context) + len(prompt)
-    system_context, prompt = _fit_tool_envelope(system_context, prompt)
-    compact_size = len(system_context) + len(prompt)
-    if compact_size < original_size:
-        log("INFO", f"OpenAI agent envelope compacted · {original_size} → {compact_size} chars · tools {len(_tool_openai_defs(body))} · messages {len(body.get('messages') or [])}")
-    chat_id = _disposable_chat_id("api-tool")
+    if continuation:
+        log(
+            "INFO",
+            f"OpenAI tool continuation · logical chat {chat_id[-12:]} · "
+            f"delta {len(prompt)} chars · handoff {len(handoff_prompt)} chars · "
+            f"tools {len(_tool_openai_defs(body))}",
+        )
+    else:
+        original_size = len(system_context) + len(prompt)
+        system_context, prompt = _fit_tool_envelope(system_context, prompt)
+        compact_size = len(system_context) + len(prompt)
+        if compact_size < original_size:
+            log(
+                "INFO",
+                f"OpenAI agent envelope compacted · {original_size} → {compact_size} chars · "
+                f"tools {len(_tool_openai_defs(body))} · messages {len(body.get('messages') or [])}",
+            )
     created = int(time.time())
     rid = "chatcmpl-" + uuid7()[:23]
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
@@ -13181,7 +13688,7 @@ async def _openai_tool_stream(body: dict, keyinfo: dict):
             attachments=body.get("attachments"),
             system_prompt=system_context,
             tenant_id=_tenant_identity(keyinfo),
-            handoff_prompt=prompt,
+            handoff_prompt=handoff_prompt,
         ):
             if kind == "content" and isinstance(payload, str):
                 acc += payload
@@ -13767,14 +14274,23 @@ async def _native_anthropic_request(request: Request, endpoint: str):
 
 
 async def _anthropic_tool_response(body: dict, keyinfo: dict):
-    prompt = _anthropic_prompt(body)
+    model = body.get("model", "auto")
+    chat_id, prompt, handoff_prompt, continuation = _anthropic_tool_turn_prompts(
+        body, keyinfo, model
+    )
     if not prompt:
         raise HTTPException(status_code=400, detail="no conversation content")
-    model = body.get("model", "auto")
-    chat_id = _disposable_chat_id("anthropic-tool")
+
     tenant_id = _tenant_identity(keyinfo)
     system_prompt = _tool_runtime_system_context(body, "anthropic")
-    system_prompt, prompt = _fit_tool_envelope(system_prompt, prompt)
+    if not continuation:
+        system_prompt, prompt = _fit_tool_envelope(system_prompt, prompt)
+    else:
+        log(
+            "INFO",
+            f"Anthropic tool continuation · logical chat {chat_id[-12:]} · "
+            f"delta {len(prompt)} chars · handoff {len(handoff_prompt)} chars",
+        )
     message_id = "msg_" + uuid7().replace("-", "")
     input_tokens = _rough_tokens(prompt + "\n" + system_prompt)
 
@@ -13787,7 +14303,7 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
                 attachments=body.get("attachments"),
                 system_prompt=system_prompt,
                 tenant_id=tenant_id,
-                handoff_prompt=prompt,
+                handoff_prompt=handoff_prompt,
             ):
                 if kind == "content" and isinstance(payload, str):
                     acc += payload
@@ -13825,7 +14341,7 @@ async def _anthropic_tool_response(body: dict, keyinfo: dict):
                 attachments=body.get("attachments"),
                 system_prompt=system_prompt,
                 tenant_id=tenant_id,
-                handoff_prompt=prompt,
+                handoff_prompt=handoff_prompt,
             ):
                 if kind == "content" and isinstance(payload, str):
                     acc += payload
@@ -15314,7 +15830,14 @@ async def _lifespan(app):
                 f"normal wait {UNBOUND_READY_KEEPER_WAIT_SEC:.0f}s · tool wait {TOOL_READY_KEEPER_WAIT_SEC:.0f}s")
     log("INFO", "OpenAI tool transport · upstream admission buffered before SSE commit · real HTTP retry statuses ON")
     log("INFO", f"Agent envelope · total <= {TOOL_TOTAL_ENVELOPE_MAX_CHARS} chars · tool schema <= {TOOL_SCHEMA_MAX_CHARS} · transcript <= {TOOL_TRANSCRIPT_MAX_CHARS}")
-    log("INFO", f"Agent challenge circuit · identical request backoff base {AGENT_CHALLENGE_BACKOFF_SEC:.0f}s · retry storms cannot consume the keeper fleet")
+    log("INFO", f"Agent challenge circuit · backoff {AGENT_CHALLENGE_BACKOFF_SEC:.0f}s → "
+                f"max {AGENT_CHALLENGE_BACKOFF_MAX_SEC:.0f}s · no 90s interactive stalls")
+    log("INFO", f"Agent tool-loop continuity · stable logical Arena chat ON · "
+                f"tool-result delta <= {TOOL_CONTINUATION_MAX_CHARS} chars")
+    log("INFO", f"Bridgena Action Protocol · {BRIDGENA_ACTION_PROTOCOL} ON · "
+                "model actions → OpenAI tool_calls / Anthropic tool_use")
+    log("INFO", "Action boundary · first valid bridgena_*[] action wins · trailing prose discarded")
+    log("INFO", "MCP action bridge · bridgena_mcp[{tool,arguments}] → client-exposed MCP tool")
     log("INFO", f"Browser-native session mode · persistent contexts "
                 f"{'ON' if BROWSER_PERSISTENT_CONTEXT else 'OFF'} · JavaScript ON · "
                 f"service workers {'ON' if BROWSER_SERVICE_WORKERS else 'OFF'} · "
